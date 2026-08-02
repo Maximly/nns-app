@@ -36,7 +36,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.0.17"
+readonly VERSION="1.0.18"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -50,13 +50,40 @@ readonly VPNGATE_API_URL="https://www.vpngate.net/api/iphone/"
 readonly CACHE_DIR="/var/cache/nns-app"
 readonly STATE_DIR="/var/lib/nns-app"
 readonly VPNGATE_CACHE_FILE="$CACHE_DIR/vpngate.csv"
-readonly VPNGATE_CACHE_TTL=1800
-readonly VPNGATE_PROBE_TIMEOUT=3
-readonly VPNGATE_PROBE_ATTEMPTS=6
+# Candidate profiles are live-tested before import, so the large VPN Gate
+# CSV does not need to be downloaded every few minutes.
+readonly VPNGATE_CACHE_TTL=172800
+readonly VPNGATE_PROBE_TIMEOUT=6
+readonly VPNGATE_PROBE_ATTEMPTS=10
 
 log()  { printf '%s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+format_duration() {
+    local seconds=${1:-0}
+    [[ "$seconds" =~ ^[0-9]+$ ]] || seconds=0
+
+    if (( seconds >= 86400 )); then
+        local days=$((seconds / 86400))
+        local hours=$(((seconds % 86400) / 3600))
+        if (( hours > 0 )); then
+            printf '%dd %dh' "$days" "$hours"
+        else
+            printf '%dd' "$days"
+        fi
+    elif (( seconds >= 3600 )); then
+        local hours=$((seconds / 3600))
+        local minutes=$(((seconds % 3600) / 60))
+        if (( minutes > 0 )); then
+            printf '%dh %dm' "$hours" "$minutes"
+        else
+            printf '%dh' "$hours"
+        fi
+    else
+        printf '%dm' "$((seconds / 60))"
+    fi
+}
 
 show_version() {
     printf '%s %s\n' "$PROGRAM_NAME" "$VERSION"
@@ -697,7 +724,7 @@ add_any_profile() {
         age=$((now - mtime))
         if (( age >= 0 && age <= VPNGATE_CACHE_TTL )); then
             use_cache="on"
-            log "Using cached VPN Gate relay list (age $((age / 60)) min; TTL $((VPNGATE_CACHE_TTL / 60)) min)."
+            log "Using cached VPN Gate relay list (age $(format_duration "$age"); TTL $(format_duration "$VPNGATE_CACHE_TTL"))."
         fi
     fi
 
@@ -722,7 +749,7 @@ add_any_profile() {
             mtime=$(stat -c %Y "$VPNGATE_CACHE_FILE" 2>/dev/null || printf '0')
             [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
             age=$((now - mtime))
-            warn "Could not refresh the VPN Gate list; using stale cache (age $((age / 60)) min)."
+            warn "Could not refresh the VPN Gate list; using stale cache (age $(format_duration "$age"))."
         else
             rm -f "$cache_tmp"
             cache_tmp=""
@@ -1104,14 +1131,22 @@ tested = 0
 probe_note = ""
 
 print(
+    f"Candidate pool: {len(pool)} usable matching relay(s).",
+    file=sys.stderr,
+    flush=True,
+)
+print(
     f"Quick-checking up to {min(probe_attempts, len(pool))} candidate(s); "
     f"{probe_timeout:g}s each, through the host network namespace.",
     file=sys.stderr,
     flush=True,
 )
 
+last_tested_row = None
+
 for pool_index in ordered_indexes[:probe_attempts]:
     _, candidate_row, candidate_config = pool[pool_index]
+    last_tested_row = candidate_row
     endpoint = first_endpoint(candidate_config)
     candidate_host = get(candidate_row, "HostName")
     candidate_ip = get(candidate_row, "IP")
@@ -1158,9 +1193,26 @@ for pool_index in ordered_indexes[:probe_attempts]:
     )
 
 if selected_index is None or row is None or config is None:
+    # Advance round-robin state even after a failed batch, so a later call
+    # continues with candidates that were not tested in this invocation.
+    if last_tested_row is not None:
+        failed_host = get(last_tested_row, "HostName")
+        failed_ip = get(last_tested_row, "IP")
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_tmp = state_path.with_name(
+            state_path.name + f".tmp.{os.getpid()}"
+        )
+        state_tmp.write_text(
+            f"{failed_host}|{failed_ip}\n",
+            encoding="utf-8",
+        )
+        os.chmod(state_tmp, 0o600)
+        os.replace(state_tmp, state_path)
+
     raise SystemExit(
         "No candidate completed a quick OpenVPN handshake "
-        f"(tested {tested}; timeout {probe_timeout:g}s each)"
+        f"(tested {tested} of {len(pool)}; "
+        f"timeout {probe_timeout:g}s each)"
     )
 
 host = get(row, "HostName")

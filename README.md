@@ -4,7 +4,7 @@
 
 A browser, messenger, crawler, build tool, or another process can use its own VPN without replacing the host's default route or DNS configuration. Each named environment has separate routes, DNS, firewall state, tunnel state, and a kill switch.
 
-> **Release:** 1.0.17  
+> **Release:** 1.0.18  
 > **Status:** experimental  
 > **Current backend:** OpenVPN  
 > **Planned backends:** WireGuard, AmneziaWG, and provider-specific transports
@@ -19,7 +19,7 @@ A browser, messenger, crawler, build tool, or another process can use its own VP
 - systemd manages namespace and OpenVPN lifecycles.
 - Self-contained OpenVPN profiles can be imported.
 - A public OpenVPN relay can be selected automatically with `add ... any`.
-- VPN Gate metadata is cached for 30 minutes with stale-cache fallback.
+- VPN Gate metadata is cached for two days with stale-cache fallback.
 - Namespace and OpenVPN service startup failures print their own recent logs.
 - Two-letter VPN Gate country filters now match country codes exactly.
 - Restarting after an incomplete namespace setup safely rebuilds endpoint runtime files.
@@ -117,7 +117,7 @@ nns-app --version
 Expected:
 
 ```text
-nns-app 1.0.17
+nns-app 1.0.18
 Author:  Maxim Lyadvinsky
 License: GPL-3.0-or-later
 ```
@@ -174,8 +174,9 @@ The VPN Gate CSV list is cached in:
 /var/cache/nns-app/vpngate.csv
 ```
 
-The cache is reused for 30 minutes. A failed refresh falls back to the last
-cached list, even when it is older. Force a fresh download with:
+The cache is reused for two days. A failed refresh falls back to the last
+cached list even when it is older. Live OpenVPN probing protects selection
+from obviously dead entries in an older list. Force a fresh download with:
 
 ```bash
 sudo nns-app add browser any DE --refresh
@@ -195,10 +196,17 @@ selecting the same top-scoring server repeatedly. State files are stored under:
 Delete the corresponding state file to restart rotation from the strongest
 candidate.
 
-Before importing a relay, nns-app now quick-checks up to six round-robin
-candidates. Each candidate receives a three-second OpenVPN handshake probe.
+Before importing a relay, nns-app quick-checks up to ten round-robin
+candidates. Each candidate receives a six-second OpenVPN handshake probe.
 A successful TCP socket connection alone is not sufficient; the probe requires
-OpenVPN to report `Initialization Sequence Completed`.
+OpenVPN to report `Initialization Sequence Completed`. The selector prints the
+number of usable matching candidates found in the cached list. Thus, “up to 2”
+means only two profiles survived country and safety filtering, not that the
+configured probe-attempt limit is two.
+
+When an entire probe batch fails, the round-robin marker advances to the last
+tested relay. A subsequent `add any` call therefore continues with the next
+untested candidates when the pool contains more entries.
 
 When `add any` is invoked from another NNS namespace, for example:
 
