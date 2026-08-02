@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# nns-app - manage per-application OpenVPN network namespaces on Ubuntu.
+# nns-app - manage per-application VPN network namespaces on Ubuntu.
 #
 # Copyright (C) 2026 Maxim Lyadvinsky
 #
@@ -25,7 +25,8 @@
 #   purge
 #   list
 #   add     <app_name> <profile.ovpn>
-#   start   <app_name>
+#   add     <app_name> any [country]
+#   start   [-i|--ignore-start-error] <app_name>
 #   stop    <app_name>
 #   run     <app_name> <command> [args...]
 #
@@ -35,7 +36,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.0.8"
+readonly VERSION="1.0.11"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -45,6 +46,7 @@ readonly BASE_DIR="/etc/nns-app"
 readonly RUN_DIR="/run/nns-app"
 readonly NETNS_UNIT="/etc/systemd/system/nns-netns@.service"
 readonly VPN_UNIT="/etc/systemd/system/nns-openvpn@.service"
+readonly VPNGATE_API_URL="https://www.vpngate.net/api/iphone/"
 
 log()  { printf '%s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
@@ -64,14 +66,18 @@ Usage:
   nns-app purge
   nns-app list
   nns-app add     <app_name> <profile.ovpn>
-  nns-app start   <app_name>
+  nns-app add     <app_name> any [country-code-or-name]
+  nns-app start   [-i|--ignore-start-error] <app_name>
   nns-app stop    <app_name>
   nns-app run     <app_name> <command> [arguments...]
 
 Examples:
   sudo ./nns-app.sh install browser
   sudo nns-app add browser ~/Downloads/NorwayS23.ovpn
+  sudo nns-app add browser any
+  sudo nns-app add browser any JP
   nns-app start browser
+  nns-app start -i browser   # leave a slow connection running in background
   nns-app run browser curl -4 https://api.ipify.org
   nns-app run browser firefox --no-remote
   sudo nns-app purge
@@ -187,6 +193,7 @@ ensure_dependencies() {
     command -v setpriv >/dev/null 2>&1  || missing+=(util-linux)
     command -v sudo >/dev/null 2>&1     || missing+=(sudo)
     command -v openssl >/dev/null 2>&1  || missing+=(openssl)
+    command -v python3 >/dev/null 2>&1  || missing+=(python3)
 
     if (( ${#missing[@]} )); then
         log "Installing required packages: ${missing[*]}"
@@ -292,7 +299,7 @@ write_sudoers_for_app() {
     cat >"$tmp" <<SUDOERS_EOF
 Defaults!$ENGINE_PATH !use_pty
 Defaults!$ENGINE_PATH env_keep += "DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR LANG LC_ALL TERM COLORTERM SSH_AUTH_SOCK"
-Cmnd_Alias $alias = $ENGINE_PATH list, $ENGINE_PATH start $app, $ENGINE_PATH stop $app, $ENGINE_PATH run $app *
+Cmnd_Alias $alias = $ENGINE_PATH list, $ENGINE_PATH start $app, $ENGINE_PATH start -i $app, $ENGINE_PATH start --ignore-start-error $app, $ENGINE_PATH start $app -i, $ENGINE_PATH start $app --ignore-start-error, $ENGINE_PATH stop $app, $ENGINE_PATH run $app *
 $user ALL=(root) NOPASSWD: $alias
 SUDOERS_EOF
 
@@ -365,7 +372,7 @@ DISABLE_DCO="off"
 #     add a data-ciphers fallback for legacy CBC-only profiles.
 # off: store the profile byte-for-byte without compatibility changes.
 PROFILE_FIXUPS="on"
-READY_TIMEOUT="75"
+READY_TIMEOUT="5"
 EXTERNAL_IP_URL="https://api.ipify.org"
 
 # Allocated internal namespace network. Do not copy these values to another app.
@@ -385,6 +392,7 @@ CONFIG_EOF
     log "Config:   $file"
     log "Profiles: $(profiles_dir "$app")"
     log "Next:     sudo $USER_PATH add $app /path/to/profile.ovpn"
+    log "          or: sudo $USER_PATH add $app any [country]"
 }
 
 profile_name_from_path() {
@@ -631,6 +639,205 @@ add_profile() {
     if systemctl is-active --quiet "nns-openvpn@${app}.service"; then
         warn "'$app' is currently running. Stop and start it to switch profiles."
     fi
+}
+
+
+add_any_profile() {
+    require_root
+    local app=$1 country=${2:-}
+    validate_app_name "$app"
+    load_cfg "$app"
+
+    command -v curl >/dev/null 2>&1 || die "curl is required. Refresh the installation with: nns-app install $app"
+    command -v python3 >/dev/null 2>&1 || die "python3 is required. Refresh the installation with: nns-app install $app"
+
+    local tmpdir csv_file selected metadata
+    tmpdir=$(mktemp -d)
+    csv_file="$tmpdir/vpngate.csv"
+    trap 'rm -rf "${tmpdir:-}"' EXIT
+
+    log "Searching the current VPN Gate public relay list${country:+ for '$country'}..."
+    if ! curl --fail --silent --show-error --location \
+        --connect-timeout 5 --max-time 15 --retry 1 \
+        --user-agent "nns-app/${VERSION}" \
+        "$VPNGATE_API_URL" -o "$csv_file"; then
+        die "Could not download the VPN Gate server list."
+    fi
+
+    metadata=$(python3 - "$csv_file" "$tmpdir" "$country" <<'PY_SELECT'
+import base64
+import csv
+import io
+import os
+import random
+import re
+import sys
+from pathlib import Path
+
+csv_path = Path(sys.argv[1])
+out_dir = Path(sys.argv[2])
+country_filter = sys.argv[3].strip().casefold()
+
+raw = csv_path.read_text(encoding="utf-8-sig", errors="replace")
+lines = [line for line in raw.splitlines() if line and not line.startswith("*")]
+if not lines:
+    raise SystemExit("VPN Gate returned no CSV records")
+
+reader = csv.reader(io.StringIO("\n".join(lines)))
+try:
+    header = next(reader)
+except StopIteration:
+    raise SystemExit("VPN Gate returned an empty CSV document")
+
+header = [field.strip() for field in header]
+header[0] = header[0].lstrip("#")
+index = {name: i for i, name in enumerate(header)}
+required = {
+    "HostName", "IP", "Score", "Ping", "Speed", "CountryLong",
+    "CountryShort", "NumVpnSessions", "Uptime",
+    "OpenVPN_ConfigData_Base64",
+}
+missing = sorted(required - index.keys())
+if missing:
+    raise SystemExit("VPN Gate CSV lacks fields: " + ", ".join(missing))
+
+def get(row, name, default=""):
+    pos = index[name]
+    return row[pos].strip() if pos < len(row) else default
+
+def number(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+def country_matches(short_name, long_name):
+    if not country_filter:
+        return True
+    short_cf = short_name.casefold()
+    long_cf = long_name.casefold()
+    return (
+        country_filter == short_cf
+        or country_filter == long_cf
+        or country_filter in long_cf
+    )
+
+def looks_usable(config):
+    text = config.decode("utf-8", errors="replace")
+    if not re.search(r"(?im)^\s*remote\s+\S+", text):
+        return False
+    if re.search(r"(?im)^\s*(dev\s+tap|dev-type\s+tap)\b", text):
+        return False
+    if re.search(r"(?im)^\s*(?:up|down|route-up|route-pre-down|plugin|script-security|management\S*)\b", text):
+        return False
+    if re.search(r"(?im)^\s*auth-user-pass(?:\s+(?!\[inline\])\S+)?\s*$", text):
+        return False
+    return True
+
+candidates = []
+for row in reader:
+    if not row or len(row) < len(header):
+        continue
+
+    short_name = get(row, "CountryShort").upper()
+    long_name = get(row, "CountryLong")
+    if not country_matches(short_name, long_name):
+        continue
+
+    encoded = "".join(get(row, "OpenVPN_ConfigData_Base64").split())
+    if not encoded:
+        continue
+    try:
+        config = base64.b64decode(encoded, validate=True)
+    except Exception:
+        continue
+    if not config or len(config) > 5 * 1024 * 1024 or not looks_usable(config):
+        continue
+
+    score = number(get(row, "Score"))
+    ping = number(get(row, "Ping"), 999999)
+    speed = number(get(row, "Speed"))
+    uptime = number(get(row, "Uptime"))
+    sessions = number(get(row, "NumVpnSessions"))
+
+    # Prefer the service's own score, then measured speed and uptime. Unknown
+    # ping values rank below measured ones. A small random tie-break avoids
+    # every nns-app user selecting exactly the same volunteer relay.
+    rank = (
+        score,
+        speed,
+        uptime,
+        -sessions,
+        -(ping if ping > 0 else 999999),
+        random.random(),
+    )
+    candidates.append((rank, row, config))
+
+if not candidates:
+    label = sys.argv[3] or "any country"
+    raise SystemExit(f"No usable VPN Gate OpenVPN profile found for {label}")
+
+# Randomly choose among the strongest few rather than concentrating all users
+# on one relay. They are already ordered by VPN Gate's quality measurements.
+candidates.sort(key=lambda item: item[0], reverse=True)
+pool = candidates[: min(5, len(candidates))]
+_, row, config = random.choice(pool)
+
+host = get(row, "HostName")
+ip = get(row, "IP")
+short_name = get(row, "CountryShort").upper() or "XX"
+long_name = get(row, "CountryLong") or "Unknown"
+score = number(get(row, "Score"))
+ping = number(get(row, "Ping"))
+speed = number(get(row, "Speed"))
+uptime = number(get(row, "Uptime"))
+sessions = number(get(row, "NumVpnSessions"))
+
+safe_host = re.sub(r"[^A-Za-z0-9._-]+", "_", host).strip("_") or ip.replace(".", "_")
+filename = f"vpngate_{short_name}_{safe_host}.ovpn"[:64]
+if not filename.endswith(".ovpn"):
+    filename = filename[:59] + ".ovpn"
+path = out_dir / filename
+
+comment = (
+    "# Downloaded automatically by nns-app from the VPN Gate Academic "
+    "Experiment public relay list.\n"
+    f"# Relay: {host} ({ip}); country: {long_name} ({short_name}); "
+    f"score: {score}; ping: {ping} ms; sessions: {sessions}.\n"
+    "# This is a volunteer-operated public VPN relay. Do not assume privacy "
+    "or no logging.\n\n"
+).encode("utf-8")
+path.write_bytes(comment + config)
+os.chmod(path, 0o600)
+
+speed_mbps = speed / 1_000_000 if speed > 0 else 0.0
+uptime_minutes = uptime / 60_000 if uptime > 0 else 0.0
+print(
+    "\t".join(
+        [
+            str(path), short_name, long_name, host, ip, str(score),
+            str(ping), f"{speed_mbps:.1f}", f"{uptime_minutes:.0f}",
+            str(sessions),
+        ]
+    )
+)
+PY_SELECT
+    ) || die "Could not select a usable free VPN profile."
+
+    IFS=$'\t' read -r selected country_short country_long host ip score ping speed_mbps uptime_minutes sessions <<<"$metadata"
+    [[ -f "$selected" ]] || die "The VPN Gate selector did not produce a profile."
+
+    log "Selected VPN Gate relay:"
+    log "  Country:  $country_long ($country_short)"
+    log "  Server:   $host ($ip)"
+    log "  Quality:  score $score, ping ${ping:-unknown} ms, ${speed_mbps} Mbps"
+    log "  Uptime:   ${uptime_minutes} min; active sessions: $sessions"
+    warn "VPN Gate relays are operated by volunteers and may log traffic."
+    warn "Use end-to-end encryption and do not treat this as a trusted privacy VPN."
+
+    add_profile "$app" "$selected"
+    rm -rf "$tmpdir"
+    trap - EXIT
 }
 
 
@@ -936,19 +1143,24 @@ app_is_started() {
 }
 
 wait_online() {
-    local app=$1 timeout=$2 elapsed=0
+    local app=$1 timeout=$2 deadline
     load_cfg "$app"
 
-    while (( elapsed < timeout )); do
-        if ip -n "$NS_NAME" route get 1.1.1.1 2>/dev/null | grep -qE ' dev (tun|tap)[^ ]* '; then
+    deadline=$((SECONDS + timeout))
+    while (( SECONDS < deadline )); do
+        if ip -n "$NS_NAME" route get 1.1.1.1 2>/dev/null |
+           grep -qE ' dev (tun|tap)[^ ]* '; then
+            # A tunnel interface and route are not enough: verify that packets
+            # actually traverse the VPN. Keep each probe short so a five-second
+            # readiness deadline remains a real five-second deadline.
             if ip netns exec "$NS_NAME" ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1 ||
-               ip netns exec "$NS_NAME" curl -4fsS --connect-timeout 2 --max-time 4 \
+               ip netns exec "$NS_NAME" curl -4fsS \
+                   --connect-timeout 1 --max-time 1 \
                    http://1.1.1.1/cdn-cgi/trace >/dev/null 2>&1; then
                 return 0
             fi
         fi
-        sleep 1
-        ((elapsed++))
+        sleep 0.2
     done
     return 1
 }
@@ -956,6 +1168,7 @@ wait_online() {
 start_app() {
     require_root
     local app=$1
+    local ignore_start_error=${2:-off}
     validate_app_name "$app"
     load_cfg "$app"
     [[ -n "$DEFAULT_PROFILE" ]] || die "No profile configured. Use: nns-app add $app profile.ovpn"
@@ -982,17 +1195,41 @@ start_app() {
     systemctl start "nns-netns@${app}.service"
     systemctl start "nns-openvpn@${app}.service"
 
-    local timeout=${READY_TIMEOUT:-20}
-    [[ "$timeout" =~ ^[0-9]+$ ]] || timeout=20
+    local timeout
+    if bool_on "$ignore_start_error"; then
+        # -i is an asynchronous/ignore-readiness mode. Use a one-second
+        # readiness budget; the ping plus HTTP fallback may make wall time
+        # approximately one to two seconds. A failed probe leaves the services
+        # running and still returns success to the caller.
+        timeout=1
+    else
+        timeout=${READY_TIMEOUT:-5}
+        [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || timeout=5
+    fi
+
     if wait_online "$app" "$timeout"; then
         local ext
-        ext=$(ip netns exec "$NS_NAME" curl -4fsS --connect-timeout 3 --max-time 6 \
+        ext=$(ip netns exec "$NS_NAME" curl -4fsS \
+              --connect-timeout 1 --max-time 1 \
               "$EXTERNAL_IP_URL" 2>/dev/null || true)
         log "Started '$app' with '$DEFAULT_PROFILE'.${ext:+ External IP: $ext}"
-    else
-        warn "'$app' started, but the VPN data path was not online within ${timeout}s."
-        warn "Logs: sudo journalctl -fu nns-openvpn@${app}.service"
+        return 0
     fi
+
+    if bool_on "$ignore_start_error"; then
+        warn "'$app' is not online yet; -i ignored the readiness error."
+        warn "The namespace and VPN service were left running in the background."
+        warn "Check later with: nns-app list"
+        return 0
+    fi
+
+    warn "'$app' failed: the VPN data path was not online within ${timeout}s."
+    warn "Stopping the failed VPN instance instead of leaving it reconnecting."
+    warn "Recent OpenVPN log:"
+    journalctl -u "nns-openvpn@${app}.service" -n 20 \
+        -o cat --no-pager >&2 2>/dev/null || true
+    stop_app "$app"
+    return 1
 }
 
 stop_app() {
@@ -1265,12 +1502,36 @@ main() {
             list_apps
             ;;
         add)
-            [[ $# -eq 3 ]] || die "Usage: nns-app add <app_name> <profile.ovpn>"
-            add_profile "$2" "$3"
+            (( $# == 3 || $# == 4 )) ||
+                die "Usage: nns-app add <app_name> <profile.ovpn>|any [country]"
+            if [[ "$3" == any ]]; then
+                add_any_profile "$2" "${4:-}"
+            else
+                [[ $# -eq 3 ]] ||
+                    die "A country filter is valid only with: nns-app add <app_name> any [country]"
+                add_profile "$2" "$3"
+            fi
             ;;
         start)
-            [[ $# -eq 2 ]] || die "Usage: nns-app start <app_name>"
-            start_app "$2"
+            local start_app_name="" ignore_start_error="off" arg
+            shift
+            for arg in "$@"; do
+                case "$arg" in
+                    -i|--ignore-start-error)
+                        ignore_start_error="on"
+                        ;;
+                    -*)
+                        die "Unknown start option '$arg'. Usage: nns-app start [-i] <app_name>"
+                        ;;
+                    *)
+                        [[ -z "$start_app_name" ]] ||
+                            die "Usage: nns-app start [-i] <app_name>"
+                        start_app_name=$arg
+                        ;;
+                esac
+            done
+            [[ -n "$start_app_name" ]] || die "Usage: nns-app start [-i] <app_name>"
+            start_app "$start_app_name" "$ignore_start_error"
             ;;
         stop)
             [[ $# -eq 2 ]] || die "Usage: nns-app stop <app_name>"

@@ -1,22 +1,26 @@
 # nns-app
 
-`nns-app` runs selected Linux applications inside dedicated network namespaces and attaches each namespace to an isolated network transport.
+`nns-app` runs selected Linux applications inside dedicated network namespaces and connects each namespace through an isolated network transport.
 
-The project is designed as a small, auditable command-line alternative to routing the whole desktop through one VPN. A browser, messenger, crawler, build tool, or any other process can be launched in its own network namespace without changing the host's default route or DNS configuration.
+A browser, messenger, crawler, build tool, or another process can use its own VPN without replacing the host's default route or DNS configuration. Each named environment has separate routes, DNS, firewall state, tunnel state, and a kill switch.
 
-> **Project status:** experimental. The current implementation provides an OpenVPN backend. The architecture and command model are being extended for WireGuard and other transports.
+> **Release:** 1.0.11  
+> **Status:** experimental  
+> **Current backend:** OpenVPN  
+> **Planned backends:** WireGuard, AmneziaWG, and provider-specific transports
 
-## Why nns-app?
+## Main features
 
-System-wide VPN clients are often too broad: they alter host routes, replace DNS settings, and affect every application. `nns-app` isolates networking per application instead.
-
-- Separate namespace, routes, DNS, firewall, and tunnel state for every named app.
-- Host networking remains unchanged for normal applications.
-- Built-in kill switch prevents protected application traffic from falling back to the host uplink.
-- Multiple isolated app environments can coexist.
-- Applications run as the original desktop user, not as root.
-- Lifecycle is managed through systemd.
-- The transport layer is intended to be backend-independent.
+- One Linux network namespace per named application environment.
+- Host networking and host DNS remain unchanged.
+- Namespace-only resolver configuration under `/etc/netns/`.
+- Kill switch blocks direct fallback to the host uplink.
+- Applications run as the configured desktop user, not as root.
+- systemd manages namespace and OpenVPN lifecycles.
+- Self-contained OpenVPN profiles can be imported.
+- A public OpenVPN relay can be selected automatically with `add ... any`.
+- Strict five-second startup failure handling.
+- Optional `-i` asynchronous start mode leaves a slow connection running.
 
 ## Architecture
 
@@ -31,10 +35,10 @@ System-wide VPN clients are often too broad: they alter host routes, replace DNS
   +-----------------------------------------------------------+
   | network namespace: nns-browser                            |
   |                                                           |
-  |  application -> namespace firewall -> tunnel interface    |
+  | application -> namespace firewall -> tunnel interface     |
   |                                         |                 |
-  |  namespace DNS                          v                 |
-  |  /etc/netns/nns-browser/resolv.conf   VPN / transport     |
+  | namespace DNS                           v                 |
+  | /etc/netns/nns-browser/resolv.conf    VPN transport       |
   +-----------------------+-----------------------------------+
                           |
                     veth pair /30
@@ -44,33 +48,25 @@ System-wide VPN clients are often too broad: they alter host routes, replace DNS
                       host uplink
 ```
 
-The tunnel control connection is allowed to reach only its configured endpoint through the namespace veth. Protected application traffic is allowed through the tunnel interface, while direct fallback is blocked when the kill switch is enabled.
-
-## Current backend support
-
-| Backend | Status | Notes |
-|---|---:|---|
-| OpenVPN | Available | Self-contained IPv4 TUN profiles with inline credentials |
-| WireGuard | Planned | Native configuration and interface lifecycle |
-| AmneziaWG | Planned | Candidate backend for obfuscated WireGuard deployments |
-| Other transports | Design goal | Backend interface is expected to support additional routed transports |
-
-The public command model should remain stable as new backends are introduced. Backend-specific options will be kept behind per-app configuration rather than exposed to launched applications.
+Before the tunnel is online, the namespace may contact only the configured VPN endpoint and its namespace DNS servers. Protected application traffic is accepted through the tunnel interface. Direct fallback is blocked when the kill switch is enabled.
 
 ## Requirements
 
-Current builds target Ubuntu and require:
+The current release targets Ubuntu with systemd and requires:
 
 - Bash
-- systemd
+- OpenVPN
 - iproute2 network namespaces
 - iptables
+- systemd
 - sudo
+- curl
+- ping
+- OpenSSL
+- Python 3 for public-relay profile selection
 - util-linux (`setpriv`)
-- curl and ping for readiness checks
-- a supported tunnel backend; currently OpenVPN
 
-Dependencies are installed automatically by `nns-app install` on supported Ubuntu systems.
+Missing dependencies are installed automatically by `nns-app install` on supported Ubuntu systems.
 
 ## Installation
 
@@ -79,26 +75,38 @@ chmod +x nns-app.sh
 sudo ./nns-app.sh install browser
 ```
 
-The installer creates:
+The installer creates or refreshes:
 
 ```text
-/usr/local/bin/nns-app                 user-facing command
-/usr/local/sbin/nns_app.sh             installed engine
-/etc/nns-app/<app>/                    per-app configuration
-/etc/systemd/system/nns-netns@.service namespace service
-/etc/systemd/system/nns-openvpn@.service current OpenVPN backend service
-/etc/sudoers.d/nns-app-<app>           restricted app-owner permissions
+/usr/local/bin/nns-app
+/usr/local/sbin/nns_app.sh
+/etc/nns-app/<name>/
+/etc/systemd/system/nns-netns@.service
+/etc/systemd/system/nns-openvpn@.service
+/etc/sudoers.d/nns-app-<name>
 ```
 
-Run without arguments to display version and usage information:
+Verify the installed version:
 
 ```bash
-nns-app
+nns-app --version
 ```
 
-## Quick start
+Expected:
 
-The current release uses an OpenVPN profile as the transport configuration:
+```text
+nns-app 1.0.11
+Author:  Maxim Lyadvinsky
+License: GPL-3.0-or-later
+```
+
+Running `install` again refreshes the engine, systemd units, and sudoers rules while preserving existing app configuration and imported profiles:
+
+```bash
+sudo ./nns-app.sh install browser
+```
+
+## Quick start with an existing profile
 
 ```bash
 sudo nns-app add browser ~/Downloads/location.ovpn
@@ -107,45 +115,113 @@ nns-app run browser curl -4 https://api.ipify.org
 nns-app run browser firefox --no-remote
 ```
 
-Check all configured environments:
+Inspect state:
 
 ```bash
 nns-app list
 ```
 
-Example output:
-
-```text
-Name               Status    Online
------------------- --------- -----------------------------------------------
-browser            started   location | 10.20.30.40 -> 203.0.113.10
-```
-
-Stop the environment:
+Stop and remove the runtime namespace:
 
 ```bash
 nns-app stop browser
 ```
 
+## Find and add a public VPN profile
+
+Use `any` to download the current VPN Gate relay list, select a supported OpenVPN profile, validate it, and add it as the active profile:
+
+```bash
+sudo nns-app add browser any
+```
+
+Optionally filter by a two-letter country code or a country-name fragment:
+
+```bash
+sudo nns-app add browser any JP
+sudo nns-app add browser any Germany
+```
+
+The current implementation uses the VPN Gate public relay list. Relays are operated by volunteers and may be slow, unavailable, logged, filtered, or untrusted. This feature is suitable for testing and low-risk HTTPS traffic; it should not be treated as trusted privacy infrastructure.
+
+Profiles downloaded through `any` pass the same validation and managed-copy processing as locally imported profiles.
+
+## Startup modes
+
+### Strict start
+
+```bash
+nns-app start browser
+```
+
+Strict start waits up to `READY_TIMEOUT`, which defaults to five seconds. A tunnel interface alone is not considered success: `nns-app` also checks that the namespace can pass traffic.
+
+When the data path is still offline after the deadline, `nns-app`:
+
+1. prints recent OpenVPN log lines;
+2. stops the VPN service;
+3. removes the runtime namespace;
+4. returns a nonzero exit status.
+
+This prevents a failed connection from retrying indefinitely in the background.
+
+### Ignore/asynchronous start
+
+```bash
+nns-app start -i browser
+```
+
+The long form is also accepted:
+
+```bash
+nns-app start --ignore-start-error browser
+```
+
+For compatibility, the option may also follow the app name:
+
+```bash
+nns-app start browser -i
+```
+
+With `-i`, `nns-app` uses a short readiness probe and normally returns in about one to two seconds. When the VPN is not online yet, it:
+
+- prints a warning;
+- returns success;
+- leaves the namespace and VPN service running;
+- does not stop the failed or slow connection.
+
+Check progress later:
+
+```bash
+nns-app list
+sudo journalctl -fu nns-openvpn@browser.service
+```
+
+`-i` ignores only the readiness failure. Invalid configuration, a missing profile, failure to create the namespace, or failure to start systemd services remains an actual error.
+
+Applications are still protected: with the kill switch enabled, `nns-app run` refuses to launch a command until the tunnel route and data path are usable.
+
 ## Commands
 
 | Command | Description |
 |---|---|
-| `nns-app install <name>` | Install or refresh the engine and create a named app environment |
-| `nns-app add <name> <profile>` | Import a backend profile and make it the active profile |
-| `nns-app start <name>` | Create the namespace and start its transport |
+| `nns-app install <name>` | Install or refresh the engine and create a named environment |
+| `nns-app add <name> <profile.ovpn>` | Validate and import a self-contained OpenVPN profile |
+| `nns-app add <name> any [country]` | Find and import a current public VPN Gate profile |
+| `nns-app start <name>` | Start and require a usable data path within the configured timeout |
+| `nns-app start -i <name>` | Start asynchronously; leave a slow/offline service running |
 | `nns-app stop <name>` | Stop the transport and remove the runtime namespace |
-| `nns-app run <name> <command> [args...]` | Run a command inside the namespace as the configured user |
-| `nns-app list` | Show app state, active profile, tunnel address, and external address |
+| `nns-app run <name> <command> [args...]` | Run a command in the namespace as the configured user |
+| `nns-app list` | Show state, active profile, tunnel address, and external address |
 | `nns-app remove <name>` | Remove one app environment and its profiles |
-| `nns-app purge` | Remove the engine and all nns-app environments |
+| `nns-app purge` | Remove the engine and all `nns-app` environments |
 | `nns-app --version` | Show version, author, and license |
 
 App names may contain letters, digits, `.`, `_`, and `-`, with a maximum length of 32 characters.
 
 ## Per-app configuration
 
-Each app has a root-owned configuration file:
+Each environment has a root-owned configuration file:
 
 ```text
 /etc/nns-app/<name>/<name>.cfg
@@ -157,70 +233,44 @@ Edit it with:
 sudoedit /etc/nns-app/browser/browser.cfg
 ```
 
-Important settings in the current release:
+Important settings:
 
 | Setting | Default | Purpose |
 |---|---:|---|
 | `APP_USER` | installing user | User identity used for launched applications |
-| `DEFAULT_PROFILE` | empty | Active backend profile |
-| `KILLSWITCH` | `on` | Block direct application traffic outside the tunnel |
-| `AUTOSTART` | `off` | Enable the app services at boot |
-| `WAN_IFACE` | `auto` | Host uplink or an explicitly pinned interface |
-| `DNS_SERVERS` | `1.1.1.1 9.9.9.9` | Namespace-only DNS servers |
+| `DEFAULT_PROFILE` | empty | Active OpenVPN profile |
+| `KILLSWITCH` | `on` | Block direct traffic outside the tunnel |
+| `AUTOSTART` | `off` | Enable the environment at boot |
+| `WAN_IFACE` | `auto` | Host uplink or explicitly selected interface |
+| `DNS_SERVERS` | `1.1.1.1 9.9.9.9` | Namespace-only DNS resolvers |
 | `DISABLE_IPV6` | `on` | Disable IPv6 inside the namespace |
-| `READY_TIMEOUT` | `75` | Seconds to wait for a usable data path |
-| `EXTERNAL_IP_URL` | `https://api.ipify.org` | Endpoint used by status checks |
+| `PROFILE_FIXUPS` | `on` | Normalize the managed copy for compatibility |
+| `DISABLE_DCO` | `off` | Explicit OpenVPN DCO policy |
+| `READY_TIMEOUT` | `5` | Strict-start readiness deadline in seconds |
+| `EXTERNAL_IP_URL` | `https://api.ipify.org` | External-address status endpoint |
 
-Current OpenVPN-specific compatibility settings are also stored here. They will move under backend-specific configuration as the multi-backend design matures.
+The `-i` startup mode intentionally uses its own short probe instead of `READY_TIMEOUT`.
 
-## Isolation and security model
+## OpenVPN profile policy
 
-### Namespace isolation
+Imported profiles are treated as untrusted input. The current backend accepts a restricted profile subset:
 
-Every app receives its own:
-
-- Linux network namespace;
-- loopback device;
-- veth pair and allocated `/30` network;
-- route table;
-- resolver file under `/etc/netns`;
-- namespace-local firewall;
-- tunnel process and systemd instance.
-
-### Kill switch
-
-With `KILLSWITCH="on"`:
-
-- direct application output through the namespace veth is denied;
-- only the configured transport endpoint is reachable before the tunnel is up;
-- established return traffic is accepted;
-- application traffic is accepted through the tunnel interface;
-- `nns-app run` refuses to launch a protected command until the data path is online.
-
-The kill switch is intended to prevent accidental fallback. It is not a replacement for auditing the host firewall, kernel, tunnel backend, or provider.
-
-### Host DNS protection
-
-Namespace applications use `/etc/netns/<namespace>/resolv.conf`. The current OpenVPN backend disables OpenVPN's systemd-resolved helper so a profile cannot replace the host resolver through a namespace boundary.
-
-### Privilege separation
-
-Namespace and tunnel setup require root. A launched application is entered into the namespace and then permanently dropped to the configured user with `setpriv`. Commands are executed directly without `eval` or shell re-parsing.
-
-The installer creates a narrowly scoped sudoers rule allowing the app owner to run only routine operations for that app without repeatedly entering a password.
-
-## OpenVPN backend notes
-
-The current backend intentionally accepts a restricted profile subset:
-
-- TUN profiles only; TAP is currently rejected.
-- Credentials and certificates must be embedded in the profile.
+- TUN profiles only; TAP is rejected.
+- Certificates and keys must be embedded in the profile.
 - Interactive password prompts are unsupported.
-- Profile scripts, plugins, management directives, external key paths, and other root-executed hooks are rejected.
-- The original source profile is never modified; `nns-app` stores and, when enabled, normalizes a managed copy.
-- Vendor-specific patched OpenVPN directives are not supported by the stock Ubuntu OpenVPN binary.
+- External credential/key paths are rejected.
+- Scripts, plugins, management directives, and other root-executed hooks are rejected.
+- The source profile is never modified.
+- A root-owned managed copy is stored under `/etc/nns-app/<name>/profiles/`.
+- Vendor-specific directives requiring a patched OpenVPN binary are unsupported by stock Ubuntu OpenVPN.
 
-Automatic profile compatibility changes can include disabling DCO, permitting a detected legacy certificate chain, and adding a legacy CBC cipher fallback. Disable this behavior per app with:
+With `PROFILE_FIXUPS="on"`, managed-copy compatibility processing may:
+
+- add `disable-dco`;
+- permit a detected legacy SHA-1/MD5 certificate chain;
+- add a CBC cipher fallback for a legacy profile.
+
+Disable automatic changes with:
 
 ```bash
 PROFILE_FIXUPS="off"
@@ -228,99 +278,94 @@ PROFILE_FIXUPS="off"
 
 Then re-add the original profile.
 
+## Isolation and security
+
+Every environment receives its own:
+
+- network namespace;
+- loopback interface;
+- veth pair and allocated `/30` network;
+- route table;
+- resolver file;
+- namespace-local firewall;
+- OpenVPN process and systemd service instances.
+
+OpenVPN DNS helper integration is disabled so a profile cannot replace host DNS through `systemd-resolved`.
+
+Namespace and tunnel setup require root. `nns-app run` enters the namespace as root and then permanently drops to `APP_USER` with `setpriv` before executing the requested program. Commands are executed directly without `eval` or shell re-parsing.
+
+The installer creates restricted sudoers commands for routine operations. Re-run `install` after upgrading so new command forms such as `start -i` are added to the sudoers rule.
+
 ## Troubleshooting
 
-Show overall state:
+Show all environments:
 
 ```bash
 nns-app list
 ```
 
-Follow the current OpenVPN backend log:
+Follow OpenVPN logs:
 
 ```bash
 sudo journalctl -fu nns-openvpn@browser.service
 ```
 
-Inspect namespace creation and firewall setup:
+Inspect namespace setup:
 
 ```bash
 sudo journalctl -u nns-netns@browser.service -n 100 --no-pager
 ```
 
-Inspect routes:
+Inspect interfaces and routes:
 
 ```bash
+sudo ip -n nns-browser address
 sudo ip -n nns-browser route
 ```
 
-Inspect namespace firewall counters:
+Inspect firewall counters:
 
 ```bash
 sudo ip netns exec nns-browser iptables -nvL --line-numbers
 ```
 
-Test connectivity without launching a GUI application:
+Test the data path:
 
 ```bash
 nns-app run browser ping -c 3 1.1.1.1
 nns-app run browser curl -4 https://api.ipify.org
 ```
 
-A tunnel backend can report that its handshake completed while the provider still does not pass data. `nns-app` therefore checks the data path separately and reports the environment as offline until traffic succeeds.
+A log message such as `Initialization Sequence Completed` proves that OpenVPN initialized its control/data-channel state; it does not by itself prove that the provider is forwarding application traffic. `nns-app` therefore performs a separate namespace data-path probe.
 
 ## Known limitations
 
 - Linux and systemd only.
 - Ubuntu is the primary tested platform.
 - IPv4 is the primary supported path; IPv6 is disabled by default.
-- The current release implements only the OpenVPN backend.
-- Stopping an app currently removes its runtime namespace rather than keeping a persistent idle namespace.
-- Profile selection currently follows the most recently added profile.
+- OpenVPN is the only implemented backend in this release.
+- Runtime namespaces are removed on normal stop.
+- The most recently added profile becomes active.
 - Firewall management currently uses iptables.
-- Desktop applications with strict single-instance or sandbox rules may require application-specific launch options.
-- Provider-side session limits, stale mappings, authentication policy, and custom protocol extensions are outside the engine's control.
+- Public relays may disappear or change without notice.
+- Provider-side session limits, stale mappings, custom clients, and custom protocol extensions are outside the generic OpenVPN backend's control.
+- GUI applications with single-instance or sandbox policies may need application-specific launch options.
 
 ## Roadmap
 
-Planned development areas include:
-
-1. A transport/backend abstraction shared by OpenVPN, WireGuard, and future providers.
-2. Native WireGuard profile import and `wg`/`wg-quick` lifecycle management.
-3. Fast profile switching without destroying the application namespace.
-4. Explicit `profile list`, `profile select`, and `switch` commands.
-5. nftables support with transactional rule updates.
-6. IPv6 tunnel and kill-switch support.
-7. Backend health states separating process, handshake, route, DNS, and Internet readiness.
-8. Optional persistent namespaces and make-before-break transport switching.
-9. Packaging for Debian/Ubuntu and automated integration tests.
-
-## Design principles
-
-- Keep host networking stable.
-- Isolate each application independently.
-- Fail closed when the kill switch is enabled.
-- Treat imported profiles as untrusted input.
-- Avoid executing provider-supplied scripts as root.
-- Keep the engine small enough to audit.
-- Separate generic namespace lifecycle from transport-specific behavior.
-- Preserve a consistent CLI as backends are added.
-
-## Contributing
-
-Issues and patches are welcome, especially for:
-
-- backend abstraction design;
-- WireGuard and AmneziaWG support;
-- namespace/firewall cleanup correctness;
-- additional Linux distribution testing;
-- reproducible integration tests;
-- security review.
-
-Please avoid committing VPN credentials, private keys, access tokens, generated runtime profiles, packet captures containing sensitive traffic, or provider-specific secrets.
+- Transport/backend abstraction shared by OpenVPN, WireGuard, and future transports.
+- Native WireGuard configuration without host-global `wg-quick` side effects.
+- AmneziaWG support.
+- Provider-specific configuration/control-plane helpers.
+- Fast profile switching without destroying the namespace.
+- Explicit profile listing and selection commands.
+- nftables backend with transactional updates.
+- IPv6 tunnel and kill-switch support.
+- Health states separating process, handshake, route, DNS, and Internet readiness.
+- Debian/Ubuntu packaging and automated integration tests.
 
 ## License
 
 Copyright © 2026 Maxim Lyadvinsky.
 
-This project is licensed under the **GNU General Public License v3.0 or later** (`GPL-3.0-or-later`). See [`LICENSE`](LICENSE) for the full license text.
+`nns-app` is licensed under the GNU General Public License v3.0 or later (`GPL-3.0-or-later`).
