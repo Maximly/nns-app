@@ -25,7 +25,7 @@
 #   purge
 #   list
 #   add     <app_name> <profile.ovpn>
-#   add     <app_name> any [country]
+#   add     <app_name> any [country] [--refresh]
 #   start   [-i|--ignore-start-error] <app_name>
 #   stop    <app_name>
 #   run     <app_name> <command> [args...]
@@ -36,7 +36,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.0.11"
+readonly VERSION="1.0.13"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -47,6 +47,9 @@ readonly RUN_DIR="/run/nns-app"
 readonly NETNS_UNIT="/etc/systemd/system/nns-netns@.service"
 readonly VPN_UNIT="/etc/systemd/system/nns-openvpn@.service"
 readonly VPNGATE_API_URL="https://www.vpngate.net/api/iphone/"
+readonly CACHE_DIR="/var/cache/nns-app"
+readonly VPNGATE_CACHE_FILE="$CACHE_DIR/vpngate.csv"
+readonly VPNGATE_CACHE_TTL=1800
 
 log()  { printf '%s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
@@ -66,7 +69,7 @@ Usage:
   nns-app purge
   nns-app list
   nns-app add     <app_name> <profile.ovpn>
-  nns-app add     <app_name> any [country-code-or-name]
+  nns-app add     <app_name> any [country-code-or-name] [--refresh]
   nns-app start   [-i|--ignore-start-error] <app_name>
   nns-app stop    <app_name>
   nns-app run     <app_name> <command> [arguments...]
@@ -76,6 +79,7 @@ Examples:
   sudo nns-app add browser ~/Downloads/NorwayS23.ovpn
   sudo nns-app add browser any
   sudo nns-app add browser any JP
+  sudo nns-app add browser any DE --refresh
   nns-app start browser
   nns-app start -i browser   # leave a slow connection running in background
   nns-app run browser curl -4 https://api.ipify.org
@@ -612,9 +616,14 @@ add_profile() {
     dest="$(profiles_dir "$app")/$name"
     tmp=$(mktemp)
 
-    # Never alter the user's downloaded profile. Compatibility adjustments are
-    # applied only to the protected managed copy under /etc/nns-app.
+    # Never alter the user's downloaded profile. Normalize line endings and
+    # apply compatibility adjustments only to the protected managed copy under
+    # /etc/nns-app. CRLF is common in VPN Gate profiles; leaving the trailing
+    # carriage return would corrupt parsed protocol/port values passed to
+    # iptables during namespace creation.
     cat "$src" >"$tmp"
+    sed -i 's/\r$//' "$tmp"
+    validate_ovpn "$tmp"
     if bool_on "${PROFILE_FIXUPS:-on}"; then
         apply_profile_fixups "$tmp" applied
     fi
@@ -644,7 +653,7 @@ add_profile() {
 
 add_any_profile() {
     require_root
-    local app=$1 country=${2:-}
+    local app=$1 country=${2:-} force_refresh=${3:-off}
     validate_app_name "$app"
     load_cfg "$app"
 
@@ -652,17 +661,55 @@ add_any_profile() {
     command -v python3 >/dev/null 2>&1 || die "python3 is required. Refresh the installation with: nns-app install $app"
 
     local tmpdir csv_file selected metadata
+    local now mtime age cache_tmp use_cache="off"
     tmpdir=$(mktemp -d)
-    csv_file="$tmpdir/vpngate.csv"
-    trap 'rm -rf "${tmpdir:-}"' EXIT
+    trap 'rm -rf "${tmpdir:-}" "${cache_tmp:-}"' EXIT
 
-    log "Searching the current VPN Gate public relay list${country:+ for '$country'}..."
-    if ! curl --fail --silent --show-error --location \
-        --connect-timeout 5 --max-time 15 --retry 1 \
-        --user-agent "nns-app/${VERSION}" \
-        "$VPNGATE_API_URL" -o "$csv_file"; then
-        die "Could not download the VPN Gate server list."
+    install -d -o root -g root -m 0755 "$CACHE_DIR"
+    csv_file="$VPNGATE_CACHE_FILE"
+    now=$(date +%s)
+
+    if [[ -s "$VPNGATE_CACHE_FILE" ]] && ! bool_on "$force_refresh"; then
+        mtime=$(stat -c %Y "$VPNGATE_CACHE_FILE" 2>/dev/null || printf '0')
+        [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
+        age=$((now - mtime))
+        if (( age >= 0 && age <= VPNGATE_CACHE_TTL )); then
+            use_cache="on"
+            log "Using cached VPN Gate relay list (age $((age / 60)) min; TTL $((VPNGATE_CACHE_TTL / 60)) min)."
+        fi
     fi
+
+    if ! bool_on "$use_cache"; then
+        log "Downloading the VPN Gate public relay list${country:+ for '$country'}..."
+        cache_tmp=$(mktemp "$CACHE_DIR/.vpngate.csv.XXXXXX")
+
+        if curl --fail --silent --show-error --location --compressed \
+            --connect-timeout 5 --max-time 45 \
+            --retry 2 --retry-delay 1 --retry-all-errors \
+            --user-agent "nns-app/${VERSION}" \
+            "$VPNGATE_API_URL" -o "$cache_tmp" &&
+           grep -q '^#HostName,' "$cache_tmp"; then
+            chmod 0644 "$cache_tmp"
+            chown root:root "$cache_tmp"
+            mv -f "$cache_tmp" "$VPNGATE_CACHE_FILE"
+            cache_tmp=""
+            log "Updated VPN Gate cache: $VPNGATE_CACHE_FILE"
+        elif [[ -s "$VPNGATE_CACHE_FILE" ]]; then
+            rm -f "$cache_tmp"
+            cache_tmp=""
+            mtime=$(stat -c %Y "$VPNGATE_CACHE_FILE" 2>/dev/null || printf '0')
+            [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
+            age=$((now - mtime))
+            warn "Could not refresh the VPN Gate list; using stale cache (age $((age / 60)) min)."
+        else
+            rm -f "$cache_tmp"
+            cache_tmp=""
+            die "Could not download the VPN Gate server list and no cached copy is available."
+        fi
+    fi
+
+    [[ -s "$csv_file" ]] || die "VPN Gate cache is empty: $csv_file"
+    log "Searching VPN Gate candidates${country:+ for '$country'}..."
 
     metadata=$(python3 - "$csv_file" "$tmpdir" "$country" <<'PY_SELECT'
 import base64
@@ -751,6 +798,12 @@ for row in reader:
         config = base64.b64decode(encoded, validate=True)
     except Exception:
         continue
+
+    # VPN Gate commonly embeds Windows-style CRLF profiles. Store a canonical
+    # LF-only profile so shell/awk/iptables consumers never receive values such
+    # as "tcp\\r" or "1598\\r".
+    config = config.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+
     if not config or len(config) > 5 * 1024 * 1024 or not looks_usable(config):
         continue
 
@@ -827,10 +880,17 @@ PY_SELECT
     IFS=$'\t' read -r selected country_short country_long host ip score ping speed_mbps uptime_minutes sessions <<<"$metadata"
     [[ -f "$selected" ]] || die "The VPN Gate selector did not produce a profile."
 
+    local selected_endpoint selected_host selected_port selected_proto
+    selected_endpoint=$(profile_endpoints "$selected" | head -n 1 || true)
+    IFS='|' read -r selected_host selected_port selected_proto <<<"$selected_endpoint"
+
     log "Selected VPN Gate relay:"
-    log "  Country:  $country_long ($country_short)"
-    log "  Server:   $host ($ip)"
-    log "  Quality:  score $score, ping ${ping:-unknown} ms, ${speed_mbps} Mbps"
+    log "  Country:   $country_long ($country_short)"
+    log "  Server:    $host ($ip)"
+    if [[ -n "$selected_host" && -n "$selected_port" && -n "$selected_proto" ]]; then
+        log "  Transport: ${selected_proto^^} $selected_host:$selected_port"
+    fi
+    log "  Quality:   score $score, ping ${ping:-unknown} ms, ${speed_mbps} Mbps"
     log "  Uptime:   ${uptime_minutes} min; active sessions: $sessions"
     warn "VPN Gate relays are operated by volunteers and may log traffic."
     warn "Use end-to-end encryption and do not treat this as a trusted privacy VPN."
@@ -847,6 +907,7 @@ profile_endpoints() {
     # Output: host|port|protocol. Ignore inline certificate/key blocks.
     awk '
         BEGIN { inblock=0; proto="udp"; port="1194" }
+        { sub(/\r$/, "", $0) }
         /^[[:space:]]*<[^/][^>]*>[[:space:]]*$/ { inblock=1; next }
         /^[[:space:]]*<\/[A-Za-z0-9_-]+>[[:space:]]*$/ { inblock=0; next }
         inblock { next }
@@ -874,10 +935,25 @@ resolve_profile_endpoints() {
     : >"$tmp"
 
     while IFS='|' read -r host port proto; do
+        host=${host//$'\r'/}
+        port=${port//$'\r'/}
+        proto=${proto//$'\r'/}
+
         [[ -n "$host" && -n "$port" && -n "$proto" ]] || continue
+        [[ "$port" =~ ^[0-9]+$ ]] ||
+            die "Invalid VPN endpoint port '$port' in $profile"
+        (( port >= 1 && port <= 65535 )) ||
+            die "VPN endpoint port '$port' is outside 1..65535 in $profile"
+        case "$proto" in
+            tcp|udp) ;;
+            *) die "Invalid VPN endpoint protocol '$proto' in $profile" ;;
+        esac
+
         if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
             printf '%s|%s|%s\n' "$host" "$port" "$proto" >>"$tmp"
         else
+            [[ "$host" =~ ^[A-Za-z0-9.-]+$ ]] ||
+                die "Invalid VPN endpoint host '$host' in $profile"
             while read -r ip; do
                 [[ -n "$ip" ]] && printf '%s|%s|%s\n' "$ip" "$port" "$proto" >>"$tmp"
             done < <(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u)
@@ -1192,8 +1268,24 @@ start_app() {
         systemctl disable "nns-netns@${app}.service" "nns-openvpn@${app}.service" >/dev/null 2>&1 || true
     fi
 
-    systemctl start "nns-netns@${app}.service"
-    systemctl start "nns-openvpn@${app}.service"
+    if ! systemctl start "nns-netns@${app}.service"; then
+        warn "Failed to create the network namespace for '$app'."
+        warn "Recent namespace-service log:"
+        journalctl -u "nns-netns@${app}.service" -n 40 \
+            -o cat --no-pager >&2 2>/dev/null || true
+        netns_down "$app" >/dev/null 2>&1 || true
+        systemctl reset-failed "nns-netns@${app}.service" 2>/dev/null || true
+        return 1
+    fi
+
+    if ! systemctl start "nns-openvpn@${app}.service"; then
+        warn "Failed to start OpenVPN for '$app'."
+        warn "Recent OpenVPN-service log:"
+        journalctl -u "nns-openvpn@${app}.service" -n 40 \
+            -o cat --no-pager >&2 2>/dev/null || true
+        stop_app "$app"
+        return 1
+    fi
 
     local timeout
     if bool_on "$ignore_start_error"; then
@@ -1502,13 +1594,29 @@ main() {
             list_apps
             ;;
         add)
-            (( $# == 3 || $# == 4 )) ||
-                die "Usage: nns-app add <app_name> <profile.ovpn>|any [country]"
+            (( $# >= 3 && $# <= 5 )) ||
+                die "Usage: nns-app add <app_name> <profile.ovpn>|any [country] [--refresh]"
             if [[ "$3" == any ]]; then
-                add_any_profile "$2" "${4:-}"
+                local add_country="" add_refresh="off" add_arg
+                for add_arg in "${@:4}"; do
+                    case "$add_arg" in
+                        --refresh)
+                            add_refresh="on"
+                            ;;
+                        -*)
+                            die "Unknown add option '$add_arg'."
+                            ;;
+                        *)
+                            [[ -z "$add_country" ]] ||
+                                die "Only one country filter may be supplied."
+                            add_country=$add_arg
+                            ;;
+                    esac
+                done
+                add_any_profile "$2" "$add_country" "$add_refresh"
             else
                 [[ $# -eq 3 ]] ||
-                    die "A country filter is valid only with: nns-app add <app_name> any [country]"
+                    die "Options are valid only with: nns-app add <app_name> any [country] [--refresh]"
                 add_profile "$2" "$3"
             fi
             ;;

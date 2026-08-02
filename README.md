@@ -4,7 +4,7 @@
 
 A browser, messenger, crawler, build tool, or another process can use its own VPN without replacing the host's default route or DNS configuration. Each named environment has separate routes, DNS, firewall state, tunnel state, and a kill switch.
 
-> **Release:** 1.0.11  
+> **Release:** 1.0.13  
 > **Status:** experimental  
 > **Current backend:** OpenVPN  
 > **Planned backends:** WireGuard, AmneziaWG, and provider-specific transports
@@ -19,6 +19,8 @@ A browser, messenger, crawler, build tool, or another process can use its own VP
 - systemd manages namespace and OpenVPN lifecycles.
 - Self-contained OpenVPN profiles can be imported.
 - A public OpenVPN relay can be selected automatically with `add ... any`.
+- VPN Gate metadata is cached for 30 minutes with stale-cache fallback.
+- Namespace and OpenVPN service startup failures print their own recent logs.
 - Strict five-second startup failure handling.
 - Optional `-i` asynchronous start mode leaves a slow connection running.
 
@@ -95,7 +97,7 @@ nns-app --version
 Expected:
 
 ```text
-nns-app 1.0.11
+nns-app 1.0.13
 Author:  Maxim Lyadvinsky
 License: GPL-3.0-or-later
 ```
@@ -141,6 +143,22 @@ Optionally filter by a two-letter country code or a country-name fragment:
 sudo nns-app add browser any JP
 sudo nns-app add browser any Germany
 ```
+
+The VPN Gate CSV list is cached in:
+
+```text
+/var/cache/nns-app/vpngate.csv
+```
+
+The cache is reused for 30 minutes. A failed refresh falls back to the last
+cached list, even when it is older. Force a fresh download with:
+
+```bash
+sudo nns-app add browser any DE --refresh
+```
+
+The profile itself is copied into the named app environment, so removing or
+refreshing the server-list cache does not remove previously imported profiles.
 
 The current implementation uses the VPN Gate public relay list. Relays are operated by volunteers and may be slow, unavailable, logged, filtered, or untrusted. This feature is suitable for testing and low-risk HTTPS traffic; it should not be treated as trusted privacy infrastructure.
 
@@ -199,6 +217,10 @@ sudo journalctl -fu nns-openvpn@browser.service
 
 `-i` ignores only the readiness failure. Invalid configuration, a missing profile, failure to create the namespace, or failure to start systemd services remains an actual error.
 
+A namespace creation error occurs before OpenVPN is launched. Version 1.0.13
+prints the recent `nns-netns@<name>.service` log automatically in this case;
+`-i` cannot and should not hide this structural failure.
+
 Applications are still protected: with the kill switch enabled, `nns-app run` refuses to launch a command until the tunnel route and data path are usable.
 
 ## Commands
@@ -207,7 +229,7 @@ Applications are still protected: with the kill switch enabled, `nns-app run` re
 |---|---|
 | `nns-app install <name>` | Install or refresh the engine and create a named environment |
 | `nns-app add <name> <profile.ovpn>` | Validate and import a self-contained OpenVPN profile |
-| `nns-app add <name> any [country]` | Find and import a current public VPN Gate profile |
+| `nns-app add <name> any [country] [--refresh]` | Find and import a VPN Gate profile using the shared cache |
 | `nns-app start <name>` | Start and require a usable data path within the configured timeout |
 | `nns-app start -i <name>` | Start asynchronously; leave a slow/offline service running |
 | `nns-app stop <name>` | Stop the transport and remove the runtime namespace |
@@ -261,6 +283,8 @@ Imported profiles are treated as untrusted input. The current backend accepts a 
 - External credential/key paths are rejected.
 - Scripts, plugins, management directives, and other root-executed hooks are rejected.
 - The source profile is never modified.
+- The managed copy is normalized from CRLF/CR to Unix LF line endings before parsing.
+- Parsed VPN endpoint ports and protocols are validated before any iptables rule is created.
 - A root-owned managed copy is stored under `/etc/nns-app/<name>/profiles/`.
 - Vendor-specific directives requiring a patched OpenVPN binary are unsupported by stock Ubuntu OpenVPN.
 
@@ -314,6 +338,15 @@ Inspect namespace setup:
 
 ```bash
 sudo journalctl -u nns-netns@browser.service -n 100 --no-pager
+```
+
+Version 1.0.12 normalizes Windows-style CRLF profiles automatically. On an
+older installation, `proto tcp^M` or `remote ... 443^M` in `cat -v` output can
+make iptables reject the endpoint rule. Re-add the profile after upgrading, or
+temporarily normalize the managed copy with:
+
+```bash
+sudo sed -i 's/\r$//' /etc/nns-app/<name>/profiles/<profile>.ovpn
 ```
 
 Inspect interfaces and routes:
