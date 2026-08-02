@@ -4,7 +4,7 @@
 
 A browser, messenger, crawler, build tool, or another process can use its own VPN without replacing the host's default route or DNS configuration. Each named environment has separate routes, DNS, firewall state, tunnel state, and a kill switch.
 
-> **Release:** 1.0.16  
+> **Release:** 1.0.17  
 > **Status:** experimental  
 > **Current backend:** OpenVPN  
 > **Planned backends:** WireGuard, AmneziaWG, and provider-specific transports
@@ -25,6 +25,7 @@ A browser, messenger, crawler, build tool, or another process can use its own VP
 - Restarting after an incomplete namespace setup safely rebuilds endpoint runtime files.
 - `./nns-app.sh install` now installs or refreshes the engine without creating an app.
 - Repeated `add <name> any` calls rotate through the top 20 matching VPN Gate relays.
+- VPN Gate candidates must complete a short OpenVPN handshake before import.
 - Strict five-second startup failure handling.
 - Optional `-i` asynchronous start mode leaves a slow connection running.
 
@@ -116,7 +117,7 @@ nns-app --version
 Expected:
 
 ```text
-nns-app 1.0.16
+nns-app 1.0.17
 Author:  Maxim Lyadvinsky
 License: GPL-3.0-or-later
 ```
@@ -193,6 +194,26 @@ selecting the same top-scoring server repeatedly. State files are stored under:
 
 Delete the corresponding state file to restart rotation from the strongest
 candidate.
+
+Before importing a relay, nns-app now quick-checks up to six round-robin
+candidates. Each candidate receives a three-second OpenVPN handshake probe.
+A successful TCP socket connection alone is not sufficient; the probe requires
+OpenVPN to report `Initialization Sequence Completed`.
+
+When `add any` is invoked from another NNS namespace, for example:
+
+```bash
+nns-app run hidemy nns-app add test any US
+```
+
+the server list is fetched through `hidemy`, but candidate probes are run
+through PID 1's host network namespace. This tests the route that `test` will
+actually use later. The probe uses a temporary TUN interface with route pulling
+disabled and removes it immediately after the check.
+
+The quick check confirms that the relay currently completes OpenVPN negotiation.
+It does not establish that the volunteer relay is trustworthy or that every
+destination will be reachable through it.
 
 The current implementation uses the VPN Gate public relay list. Relays are operated by volunteers and may be slow, unavailable, logged, filtered, or untrusted. This feature is suitable for testing and low-risk HTTPS traffic; it should not be treated as trusted privacy infrastructure.
 

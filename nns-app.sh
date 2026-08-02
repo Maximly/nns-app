@@ -36,7 +36,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.0.16"
+readonly VERSION="1.0.17"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -51,6 +51,8 @@ readonly CACHE_DIR="/var/cache/nns-app"
 readonly STATE_DIR="/var/lib/nns-app"
 readonly VPNGATE_CACHE_FILE="$CACHE_DIR/vpngate.csv"
 readonly VPNGATE_CACHE_TTL=1800
+readonly VPNGATE_PROBE_TIMEOUT=3
+readonly VPNGATE_PROBE_ATTEMPTS=6
 
 log()  { printf '%s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
@@ -731,19 +733,24 @@ add_any_profile() {
     [[ -s "$csv_file" ]] || die "VPN Gate cache is empty: $csv_file"
     log "Searching VPN Gate candidates${country:+ for '$country'}..."
 
-    metadata=$(python3 - "$csv_file" "$tmpdir" "$country" "$state_file" <<'PY_SELECT'
+    metadata=$(python3 -         "$csv_file" "$tmpdir" "$country" "$state_file"         "$VPNGATE_PROBE_TIMEOUT" "$VPNGATE_PROBE_ATTEMPTS" <<'PY_SELECT'
 import base64
 import csv
 import io
 import os
 import re
+import shutil
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 csv_path = Path(sys.argv[1])
 out_dir = Path(sys.argv[2])
 country_filter = sys.argv[3].strip().casefold()
 state_path = Path(sys.argv[4])
+probe_timeout = max(1.0, float(sys.argv[5]))
+probe_attempts = max(1, int(sys.argv[6]))
 
 raw = csv_path.read_text(encoding="utf-8-sig", errors="replace")
 lines = [line for line in raw.splitlines() if line and not line.startswith("*")]
@@ -810,6 +817,211 @@ def looks_usable(config):
         return False
     return True
 
+def normalize_proto(value):
+    value = value.strip().casefold()
+    if value.startswith("tcp"):
+        return "tcp"
+    if value.startswith("udp"):
+        return "udp"
+    return value
+
+def first_endpoint(config):
+    text = config.decode("utf-8", errors="replace")
+    proto = "udp"
+    default_port = 1194
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+
+        parts = line.split()
+        key = parts[0].casefold()
+
+        if key == "proto" and len(parts) >= 2:
+            proto = normalize_proto(parts[1])
+            continue
+
+        if key == "port" and len(parts) >= 2:
+            try:
+                default_port = int(parts[1])
+            except ValueError:
+                pass
+            continue
+
+        if key == "remote" and len(parts) >= 2:
+            host = parts[1].strip('"')
+            port = default_port
+            remote_proto = proto
+
+            if len(parts) >= 3:
+                try:
+                    port = int(parts[2])
+                except ValueError:
+                    return None
+
+            if len(parts) >= 4:
+                remote_proto = normalize_proto(parts[3])
+
+            if not (1 <= port <= 65535):
+                return None
+            if remote_proto not in {"tcp", "udp"}:
+                return None
+
+            return host, port, remote_proto
+
+    return None
+
+def probe_compatible_config(config):
+    text = config.decode("utf-8", errors="replace")
+    additions = []
+
+    if not re.search(r"(?im)^\s*disable-dco(?:\s|$)", text):
+        additions.append("disable-dco")
+
+    # The public VPN Gate pool still contains SHA-1-era certificate chains.
+    # This mirrors the managed-profile compatibility fix used after import.
+    if not re.search(r"(?im)^\s*tls-cert-profile(?:\s|$)", text):
+        additions.append("tls-cert-profile insecure")
+
+    if not re.search(r"(?im)^\s*data-ciphers(?:\s|$)", text):
+        match = re.search(
+            r"(?im)^\s*cipher\s+(AES-(?:128|192|256)-CBC)\s*$",
+            text,
+        )
+        if match:
+            additions.append(f"data-ciphers DEFAULT:{match.group(1).upper()}")
+
+    if additions:
+        text = text.rstrip() + "\n\n" + "\n".join(additions) + "\n"
+
+    return text.encode("utf-8")
+
+def classify_probe_log(log_text, endpoint):
+    lower = log_text.casefold()
+    _, _, proto = endpoint
+
+    if "auth_failed" in lower:
+        return "authentication rejected"
+    if "certificate verification failed" in lower:
+        return "certificate verification failed"
+    if "connection refused" in lower:
+        return "connection refused"
+    if "network is unreachable" in lower or "no route to host" in lower:
+        return "network unreachable"
+    if "tls error" in lower or "tls key negotiation failed" in lower:
+        return "TLS negotiation failed"
+    if "options error" in lower:
+        return "OpenVPN configuration rejected"
+    if "tcp connection established" in lower:
+        return "TCP connected, but OpenVPN handshake timed out"
+    if proto == "tcp":
+        return "TCP connection timed out"
+    return "UDP/OpenVPN handshake timed out"
+
+def terminate_process(proc):
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=1)
+
+def quick_openvpn_probe(config, endpoint, candidate_number):
+    openvpn = shutil.which("openvpn") or "/usr/sbin/openvpn"
+    if not Path(openvpn).is_file():
+        return False, "OpenVPN executable is unavailable", 0.0
+
+    probe_config = out_dir / f".probe-{os.getpid()}-{candidate_number}.ovpn"
+    probe_log = out_dir / f".probe-{os.getpid()}-{candidate_number}.log"
+    device = f"np{os.getpid():x}{candidate_number:x}"[:15]
+
+    probe_config.write_bytes(probe_compatible_config(config))
+    os.chmod(probe_config, 0o600)
+
+    command = [
+        openvpn,
+        "--config", str(probe_config),
+        "--dev", device,
+        "--dev-type", "tun",
+        "--route-nopull",
+        "--connect-retry-max", "1",
+        "--connect-timeout", str(max(1, int(probe_timeout))),
+        "--server-poll-timeout", str(max(1, int(probe_timeout))),
+        "--resolv-retry", "0",
+        "--nobind",
+        "--auth-nocache",
+        "--disable-dco",
+        "--verb", "3",
+        "--log", str(probe_log),
+    ]
+
+    # `nns-app run hidemy nns-app add ...` executes this selector inside the
+    # hidemy namespace. The new app will later connect from the host namespace,
+    # so probe through PID 1's network namespace when nsenter is available.
+    try:
+        current_netns = os.readlink("/proc/self/ns/net")
+        host_netns = os.readlink("/proc/1/ns/net")
+    except OSError:
+        current_netns = host_netns = ""
+
+    nsenter = shutil.which("nsenter")
+    if nsenter and current_netns and host_netns and current_netns != host_netns:
+        command = [nsenter, "--target", "1", "--net", "--"] + command
+
+    started = time.monotonic()
+    proc = None
+    success = False
+
+    try:
+        proc = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+
+        deadline = started + probe_timeout
+        while time.monotonic() < deadline:
+            if probe_log.exists():
+                log_text = probe_log.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                if "Initialization Sequence Completed" in log_text:
+                    success = True
+                    break
+
+            if proc.poll() is not None:
+                break
+
+            time.sleep(0.1)
+    except OSError as exc:
+        return False, f"could not start OpenVPN probe: {exc}", 0.0
+    finally:
+        if proc is not None:
+            terminate_process(proc)
+
+    elapsed = time.monotonic() - started
+    try:
+        log_text = probe_log.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        log_text = ""
+
+    for path in (probe_config, probe_log):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+    if success:
+        return True, "OpenVPN handshake completed", elapsed
+
+    return False, classify_probe_log(log_text, endpoint), elapsed
+
 candidates = []
 for row in reader:
     if not row or len(row) < len(header):
@@ -872,15 +1084,84 @@ try:
 except OSError:
     last_relay = ""
 
-selected_index = 0
+start_index = 0
 if last_relay:
     for i, (_, candidate_row, _) in enumerate(pool):
         relay_id = f"{get(candidate_row, 'HostName')}|{get(candidate_row, 'IP')}"
         if relay_id == last_relay:
-            selected_index = (i + 1) % len(pool)
+            start_index = (i + 1) % len(pool)
             break
 
-_, row, config = pool[selected_index]
+ordered_indexes = [
+    (start_index + offset) % len(pool)
+    for offset in range(len(pool))
+]
+
+selected_index = None
+row = None
+config = None
+tested = 0
+probe_note = ""
+
+print(
+    f"Quick-checking up to {min(probe_attempts, len(pool))} candidate(s); "
+    f"{probe_timeout:g}s each, through the host network namespace.",
+    file=sys.stderr,
+    flush=True,
+)
+
+for pool_index in ordered_indexes[:probe_attempts]:
+    _, candidate_row, candidate_config = pool[pool_index]
+    endpoint = first_endpoint(candidate_config)
+    candidate_host = get(candidate_row, "HostName")
+    candidate_ip = get(candidate_row, "IP")
+
+    if endpoint is None:
+        print(
+            f"  reject {candidate_host} ({candidate_ip}): invalid endpoint",
+            file=sys.stderr,
+            flush=True,
+        )
+        continue
+
+    endpoint_host, endpoint_port, endpoint_proto = endpoint
+    tested += 1
+    print(
+        f"  check {tested}: {candidate_host} ({candidate_ip}), "
+        f"{endpoint_proto.upper()} {endpoint_host}:{endpoint_port} ...",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    ok, reason, elapsed = quick_openvpn_probe(
+        candidate_config,
+        endpoint,
+        tested,
+    )
+
+    if ok:
+        print(
+            f"    accepted: {reason} in {elapsed:.1f}s",
+            file=sys.stderr,
+            flush=True,
+        )
+        selected_index = pool_index
+        row = candidate_row
+        config = candidate_config
+        probe_note = f"{reason} in {elapsed:.1f}s"
+        break
+
+    print(
+        f"    rejected: {reason} ({elapsed:.1f}s)",
+        file=sys.stderr,
+        flush=True,
+    )
+
+if selected_index is None or row is None or config is None:
+    raise SystemExit(
+        "No candidate completed a quick OpenVPN handshake "
+        f"(tested {tested}; timeout {probe_timeout:g}s each)"
+    )
 
 host = get(row, "HostName")
 ip = get(row, "IP")
@@ -923,14 +1204,15 @@ print(
             str(path), short_name, long_name, host, ip, str(score),
             str(ping), f"{speed_mbps:.1f}", f"{uptime_minutes:.0f}",
             str(sessions), str(selected_index + 1), str(len(pool)),
+            str(tested), probe_note,
         ]
     )
 )
 PY_SELECT
     ) || die "Could not select a usable free VPN profile."
 
-    local rotation_index rotation_count
-    IFS=$'\t' read -r selected country_short country_long host ip score ping speed_mbps uptime_minutes sessions rotation_index rotation_count <<<"$metadata"
+    local rotation_index rotation_count probe_tested probe_note
+    IFS=$'\t' read -r selected country_short country_long host ip score ping speed_mbps uptime_minutes sessions rotation_index rotation_count probe_tested probe_note <<<"$metadata"
     [[ -f "$selected" ]] || die "The VPN Gate selector did not produce a profile."
 
     local selected_endpoint selected_host selected_port selected_proto
@@ -946,6 +1228,7 @@ PY_SELECT
     log "  Quality:   score $score, ping ${ping:-unknown} ms, ${speed_mbps} Mbps"
     log "  Uptime:    ${uptime_minutes} min; active sessions: $sessions"
     log "  Rotation:  candidate ${rotation_index}/${rotation_count}"
+    log "  Probe:     ${probe_note}; tested ${probe_tested} candidate(s)"
     warn "VPN Gate relays are operated by volunteers and may log traffic."
     warn "Use end-to-end encryption and do not treat this as a trusted privacy VPN."
 
