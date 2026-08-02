@@ -36,7 +36,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.0.14"
+readonly VERSION="1.0.15"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -64,7 +64,7 @@ show_version() {
 usage() {
     cat <<'USAGE'
 Usage:
-  nns-app install <app_name>
+  nns-app install [app_name]
   nns-app remove  <app_name>
   nns-app purge
   nns-app list
@@ -75,7 +75,8 @@ Usage:
   nns-app run     <app_name> <command> [arguments...]
 
 Examples:
-  sudo ./nns-app.sh install browser
+  sudo ./nns-app.sh install          # install/refresh the engine only
+  sudo nns-app install browser      # create or refresh an app environment
   sudo nns-app add browser ~/Downloads/NorwayS23.ovpn
   sudo nns-app add browser any
   sudo nns-app add browser any JP
@@ -262,6 +263,19 @@ VPN_UNIT_EOF
     systemctl daemon-reload
 }
 
+install_engine() {
+    require_root
+
+    ensure_dependencies
+    install_engine_files
+    install -d -o root -g root -m 0755         "$BASE_DIR" "$RUN_DIR" "$CACHE_DIR"
+
+    log "Installed nns-app $VERSION."
+    log "Command: $USER_PATH"
+    log "Engine:  $ENGINE_PATH"
+}
+
+
 allocate_network() {
     local used idx offset o3 o4 net host ns cidr
     used=""
@@ -322,7 +336,7 @@ install_app() {
 
     ensure_dependencies
     install_engine_files
-    install -d -o root -g root -m 0755 "$BASE_DIR" "$RUN_DIR"
+    install -d -o root -g root -m 0755         "$BASE_DIR" "$RUN_DIR" "$CACHE_DIR"
 
     local dir file user net_data cidr host_addr ns_addr veth_data veth_host veth_ns
     dir=$(cfg_dir "$app")
@@ -1591,8 +1605,17 @@ main() {
 
     case "$cmd" in
         install)
-            [[ $# -eq 2 ]] || die "Usage: nns-app install <app_name>"
-            install_app "$2"
+            case $# in
+                1)
+                    install_engine
+                    ;;
+                2)
+                    install_app "$2"
+                    ;;
+                *)
+                    die "Usage: nns-app install [app_name]"
+                    ;;
+            esac
             ;;
         remove)
             [[ $# -eq 2 ]] || die "Usage: nns-app remove <app_name>"

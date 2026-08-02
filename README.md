@@ -4,7 +4,7 @@
 
 A browser, messenger, crawler, build tool, or another process can use its own VPN without replacing the host's default route or DNS configuration. Each named environment has separate routes, DNS, firewall state, tunnel state, and a kill switch.
 
-> **Release:** 1.0.14  
+> **Release:** 1.0.15  
 > **Status:** experimental  
 > **Current backend:** OpenVPN  
 > **Planned backends:** WireGuard, AmneziaWG, and provider-specific transports
@@ -23,6 +23,7 @@ A browser, messenger, crawler, build tool, or another process can use its own VP
 - Namespace and OpenVPN service startup failures print their own recent logs.
 - Two-letter VPN Gate country filters now match country codes exactly.
 - Restarting after an incomplete namespace setup safely rebuilds endpoint runtime files.
+- `./nns-app.sh install` now installs or refreshes the engine without creating an app.
 - Strict five-second startup failure handling.
 - Optional `-i` asynchronous start mode leaves a slow connection running.
 
@@ -74,9 +75,24 @@ Missing dependencies are installed automatically by `nns-app install` on support
 
 ## Installation
 
+Install or refresh the engine itself:
+
 ```bash
 chmod +x nns-app.sh
-sudo ./nns-app.sh install browser
+sudo ./nns-app.sh install
+```
+
+This installs:
+
+```text
+/usr/local/sbin/nns_app.sh
+/usr/local/bin/nns-app
+```
+
+Create an application environment separately:
+
+```bash
+sudo nns-app install browser
 ```
 
 The installer creates or refreshes:
@@ -99,7 +115,7 @@ nns-app --version
 Expected:
 
 ```text
-nns-app 1.0.14
+nns-app 1.0.15
 Author:  Maxim Lyadvinsky
 License: GPL-3.0-or-later
 ```
