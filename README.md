@@ -4,7 +4,7 @@
 
 A browser, messenger, crawler, build tool, or another process can use its own VPN without replacing the host's default route or DNS configuration. Each named environment has separate routes, DNS, firewall state, tunnel state, and a kill switch.
 
-> **Release:** 1.0.15  
+> **Release:** 1.0.16  
 > **Status:** experimental  
 > **Current backend:** OpenVPN  
 > **Planned backends:** WireGuard, AmneziaWG, and provider-specific transports
@@ -24,6 +24,7 @@ A browser, messenger, crawler, build tool, or another process can use its own VP
 - Two-letter VPN Gate country filters now match country codes exactly.
 - Restarting after an incomplete namespace setup safely rebuilds endpoint runtime files.
 - `./nns-app.sh install` now installs or refreshes the engine without creating an app.
+- Repeated `add <name> any` calls rotate through the top 20 matching VPN Gate relays.
 - Strict five-second startup failure handling.
 - Optional `-i` asynchronous start mode leaves a slow connection running.
 
@@ -115,7 +116,7 @@ nns-app --version
 Expected:
 
 ```text
-nns-app 1.0.15
+nns-app 1.0.16
 Author:  Maxim Lyadvinsky
 License: GPL-3.0-or-later
 ```
@@ -181,6 +182,17 @@ sudo nns-app add browser any DE --refresh
 
 The profile itself is copied into the named app environment, so removing or
 refreshing the server-list cache does not remove previously imported profiles.
+
+Selection uses persistent round-robin state. For each application and country
+filter, nns-app rotates through the 20 highest-ranked matching relays instead of
+selecting the same top-scoring server repeatedly. State files are stored under:
+
+```text
+/var/lib/nns-app/vpngate-<app>-<filter>.last
+```
+
+Delete the corresponding state file to restart rotation from the strongest
+candidate.
 
 The current implementation uses the VPN Gate public relay list. Relays are operated by volunteers and may be slow, unavailable, logged, filtered, or untrusted. This feature is suitable for testing and low-risk HTTPS traffic; it should not be treated as trusted privacy infrastructure.
 

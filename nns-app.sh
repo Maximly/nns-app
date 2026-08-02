@@ -36,7 +36,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.0.15"
+readonly VERSION="1.0.16"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -48,6 +48,7 @@ readonly NETNS_UNIT="/etc/systemd/system/nns-netns@.service"
 readonly VPN_UNIT="/etc/systemd/system/nns-openvpn@.service"
 readonly VPNGATE_API_URL="https://www.vpngate.net/api/iphone/"
 readonly CACHE_DIR="/var/cache/nns-app"
+readonly STATE_DIR="/var/lib/nns-app"
 readonly VPNGATE_CACHE_FILE="$CACHE_DIR/vpngate.csv"
 readonly VPNGATE_CACHE_TTL=1800
 
@@ -268,7 +269,7 @@ install_engine() {
 
     ensure_dependencies
     install_engine_files
-    install -d -o root -g root -m 0755         "$BASE_DIR" "$RUN_DIR" "$CACHE_DIR"
+    install -d -o root -g root -m 0755         "$BASE_DIR" "$RUN_DIR" "$CACHE_DIR" "$STATE_DIR"
 
     log "Installed nns-app $VERSION."
     log "Command: $USER_PATH"
@@ -336,7 +337,7 @@ install_app() {
 
     ensure_dependencies
     install_engine_files
-    install -d -o root -g root -m 0755         "$BASE_DIR" "$RUN_DIR" "$CACHE_DIR"
+    install -d -o root -g root -m 0755         "$BASE_DIR" "$RUN_DIR" "$CACHE_DIR" "$STATE_DIR"
 
     local dir file user net_data cidr host_addr ns_addr veth_data veth_host veth_ns
     dir=$(cfg_dir "$app")
@@ -676,10 +677,15 @@ add_any_profile() {
 
     local tmpdir csv_file selected metadata
     local now mtime age cache_tmp use_cache="off"
+    local state_key state_file
     tmpdir=$(mktemp -d)
     trap 'rm -rf "${tmpdir:-}" "${cache_tmp:-}"' EXIT
 
-    install -d -o root -g root -m 0755 "$CACHE_DIR"
+    install -d -o root -g root -m 0755 "$CACHE_DIR" "$STATE_DIR"
+    state_key=$(printf '%s' "${country:-ANY}" |
+        tr '[:lower:]' '[:upper:]' |
+        tr -c 'A-Z0-9._-' '_')
+    state_file="$STATE_DIR/vpngate-${app}-${state_key}.last"
     csv_file="$VPNGATE_CACHE_FILE"
     now=$(date +%s)
 
@@ -725,12 +731,11 @@ add_any_profile() {
     [[ -s "$csv_file" ]] || die "VPN Gate cache is empty: $csv_file"
     log "Searching VPN Gate candidates${country:+ for '$country'}..."
 
-    metadata=$(python3 - "$csv_file" "$tmpdir" "$country" <<'PY_SELECT'
+    metadata=$(python3 - "$csv_file" "$tmpdir" "$country" "$state_file" <<'PY_SELECT'
 import base64
 import csv
 import io
 import os
-import random
 import re
 import sys
 from pathlib import Path
@@ -738,6 +743,7 @@ from pathlib import Path
 csv_path = Path(sys.argv[1])
 out_dir = Path(sys.argv[2])
 country_filter = sys.argv[3].strip().casefold()
+state_path = Path(sys.argv[4])
 
 raw = csv_path.read_text(encoding="utf-8-sig", errors="replace")
 lines = [line for line in raw.splitlines() if line and not line.startswith("*")]
@@ -837,15 +843,16 @@ for row in reader:
     sessions = number(get(row, "NumVpnSessions"))
 
     # Prefer the service's own score, then measured speed and uptime. Unknown
-    # ping values rank below measured ones. A small random tie-break avoids
-    # every nns-app user selecting exactly the same volunteer relay.
+    # ping values rank below measured ones. Host/IP are stable tie-breakers so
+    # the round-robin order remains deterministic for a cached server list.
     rank = (
         score,
         speed,
         uptime,
         -sessions,
         -(ping if ping > 0 else 999999),
-        random.random(),
+        get(row, "HostName"),
+        get(row, "IP"),
     )
     candidates.append((rank, row, config))
 
@@ -853,11 +860,27 @@ if not candidates:
     label = sys.argv[3] or "any country"
     raise SystemExit(f"No usable VPN Gate OpenVPN profile found for {label}")
 
-# Randomly choose among the strongest few rather than concentrating all users
-# on one relay. They are already ordered by VPN Gate's quality measurements.
+# Rotate through the strongest candidates. A persistent last-relay marker makes
+# repeated `add ... any` calls select the next relay instead of repeatedly
+# returning the same highest-scoring profile. The top 20 cap avoids rotating
+# into very low-quality entries when a country has a large server list.
 candidates.sort(key=lambda item: item[0], reverse=True)
-pool = candidates[: min(5, len(candidates))]
-_, row, config = random.choice(pool)
+pool = candidates[: min(20, len(candidates))]
+
+try:
+    last_relay = state_path.read_text(encoding="utf-8").strip()
+except OSError:
+    last_relay = ""
+
+selected_index = 0
+if last_relay:
+    for i, (_, candidate_row, _) in enumerate(pool):
+        relay_id = f"{get(candidate_row, 'HostName')}|{get(candidate_row, 'IP')}"
+        if relay_id == last_relay:
+            selected_index = (i + 1) % len(pool)
+            break
+
+_, row, config = pool[selected_index]
 
 host = get(row, "HostName")
 ip = get(row, "IP")
@@ -868,6 +891,12 @@ ping = number(get(row, "Ping"))
 speed = number(get(row, "Speed"))
 uptime = number(get(row, "Uptime"))
 sessions = number(get(row, "NumVpnSessions"))
+
+state_path.parent.mkdir(parents=True, exist_ok=True)
+state_tmp = state_path.with_name(state_path.name + f".tmp.{os.getpid()}")
+state_tmp.write_text(f"{host}|{ip}\n", encoding="utf-8")
+os.chmod(state_tmp, 0o600)
+os.replace(state_tmp, state_path)
 
 safe_host = re.sub(r"[^A-Za-z0-9._-]+", "_", host).strip("_") or ip.replace(".", "_")
 filename = f"vpngate_{short_name}_{safe_host}.ovpn"[:64]
@@ -893,14 +922,15 @@ print(
         [
             str(path), short_name, long_name, host, ip, str(score),
             str(ping), f"{speed_mbps:.1f}", f"{uptime_minutes:.0f}",
-            str(sessions),
+            str(sessions), str(selected_index + 1), str(len(pool)),
         ]
     )
 )
 PY_SELECT
     ) || die "Could not select a usable free VPN profile."
 
-    IFS=$'\t' read -r selected country_short country_long host ip score ping speed_mbps uptime_minutes sessions <<<"$metadata"
+    local rotation_index rotation_count
+    IFS=$'\t' read -r selected country_short country_long host ip score ping speed_mbps uptime_minutes sessions rotation_index rotation_count <<<"$metadata"
     [[ -f "$selected" ]] || die "The VPN Gate selector did not produce a profile."
 
     local selected_endpoint selected_host selected_port selected_proto
@@ -914,7 +944,8 @@ PY_SELECT
         log "  Transport: ${selected_proto^^} $selected_host:$selected_port"
     fi
     log "  Quality:   score $score, ping ${ping:-unknown} ms, ${speed_mbps} Mbps"
-    log "  Uptime:   ${uptime_minutes} min; active sessions: $sessions"
+    log "  Uptime:    ${uptime_minutes} min; active sessions: $sessions"
+    log "  Rotation:  candidate ${rotation_index}/${rotation_count}"
     warn "VPN Gate relays are operated by volunteers and may log traffic."
     warn "Use end-to-end encryption and do not treat this as a trusted privacy VPN."
 
