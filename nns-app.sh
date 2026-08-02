@@ -36,7 +36,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.0.18"
+readonly VERSION="1.0.19"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -1827,27 +1827,60 @@ purge_engine() {
     log "Removed: $BASE_DIR, /etc/netns/nns-*, NNS systemd units, NNS sudoers rules, $USER_PATH and $ENGINE_PATH"
 }
 
-run_in_app() {
+mount_type_at() {
+    local path=$1
+    awk -v path="$path" '
+        $5 == path {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "-") {
+                    print $(i + 1)
+                    exit
+                }
+            }
+        }
+    ' /proc/self/mountinfo
+}
+
+prepare_namespaced_desktop_mounts() {
+    # `ip netns exec` creates a private mount namespace so it can bind
+    # /etc/netns/<name>/* over the normal configuration paths. Snap's launcher
+    # also needs cgroup2 and securityfs visible in that same mount namespace.
+    # These mounts are private to this command and disappear when it exits.
+    local current_type
+
+    install -d -m 0755 /sys/fs/cgroup /sys/kernel/security
+
+    current_type=$(mount_type_at /sys/fs/cgroup)
+    if [[ "$current_type" != cgroup2 ]]; then
+        if ! mount -t cgroup2 cgroup2 /sys/fs/cgroup; then
+            warn "Could not mount cgroup2 inside the command mount namespace; Snap applications may fail."
+        fi
+    fi
+
+    current_type=$(mount_type_at /sys/kernel/security)
+    if [[ "$current_type" != securityfs ]]; then
+        if ! mount -t securityfs securityfs /sys/kernel/security; then
+            warn "Could not mount securityfs inside the command mount namespace; Snap applications may fail."
+        fi
+    fi
+}
+
+run_user_exec() {
     require_root
     local app=$1
     shift
-    (( $# > 0 )) || die "run requires a command line."
+    (( $# > 0 )) || die "_run-user requires an app and command."
     validate_app_name "$app"
     load_cfg "$app"
 
-    systemctl is-active --quiet "nns-netns@${app}.service" ||
-        die "'$app' is stopped. Start it first."
-    ip netns list | awk '{print $1}' | grep -Fxq "$NS_NAME" ||
-        die "Namespace '$NS_NAME' does not exist."
+    # Prevent this internal helper from being used in the host namespace.
+    local current_netns expected_netns
+    current_netns=$(readlink /proc/self/ns/net)
+    expected_netns=$(readlink "/run/netns/$NS_NAME")
+    [[ -n "$current_netns" && "$current_netns" == "$expected_netns" ]] ||
+        die "_run-user is not inside the expected namespace '$NS_NAME'."
 
-    if bool_on "$KILLSWITCH"; then
-        systemctl is-active --quiet "nns-openvpn@${app}.service" ||
-            die "VPN service for '$app' is not running."
-        ip -n "$NS_NAME" route get 1.1.1.1 2>/dev/null | grep -qE ' dev (tun|tap)[^ ]* ' ||
-            die "VPN tunnel route for '$app' is not ready."
-        wait_online "$app" 2 ||
-            die "VPN data path for '$app' is not online yet."
-    fi
+    prepare_namespaced_desktop_mounts
 
     local uid gid home shell
     uid=$(id -u "$APP_USER")
@@ -1871,15 +1904,41 @@ run_in_app() {
         [[ -z "$value" ]] || env_args+=("$name=$value")
     done
 
-    # No eval, no shell re-parsing. Enter the network namespace as root, then
-    # permanently drop to APP_USER before executing the requested program.
-    exec /usr/sbin/ip netns exec "$NS_NAME" \
-        /usr/bin/setpriv \
-            --reuid="$uid" \
-            --regid="$gid" \
-            --init-groups \
-            -- \
+    exec /usr/bin/setpriv \
+        --reuid="$uid" \
+        --regid="$gid" \
+        --init-groups \
+        -- \
         /usr/bin/env -i "${env_args[@]}" "$@"
+}
+
+run_in_app() {
+    require_root
+    local app=$1
+    shift
+    (( $# > 0 )) || die "run requires a command line."
+    validate_app_name "$app"
+    load_cfg "$app"
+
+    systemctl is-active --quiet "nns-netns@${app}.service" ||
+        die "'$app' is stopped. Start it first."
+    ip netns list | awk '{print $1}' | grep -Fxq "$NS_NAME" ||
+        die "Namespace '$NS_NAME' does not exist."
+
+    if bool_on "$KILLSWITCH"; then
+        systemctl is-active --quiet "nns-openvpn@${app}.service" ||
+            die "VPN service for '$app' is not running."
+        ip -n "$NS_NAME" route get 1.1.1.1 2>/dev/null | grep -qE ' dev (tun|tap)[^ ]* ' ||
+            die "VPN tunnel route for '$app' is not ready."
+        wait_online "$app" 2 ||
+            die "VPN data path for '$app' is not online yet."
+    fi
+
+    # ip-netns supplies the namespace-specific /etc/resolv.conf bind mount.
+    # The internal helper then prepares cgroup2/securityfs for Snap and drops
+    # permanently to APP_USER without shell re-parsing or eval.
+    exec /usr/sbin/ip netns exec "$NS_NAME" \
+        "$ENGINE_PATH" _run-user "$app" "$@"
 }
 
 list_apps() {
@@ -1963,6 +2022,14 @@ main() {
             require_root
             [[ $# -eq 2 ]] || die "_openvpn requires app_name."
             openvpn_exec "$2"
+            exit
+            ;;
+        _run-user)
+            require_root
+            (( $# >= 3 )) || die "_run-user requires app_name and command."
+            local internal_app=$2
+            shift 2
+            run_user_exec "$internal_app" "$@"
             exit
             ;;
     esac

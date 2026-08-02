@@ -4,7 +4,7 @@
 
 A browser, messenger, crawler, build tool, or another process can use its own VPN without replacing the host's default route or DNS configuration. Each named environment has separate routes, DNS, firewall state, tunnel state, and a kill switch.
 
-> **Release:** 1.0.18  
+> **Release:** 1.0.19  
 > **Status:** experimental  
 > **Current backend:** OpenVPN  
 > **Planned backends:** WireGuard, AmneziaWG, and provider-specific transports
@@ -26,6 +26,7 @@ A browser, messenger, crawler, build tool, or another process can use its own VP
 - `./nns-app.sh install` now installs or refreshes the engine without creating an app.
 - Repeated `add <name> any` calls rotate through the top 20 matching VPN Gate relays.
 - VPN Gate candidates must complete a short OpenVPN handshake before import.
+- `nns-app run` prepares cgroup2 and securityfs inside its private mount namespace so Snap GUI applications can start.
 - Strict five-second startup failure handling.
 - Optional `-i` asynchronous start mode leaves a slow connection running.
 
@@ -117,7 +118,7 @@ nns-app --version
 Expected:
 
 ```text
-nns-app 1.0.18
+nns-app 1.0.19
 Author:  Maxim Lyadvinsky
 License: GPL-3.0-or-later
 ```
@@ -469,3 +470,32 @@ A log message such as `Initialization Sequence Completed` proves that OpenVPN in
 Copyright © 2026 Maxim Lyadvinsky.
 
 `nns-app` is licensed under the GNU General Public License v3.0 or later (`GPL-3.0-or-later`).
+
+## Snap applications inside an NNS namespace
+
+`ip netns exec` creates a private mount namespace while binding
+`/etc/netns/<namespace>/resolv.conf` over `/etc/resolv.conf`. Snap applications
+need both cgroup v2 and securityfs visible in that mount namespace. Older
+versions of nns-app could therefore fail with:
+
+```text
+internal error, please report: running "firefox" failed:
+cannot find tracking cgroup
+```
+
+Version 1.0.19 mounts `cgroup2` and `securityfs` in the private command mount
+namespace before dropping privileges to the configured application user. The
+mounts disappear when the command exits and do not alter the host mount table.
+
+Example:
+
+```bash
+nns-app run hidemy firefox --no-remote
+```
+
+To inspect the mounts from a namespaced shell:
+
+```bash
+nns-app run hidemy bash
+findmnt /sys/fs/cgroup /sys/kernel/security
+```
