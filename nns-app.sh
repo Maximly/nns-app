@@ -36,7 +36,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.0.13"
+readonly VERSION="1.0.14"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -761,8 +761,17 @@ def number(value, default=0):
 def country_matches(short_name, long_name):
     if not country_filter:
         return True
+
     short_cf = short_name.casefold()
     long_cf = long_name.casefold()
+
+    # A two-letter value is a country code and must match CountryShort exactly.
+    # The old substring rule made "US" match "Russian Federation" because
+    # "russian" contains the letters "us".
+    if re.fullmatch(r"[a-z]{2}", country_filter):
+        return country_filter == short_cf
+
+    # Longer values are treated as country-name filters.
     return (
         country_filter == short_cf
         or country_filter == long_cf
@@ -907,7 +916,7 @@ profile_endpoints() {
     # Output: host|port|protocol. Ignore inline certificate/key blocks.
     awk '
         BEGIN { inblock=0; proto="udp"; port="1194" }
-        { sub(/\r$/, "", $0) }
+        { gsub(/\r/, "", $0) }
         /^[[:space:]]*<[^/][^>]*>[[:space:]]*$/ { inblock=1; next }
         /^[[:space:]]*<\/[A-Za-z0-9_-]+>[[:space:]]*$/ { inblock=0; next }
         inblock { next }
@@ -1028,18 +1037,13 @@ netns_up() {
     load_cfg "$app"
 
     local wan host_ip runtime profile endpoints_file
-    wan=$(detect_wan_iface "$WAN_IFACE")
-    host_ip=${HOST_ADDR%/*}
     runtime="$RUN_DIR/${app}.env"
-    profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
     endpoints_file="$RUN_DIR/${app}.endpoints"
-    [[ -n "$DEFAULT_PROFILE" && -f "$profile" ]] ||
-        die "No usable default profile is configured for '$app'."
-    install -d -o root -g root -m 0755 "$RUN_DIR"
-    resolve_profile_endpoints "$profile" "$endpoints_file"
-    chmod 0600 "$endpoints_file"
 
-    # Clean any incomplete previous instance before recreating it.
+    # Clean an incomplete previous instance before creating any new runtime
+    # files. netns_down() removes <app>.env and <app>.endpoints, so resolving
+    # endpoints before this cleanup made a second start fail with:
+    #   /run/nns-app/<app>.endpoints: No such file or directory
     if ip netns list | awk '{print $1}' | grep -Fxq "$NS_NAME"; then
         warn "Removing stale namespace '$NS_NAME'."
         netns_down "$app"
@@ -1047,7 +1051,16 @@ netns_up() {
     fi
     ip link del "$VETH_HOST" 2>/dev/null || true
 
+    wan=$(detect_wan_iface "$WAN_IFACE")
+    host_ip=${HOST_ADDR%/*}
+    profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
+    [[ -n "$DEFAULT_PROFILE" && -f "$profile" ]] ||
+        die "No usable default profile is configured for '$app'."
+
     install -d -o root -g root -m 0755 "$RUN_DIR"
+    resolve_profile_endpoints "$profile" "$endpoints_file"
+    chmod 0600 "$endpoints_file"
+
     printf 'WAN_IFACE_RUNTIME=%q\n' "$wan" >"$runtime"
     chmod 0600 "$runtime"
 

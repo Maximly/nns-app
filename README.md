@@ -4,7 +4,7 @@
 
 A browser, messenger, crawler, build tool, or another process can use its own VPN without replacing the host's default route or DNS configuration. Each named environment has separate routes, DNS, firewall state, tunnel state, and a kill switch.
 
-> **Release:** 1.0.13  
+> **Release:** 1.0.14  
 > **Status:** experimental  
 > **Current backend:** OpenVPN  
 > **Planned backends:** WireGuard, AmneziaWG, and provider-specific transports
@@ -21,6 +21,8 @@ A browser, messenger, crawler, build tool, or another process can use its own VP
 - A public OpenVPN relay can be selected automatically with `add ... any`.
 - VPN Gate metadata is cached for 30 minutes with stale-cache fallback.
 - Namespace and OpenVPN service startup failures print their own recent logs.
+- Two-letter VPN Gate country filters now match country codes exactly.
+- Restarting after an incomplete namespace setup safely rebuilds endpoint runtime files.
 - Strict five-second startup failure handling.
 - Optional `-i` asynchronous start mode leaves a slow connection running.
 
@@ -97,7 +99,7 @@ nns-app --version
 Expected:
 
 ```text
-nns-app 1.0.13
+nns-app 1.0.14
 Author:  Maxim Lyadvinsky
 License: GPL-3.0-or-later
 ```
@@ -143,6 +145,10 @@ Optionally filter by a two-letter country code or a country-name fragment:
 sudo nns-app add browser any JP
 sudo nns-app add browser any Germany
 ```
+
+Two-letter values are matched only against VPN Gate's `CountryShort` field.
+For example, `US` cannot match `Russian Federation`. Longer values such as
+`Germany` continue to use case-insensitive country-name matching.
 
 The VPN Gate CSV list is cached in:
 
@@ -217,9 +223,13 @@ sudo journalctl -fu nns-openvpn@browser.service
 
 `-i` ignores only the readiness failure. Invalid configuration, a missing profile, failure to create the namespace, or failure to start systemd services remains an actual error.
 
-A namespace creation error occurs before OpenVPN is launched. Version 1.0.13
+A namespace creation error occurs before OpenVPN is launched. Version 1.0.14
 prints the recent `nns-netns@<name>.service` log automatically in this case;
 `-i` cannot and should not hide this structural failure.
+
+Version 1.0.14 also fixes restart cleanup ordering. A stale namespace is removed
+before `/run/nns-app/<name>.endpoints` is generated, preventing cleanup from
+deleting the newly generated endpoint list during the same start operation.
 
 Applications are still protected: with the kill switch enabled, `nns-app run` refuses to launch a command until the tunnel route and data path are usable.
 
