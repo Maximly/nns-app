@@ -20,13 +20,13 @@
 # Author: Maxim Lyadvinsky
 #
 # Public commands:
-#   install <app_name>
+#   install [<app_name> [--via <upstream-app>|host]]
 #   remove  <app_name>
 #   purge
 #   list
 #   add     <app_name> <profile.ovpn>
-#   add     <app_name> any [country] [--refresh]
-#   start   [-i|--ignore-start-error] <app_name>
+#   add     <app_name> any [country] [--refresh] [--via <upstream-app>|host]
+#   start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
 #   stop    <app_name>
 #   run     <app_name> <command> [args...]
 #
@@ -36,7 +36,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.0.19"
+readonly VERSION="1.0.20"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -94,25 +94,24 @@ show_version() {
 usage() {
     cat <<'USAGE'
 Usage:
-  nns-app install [app_name]
+  nns-app install [app_name [--via <upstream-app>|host]]
   nns-app remove  <app_name>
   nns-app purge
   nns-app list
   nns-app add     <app_name> <profile.ovpn>
-  nns-app add     <app_name> any [country-code-or-name] [--refresh]
-  nns-app start   [-i|--ignore-start-error] <app_name>
+  nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
+  nns-app start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
   nns-app stop    <app_name>
   nns-app run     <app_name> <command> [arguments...]
 
 Examples:
-  sudo ./nns-app.sh install          # install/refresh the engine only
-  sudo nns-app install browser      # create or refresh an app environment
+  sudo ./nns-app.sh install
+  sudo nns-app install hidemy
+  sudo nns-app install browser --via hidemy   # persistent upstream
   sudo nns-app add browser ~/Downloads/NorwayS23.ovpn
-  sudo nns-app add browser any
-  sudo nns-app add browser any JP
-  sudo nns-app add browser any DE --refresh
+  sudo nns-app add browser any US --via hidemy
   nns-app start browser
-  nns-app start -i browser   # leave a slow connection running in background
+  nns-app start -i browser --via hidemy       # one-start override
   nns-app run browser curl -4 https://api.ipify.org
   nns-app run browser firefox --no-remote
   sudo nns-app purge
@@ -159,6 +158,21 @@ reexec_as_root_if_needed() {
             ;;
     esac
 
+    # Canonicalize flexible start-option ordering before sudo. This lets the
+    # per-app sudoers entry remain narrow while accepting --via in any position.
+    if [[ "$cmd" == start ]]; then
+        shift
+        parse_start_cli "$@"
+        local -a canonical=(start)
+        bool_on "$START_IGNORE" && canonical+=(-i)
+        canonical+=("$START_APP_NAME")
+        if [[ "$START_VIA" != __default__ ]]; then
+            canonical+=(--via "$START_VIA")
+        fi
+        "${sudo_args[@]}" "$target" "${canonical[@]}"
+        exit $?
+    fi
+
     # Do not exec sudo here. Keeping this wrapper process separate avoids
     # replacing an interactive caller and gives normal shells clean SIGINT flow.
     "${sudo_args[@]}" "$target" "$@"
@@ -178,6 +192,10 @@ load_cfg() {
     mode_octal=$((8#$mode))
     (( (mode_octal & 0022) == 0 )) ||
         die "Unsafe config permissions on $file; it must not be group/world writable."
+
+    # Newer optional fields must be reset before sourcing an older config;
+    # otherwise a value from a previously loaded app could leak into this one.
+    UPSTREAM_APP=""
 
     # shellcheck disable=SC1090
     source "$file"
@@ -216,6 +234,163 @@ bool_on() {
         1|yes|true|on|enabled) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+cfg_read_value() {
+    local app=$1 key=$2 file
+    validate_app_name "$app"
+    file=$(cfg_file "$app")
+    [[ -f "$file" ]] || return 1
+
+    (
+        set +u
+        # shellcheck disable=SC1090
+        source "$file"
+        printf '%s\n' "${!key-}"
+    )
+}
+
+runtime_read_value() {
+    local file=$1 key=$2
+    [[ -f "$file" ]] || return 1
+    (
+        set +u
+        # shellcheck disable=SC1090
+        source "$file"
+        printf '%s\n' "${!key-}"
+    )
+}
+
+normalize_via() {
+    local child=$1 via=${2:-host}
+    [[ -n "$via" ]] || via=host
+    if [[ "$via" == host ]]; then
+        printf 'host\n'
+        return 0
+    fi
+
+    validate_app_name "$via"
+    [[ "$via" != "$child" ]] || die "An app cannot use itself as its upstream."
+    [[ -f "$(cfg_file "$via")" ]] || die "Upstream app '$via' is not installed."
+    printf '%s\n' "$via"
+}
+
+current_nns_app() {
+    local current dir app ns target
+    current=$(readlink /proc/self/ns/net 2>/dev/null || true)
+    [[ -n "$current" ]] || return 1
+
+    shopt -s nullglob
+    for dir in "$BASE_DIR"/*; do
+        [[ -d "$dir" ]] || continue
+        app=$(basename "$dir")
+        [[ -f "$(cfg_file "$app")" ]] || continue
+        ns=$(cfg_read_value "$app" NS_NAME 2>/dev/null || true)
+        [[ -n "$ns" && -e "/run/netns/$ns" ]] || continue
+        target=$(readlink "/run/netns/$ns" 2>/dev/null || true)
+        if [[ "$current" == "$target" ]]; then
+            printf '%s\n' "$app"
+            return 0
+        fi
+    done
+    return 1
+}
+
+effective_via_for_app() {
+    local app=$1 override=${2:-__default__} configured
+    if [[ "$override" != __default__ ]]; then
+        normalize_via "$app" "$override"
+        return
+    fi
+
+    configured=$(cfg_read_value "$app" UPSTREAM_APP 2>/dev/null || true)
+    normalize_via "$app" "${configured:-host}"
+}
+
+effective_via_runtime() {
+    local app=$1 override_file="$RUN_DIR/${app}.via" selected
+    if [[ -s "$override_file" ]]; then
+        selected=$(<"$override_file")
+        normalize_via "$app" "$selected"
+    else
+        effective_via_for_app "$app" __default__
+    fi
+}
+
+runtime_via_for_app() {
+    local app=$1 runtime="$RUN_DIR/${app}.env" mode upstream
+    mode=$(runtime_read_value "$runtime" UPLINK_MODE_RUNTIME 2>/dev/null || true)
+    upstream=$(runtime_read_value "$runtime" UPSTREAM_APP_RUNTIME 2>/dev/null || true)
+    if [[ "$mode" == app && -n "$upstream" ]]; then
+        printf '%s\n' "$upstream"
+    else
+        printf 'host\n'
+    fi
+}
+
+upstream_tunnel_iface() {
+    local upstream=$1 ns dev
+    ns=$(cfg_read_value "$upstream" NS_NAME 2>/dev/null || true)
+    [[ -n "$ns" ]] || return 1
+    dev=$(ip -n "$ns" -4 route get 1.1.1.1 2>/dev/null |
+          awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+    [[ "$dev" =~ ^(tun|tap) ]] || return 1
+    printf '%s|%s\n' "$ns" "$dev"
+}
+
+ensure_upstream_ready() {
+    local child=$1 upstream=$2 data
+    [[ "$upstream" != host ]] || return 0
+    normalize_via "$child" "$upstream" >/dev/null
+
+    systemctl is-active --quiet "nns-netns@${upstream}.service" ||
+        die "Upstream app '$upstream' is not started."
+    systemctl is-active --quiet "nns-openvpn@${upstream}.service" ||
+        die "Upstream VPN service for '$upstream' is not running."
+
+    data=$(upstream_tunnel_iface "$upstream" 2>/dev/null || true)
+    [[ -n "$data" ]] || die "Upstream app '$upstream' has no active tunnel route."
+
+    if ! ( wait_online "$upstream" 3 ); then
+        die "Upstream VPN data path for '$upstream' is offline."
+    fi
+    printf '%s\n' "$data"
+}
+
+parse_start_cli() {
+    START_APP_NAME=""
+    START_IGNORE="off"
+    START_VIA="__default__"
+
+    while (( $# > 0 )); do
+        case "$1" in
+            -i|--ignore-start-error)
+                START_IGNORE="on"
+                shift
+                ;;
+            --via)
+                (( $# >= 2 )) || die "--via requires an upstream app name or 'host'."
+                START_VIA=$2
+                shift 2
+                ;;
+            --via=*)
+                START_VIA=${1#--via=}
+                shift
+                ;;
+            -*)
+                die "Unknown start option '$1'."
+                ;;
+            *)
+                [[ -z "$START_APP_NAME" ]] ||
+                    die "Usage: nns-app start [-i] <app_name> [--via <upstream-app>|host]"
+                START_APP_NAME=$1
+                shift
+                ;;
+        esac
+    done
+
+    [[ -n "$START_APP_NAME" ]] ||
+        die "Usage: nns-app start [-i] <app_name> [--via <upstream-app>|host]"
 }
 
 ensure_dependencies() {
@@ -347,7 +522,7 @@ write_sudoers_for_app() {
     cat >"$tmp" <<SUDOERS_EOF
 Defaults!$ENGINE_PATH !use_pty
 Defaults!$ENGINE_PATH env_keep += "DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR LANG LC_ALL TERM COLORTERM SSH_AUTH_SOCK"
-Cmnd_Alias $alias = $ENGINE_PATH list, $ENGINE_PATH start $app, $ENGINE_PATH start -i $app, $ENGINE_PATH start --ignore-start-error $app, $ENGINE_PATH start $app -i, $ENGINE_PATH start $app --ignore-start-error, $ENGINE_PATH stop $app, $ENGINE_PATH run $app *
+Cmnd_Alias $alias = $ENGINE_PATH list, $ENGINE_PATH start $app, $ENGINE_PATH start -i $app, $ENGINE_PATH start --ignore-start-error $app, $ENGINE_PATH start $app --via *, $ENGINE_PATH start -i $app --via *, $ENGINE_PATH start --ignore-start-error $app --via *, $ENGINE_PATH stop $app, $ENGINE_PATH run $app *
 $user ALL=(root) NOPASSWD: $alias
 SUDOERS_EOF
 
@@ -361,8 +536,11 @@ SUDOERS_EOF
 
 install_app() {
     require_root
-    local app=$1
+    local app=$1 via_setting=${2:-__default__} normalized_via=""
     validate_app_name "$app"
+    if [[ "$via_setting" != __default__ ]]; then
+        normalized_via=$(normalize_via "$app" "$via_setting")
+    fi
 
     ensure_dependencies
     install_engine_files
@@ -374,9 +552,18 @@ install_app() {
 
     if [[ -f "$file" ]]; then
         load_cfg "$app"
+        if [[ "$via_setting" != __default__ ]]; then
+            if [[ "$normalized_via" == host ]]; then
+                cfg_set "$app" UPSTREAM_APP ""
+            else
+                cfg_set "$app" UPSTREAM_APP "$normalized_via"
+            fi
+            load_cfg "$app"
+        fi
         write_sudoers_for_app "$app" "$APP_USER"
         log "NNS app '$app' is already installed; engine files were refreshed."
         log "Config: $file"
+        log "Upstream: ${UPSTREAM_APP:-host}"
         return 0
     fi
 
@@ -409,7 +596,11 @@ KILLSWITCH="on"
 # Enable/disable automatic startup at boot.
 AUTOSTART="off"
 
-# auto uses the host's current IPv4 default-route interface.
+# Empty/host: connect this namespace directly through the host uplink.
+# An app name: connect through that app's active VPN namespace.
+UPSTREAM_APP="${normalized_via#host}"
+
+# Used only when UPSTREAM_APP is empty. auto follows the host IPv4 default route.
 WAN_IFACE="auto"
 DNS_SERVERS="1.1.1.1 9.9.9.9"
 DISABLE_IPV6="on"
@@ -439,8 +630,9 @@ CONFIG_EOF
     log "Installed NNS app '$app'."
     log "Config:   $file"
     log "Profiles: $(profiles_dir "$app")"
+    log "Upstream: ${normalized_via:-host}"
     log "Next:     sudo $USER_PATH add $app /path/to/profile.ovpn"
-    log "          or: sudo $USER_PATH add $app any [country]"
+    log "          or: sudo $USER_PATH add $app any [country]${normalized_via:+ --via $normalized_via}"
 }
 
 profile_name_from_path() {
@@ -697,7 +889,7 @@ add_profile() {
 
 add_any_profile() {
     require_root
-    local app=$1 country=${2:-} force_refresh=${3:-off}
+    local app=$1 country=${2:-} force_refresh=${3:-off} via_override=${4:-__default__}
     validate_app_name "$app"
     load_cfg "$app"
 
@@ -706,11 +898,32 @@ add_any_profile() {
 
     local tmpdir csv_file selected metadata
     local now mtime age cache_tmp use_cache="off"
-    local state_key state_file
+    local state_key state_file probe_via probe_ns="host" current_app=""
+    local -a path_prefix=()
     tmpdir=$(mktemp -d)
     trap 'rm -rf "${tmpdir:-}" "${cache_tmp:-}"' EXIT
 
     install -d -o root -g root -m 0755 "$CACHE_DIR" "$STATE_DIR"
+
+    if [[ "$via_override" != __default__ ]]; then
+        probe_via=$(normalize_via "$app" "$via_override")
+    else
+        probe_via=$(effective_via_for_app "$app" __default__)
+        if [[ "$probe_via" == host ]]; then
+            current_app=$(current_nns_app 2>/dev/null || true)
+            if [[ -n "$current_app" && "$current_app" != "$app" ]]; then
+                probe_via=$current_app
+            fi
+        fi
+    fi
+
+    if [[ "$probe_via" != host ]]; then
+        local upstream_data
+        upstream_data=$(ensure_upstream_ready "$app" "$probe_via")
+        probe_ns=${upstream_data%%|*}
+        path_prefix=(/usr/sbin/ip netns exec "$probe_ns")
+    fi
+
     state_key=$(printf '%s' "${country:-ANY}" |
         tr '[:lower:]' '[:upper:]' |
         tr -c 'A-Z0-9._-' '_')
@@ -732,7 +945,7 @@ add_any_profile() {
         log "Downloading the VPN Gate public relay list${country:+ for '$country'}..."
         cache_tmp=$(mktemp "$CACHE_DIR/.vpngate.csv.XXXXXX")
 
-        if curl --fail --silent --show-error --location --compressed \
+        if "${path_prefix[@]}" curl --fail --silent --show-error --location --compressed \
             --connect-timeout 5 --max-time 45 \
             --retry 2 --retry-delay 1 --retry-all-errors \
             --user-agent "nns-app/${VERSION}" \
@@ -760,7 +973,10 @@ add_any_profile() {
     [[ -s "$csv_file" ]] || die "VPN Gate cache is empty: $csv_file"
     log "Searching VPN Gate candidates${country:+ for '$country'}..."
 
-    metadata=$(python3 -         "$csv_file" "$tmpdir" "$country" "$state_file"         "$VPNGATE_PROBE_TIMEOUT" "$VPNGATE_PROBE_ATTEMPTS" <<'PY_SELECT'
+    metadata=$(python3 - \
+        "$csv_file" "$tmpdir" "$country" "$state_file" \
+        "$VPNGATE_PROBE_TIMEOUT" "$VPNGATE_PROBE_ATTEMPTS" \
+        "$probe_ns" "$probe_via" <<'PY_SELECT'
 import base64
 import csv
 import io
@@ -778,6 +994,8 @@ country_filter = sys.argv[3].strip().casefold()
 state_path = Path(sys.argv[4])
 probe_timeout = max(1.0, float(sys.argv[5]))
 probe_attempts = max(1, int(sys.argv[6]))
+probe_namespace = sys.argv[7]
+probe_label = sys.argv[8]
 
 raw = csv_path.read_text(encoding="utf-8-sig", errors="replace")
 lines = [line for line in raw.splitlines() if line and not line.startswith("*")]
@@ -974,8 +1192,9 @@ def quick_openvpn_probe(config, endpoint, candidate_number):
         "--dev", device,
         "--dev-type", "tun",
         "--route-nopull",
+        "--route-noexec",
+        "--ifconfig-noexec",
         "--connect-retry-max", "1",
-        "--connect-timeout", str(max(1, int(probe_timeout))),
         "--server-poll-timeout", str(max(1, int(probe_timeout))),
         "--resolv-retry", "0",
         "--nobind",
@@ -985,18 +1204,10 @@ def quick_openvpn_probe(config, endpoint, candidate_number):
         "--log", str(probe_log),
     ]
 
-    # `nns-app run hidemy nns-app add ...` executes this selector inside the
-    # hidemy namespace. The new app will later connect from the host namespace,
-    # so probe through PID 1's network namespace when nsenter is available.
-    try:
-        current_netns = os.readlink("/proc/self/ns/net")
-        host_netns = os.readlink("/proc/1/ns/net")
-    except OSError:
-        current_netns = host_netns = ""
-
-    nsenter = shutil.which("nsenter")
-    if nsenter and current_netns and host_netns and current_netns != host_netns:
-        command = [nsenter, "--target", "1", "--net", "--"] + command
+    if probe_namespace != "host":
+        command = [
+            "/usr/sbin/ip", "netns", "exec", probe_namespace,
+        ] + command
 
     started = time.monotonic()
     proc = None
@@ -1018,7 +1229,10 @@ def quick_openvpn_probe(config, endpoint, candidate_number):
                     encoding="utf-8",
                     errors="replace",
                 )
-                if "Initialization Sequence Completed" in log_text:
+                if (
+                    "Peer Connection Initiated" in log_text
+                    or "Initialization Sequence Completed" in log_text
+                ):
                     success = True
                     break
 
@@ -1045,7 +1259,7 @@ def quick_openvpn_probe(config, endpoint, candidate_number):
             pass
 
     if success:
-        return True, "OpenVPN handshake completed", elapsed
+        return True, "OpenVPN peer connection established", elapsed
 
     return False, classify_probe_log(log_text, endpoint), elapsed
 
@@ -1137,7 +1351,7 @@ print(
 )
 print(
     f"Quick-checking up to {min(probe_attempts, len(pool))} candidate(s); "
-    f"{probe_timeout:g}s each, through the host network namespace.",
+    f"{probe_timeout:g}s each, via {probe_label}.",
     file=sys.stderr,
     flush=True,
 )
@@ -1280,11 +1494,14 @@ PY_SELECT
     log "  Quality:   score $score, ping ${ping:-unknown} ms, ${speed_mbps} Mbps"
     log "  Uptime:    ${uptime_minutes} min; active sessions: $sessions"
     log "  Rotation:  candidate ${rotation_index}/${rotation_count}"
-    log "  Probe:     ${probe_note}; tested ${probe_tested} candidate(s)"
+    log "  Probe:     ${probe_note}; tested ${probe_tested} candidate(s) via $probe_via"
     warn "VPN Gate relays are operated by volunteers and may log traffic."
     warn "Use end-to-end encryption and do not treat this as a trusted privacy VPN."
 
     add_profile "$app" "$selected"
+    if [[ "$probe_via" != host ]]; then
+        log "Start this profile through the same path with: nns-app start $app --via $probe_via"
+    fi
     rm -rf "$tmpdir"
     trap - EXIT
 }
@@ -1317,7 +1534,7 @@ profile_endpoints() {
 }
 
 resolve_profile_endpoints() {
-    local profile=$1 outfile=$2
+    local profile=$1 outfile=$2 resolver_ns=${3:-host}
     local host port proto ip
     local tmp
     tmp=$(mktemp)
@@ -1343,9 +1560,16 @@ resolve_profile_endpoints() {
         else
             [[ "$host" =~ ^[A-Za-z0-9.-]+$ ]] ||
                 die "Invalid VPN endpoint host '$host' in $profile"
-            while read -r ip; do
-                [[ -n "$ip" ]] && printf '%s|%s|%s\n' "$ip" "$port" "$proto" >>"$tmp"
-            done < <(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u)
+            if [[ "$resolver_ns" == host ]]; then
+                while read -r ip; do
+                    [[ -n "$ip" ]] && printf '%s|%s|%s\n' "$ip" "$port" "$proto" >>"$tmp"
+                done < <(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u)
+            else
+                while read -r ip; do
+                    [[ -n "$ip" ]] && printf '%s|%s|%s\n' "$ip" "$port" "$proto" >>"$tmp"
+                done < <(ip netns exec "$resolver_ns" getent ahostsv4 "$host" 2>/dev/null |
+                         awk '{print $1}' | sort -u)
+            fi
         fi
     done < <(profile_endpoints "$profile")
 
@@ -1410,56 +1634,144 @@ host_rules_down() {
     iptables_delete_all nat POSTROUTING -s "$NS_CIDR" -o "$wan" -j MASQUERADE
 }
 
+netns_iptables_add_once() {
+    local ns=$1 table=$2
+    shift 2
+    if [[ "$table" == filter ]]; then
+        ip netns exec "$ns" iptables -w 5 -C "$@" 2>/dev/null ||
+            ip netns exec "$ns" iptables -w 5 -I "$@"
+    else
+        ip netns exec "$ns" iptables -w 5 -t "$table" -C "$@" 2>/dev/null ||
+            ip netns exec "$ns" iptables -w 5 -t "$table" -A "$@"
+    fi
+}
+
+netns_iptables_delete_all() {
+    local ns=$1 table=$2
+    shift 2
+    if [[ "$table" == filter ]]; then
+        while ip netns exec "$ns" iptables -w 5 -C "$@" 2>/dev/null; do
+            ip netns exec "$ns" iptables -w 5 -D "$@" || break
+        done
+    else
+        while ip netns exec "$ns" iptables -w 5 -t "$table" -C "$@" 2>/dev/null; do
+            ip netns exec "$ns" iptables -w 5 -t "$table" -D "$@" || break
+        done
+    fi
+}
+
+upstream_rules_up() {
+    local upstream_ns=$1 upstream_tun=$2
+    ip netns exec "$upstream_ns" sysctl -q -w net.ipv4.ip_forward=1
+    netns_iptables_add_once "$upstream_ns" filter FORWARD \
+        -i "$VETH_HOST" -o "$upstream_tun" -j ACCEPT
+    netns_iptables_add_once "$upstream_ns" filter FORWARD \
+        -i "$upstream_tun" -o "$VETH_HOST" \
+        -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    netns_iptables_add_once "$upstream_ns" nat POSTROUTING \
+        -s "$NS_CIDR" -o "$upstream_tun" -j MASQUERADE
+    netns_iptables_add_once "$upstream_ns" mangle FORWARD \
+        -i "$VETH_HOST" -o "$upstream_tun" -p tcp \
+        --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+}
+
+upstream_rules_down() {
+    local upstream_ns=$1 upstream_tun=$2
+    netns_iptables_delete_all "$upstream_ns" filter FORWARD \
+        -i "$VETH_HOST" -o "$upstream_tun" -j ACCEPT
+    netns_iptables_delete_all "$upstream_ns" filter FORWARD \
+        -i "$upstream_tun" -o "$VETH_HOST" \
+        -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    netns_iptables_delete_all "$upstream_ns" nat POSTROUTING \
+        -s "$NS_CIDR" -o "$upstream_tun" -j MASQUERADE
+    netns_iptables_delete_all "$upstream_ns" mangle FORWARD \
+        -i "$VETH_HOST" -o "$upstream_tun" -p tcp \
+        --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+}
+
+delete_veth_everywhere() {
+    local name=$1 ns
+    ip link del "$name" 2>/dev/null || true
+    while read -r ns _; do
+        [[ -n "$ns" ]] || continue
+        ip -n "$ns" link del "$name" 2>/dev/null || true
+    done < <(ip netns list 2>/dev/null || true)
+}
+
 netns_up() {
     require_root
     local app=$1
     validate_app_name "$app"
     load_cfg "$app"
 
-    local wan host_ip runtime profile endpoints_file
+    local runtime profile endpoints_file via_app host_ip
+    local wan="" upstream_ns="" upstream_tun="" upstream_data=""
     runtime="$RUN_DIR/${app}.env"
     endpoints_file="$RUN_DIR/${app}.endpoints"
+    via_app=$(effective_via_runtime "$app")
 
-    # Clean an incomplete previous instance before creating any new runtime
-    # files. netns_down() removes <app>.env and <app>.endpoints, so resolving
-    # endpoints before this cleanup made a second start fail with:
-    #   /run/nns-app/<app>.endpoints: No such file or directory
+    # Capture the requested upstream before cleanup. A stale cleanup removes
+    # the one-start override file, but this invocation must keep using it.
     if ip netns list | awk '{print $1}' | grep -Fxq "$NS_NAME"; then
         warn "Removing stale namespace '$NS_NAME'."
         netns_down "$app"
         load_cfg "$app"
     fi
-    ip link del "$VETH_HOST" 2>/dev/null || true
+    delete_veth_everywhere "$VETH_HOST"
 
-    wan=$(detect_wan_iface "$WAN_IFACE")
+    if [[ "$via_app" == host ]]; then
+        wan=$(detect_wan_iface "$WAN_IFACE")
+    else
+        upstream_data=$(ensure_upstream_ready "$app" "$via_app")
+        IFS='|' read -r upstream_ns upstream_tun <<<"$upstream_data"
+    fi
+
     host_ip=${HOST_ADDR%/*}
     profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
     [[ -n "$DEFAULT_PROFILE" && -f "$profile" ]] ||
         die "No usable default profile is configured for '$app'."
 
     install -d -o root -g root -m 0755 "$RUN_DIR"
-    resolve_profile_endpoints "$profile" "$endpoints_file"
+    resolve_profile_endpoints "$profile" "$endpoints_file"         "${upstream_ns:-host}"
     chmod 0600 "$endpoints_file"
 
-    printf 'WAN_IFACE_RUNTIME=%q\n' "$wan" >"$runtime"
+    if [[ "$via_app" == host ]]; then
+        {
+            printf 'UPLINK_MODE_RUNTIME=%q\n' host
+            printf 'WAN_IFACE_RUNTIME=%q\n' "$wan"
+            printf 'UPSTREAM_APP_RUNTIME=%q\n' ""
+        } >"$runtime"
+    else
+        {
+            printf 'UPLINK_MODE_RUNTIME=%q\n' app
+            printf 'WAN_IFACE_RUNTIME=%q\n' ""
+            printf 'UPSTREAM_APP_RUNTIME=%q\n' "$via_app"
+            printf 'UPSTREAM_NS_RUNTIME=%q\n' "$upstream_ns"
+            printf 'UPSTREAM_TUN_RUNTIME=%q\n' "$upstream_tun"
+        } >"$runtime"
+    fi
     chmod 0600 "$runtime"
 
     ip netns add "$NS_NAME"
     ip link add "$VETH_HOST" type veth peer name "$VETH_NS"
     ip link set "$VETH_NS" netns "$NS_NAME"
 
-    ip addr add "$HOST_ADDR" dev "$VETH_HOST"
-    ip link set "$VETH_HOST" up
+    if [[ "$via_app" == host ]]; then
+        ip addr add "$HOST_ADDR" dev "$VETH_HOST"
+        ip link set "$VETH_HOST" up
+    else
+        ip link set "$VETH_HOST" netns "$upstream_ns"
+        ip -n "$upstream_ns" addr add "$HOST_ADDR" dev "$VETH_HOST"
+        ip -n "$upstream_ns" link set "$VETH_HOST" up
+    fi
 
     ip -n "$NS_NAME" link set lo up
     ip -n "$NS_NAME" addr add "$NS_ADDR" dev "$VETH_NS"
     ip -n "$NS_NAME" link set "$VETH_NS" up
     ip -n "$NS_NAME" route add default via "$host_ip" dev "$VETH_NS"
 
-    # The original known-good implementation pinned the OpenVPN endpoint to
-    # the veth gateway before OpenVPN installed redirect-gateway routes. This
-    # prevents reconnects and persisted routes from accidentally sending the
-    # control channel back into the VPN tunnel.
+    # Keep the inner OpenVPN control channel outside the inner tunnel. For a
+    # chained app this route reaches the endpoint through the upstream VPN.
     local endpoint_ip endpoint_port endpoint_proto
     while IFS='|' read -r endpoint_ip endpoint_port endpoint_proto; do
         ip -n "$NS_NAME" route replace "$endpoint_ip/32" \
@@ -1476,17 +1788,20 @@ netns_up() {
     printf 'options timeout:2 attempts:2 rotate\n' >>"/etc/netns/$NS_NAME/resolv.conf"
     chmod 0644 "/etc/netns/$NS_NAME/resolv.conf"
 
-    sysctl -q -w net.ipv4.ip_forward=1
+    if [[ "$via_app" == host ]]; then
+        sysctl -q -w net.ipv4.ip_forward=1
+        host_rules_up "$wan"
+    else
+        upstream_rules_up "$upstream_ns" "$upstream_tun"
+    fi
+
     if bool_on "$DISABLE_IPV6"; then
         ip netns exec "$NS_NAME" sysctl -q -w net.ipv6.conf.all.disable_ipv6=1 || true
         ip netns exec "$NS_NAME" sysctl -q -w net.ipv6.conf.default.disable_ipv6=1 || true
     fi
 
-    host_rules_up "$wan"
-
-    # Namespace-local firewall. OpenVPN remains root; launched applications are
-    # dropped to APP_USER. With KILLSWITCH=on only root may use the veth uplink,
-    # while application traffic is accepted only through tun+.
+    # Namespace-local firewall. Before the inner tunnel exists only OpenVPN's
+    # exact endpoint and root-owned DNS may leave over the veth uplink.
     ip netns exec "$NS_NAME" iptables -w 5 -F
     ip netns exec "$NS_NAME" iptables -w 5 -X
     ip netns exec "$NS_NAME" iptables -w 5 -P INPUT DROP
@@ -1506,17 +1821,12 @@ netns_up() {
         -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
     if bool_on "$KILLSWITCH"; then
-        # Match the original known-good firewall model: permit only the exact
-        # OpenVPN endpoint(s) over the physical veth before the tunnel exists.
-        # Do not depend on xt_owner/UID matching for the control channel.
         while IFS='|' read -r endpoint_ip endpoint_port endpoint_proto; do
             ip netns exec "$NS_NAME" iptables -w 5 -A OUTPUT \
                 -o "$VETH_NS" -d "$endpoint_ip" \
                 -p "$endpoint_proto" --dport "$endpoint_port" -j ACCEPT
         done <"$endpoints_file"
 
-        # Permit root-owned DNS only while it follows the pre-tunnel default
-        # route over veth. After redirect-gateway, DNS follows tun+ instead.
         local dns_server
         local -a dns_servers=()
         IFS=' ' read -r -a dns_servers <<<"$DNS_SERVERS"
@@ -1533,7 +1843,11 @@ netns_up() {
         ip netns exec "$NS_NAME" iptables -w 5 -A OUTPUT -o 'tun+' -j ACCEPT
     fi
 
-    log "Namespace '$NS_NAME' is ready on $NS_CIDR via $wan."
+    if [[ "$via_app" == host ]]; then
+        log "Namespace '$NS_NAME' is ready on $NS_CIDR via host/$wan."
+    else
+        log "Namespace '$NS_NAME' is ready on $NS_CIDR via $via_app/$upstream_tun."
+    fi
     while IFS='|' read -r endpoint_ip endpoint_port endpoint_proto; do
         log "VPN endpoint: $endpoint_ip:$endpoint_port/$endpoint_proto via $VETH_NS"
     done <"$endpoints_file"
@@ -1545,16 +1859,28 @@ netns_down() {
     validate_app_name "$app"
     load_cfg "$app"
 
-    local runtime wan pids
+    local runtime mode="" wan="" upstream_app="" upstream_ns="" upstream_tun="" pids
     runtime="$RUN_DIR/${app}.env"
-    wan=""
     if [[ -f "$runtime" ]]; then
-        # shellcheck disable=SC1090
-        source "$runtime"
-        wan=${WAN_IFACE_RUNTIME:-}
+        mode=$(runtime_read_value "$runtime" UPLINK_MODE_RUNTIME 2>/dev/null || true)
+        wan=$(runtime_read_value "$runtime" WAN_IFACE_RUNTIME 2>/dev/null || true)
+        upstream_app=$(runtime_read_value "$runtime" UPSTREAM_APP_RUNTIME 2>/dev/null || true)
+        upstream_ns=$(runtime_read_value "$runtime" UPSTREAM_NS_RUNTIME 2>/dev/null || true)
+        upstream_tun=$(runtime_read_value "$runtime" UPSTREAM_TUN_RUNTIME 2>/dev/null || true)
     fi
-    if [[ -z "$wan" ]]; then
-        wan=$(detect_wan_iface "$WAN_IFACE" 2>/dev/null || true)
+
+    if [[ -z "$mode" ]]; then
+        upstream_app=$(effective_via_runtime "$app" 2>/dev/null || printf 'host')
+        if [[ "$upstream_app" == host ]]; then
+            mode=host
+            wan=$(detect_wan_iface "$WAN_IFACE" 2>/dev/null || true)
+        else
+            mode=app
+            upstream_ns=$(cfg_read_value "$upstream_app" NS_NAME 2>/dev/null || true)
+            local data
+            data=$(upstream_tunnel_iface "$upstream_app" 2>/dev/null || true)
+            [[ -z "$data" ]] || IFS='|' read -r upstream_ns upstream_tun <<<"$data"
+        fi
     fi
 
     pids=$(ip netns pids "$NS_NAME" 2>/dev/null || true)
@@ -1565,11 +1891,19 @@ netns_down() {
         [[ -z "$pids" ]] || kill -9 $pids 2>/dev/null || true
     fi
 
-    [[ -z "$wan" ]] || host_rules_down "$wan"
+    if [[ "$mode" == app ]]; then
+        if [[ -n "$upstream_ns" ]] && ip netns list | awk '{print $1}' | grep -Fxq "$upstream_ns"; then
+            [[ -z "$upstream_tun" ]] || upstream_rules_down "$upstream_ns" "$upstream_tun"
+            ip -n "$upstream_ns" link del "$VETH_HOST" 2>/dev/null || true
+        fi
+    else
+        [[ -z "$wan" ]] || host_rules_down "$wan"
+    fi
+
     ip netns del "$NS_NAME" 2>/dev/null || true
-    ip link del "$VETH_HOST" 2>/dev/null || true
+    delete_veth_everywhere "$VETH_HOST"
     rm -rf "/etc/netns/$NS_NAME"
-    rm -f "$runtime" "$RUN_DIR/${app}.profile" "$RUN_DIR/${app}.endpoints"
+    rm -f "$runtime" "$RUN_DIR/${app}.via" "$RUN_DIR/${app}.profile" "$RUN_DIR/${app}.endpoints"
     log "Namespace '$NS_NAME' stopped."
 }
 
@@ -1638,24 +1972,44 @@ start_app() {
     require_root
     local app=$1
     local ignore_start_error=${2:-off}
+    local via_override=${3:-__default__}
     validate_app_name "$app"
     load_cfg "$app"
     [[ -n "$DEFAULT_PROFILE" ]] || die "No profile configured. Use: nns-app add $app profile.ovpn"
     [[ -f "$(profiles_dir "$app")/$DEFAULT_PROFILE" ]] ||
         die "Configured profile '$DEFAULT_PROFILE' is missing."
 
+    local desired_via current_via="host"
+    desired_via=$(effective_via_for_app "$app" "$via_override")
+    if [[ "$desired_via" != host ]]; then
+        ensure_upstream_ready "$app" "$desired_via" >/dev/null
+    fi
+
     local current=""
     [[ -f "$RUN_DIR/${app}.profile" ]] && current=$(<"$RUN_DIR/${app}.profile")
-    if app_is_started "$app" && [[ "$current" == "$DEFAULT_PROFILE" ]]; then
-        log "'$app' is already started with '$DEFAULT_PROFILE'."
+    if app_is_started "$app"; then
+        current_via=$(runtime_via_for_app "$app")
+    fi
+    if app_is_started "$app" && [[ "$current" == "$DEFAULT_PROFILE" && "$current_via" == "$desired_via" ]]; then
+        log "'$app' is already started with '$DEFAULT_PROFILE' via $desired_via."
         return 0
     fi
 
     if app_is_started "$app" || systemctl is-active --quiet "nns-netns@${app}.service"; then
         stop_app "$app"
+        # stop_app may recursively stop downstream apps and load their configs.
+        # Restore this app's settings before continuing the restart.
+        load_cfg "$app"
     fi
 
+    install -d -o root -g root -m 0755 "$RUN_DIR"
+    printf '%s\n' "$desired_via" >"$RUN_DIR/${app}.via"
+    chmod 0600 "$RUN_DIR/${app}.via"
+
     if bool_on "$AUTOSTART"; then
+        if [[ "$via_override" != __default__ ]]; then
+            warn "A one-start --via override is not persistent across boot; set UPSTREAM_APP in $(cfg_file "$app")."
+        fi
         systemctl enable "nns-netns@${app}.service" "nns-openvpn@${app}.service" >/dev/null
     else
         systemctl disable "nns-netns@${app}.service" "nns-openvpn@${app}.service" >/dev/null 2>&1 || true
@@ -1664,7 +2018,7 @@ start_app() {
     if ! systemctl start "nns-netns@${app}.service"; then
         warn "Failed to create the network namespace for '$app'."
         warn "Recent namespace-service log:"
-        journalctl -u "nns-netns@${app}.service" -n 40 \
+        journalctl -u "nns-netns@${app}.service" -n 60 \
             -o cat --no-pager >&2 2>/dev/null || true
         netns_down "$app" >/dev/null 2>&1 || true
         systemctl reset-failed "nns-netns@${app}.service" 2>/dev/null || true
@@ -1682,10 +2036,6 @@ start_app() {
 
     local timeout
     if bool_on "$ignore_start_error"; then
-        # -i is an asynchronous/ignore-readiness mode. Use a one-second
-        # readiness budget; the ping plus HTTP fallback may make wall time
-        # approximately one to two seconds. A failed probe leaves the services
-        # running and still returns success to the caller.
         timeout=1
     else
         timeout=${READY_TIMEOUT:-5}
@@ -1697,13 +2047,13 @@ start_app() {
         ext=$(ip netns exec "$NS_NAME" curl -4fsS \
               --connect-timeout 1 --max-time 1 \
               "$EXTERNAL_IP_URL" 2>/dev/null || true)
-        log "Started '$app' with '$DEFAULT_PROFILE'.${ext:+ External IP: $ext}"
+        log "Started '$app' with '$DEFAULT_PROFILE' via $desired_via.${ext:+ External IP: $ext}"
         return 0
     fi
 
     if bool_on "$ignore_start_error"; then
         warn "'$app' is not online yet; -i ignored the readiness error."
-        warn "The namespace and VPN service were left running in the background."
+        warn "The namespace and VPN service were left running via $desired_via."
         warn "Check later with: nns-app list"
         return 0
     fi
@@ -1717,16 +2067,33 @@ start_app() {
     return 1
 }
 
+stop_dependents() {
+    local upstream=$1 env child parent
+    shopt -s nullglob
+    for env in "$RUN_DIR"/*.env; do
+        child=$(basename "$env" .env)
+        [[ "$child" != "$upstream" ]] || continue
+        parent=$(runtime_read_value "$env" UPSTREAM_APP_RUNTIME 2>/dev/null || true)
+        [[ "$parent" == "$upstream" ]] || continue
+        if systemctl is-active --quiet "nns-netns@${child}.service" ||
+           systemctl is-active --quiet "nns-openvpn@${child}.service"; then
+            warn "Stopping dependent app '$child' before upstream '$upstream'."
+            stop_app "$child"
+        fi
+    done
+}
+
 stop_app() {
     require_root
     local app=$1
     validate_app_name "$app"
     load_cfg "$app"
 
+    stop_dependents "$app"
     systemctl stop "nns-openvpn@${app}.service" 2>/dev/null || true
     systemctl stop "nns-netns@${app}.service" 2>/dev/null || true
     systemctl reset-failed "nns-openvpn@${app}.service" "nns-netns@${app}.service" 2>/dev/null || true
-    rm -f "$RUN_DIR/${app}.profile"
+    rm -f "$RUN_DIR/${app}.profile" "$RUN_DIR/${app}.via"
     log "Stopped '$app'."
 }
 
@@ -1737,10 +2104,12 @@ remove_app() {
     load_cfg "$app"
 
     stop_app "$app"
+    # stop_app may load a dependent app config while unwinding a chain.
+    load_cfg "$app"
     systemctl disable "nns-openvpn@${app}.service" "nns-netns@${app}.service" >/dev/null 2>&1 || true
     rm -f "/etc/sudoers.d/nns-app-${app}"
     rm -rf "$(cfg_dir "$app")" "/etc/netns/$NS_NAME"
-    rm -f "$RUN_DIR/${app}.env" "$RUN_DIR/${app}.profile"
+    rm -f "$RUN_DIR/${app}.env" "$RUN_DIR/${app}.profile" "$RUN_DIR/${app}.via"
     systemctl daemon-reload
     log "Removed NNS app '$app'."
 }
@@ -1945,10 +2314,10 @@ list_apps() {
     require_root
     install -d -o root -g root -m 0755 "$BASE_DIR" "$RUN_DIR"
 
-    printf '%-18s %-9s %s\n' "Name" "Status" "Online"
-    printf '%-18s %-9s %s\n' "------------------" "---------" "-----------------------------------------------"
+    printf '%-18s %-9s %-12s %s\n' "Name" "Status" "Via" "Online"
+    printf '%-18s %-9s %-12s %s\n' "------------------" "---------" "------------" "-----------------------------------------------"
 
-    local found=0 dir app status profile local_ip external online
+    local found=0 dir app status profile local_ip external online via
     shopt -s nullglob
     for dir in "$BASE_DIR"/*; do
         [[ -d "$dir" ]] || continue
@@ -1960,10 +2329,15 @@ list_apps() {
         profile=${DEFAULT_PROFILE:-none}
         profile=${profile%.ovpn}
         status=stopped
+        via=$(effective_via_for_app "$app" __default__)
         online="$profile | -"
 
         if app_is_started "$app"; then
             status=started
+            via=$(runtime_via_for_app "$app")
+            if [[ "$via" != host ]] && ! app_is_started "$via"; then
+                via="${via}!"
+            fi
             local_ip=$(ip -n "$NS_NAME" -o -4 addr show 2>/dev/null |
                        awk '$2 ~ /^(tun|tap)/ {split($4,a,"/"); print a[1]; exit}' || true)
             [[ -n "$local_ip" ]] || local_ip="-"
@@ -1976,7 +2350,7 @@ list_apps() {
             online="$profile | $local_ip -> $external"
         fi
 
-        printf '%-18s %-9s %s\n' "$app" "$status" "$online"
+        printf '%-18s %-9s %-12s %s\n' "$app" "$status" "$via" "$online"
     done
 
     (( found )) || log "No NNS apps installed."
@@ -2038,17 +2412,29 @@ main() {
 
     case "$cmd" in
         install)
-            case $# in
-                1)
-                    install_engine
-                    ;;
-                2)
-                    install_app "$2"
-                    ;;
-                *)
-                    die "Usage: nns-app install [app_name]"
-                    ;;
-            esac
+            if (( $# == 1 )); then
+                install_engine
+            else
+                local install_app_name=$2 install_via="__default__"
+                shift 2
+                while (( $# > 0 )); do
+                    case "$1" in
+                        --via)
+                            (( $# >= 2 )) || die "--via requires an upstream app name or 'host'."
+                            install_via=$2
+                            shift 2
+                            ;;
+                        --via=*)
+                            install_via=${1#--via=}
+                            shift
+                            ;;
+                        *)
+                            die "Usage: nns-app install <app_name> [--via <upstream-app>|host]"
+                            ;;
+                    esac
+                done
+                install_app "$install_app_name" "$install_via"
+            fi
             ;;
         remove)
             [[ $# -eq 2 ]] || die "Usage: nns-app remove <app_name>"
@@ -2063,52 +2449,48 @@ main() {
             list_apps
             ;;
         add)
-            (( $# >= 3 && $# <= 5 )) ||
-                die "Usage: nns-app add <app_name> <profile.ovpn>|any [country] [--refresh]"
+            (( $# >= 3 )) ||
+                die "Usage: nns-app add <app_name> <profile.ovpn>|any [country] [--refresh] [--via <upstream-app>|host]"
             if [[ "$3" == any ]]; then
-                local add_country="" add_refresh="off" add_arg
-                for add_arg in "${@:4}"; do
-                    case "$add_arg" in
+                local add_app=$2 add_country="" add_refresh="off" add_via="__default__"
+                shift 3
+                while (( $# > 0 )); do
+                    case "$1" in
                         --refresh)
                             add_refresh="on"
+                            shift
+                            ;;
+                        --via)
+                            (( $# >= 2 )) || die "--via requires an upstream app name or 'host'."
+                            add_via=$2
+                            shift 2
+                            ;;
+                        --via=*)
+                            add_via=${1#--via=}
+                            shift
                             ;;
                         -*)
-                            die "Unknown add option '$add_arg'."
+                            die "Unknown add option '$1'."
                             ;;
                         *)
                             [[ -z "$add_country" ]] ||
                                 die "Only one country filter may be supplied."
-                            add_country=$add_arg
+                            add_country=$1
+                            shift
                             ;;
                     esac
                 done
-                add_any_profile "$2" "$add_country" "$add_refresh"
+                add_any_profile "$add_app" "$add_country" "$add_refresh" "$add_via"
             else
                 [[ $# -eq 3 ]] ||
-                    die "Options are valid only with: nns-app add <app_name> any [country] [--refresh]"
+                    die "Options are valid only with: nns-app add <app_name> any [country] [--refresh] [--via <upstream-app>|host]"
                 add_profile "$2" "$3"
             fi
             ;;
         start)
-            local start_app_name="" ignore_start_error="off" arg
             shift
-            for arg in "$@"; do
-                case "$arg" in
-                    -i|--ignore-start-error)
-                        ignore_start_error="on"
-                        ;;
-                    -*)
-                        die "Unknown start option '$arg'. Usage: nns-app start [-i] <app_name>"
-                        ;;
-                    *)
-                        [[ -z "$start_app_name" ]] ||
-                            die "Usage: nns-app start [-i] <app_name>"
-                        start_app_name=$arg
-                        ;;
-                esac
-            done
-            [[ -n "$start_app_name" ]] || die "Usage: nns-app start [-i] <app_name>"
-            start_app "$start_app_name" "$ignore_start_error"
+            parse_start_cli "$@"
+            start_app "$START_APP_NAME" "$START_IGNORE" "$START_VIA"
             ;;
         stop)
             [[ $# -eq 2 ]] || die "Usage: nns-app stop <app_name>"

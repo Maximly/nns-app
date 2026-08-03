@@ -4,7 +4,7 @@
 
 A browser, messenger, crawler, build tool, or another process can use its own VPN without replacing the host's default route or DNS configuration. Each named environment has separate routes, DNS, firewall state, tunnel state, and a kill switch.
 
-> **Release:** 1.0.19  
+> **Release:** 1.0.20  
 > **Status:** experimental  
 > **Current backend:** OpenVPN  
 > **Planned backends:** WireGuard, AmneziaWG, and provider-specific transports
@@ -12,6 +12,7 @@ A browser, messenger, crawler, build tool, or another process can use its own VP
 ## Main features
 
 - One Linux network namespace per named application environment.
+- Optional namespace chaining with `--via <upstream-app>`.
 - Host networking and host DNS remain unchanged.
 - Namespace-only resolver configuration under `/etc/netns/`.
 - Kill switch blocks direct fallback to the host uplink.
@@ -27,36 +28,38 @@ A browser, messenger, crawler, build tool, or another process can use its own VP
 - Repeated `add <name> any` calls rotate through the top 20 matching VPN Gate relays.
 - VPN Gate candidates must complete a short OpenVPN handshake before import.
 - `nns-app run` prepares cgroup2 and securityfs inside its private mount namespace so Snap GUI applications can start.
+- Runtime `--via` creates a real veth/NAT chain through another active NNS VPN.
 - Strict five-second startup failure handling.
 - Optional `-i` asynchronous start mode leaves a slow connection running.
 
 ## Architecture
 
+Direct mode:
+
 ```text
-                         Linux host
-
-  normal applications ---------------------------> host uplink
-
-  nns-app run browser firefox
-              |
-              v
-  +-----------------------------------------------------------+
-  | network namespace: nns-browser                            |
-  |                                                           |
-  | application -> namespace firewall -> tunnel interface     |
-  |                                         |                 |
-  | namespace DNS                           v                 |
-  | /etc/netns/nns-browser/resolv.conf    VPN transport       |
-  +-----------------------+-----------------------------------+
-                          |
-                    veth pair /30
-                          |
-                 host forwarding + NAT
-                          |
-                      host uplink
+application -> nns-browser -> browser VPN -> host NAT -> host uplink
 ```
 
-Before the tunnel is online, the namespace may contact only the configured VPN endpoint and its namespace DNS servers. Protected application traffic is accepted through the tunnel interface. Direct fallback is blocked when the kill switch is enabled.
+Chained mode:
+
+```text
+application
+    -> nns-browser
+    -> inner VPN
+    -> veth into nns-hidemy
+    -> HideMy tunnel
+    -> Internet
+```
+
+In chained mode the downstream veth is placed directly inside the upstream
+namespace. Forwarding and NAT are installed only from that veth to the
+upstream tunnel interface. If the upstream tunnel disappears, the rule no
+longer matches another interface and the upstream namespace's default-drop
+FORWARD policy prevents fallback to its physical veth.
+
+Before the inner tunnel is online, the downstream namespace may contact only
+the configured inner VPN endpoint and its namespace DNS servers. Protected
+application traffic is accepted only through the inner tunnel interface.
 
 ## Requirements
 
@@ -92,11 +95,20 @@ This installs:
 /usr/local/bin/nns-app
 ```
 
-Create an application environment separately:
+Create a direct application environment:
 
 ```bash
 sudo nns-app install browser
 ```
+
+Persistently route it through an already installed upstream app:
+
+```bash
+sudo nns-app install browser --via hidemy
+```
+
+This writes `UPSTREAM_APP="hidemy"` to the app configuration. Use
+`--via host` to restore direct-host mode.
 
 The installer creates or refreshes:
 
@@ -118,7 +130,7 @@ nns-app --version
 Expected:
 
 ```text
-nns-app 1.0.19
+nns-app 1.0.20
 Author:  Maxim Lyadvinsky
 License: GPL-3.0-or-later
 ```
@@ -198,27 +210,26 @@ Delete the corresponding state file to restart rotation from the strongest
 candidate.
 
 Before importing a relay, nns-app quick-checks up to ten round-robin
-candidates. Each candidate receives a six-second OpenVPN handshake probe.
-A successful TCP socket connection alone is not sufficient; the probe requires
-OpenVPN to report `Initialization Sequence Completed`. The selector prints the
-number of usable matching candidates found in the cached list. Thus, “up to 2”
-means only two profiles survived country and safety filtering, not that the
-configured probe-attempt limit is two.
+candidates. Each candidate receives a six-second OpenVPN control-channel probe.
+A successful TCP socket alone is insufficient; the candidate must reach
+`Peer Connection Initiated` (or full initialization). This avoids rejecting a
+valid server merely because pushed routes and DNS take several more seconds.
+The selector prints the actual candidate-pool size.
 
 When an entire probe batch fails, the round-robin marker advances to the last
 tested relay. A subsequent `add any` call therefore continues with the next
 untested candidates when the pool contains more entries.
 
-When `add any` is invoked from another NNS namespace, for example:
+Select and probe a public profile through the intended upstream path:
 
 ```bash
-nns-app run hidemy nns-app add test any US
+sudo nns-app add test any US --via hidemy
 ```
 
-the server list is fetched through `hidemy`, but candidate probes are run
-through PID 1's host network namespace. This tests the route that `test` will
-actually use later. The probe uses a temporary TUN interface with route pulling
-disabled and removes it immediately after the check.
+Both a required cache refresh and candidate probes use `nns-hidemy`. When the
+command itself is launched through `nns-app run hidemy`, the selector also
+detects that current namespace unless an explicit `--via` overrides it.
+Temporary probe interfaces do not install routes or configure addresses.
 
 The quick check confirms that the relay currently completes OpenVPN negotiation.
 It does not establish that the volunteer relay is trustworthy or that every
@@ -227,6 +238,32 @@ destination will be reachable through it.
 The current implementation uses the VPN Gate public relay list. Relays are operated by volunteers and may be slow, unavailable, logged, filtered, or untrusted. This feature is suitable for testing and low-risk HTTPS traffic; it should not be treated as trusted privacy infrastructure.
 
 Profiles downloaded through `any` pass the same validation and managed-copy processing as locally imported profiles.
+
+## Chained startup with `--via`
+
+The persistent upstream from `UPSTREAM_APP` is used by default:
+
+```bash
+nns-app start -i test
+```
+
+Override it for one start without editing configuration:
+
+```bash
+nns-app start -i test --via hidemy
+nns-app start test --via host
+```
+
+The upstream app must already be started, have a default route through a
+`tun`/`tap` interface, and pass its own online check. Multiple downstream apps
+may share one upstream. Stopping an upstream with `nns-app stop` first stops
+its currently attached downstream apps. An unexpected upstream failure cannot
+leak downstream traffic because forwarding is accepted only toward the
+recorded upstream tunnel interface.
+
+`--via` on `add any` controls download/probe routing. `--via` on `start`
+controls the actual runtime topology; using only the former does not chain the
+application namespace.
 
 ## Startup modes
 
@@ -297,7 +334,7 @@ Applications are still protected: with the kill switch enabled, `nns-app run` re
 |---|---|
 | `nns-app install <name>` | Install or refresh the engine and create a named environment |
 | `nns-app add <name> <profile.ovpn>` | Validate and import a self-contained OpenVPN profile |
-| `nns-app add <name> any [country] [--refresh]` | Find and import a VPN Gate profile using the shared cache |
+| `nns-app add <name> any [country] [--refresh] [--via <app>|host]` | Select and probe a VPN Gate profile through the chosen path |
 | `nns-app start <name>` | Start and require a usable data path within the configured timeout |
 | `nns-app start -i <name>` | Start asynchronously; leave a slow/offline service running |
 | `nns-app stop <name>` | Stop the transport and remove the runtime namespace |
