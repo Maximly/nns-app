@@ -1,6 +1,0 @@
-nns-app release: 1.2.5
-Feature marker: adaptive data-path watchdog
-Expected installer declaration: readonly VERSION="1.2.5"
-Expected systemd templates:
-  /etc/systemd/system/nns-watchdog@.service
-  /etc/systemd/system/nns-watchdog@.timer
