@@ -4,7 +4,7 @@
 
 A browser, messenger, crawler, build tool, or another process can use its own VPN without replacing the host's default route or DNS configuration. Each named environment has separate routes, DNS, firewall state, tunnel state, and a kill switch.
 
-> **Release:** 1.0.21  
+> **Release:** 1.0.22  
 > **Status:** experimental  
 > **Current backends:** OpenVPN and WireGuard  
 > **Planned backends:** AmneziaWG and provider-specific transports
@@ -30,6 +30,7 @@ A browser, messenger, crawler, build tool, or another process can use its own VP
 - `nns-app run` prepares cgroup2 and securityfs inside its private mount namespace so Snap GUI applications can start.
 - Runtime `--via` creates a real veth/NAT chain through another active NNS VPN.
 - WireGuard supports full-tunnel IPv4 provider profiles, endpoint pinning, kill-switch rules, status reporting, and chained upstream/downstream operation.
+- `nns-app status <name>` reports profile, backend, services, endpoint, tunnel, upstream, handshake, traffic, and focused diagnostics.
 - Strict five-second startup failure handling.
 - Optional `-i` asynchronous start mode leaves a slow connection running.
 
@@ -353,6 +354,7 @@ Applications are still protected: with the kill switch enabled, `nns-app run` re
 | `nns-app stop <name>` | Stop the transport and remove the runtime namespace |
 | `nns-app run <name> <command> [args...]` | Run a command in the namespace as the configured user |
 | `nns-app list` | Show state, active profile, tunnel address, and external address |
+| `nns-app status <name>` | Show detailed health, active profile, endpoint, services, handshake, upstream and focused logs |
 | `nns-app remove <name>` | Remove one app environment and its profiles |
 | `nns-app purge` | Remove the engine and all `nns-app` environments |
 | `nns-app --version` | Show version, author, and license |
@@ -478,7 +480,7 @@ OpenVPN DNS helper integration is disabled, and WireGuard `DNS` entries are omit
 
 Namespace and tunnel setup require root. `nns-app run` enters the namespace as root and then permanently drops to `APP_USER` with `setpriv` before executing the requested program. Commands are executed directly without `eval` or shell re-parsing.
 
-The installer creates restricted sudoers commands for routine operations. Re-run `install` after upgrading so new command forms such as `start -i` are added to the sudoers rule.
+The installer creates restricted sudoers commands for routine operations. Re-run `install` after upgrading so new command forms such as `status` and `start -i` are added to the sudoers rule.
 
 ## Troubleshooting
 
@@ -487,6 +489,29 @@ Show all environments:
 ```bash
 nns-app list
 ```
+
+Show a detailed health report for one environment:
+
+```bash
+nns-app status browser
+```
+
+`status` distinguishes `ONLINE`, `OFFLINE`, `STARTING`, `FAILED`, and
+`STOPPED`. For a healthy profile it reports the backend, runtime upstream,
+endpoint, tunnel interface, tunnel address, external address, OpenVPN
+handshake state or WireGuard handshake age and transfer counters.
+
+When the profile is not usable, it classifies the most likely failure stage
+and prints focused cuts from the current namespace-service and VPN-service
+invocations rather than dumping the entire journal. Typical diagnoses include:
+
+- endpoint transport not established;
+- TCP connected but no OpenVPN/TLS response;
+- TLS established but OpenVPN initialization incomplete;
+- authentication or certificate rejection;
+- WireGuard interface active but no handshake;
+- tunnel route present but Internet data path unavailable;
+- upstream namespace stopped or not ready.
 
 Follow VPN-backend logs (the unit keeps its legacy name):
 
