@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.26
+
+- Fixed unprivileged `make test`: function tests now use a private temporary
+  lock directory instead of trying to create root-owned `/run/lock/nns-app`.
+- Restricted the lock-directory override to source-only test mode; normal
+  execution always uses the fixed root-owned system lock directory.
+- Added lock-directory ownership, permission, and symlink validation.
+- Removed a second root-only assumption in CA snapshot tests: temporary CA
+  backup directories now preserve strict permissions without forcing root
+  ownership in source-only test mode.
+- Consolidated function-test temporary files under one cleanup trap.
+- Documented that the complete test suite runs without root privileges.
+
 ## 1.1.25
 
 - Replaced unexplained example names with a consistent descriptive naming set:

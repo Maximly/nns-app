@@ -3,7 +3,14 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+TEST_TMP=$(mktemp -d)
+cleanup() {
+    rm -rf "$TEST_TMP"
+}
+trap cleanup EXIT
+
 export NNS_APP_SOURCE_ONLY=1
+export NNS_APP_LOCK_DIR="$TEST_TMP/locks"
 # shellcheck source=/dev/null
 source "$ROOT/nns-app-install.sh"
 
@@ -76,8 +83,7 @@ if ( assert_no_via_cycle A B ) >/dev/null 2>&1; then
     fail 'indirect upstream cycle was accepted'
 fi
 
-TEST_STATUS_FILE=$(mktemp)
-trap 'rm -f "$TEST_STATUS_FILE"' EXIT
+TEST_STATUS_FILE="$TEST_TMP/openvpn-status.log"
 printf '%s\n' \
     $'TITLE\tOpenVPN 2.7.0 x86_64-pc-linux-gnu' \
     $'TIME\t2026-08-03 10:00:00\t1785740400' \
@@ -93,10 +99,9 @@ parsed=$(gateway_connected_clients my-relay)
 expected='my-linux-client|203.0.113.10:41000|10.253.1.2|1234|5678|2026-08-03 09:59:00'
 [[ "$parsed" == "$expected" ]] || fail "status-v3 parser: $parsed"
 
-tmp_pki=$(mktemp -d)
-tmp_backup=$(mktemp -d)
-trap 'rm -f "$TEST_STATUS_FILE"; rm -rf "$tmp_pki" "$tmp_backup"' EXIT
-mkdir -p "$tmp_pki/newcerts"
+tmp_pki="$TEST_TMP/pki"
+tmp_backup="$TEST_TMP/pki-backup"
+mkdir -p "$tmp_pki/newcerts" "$tmp_backup"
 printf 'V\n' >"$tmp_pki/index.txt"
 printf '1000\n' >"$tmp_pki/serial"
 printf '1000\n' >"$tmp_pki/crlnumber"

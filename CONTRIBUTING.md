@@ -140,6 +140,12 @@ v2 key. Do not encourage reusing exported client profiles between machines.
 
 ## Tests
 
+Run `make test` as an unprivileged user. Source-level function tests set
+`NNS_APP_SOURCE_ONLY=1` and redirect locks with `NNS_APP_LOCK_DIR` to a private
+temporary directory. Production execution ignores that override and always
+uses `/run/lock/nns-app` with root ownership checks.
+
+
 `make test` runs:
 
 - module and combined Bash syntax checks;

@@ -9,7 +9,7 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fq 'nns-app 1.1.25' <<<"$version"
+grep -Fq 'nns-app 1.1.26' <<<"$version"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -22,6 +22,7 @@ grep -Fq 'systemctl enable --now "nns-gateway-crl-refresh@${gateway}.timer"' "$I
 grep -Fq 'delimiter="\t"' "$INSTALLER"
 grep -Fq 'iif "$tunnel_dev"' "$INSTALLER"
 grep -Fq 'NNS_APP_SOURCE_ONLY' "$INSTALLER"
+grep -Fq 'NNS_APP_LOCK_DIR' "$INSTALLER"
 grep -Fq 'iif "$GATEWAY_TUN"' "$INSTALLER"
 grep -Fq 'CONTRIBUTING.md' "$ROOT/README.md"
 test -s "$ROOT/CONTRIBUTING.md"
@@ -42,7 +43,7 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 1.1.25' "$ROOT/README.md"
+grep -Fq '**Release:** 1.1.26' "$ROOT/README.md"
 grep -Fq 'OpenVPN 2.6+' "$ROOT/README.md"
 
 # Public documentation and help use one descriptive example-name set.

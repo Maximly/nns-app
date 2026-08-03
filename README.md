@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.1.25  
+**Release:** 1.1.26  
 **Supported platform:** Ubuntu with systemd and iptables  
 **VPN backends:** OpenVPN 2.6+ and WireGuard
 
@@ -79,11 +79,15 @@ The build syntax-checks every ordered module under `src/`, concatenates the
 modules, validates the combined Bash file, compiles every embedded Python
 helper, and writes a deterministic `nns-app-install.sh` in the project root.
 
-Run the static and helper tests with:
+Run the static and helper tests as a regular user:
 
 ```bash
 make test
 ```
+
+The tests use private temporary directories and do not require root. Use root
+only for installation and for commands that change live networking, systemd,
+firewall, routing, or PKI state.
 
 ## Source layout
 

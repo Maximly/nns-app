@@ -42,7 +42,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.1.25"
+readonly VERSION="1.1.26"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -57,7 +57,16 @@ readonly ONLINE_UNIT="/etc/systemd/system/nns-online@.service"
 readonly GATEWAY_CRL_SERVICE="/etc/systemd/system/nns-gateway-crl-refresh@.service"
 readonly GATEWAY_CRL_TIMER="/etc/systemd/system/nns-gateway-crl-refresh@.timer"
 readonly SYSTEMD_UNIT_DIR="/etc/systemd/system"
-readonly LOCK_DIR="/run/lock/nns-app"
+readonly DEFAULT_LOCK_DIR="/run/lock/nns-app"
+# Unit tests source the built script without root privileges. They may point
+# locks at a private temporary directory; normal command execution always uses
+# the fixed system path so an environment variable cannot redirect root-owned
+# lock files.
+if [[ "${NNS_APP_SOURCE_ONLY:-0}" == 1 && -n "${NNS_APP_LOCK_DIR:-}" ]]; then
+    readonly LOCK_DIR="$NNS_APP_LOCK_DIR"
+else
+    readonly LOCK_DIR="$DEFAULT_LOCK_DIR"
+fi
 readonly GATEWAY_BASE_DIR="$BASE_DIR/gateways"
 readonly GATEWAY_RUN_BASE="$RUN_DIR/gateways"
 readonly VPNGATE_API_URL="https://www.vpngate.net/api/iphone/"
@@ -78,10 +87,36 @@ die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 declare -Ag NNS_LOCK_FDS=()
 declare -Ag NNS_LOCK_DEPTH=()
 
+ensure_lock_dir() {
+    local owner mode mode_octal
+
+    [[ ! -L "$LOCK_DIR" ]] || die "Refusing symbolic-link lock directory: $LOCK_DIR"
+
+    if (( EUID == 0 )); then
+        install -d -o root -g root -m 0755 "$LOCK_DIR"
+        owner=$(stat -c '%u' "$LOCK_DIR")
+        mode=$(stat -c '%a' "$LOCK_DIR")
+        mode_octal=$((8#$mode))
+        [[ "$owner" == 0 ]] || die "Unsafe lock directory owner: $LOCK_DIR"
+        (( (mode_octal & 0022) == 0 )) ||
+            die "Unsafe writable lock directory: $LOCK_DIR"
+        return 0
+    fi
+
+    # Non-root locking exists only for source-level unit tests. Requiring both
+    # source-only mode and an explicit non-system path prevents production
+    # commands from silently weakening lock ownership.
+    [[ "${NNS_APP_SOURCE_ONLY:-0}" == 1 && "$LOCK_DIR" != "$DEFAULT_LOCK_DIR" ]] ||
+        die "Creating $DEFAULT_LOCK_DIR requires root privileges."
+    install -d -m 0700 "$LOCK_DIR"
+    owner=$(stat -c '%u' "$LOCK_DIR")
+    [[ "$owner" == "$EUID" ]] || die "Test lock directory is not owned by the current user: $LOCK_DIR"
+}
+
 acquire_lock() {
     local key=$1 mode=${2:-exclusive} safe fd
     safe=${key//[^A-Za-z0-9_.-]/_}
-    install -d -o root -g root -m 0755 "$LOCK_DIR"
+    ensure_lock_dir
 
     if [[ -n "${NNS_LOCK_FDS[$safe]-}" ]]; then
         NNS_LOCK_DEPTH[$safe]=$(( ${NNS_LOCK_DEPTH[$safe]:-1} + 1 ))
@@ -4121,8 +4156,20 @@ stop_gateways_via_app() {
 }
 
 gateway_ca_snapshot() {
-    local pki=$1 backup=$2 optional
-    install -d -o root -g root -m 0700 "$backup"
+    local pki=$1 backup=$2 optional owner
+
+    [[ ! -L "$backup" ]] || return 1
+    if (( EUID == 0 )); then
+        install -d -o root -g root -m 0700 "$backup" || return 1
+    else
+        # This path is used only by source-level function tests. Production
+        # callers are root-only gateway lifecycle operations.
+        [[ "${NNS_APP_SOURCE_ONLY:-0}" == 1 ]] || return 1
+        install -d -m 0700 "$backup" || return 1
+        owner=$(stat -c '%u' "$backup")
+        [[ "$owner" == "$EUID" ]] || return 1
+    fi
+
     cp -a \
         "$pki/index.txt" \
         "$pki/serial" \

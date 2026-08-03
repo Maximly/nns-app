@@ -1020,8 +1020,20 @@ stop_gateways_via_app() {
 }
 
 gateway_ca_snapshot() {
-    local pki=$1 backup=$2 optional
-    install -d -o root -g root -m 0700 "$backup"
+    local pki=$1 backup=$2 optional owner
+
+    [[ ! -L "$backup" ]] || return 1
+    if (( EUID == 0 )); then
+        install -d -o root -g root -m 0700 "$backup" || return 1
+    else
+        # This path is used only by source-level function tests. Production
+        # callers are root-only gateway lifecycle operations.
+        [[ "${NNS_APP_SOURCE_ONLY:-0}" == 1 ]] || return 1
+        install -d -m 0700 "$backup" || return 1
+        owner=$(stat -c '%u' "$backup")
+        [[ "$owner" == "$EUID" ]] || return 1
+    fi
+
     cp -a \
         "$pki/index.txt" \
         "$pki/serial" \
