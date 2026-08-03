@@ -32,6 +32,17 @@ if namespace_ref_id "$TEST_TMP/missing-netns" >/dev/null 2>&1; then
     fail 'missing namespace reference was accepted'
 fi
 
+if command_needs_namespaced_snap_mounts ping; then
+    fail 'ordinary command incorrectly requires Snap mounts'
+fi
+if command_needs_namespaced_snap_mounts /usr/share/cursor/cursor; then
+    fail 'non-Snap desktop command incorrectly requires Snap mounts'
+fi
+command_needs_namespaced_snap_mounts /snap/bin/firefox ||
+    fail 'Snap alias path was not detected'
+command_needs_namespaced_snap_mounts /usr/bin/snap ||
+    fail 'snap launcher was not detected'
+
 IFS='|' read -r tun host ns host_fwd host_mangle ns_fwd ns_nat ns_mangle \
     <<<"$(make_gateway_names my-relay)"
 [[ -n "$tun" && -n "$host" && -n "$ns" ]] || fail 'gateway interface names'

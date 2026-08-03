@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.2.4
+
+- Preserve an explicit allow-list of desktop-session variables across the sudo and `env -i` boundaries used by `nns-app run`.
+- Restore Electron/Chromium detection of GNOME Keyring and KWallet when applications are launched inside an nns-app namespace.
+- Regenerate existing per-app sudoers rules during engine upgrades so the expanded environment allow-list is active without reinstalling each app.
+- Keep dangerous loader and shell-startup variables excluded; the launched process still receives a clean environment.
+
+## 1.2.3
+
+- Limited command-local cgroup2 and securityfs preparation to Snap launches.
+- Ordinary CLI commands and non-Snap desktop applications now enter only the
+  requested network namespace and resolver mount context.
+- Kept Cursor/Electron AppArmor user-namespace handling separate from Snap
+  mount preparation.
+
+## 1.2.2
+
+- Fixed `nns-app run` aborting before command execution when preparing `/sys/fs/cgroup` and `/sys/kernel/security`. The launcher no longer attempts to chmod kernel-managed virtual-filesystem directories.
+- Added a static regression check preventing `install -d -m` from being reintroduced for these paths.
+
 ## 1.2.1
 
 - Fixed `nns-app run` exiting silently before launching the command. The internal namespace guard used `readlink` on `/run/netns/<name>`, but iproute2 stores named namespaces as mounted namespace references rather than symbolic links.

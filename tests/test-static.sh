@@ -9,7 +9,7 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fq 'nns-app 1.2.1' <<<"$version"
+grep -Fq 'nns-app 1.2.4' <<<"$version"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -31,6 +31,41 @@ if grep -Fq 'readlink "/run/netns/$NS_NAME"' "$INSTALLER"; then
     echo 'named namespace identity incorrectly uses readlink' >&2
     exit 1
 fi
+
+if grep -Eq 'install[[:space:]]+-d[^[:cntrl:]]*(/sys/fs/cgroup|/sys/kernel/security)' "$INSTALLER"; then
+    echo 'run helper attempts to chmod a kernel-managed mount point' >&2
+    exit 1
+fi
+grep -Fq 'mkdir -p -- "$mountpoint"' "$INSTALLER"
+grep -Fq 'command_needs_namespaced_snap_mounts "$1"' "$INSTALLER"
+if grep -Fq 'prepare_namespaced_desktop_mounts' "$INSTALLER"; then
+    echo 'obsolete unconditional desktop-mount helper found' >&2
+    exit 1
+fi
+
+# Desktop applications must retain enough session identity for Chromium's
+# oscrypt/safeStorage backend selection while the launcher still uses env -i.
+for desktop_var in \
+    DBUS_SESSION_BUS_ADDRESS \
+    XDG_CURRENT_DESKTOP \
+    XDG_SESSION_DESKTOP \
+    XDG_SESSION_TYPE \
+    DESKTOP_SESSION \
+    GDMSESSION \
+    GNOME_KEYRING_CONTROL \
+    KDE_FULL_SESSION \
+    KDE_SESSION_VERSION; do
+    count=$(grep -o "$desktop_var" "$INSTALLER" | wc -l)
+    (( count >= 2 )) || {
+        echo "desktop session variable is not preserved through both launcher stages: $desktop_var" >&2
+        exit 1
+    }
+done
+
+grep -Fq 'write_sudoers_for_app "$app" "$APP_USER"' "$INSTALLER" || {
+    echo 'engine upgrade does not refresh existing per-app sudoers rules' >&2
+    exit 1
+}
 
 grep -Fq 'nns-online@.service' "$INSTALLER"
 grep -Fq 'nns-gateway-crl-refresh@.timer' "$INSTALLER"
@@ -59,7 +94,7 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 1.2.1' "$ROOT/README.md"
+grep -Fq '**Release:** 1.2.4' "$ROOT/README.md"
 grep -Fq 'OpenVPN 2.6+' "$ROOT/README.md"
 
 # Public documentation and help use one descriptive example-name set.

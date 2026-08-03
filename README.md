@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.2.1  
+**Release:** 1.2.4  
 **Supported platform:** Ubuntu with systemd and iptables  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
 
@@ -708,8 +708,10 @@ Namespace DNS remains authoritative instead of being delegated to `wg-quick`.
 
 `ip netns exec` creates a private mount namespace for namespace-specific
 resolver files. Snap launchers also require cgroup v2 and securityfs there.
-`nns-app run` mounts those filesystems inside the private command mount
-namespace before dropping to the configured desktop user.
+`nns-app run` detects commands that resolve to Snap and mounts those filesystems
+inside the private command mount namespace before dropping to the configured
+desktop user. Ordinary commands and non-Snap desktop applications skip this
+extra mount preparation.
 
 ```bash
 nns-app run my-private-app firefox --no-remote

@@ -162,7 +162,12 @@ refresh_managed_unit_metadata() {
         [[ -d "$dir" ]] || continue
         app=$(basename "$dir")
         [[ -f "$(cfg_file "$app")" ]] || continue
+        load_cfg "$app"
         write_app_unit_dropin "$app"
+        # Sudo filters the caller environment before the root engine starts.
+        # Rebuild existing per-app rules on every engine upgrade so additions
+        # to the run-time environment allow-list take effect immediately.
+        write_sudoers_for_app "$app" "$APP_USER"
     done
 
     for dir in "$GATEWAY_BASE_DIR"/*; do
@@ -309,7 +314,7 @@ write_sudoers_for_app() {
 
     cat >"$tmp" <<SUDOERS_EOF
 Defaults!$ENGINE_PATH !use_pty
-Defaults!$ENGINE_PATH env_keep += "DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR LANG LC_ALL TERM COLORTERM SSH_AUTH_SOCK"
+Defaults!$ENGINE_PATH env_keep += "DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE DESKTOP_SESSION GDMSESSION GNOME_DESKTOP_SESSION_ID GNOME_KEYRING_CONTROL KDE_FULL_SESSION KDE_SESSION_VERSION XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME XDG_CONFIG_DIRS XDG_DATA_DIRS LANG LANGUAGE LC_ALL TERM COLORTERM SSH_AUTH_SOCK"
 Cmnd_Alias $alias = \\
     $ENGINE_PATH list, \\
     $ENGINE_PATH status $app, \\

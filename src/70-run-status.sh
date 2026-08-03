@@ -13,13 +13,22 @@ mount_type_at() {
     ' /proc/self/mountinfo
 }
 
-prepare_namespaced_desktop_mounts() {
+prepare_namespaced_snap_mounts() {
     # `ip netns exec` creates a private mount namespace for per-namespace
     # configuration binds. Snap launchers also require cgroup2 and securityfs
     # there. These mounts are command-local and disappear when it exits.
     local current_type
 
-    install -d -m 0755 /sys/fs/cgroup /sys/kernel/security
+    # These are kernel-managed virtual-filesystem paths.  `install -d -m`
+    # chmods directories even when they already exist, which fails on sysfs
+    # and aborts `nns-app run` under `set -e`.  `mkdir -p` is intentionally
+    # used without a mode so existing mount points are left untouched.
+    local mountpoint
+    for mountpoint in /sys/fs/cgroup /sys/kernel/security; do
+        if ! mkdir -p -- "$mountpoint"; then
+            warn "Could not prepare $mountpoint inside the command mount namespace; Snap applications may fail."
+        fi
+    done
 
     current_type=$(mount_type_at /sys/fs/cgroup)
     if [[ "$current_type" != cgroup2 ]]; then
@@ -34,6 +43,44 @@ prepare_namespaced_desktop_mounts() {
             warn "Could not mount securityfs inside the command mount namespace; Snap applications may fail."
         fi
     fi
+}
+
+
+run_command_path() {
+    local command_name=$1 candidate
+
+    if [[ "$command_name" == */* ]]; then
+        printf '%s\n' "$command_name"
+        return 0
+    fi
+
+    candidate=$(PATH=/usr/local/bin:/usr/bin:/bin:/snap/bin type -P -- "$command_name" 2>/dev/null || true)
+    [[ -n "$candidate" ]] || return 1
+    printf '%s\n' "$candidate"
+}
+
+command_needs_namespaced_snap_mounts() {
+    local command_name=$1 candidate canonical
+
+    candidate=$(run_command_path "$command_name" 2>/dev/null || true)
+    [[ -n "$candidate" ]] || return 1
+
+    # Preserve the pre-canonical path because /snap/bin/<app> usually resolves
+    # to /usr/bin/snap and the alias path itself is useful evidence.
+    case "$candidate" in
+        /snap/bin/*|/var/lib/snapd/snap/bin/*)
+            return 0
+            ;;
+    esac
+
+    canonical=$(readlink -f -- "$candidate" 2>/dev/null || true)
+    case "$canonical" in
+        /usr/bin/snap|/usr/lib/snapd/snap|/usr/lib/snapd/snap-confine|/snap/*)
+            return 0
+            ;;
+    esac
+
+    return 1
 }
 
 namespace_ref_id() {
@@ -61,7 +108,13 @@ run_user_exec() {
     [[ "$current_netns" == "$expected_netns" ]] ||
         die "_run-user is not inside the expected namespace '$NS_NAME'."
 
-    prepare_namespaced_desktop_mounts
+    # Most commands need only the network namespace and namespace-specific
+    # resolver bind. Preparing cgroup2/securityfs for every process is both
+    # unnecessary and can fail on kernel-managed mount points. Do it only for
+    # commands that actually resolve to Snap/snap-confine.
+    if command_needs_namespaced_snap_mounts "$1"; then
+        prepare_namespaced_snap_mounts
+    fi
 
     local uid gid home shell
     uid=$(id -u "$APP_USER")
@@ -79,8 +132,17 @@ run_user_exec() {
         "XDG_RUNTIME_DIR=/run/user/$uid"
     )
     local name value
+    # Preserve the desktop-session identity and D-Bus environment needed by
+    # Electron/Chromium safeStorage to select GNOME Keyring or KWallet.  The
+    # command still receives a clean allow-listed environment; no loader or
+    # shell-startup variables are carried across the root boundary.
     for name in DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS \
-                LANG LC_ALL TERM COLORTERM SSH_AUTH_SOCK; do
+                XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE \
+                DESKTOP_SESSION GDMSESSION GNOME_DESKTOP_SESSION_ID \
+                GNOME_KEYRING_CONTROL KDE_FULL_SESSION KDE_SESSION_VERSION \
+                XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME \
+                XDG_CONFIG_DIRS XDG_DATA_DIRS \
+                LANG LANGUAGE LC_ALL TERM COLORTERM SSH_AUTH_SOCK; do
         value=${!name-}
         [[ -z "$value" ]] || env_args+=("$name=$value")
     done
