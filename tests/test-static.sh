@@ -9,10 +9,11 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fq 'nns-app 1.3.13' <<<"$version"
+grep -Fq 'nns-app 1.3.15' <<<"$version"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
+grep -Fq 'nns-app myip [<app_name>]' <<<"$help"
 grep -Fq 'nns-app gateway create' <<<"$help"
 grep -Fq 'nns-app gateway client export' <<<"$help"
 grep -Fq 'nns-app remote connect' <<<"$help"
@@ -88,6 +89,27 @@ for desktop_var in \
     }
 done
 
+
+grep -Fq '$ENGINE_PATH myip $app' "$INSTALLER" || {
+    echo 'per-app sudoers does not allow explicit myip inspection' >&2
+    exit 1
+}
+grep -Fq 'if [[ "$cmd" == myip && $# -eq 1 ]]' "$INSTALLER" || {
+    echo 'context-only myip still requires sudo' >&2
+    exit 1
+}
+grep -Fq '"NNS_APP_CONTEXT=$app"' "$INSTALLER" || {
+    echo 'run does not export an explicit app context for context-aware myip' >&2
+    exit 1
+}
+grep -Fq 'detected_app=$(current_nns_app' "$INSTALLER" || {
+    echo 'myip does not auto-detect the current nns-app namespace' >&2
+    exit 1
+}
+grep -Fq 'Remote host:' "$INSTALLER" || {
+    echo 'myip does not report automatic-remote route information' >&2
+    exit 1
+}
 grep -Fq 'write_sudoers_for_app "$app" "$APP_USER"' "$INSTALLER" || {
     echo 'engine upgrade does not refresh existing per-app sudoers rules' >&2
     exit 1
@@ -173,7 +195,13 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 1.3.10' "$ROOT/README.md"
+grep -Fq '**Release:** 1.3.15' "$ROOT/README.md"
+grep -Fq '## Quick start' "$ROOT/README.md"
+grep -Fq '### Run the VPN profile locally' "$ROOT/README.md"
+grep -Fq 'nns-app install my-private-app' "$ROOT/README.md"
+grep -Fq '### Run the same VPN profile on a remote Linux host' "$ROOT/README.md"
+grep -Fq 'nns-app install my-private-app via --remote user@remote-host' "$ROOT/README.md"
+grep -Fq 'nns-app run my-private-app ping -c 4 1.1.1.1' "$ROOT/README.md"
 grep -Fq 'OpenVPN 2.6+' "$ROOT/README.md"
 
 # Public documentation and help use one descriptive example-name set.

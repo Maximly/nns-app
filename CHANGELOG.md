@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.3.15
+
+- Added an early `Quick start` section to the README with two complete three-command workflows: run a provider profile locally, or deploy the same profile automatically to a remote Linux host.
+- Both examples finish by running `ping -c 4 1.1.1.1` inside the named nns-app environment.
+- Clarified that local and automatic-remote setup are alternatives for the same app name, and summarized what the remote workflow creates automatically.
+
+## 1.3.14
+
+- Added `nns-app myip` with context-aware behavior: from the host it reports the host route, from a shell launched by `nns-app run` it automatically reports that app's route, and `nns-app myip <app>` explicitly inspects a named running environment.
+- Report the selected local/source IPv4, external IPv4, route interface, default gateway, backend, local upstream, and a human-readable path summary.
+- For automatic-remote environments, show the remote host without exposing the SSH user, plus the managed gateway, remote exit, and SSH transport hop.
+- Keep context-only `myip` unprivileged; only explicit inspection of another app enters that namespace through the app-scoped sudo rule.
+
 ## 1.3.13
 
 - Repair automatic-remote deployments created before owner markers were introduced: when the root-owned state file and deterministic exit/gateway relationships validate, backfill only missing ownership markers before `start` or `stop`.

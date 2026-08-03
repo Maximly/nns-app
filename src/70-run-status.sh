@@ -329,6 +329,7 @@ run_user_exec() {
         "SHELL=$shell"
         "PATH=$run_path"
         "XDG_RUNTIME_DIR=/run/user/$uid"
+        "NNS_APP_CONTEXT=$app"
     )
     local name value
     # Preserve the desktop-session identity and D-Bus environment needed by
@@ -396,6 +397,243 @@ run_in_app() {
     # APP_USER without shell re-parsing or eval.
     exec /usr/sbin/ip netns exec "$NS_NAME" \
         "$ENGINE_PATH" _run-user "$app" "$@"
+}
+
+
+myip_route_snapshot_current() {
+    /usr/sbin/ip -4 route get 1.1.1.1 2>/dev/null |
+        awk 'NR == 1 {
+            dev = via = src = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i == "dev" && i < NF) dev = $(i + 1)
+                else if ($i == "via" && i < NF) via = $(i + 1)
+                else if ($i == "src" && i < NF) src = $(i + 1)
+            }
+            if (dev != "" || via != "" || src != "") {
+                printf "%s|%s|%s\n", dev, via, src
+            }
+            exit
+        }'
+}
+
+myip_route_snapshot_namespace() {
+    local ns=$1
+    /usr/sbin/ip -n "$ns" -4 route get 1.1.1.1 2>/dev/null |
+        awk 'NR == 1 {
+            dev = via = src = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i == "dev" && i < NF) dev = $(i + 1)
+                else if ($i == "via" && i < NF) via = $(i + 1)
+                else if ($i == "src" && i < NF) src = $(i + 1)
+            }
+            if (dev != "" || via != "" || src != "") {
+                printf "%s|%s|%s\n", dev, via, src
+            }
+            exit
+        }'
+}
+
+myip_external_current() {
+    local url=${1:-https://api.ipify.org} value
+    value=$(/usr/bin/curl -4fsS --connect-timeout 2 --max-time 5 "$url" 2>/dev/null || true)
+    value=${value//$'\r'/}
+    value=${value//$'\n'/}
+    [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    printf '%s\n' "$value"
+}
+
+myip_external_namespace() {
+    local ns=$1 url=${2:-https://api.ipify.org} value
+    value=$(/usr/sbin/ip netns exec "$ns" /usr/bin/curl -4fsS \
+        --connect-timeout 2 --max-time 5 "$url" 2>/dev/null || true)
+    value=${value//$'\r'/}
+    value=${value//$'\n'/}
+    [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    printf '%s\n' "$value"
+}
+
+myip_host_namespace() {
+    local current host
+    current=$(namespace_ref_id /proc/self/ns/net 2>/dev/null || true)
+    host=$(namespace_ref_id /proc/1/ns/net 2>/dev/null || true)
+    [[ -n "$current" && "$current" == "$host" ]]
+}
+
+myip_ssh_host() {
+    local target=${1:-}
+    [[ -n "$target" ]] || return 1
+    printf '%s\n' "${target##*@}"
+}
+
+myip_app_route_path() {
+    local app=$1 route_iface=$2 route_gateway=$3 type=$4 runtime_via=$5
+    local remote_host remote_port endpoint_host endpoint_port endpoint_proto profile_file
+
+    if [[ "$runtime_via" != host ]]; then
+        printf "app:%s -> %s%s -> upstream:%s -> Internet\n" \
+            "$app" "${route_iface:-route}" \
+            "${route_gateway:+ via $route_gateway}" "$runtime_via"
+        return 0
+    fi
+
+    if [[ "${REMOTE_MODE:-}" == auto ]]; then
+        remote_host=${TRANSPORT_REMOTE_HOST:-}
+        [[ -n "$remote_host" ]] || remote_host=$(myip_ssh_host "${TRANSPORT_SSH_TARGET:-}" 2>/dev/null || true)
+        remote_port=${TRANSPORT_REMOTE_PORT:-22}
+        printf "app:%s -> %s -> SSH:%s:%s -> gateway:%s -> exit:%s -> provider VPN -> Internet\n" \
+            "$app" "${route_iface:-tunnel}" "${remote_host:-remote-host}" "$remote_port" \
+            "${REMOTE_GATEWAY:-managed}" "${REMOTE_EXIT_APP:-managed}"
+        return 0
+    fi
+
+    case "$type" in
+        openvpn)
+            if [[ "${TRANSPORT_TYPE:-direct}" != direct ]]; then
+                printf "app:%s -> %s -> %s:%s:%s -> OpenVPN -> Internet\n" \
+                    "$app" "${route_iface:-tunnel}" "${TRANSPORT_TYPE:-transport}" \
+                    "${TRANSPORT_REMOTE_HOST:-remote-host}" "${TRANSPORT_REMOTE_PORT:-unknown}"
+                return 0
+            fi
+            if [[ -n "${DEFAULT_PROFILE:-}" ]]; then
+                profile_file="$(profiles_dir "$app")/$DEFAULT_PROFILE"
+                if [[ -f "$profile_file" ]]; then
+                    IFS='|' read -r endpoint_host endpoint_port endpoint_proto < <(
+                        profile_endpoints "$profile_file" 2>/dev/null | head -n 1 || true
+                    )
+                fi
+            fi
+            if [[ -n "${endpoint_host:-}" ]]; then
+                printf "app:%s -> %s -> OpenVPN:%s:%s/%s -> Internet\n" \
+                    "$app" "${route_iface:-tunnel}" "$endpoint_host" "$endpoint_port" "$endpoint_proto"
+            else
+                printf "app:%s -> %s -> OpenVPN -> Internet\n" "$app" "${route_iface:-tunnel}"
+            fi
+            ;;
+        wireguard)
+            printf "app:%s -> %s -> WireGuard -> Internet\n" "$app" "${route_iface:-tunnel}"
+            ;;
+        inherit)
+            printf "app:%s -> %s -> inherited route -> Internet\n" "$app" "${route_iface:-veth}"
+            ;;
+        *)
+            printf "app:%s -> %s -> Internet\n" "$app" "${route_iface:-route}"
+            ;;
+    esac
+}
+
+myip_report_host() {
+    local route dev gateway local_ip external_ip path context_label=${1:-host}
+    route=$(myip_route_snapshot_current 2>/dev/null || true)
+    IFS='|' read -r dev gateway local_ip <<<"$route"
+    external_ip=$(myip_external_current 2>/dev/null || true)
+
+    if [[ -n "$gateway" ]]; then
+        path="host -> gateway:$gateway -> ${dev:-interface} -> Internet"
+    elif [[ -n "$dev" ]]; then
+        path="host -> $dev -> Internet"
+    else
+        path="host -> no IPv4 default route"
+    fi
+
+    printf 'Context:           %s\n' "$context_label"
+    printf 'Local IPv4:        %s\n' "${local_ip:-unavailable}"
+    printf 'External IPv4:     %s\n' "${external_ip:-unavailable}"
+    printf 'Route interface:   %s\n' "${dev:-unavailable}"
+    printf 'Default gateway:   %s\n' "${gateway:-direct or unavailable}"
+    printf 'Route path:        %s\n' "$path"
+}
+
+myip_report_app() {
+    local app=$1 mode=${2:-namespace}
+    validate_app_name "$app"
+    load_cfg "$app"
+
+    local state=stopped route="" dev="" gateway="" local_ip="" external_ip=""
+    local type type_label configured_via runtime_via namespace_ip path remote_host remote_port
+    type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    type_label=$(vpn_type_label "${type:-unknown}")
+    configured_via=$(effective_via_for_app "$app" __default__ 2>/dev/null || printf 'host')
+    runtime_via=$configured_via
+    if (( EUID == 0 )) && [[ -r "$RUN_DIR/${app}.env" ]]; then
+        runtime_via=$(runtime_via_for_app "$app" 2>/dev/null || printf '%s' "$configured_via")
+    fi
+
+    if [[ "$mode" == current ]]; then
+        state=started
+        route=$(myip_route_snapshot_current 2>/dev/null || true)
+        external_ip=$(myip_external_current "${EXTERNAL_IP_URL:-https://api.ipify.org}" 2>/dev/null || true)
+    elif [[ -e "/run/netns/$NS_NAME" ]] && systemctl is-active --quiet "nns-netns@${app}.service"; then
+        state=started
+        route=$(myip_route_snapshot_namespace "$NS_NAME" 2>/dev/null || true)
+        external_ip=$(myip_external_namespace "$NS_NAME" "${EXTERNAL_IP_URL:-https://api.ipify.org}" 2>/dev/null || true)
+    fi
+
+    IFS='|' read -r dev gateway local_ip <<<"$route"
+    namespace_ip=${NS_ADDR%%/*}
+    if [[ "$state" != started ]]; then
+        path="app:$app -> stopped (no active route)"
+    elif [[ -z "$route" ]]; then
+        path="app:$app -> route not ready"
+    else
+        path=$(myip_app_route_path "$app" "$dev" "$gateway" "$type" "$runtime_via")
+    fi
+
+    printf 'Context:           app\n'
+    printf 'Application:       %s\n' "$app"
+    printf 'State:             %s\n' "$state"
+    printf 'Local IPv4:        %s\n' "${local_ip:-unavailable}"
+    printf 'Namespace IPv4:    %s\n' "${namespace_ip:-unavailable}"
+    printf 'External IPv4:     %s\n' "${external_ip:-unavailable}"
+    printf 'Route interface:   %s\n' "${dev:-unavailable}"
+    printf 'Default gateway:   %s\n' "${gateway:-direct or unavailable}"
+    printf 'Backend:           %s\n' "$type_label"
+    printf 'Configured via:    %s\n' "$configured_via"
+    printf 'Runtime via:       %s\n' "$runtime_via"
+
+    if [[ "${REMOTE_MODE:-}" == auto ]]; then
+        remote_host=${TRANSPORT_REMOTE_HOST:-}
+        [[ -n "$remote_host" ]] || remote_host=$(myip_ssh_host "${TRANSPORT_SSH_TARGET:-}" 2>/dev/null || true)
+        remote_port=${TRANSPORT_REMOTE_PORT:-22}
+        printf 'Remote host:       %s:%s\n' "${remote_host:-unknown}" "$remote_port"
+        printf 'Remote gateway:    %s\n' "${REMOTE_GATEWAY:-unknown}"
+        printf 'Remote exit:       %s\n' "${REMOTE_EXIT_APP:-unknown}"
+        printf 'Remote transport:  %s\n' "${TRANSPORT_TYPE:-ssh}"
+    elif [[ "${TRANSPORT_TYPE:-direct}" != direct ]]; then
+        printf 'Transport endpoint:%s:%s\n' \
+            "${TRANSPORT_REMOTE_HOST:-unknown}" "${TRANSPORT_REMOTE_PORT:-unknown}"
+        printf 'Transport:         %s\n' "${TRANSPORT_TYPE:-unknown}"
+    fi
+
+    printf 'Route path:        %s\n' "$path"
+}
+
+myip_command() {
+    local requested_app=${1:-} detected_app
+
+    if [[ -n "$requested_app" ]]; then
+        require_root
+        myip_report_app "$requested_app" namespace
+        return 0
+    fi
+
+    detected_app=$(current_nns_app 2>/dev/null || true)
+    # The run helper sets a non-privileged context hint after entering the
+    # namespace. Use it only when the current namespace is not the host and
+    # namespace-file inspection could not identify the app directly.
+    if [[ -z "$detected_app" && -n "${NNS_APP_CONTEXT:-}" ]] && ! myip_host_namespace; then
+        if [[ "${NNS_APP_CONTEXT:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ &&
+              -f "$(cfg_file "$NNS_APP_CONTEXT")" ]]; then
+            detected_app=$NNS_APP_CONTEXT
+        fi
+    fi
+
+    if [[ -n "$detected_app" ]]; then
+        myip_report_app "$detected_app" current
+    elif myip_host_namespace; then
+        myip_report_host host
+    else
+        myip_report_host 'unmanaged network namespace'
+    fi
 }
 
 

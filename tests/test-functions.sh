@@ -50,6 +50,66 @@ fi
     assert_destructive_command_from_host "stop 'host-app'"
 )
 
+
+# `myip` without an app follows the shell's current namespace and must not
+# escalate. An explicit app selects that app regardless of the current shell.
+(
+    require_root() { fail 'context-only myip unexpectedly required root'; }
+    current_nns_app() { printf 'inside-app\n'; }
+    myip_report_app() { printf 'APP:%s:%s\n' "$1" "$2"; }
+    myip_report_host() { printf 'HOST:%s\n' "$1"; }
+    output=$(myip_command)
+    [[ "$output" == 'APP:inside-app:current' ]] ||
+        fail "myip did not select the current app context: $output"
+)
+(
+    require_root() { fail 'context-hint myip unexpectedly required root'; }
+    current_nns_app() { return 1; }
+    myip_host_namespace() { return 1; }
+    cfg_file() { printf '%s/context-app.cfg\n' "$TEST_TMP"; }
+    : >"$TEST_TMP/context-app.cfg"
+    NNS_APP_CONTEXT=context-app
+    myip_report_app() { printf 'APP:%s:%s\n' "$1" "$2"; }
+    myip_report_host() { printf 'HOST:%s\n' "$1"; }
+    output=$(myip_command)
+    [[ "$output" == 'APP:context-app:current' ]] ||
+        fail "myip did not use the run-context hint: $output"
+)
+(
+    require_root() { fail 'host-context myip unexpectedly required root'; }
+    current_nns_app() { return 1; }
+    myip_host_namespace() { return 0; }
+    myip_report_app() { printf 'APP:%s:%s\n' "$1" "$2"; }
+    myip_report_host() { printf 'HOST:%s\n' "$1"; }
+    output=$(myip_command)
+    [[ "$output" == 'HOST:host' ]] ||
+        fail "myip did not select the host context: $output"
+)
+(
+    require_root() { printf 'ROOT\n'; }
+    myip_report_app() { printf 'APP:%s:%s\n' "$1" "$2"; }
+    output=$(myip_command named-app)
+    [[ "$output" == $'ROOT\nAPP:named-app:namespace' ]] ||
+        fail "explicit myip app selection failed: $output"
+)
+[[ "$(myip_ssh_host 'user@remote-host')" == remote-host ]] ||
+    fail 'myip SSH route report did not remove the account name'
+(
+    REMOTE_MODE=auto
+    TRANSPORT_SSH_TARGET=user@remote-host
+    TRANSPORT_REMOTE_HOST=remote-host
+    TRANSPORT_REMOTE_PORT=2222
+    REMOTE_GATEWAY=managed-gateway
+    REMOTE_EXIT_APP=managed-exit
+    path=$(myip_app_route_path named-app tun0 '' openvpn host)
+    [[ "$path" == *'SSH:remote-host:2222'* ]] ||
+        fail "automatic-remote myip path omitted the remote hop: $path"
+    [[ "$path" != *'user@'* ]] ||
+        fail "automatic-remote myip path exposed the SSH account: $path"
+    [[ "$path" == *'gateway:managed-gateway -> exit:managed-exit'* ]] ||
+        fail "automatic-remote myip path omitted gateway/exit details: $path"
+)
+
 caller_path='/home/test-user/.local/bin:/opt/test-tools/bin'
 composed_path=$(compose_user_run_path "$caller_path")
 [[ "$composed_path" == "$caller_path:"* ]] ||

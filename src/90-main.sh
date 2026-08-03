@@ -237,6 +237,10 @@ main() {
             [[ $# -eq 2 ]] || die "Usage: nns-app status <app_name>"
             status_app "$2"
             ;;
+        myip)
+            (( $# <= 2 )) || die "Usage: nns-app myip [<app_name>]"
+            myip_command "${2:-}"
+            ;;
         add)
             (( $# >= 3 )) ||
                 die "Usage: nns-app add <app_name> <profile.ovpn|wireguard.conf>|any [country] [--refresh] [--via <upstream-app>|host]"

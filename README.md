@@ -4,13 +4,52 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.10
+**Release:** 1.3.15
 
 **Supported platform:** Ubuntu with systemd and iptables  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
 
 The release includes both the modular source tree and a pre-built,
 single-file installer: `nns-app-install.sh`.
+
+## Quick start
+
+Install nns-app once on the local Linux host:
+
+```bash
+chmod +x nns-app-install.sh
+sudo ./nns-app-install.sh install
+```
+
+Then choose one of the following two alternatives. Use a different application
+name if you want to keep both configurations on the same client.
+
+### Run the VPN profile locally
+
+```bash
+nns-app install my-private-app
+nns-app add my-private-app ~/my-base-profile.ovpn
+nns-app run my-private-app ping -c 4 1.1.1.1
+```
+
+The provider profile runs on the current host. The `ping` process runs inside
+`my-private-app` and its traffic exits through that profile.
+
+### Run the same VPN profile on a remote Linux host
+
+```bash
+nns-app install my-private-app via --remote user@remote-host
+nns-app add my-private-app ~/my-base-profile.ovpn
+nns-app run my-private-app ping -c 4 1.1.1.1
+```
+
+The first command bootstraps or upgrades nns-app on `remote-host` over SSH. The
+second command deploys the provider profile there and automatically creates the
+private remote exit, gateway, client credentials, and local link. The final
+command runs `ping` locally inside `my-private-app`, with its traffic routed
+through the remote host and then through the deployed provider VPN. Existing
+`ssh user@remote-host` access and remote `sudo` permission are required for the
+first bootstrap.
 
 ## Highlights
 
@@ -508,6 +547,26 @@ Show a detailed report:
 ```bash
 nns-app status my-private-app
 ```
+
+Show the IP and route for the current shell context:
+
+```bash
+nns-app myip
+```
+
+On the host, this reports the host source/local IPv4, external IPv4, default
+route, and interface. Inside a shell started with `nns-app run <app> bash`, the
+same command automatically reports that app's tunnel path. Inspect a named app
+from any host shell with:
+
+```bash
+nns-app myip my-private-app
+```
+
+For an automatic-remote app, the report includes the SSH remote host, managed
+gateway and remote provider exit. The SSH account name is intentionally omitted
+from this concise route report. `myip <app>` is read-only and does not start a
+stopped environment.
 
 The report distinguishes `ONLINE`, `OFFLINE`, `STARTING`, `FAILED`, and
 `STOPPED` and includes:

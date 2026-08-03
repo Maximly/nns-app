@@ -365,6 +365,7 @@ Defaults!$ENGINE_PATH env_keep += "NNS_APP_RUN_PATH DISPLAY WAYLAND_DISPLAY XAUT
 Cmnd_Alias $alias = \\
     $ENGINE_PATH list, \\
     $ENGINE_PATH status $app, \\
+    $ENGINE_PATH myip $app, \\
     $ENGINE_PATH start $app, \\
     $ENGINE_PATH start -i $app, \\
     $ENGINE_PATH start --ignore-start-error $app, \\

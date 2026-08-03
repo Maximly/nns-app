@@ -25,9 +25,16 @@ reexec_as_root_if_needed() {
     target=$(readlink -f "$0")
     [[ -x "$target" ]] || die "Cannot execute script: $target"
 
+    # Context-only `myip` reads the namespace it is already running in and
+    # does not need privilege escalation.  An explicit app name still needs
+    # root to enter that app's network namespace from the host or another app.
+    if [[ "$cmd" == myip && $# -eq 1 ]]; then
+        return 0
+    fi
+
     local sudo_args=(/usr/bin/sudo)
     case "$cmd" in
-        list|status|start|stop|run)
+        list|status|myip|start|stop|run)
             sudo_args+=( -n )
             ;;
         install|remove|add|purge|gateway|remote|link)

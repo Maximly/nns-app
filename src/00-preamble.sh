@@ -27,6 +27,7 @@
 #   purge
 #   list
 #   status  <app_name>
+#   myip    [<app_name>]
 #   add     <app_name> <profile.ovpn|wireguard.conf>
 #   add     <app_name> any [country] [--refresh] [--via <upstream-app>|host]
 #   start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
@@ -46,7 +47,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.13"
+readonly VERSION="1.3.15"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -235,6 +236,7 @@ Usage:
   nns-app purge [--local-only]
   nns-app list
   nns-app status  <app_name>
+  nns-app myip [<app_name>]
   nns-app add     <app_name> <profile.ovpn|wireguard.conf>
   nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
   nns-app start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
@@ -290,6 +292,8 @@ Examples:
   sudo nns-app purge
   nns-app list
   nns-app status my-private-app
+  nns-app myip
+  nns-app myip my-private-app
 
   # On a remote Linux box where `my-remote-exit` is already online:
   sudo nns-app gateway create my-relay \
