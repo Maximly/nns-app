@@ -36,6 +36,11 @@ prepare_namespaced_desktop_mounts() {
     fi
 }
 
+namespace_ref_id() {
+    local path=$1
+    stat -Lc '%d:%i' -- "$path" 2>/dev/null
+}
+
 run_user_exec() {
     require_root
     local app=$1
@@ -47,9 +52,13 @@ run_user_exec() {
     # Refuse direct invocation: this helper is valid only after `ip netns exec`
     # has entered the application environment's network namespace.
     local current_netns expected_netns
-    current_netns=$(readlink /proc/self/ns/net)
-    expected_netns=$(readlink "/run/netns/$NS_NAME")
-    [[ -n "$current_netns" && "$current_netns" == "$expected_netns" ]] ||
+    if ! current_netns=$(namespace_ref_id /proc/self/ns/net); then
+        die "Cannot identify the current network namespace."
+    fi
+    if ! expected_netns=$(namespace_ref_id "/run/netns/$NS_NAME"); then
+        die "Cannot identify the configured namespace '$NS_NAME'."
+    fi
+    [[ "$current_netns" == "$expected_netns" ]] ||
         die "_run-user is not inside the expected namespace '$NS_NAME'."
 
     prepare_namespaced_desktop_mounts
@@ -200,12 +209,12 @@ status_app() {
     configured_via=$(effective_via_for_app "$app" __default__)
     runtime_via=$(runtime_via_for_app "$app" 2>/dev/null || printf '%s' "$configured_via")
 
-    if [[ -n "$profile_name" ]]; then
+    type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    type_label=$(vpn_type_label "${type:-unknown}")
+    if [[ "$type" == inherit ]]; then
+        profile_name="inherited:${configured_via}"
+    elif [[ -n "$profile_name" ]]; then
         profile_file="$(profiles_dir "$app")/$profile_name"
-        if [[ -f "$profile_file" ]]; then
-            type=$(vpn_type_for_app "$app" 2>/dev/null || true)
-            type_label=$(vpn_type_label "${type:-unknown}")
-        fi
     fi
 
     ns_state=$(systemctl is-active "$ns_unit" 2>/dev/null || true)
@@ -269,7 +278,8 @@ status_app() {
         case "$type" in
             openvpn) diagnosis=$(openvpn_status_diagnosis "$vpn_log") ;;
             wireguard) diagnosis="WireGuard is running, but its interface or full-tunnel route is not ready." ;;
-            *) diagnosis="The VPN service is active, but no usable tunnel route exists." ;;
+            inherit) diagnosis="The inherited upstream data path is not ready." ;;
+            *) diagnosis="The network backend is active, but no usable route exists." ;;
         esac
     elif [[ -n "$external_ip" || "$ping_ok" == yes ]]; then
         health="ONLINE"
@@ -283,6 +293,7 @@ status_app() {
         case "$type" in
             openvpn) diagnosis=$(openvpn_status_diagnosis "$vpn_log") ;;
             wireguard) diagnosis="The WireGuard interface exists, but the Internet data-path probe failed." ;;
+            inherit) diagnosis="The upstream route exists, but the inherited Internet data-path probe failed." ;;
             *) diagnosis="The tunnel exists, but the Internet data-path probe failed." ;;
         esac
     fi
@@ -302,6 +313,9 @@ status_app() {
     printf 'Diagnosis:         %s\n' "$diagnosis"
     printf 'Profile:           %s\n' "${profile_name:-not configured}"
     printf 'Backend:           %s\n' "$type_label"
+    if [[ "$type" == openvpn ]]; then
+        printf 'Transport:         %s\n' "${TRANSPORT_TYPE:-direct}"
+    fi
     printf 'Configured via:    %s\n' "$configured_via"
     printf 'Runtime via:       %s\n' "$runtime_via"
     if [[ "$runtime_via" != host ]]; then
@@ -321,6 +335,11 @@ status_app() {
     printf 'Tunnel IPv4:       %s\n' "${local_ip:-not assigned}"
     printf 'External IPv4:     %s\n' "${external_ip:-unavailable}"
     printf 'Ping data path:    %s\n' "$ping_ok"
+
+    if [[ "$type" == openvpn && "${TRANSPORT_TYPE:-direct}" != direct ]]; then
+        printf 'Transport endpoint:%s:%s/tcp\n' "$TRANSPORT_REMOTE_HOST" "$TRANSPORT_REMOTE_PORT"
+        printf 'Local wrapper:     127.0.0.1:%s\n' "$TRANSPORT_LOCAL_PORT"
+    fi
 
     if [[ -n "$profile_file" && -f "$profile_file" ]]; then
         printf 'Profile file:      %s\n' "$profile_file"
@@ -418,9 +437,13 @@ list_apps() {
 
         load_cfg "$app"
         profile=${DEFAULT_PROFILE:-none}
-        profile=${profile%.ovpn}
-        profile=${profile%.conf}
         type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+        if [[ "$type" == inherit ]]; then
+            profile="inherited"
+        else
+            profile=${profile%.ovpn}
+            profile=${profile%.conf}
+        fi
         type_label=$(vpn_type_label "${type:-unknown}")
         status=stopped
         via=$(effective_via_for_app "$app" __default__)

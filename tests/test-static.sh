@@ -9,12 +9,28 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fq 'nns-app 1.1.27' <<<"$version"
+grep -Fq 'nns-app 1.2.1' <<<"$version"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
 grep -Fq 'nns-app gateway create' <<<"$help"
 grep -Fq 'nns-app gateway client export' <<<"$help"
+grep -Fq 'nns-app remote connect' <<<"$help"
+grep -Fq 'nns-app link import' <<<"$help"
+grep -Fq -- '--backend inherit' <<<"$help"
+grep -Fq -- '--transport direct|stunnel|cloak' <<<"$help"
+grep -Fq -- '--server-name <cloak-decoy-host>' <<<"$help"
+grep -Fq 'cfg_set "$app" VPN_TYPE inherit' "$INSTALLER"
+grep -Fq 'TRANSPORT_TYPE' "$INSTALLER"
+grep -Fq 'nnslink_manifest_read' "$INSTALLER"
+grep -Fq 'StrictHostKeyChecking=yes' "$INSTALLER"
+grep -Fq -- '-s "$TRANSPORT_REMOTE_HOST"' "$INSTALLER"
+grep -Fq -- '-p "$TRANSPORT_REMOTE_PORT"' "$INSTALLER"
+grep -Fq 'namespace_ref_id /proc/self/ns/net' "$INSTALLER"
+if grep -Fq 'readlink "/run/netns/$NS_NAME"' "$INSTALLER"; then
+    echo 'named namespace identity incorrectly uses readlink' >&2
+    exit 1
+fi
 
 grep -Fq 'nns-online@.service' "$INSTALLER"
 grep -Fq 'nns-gateway-crl-refresh@.timer' "$INSTALLER"
@@ -43,7 +59,7 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 1.1.27' "$ROOT/README.md"
+grep -Fq '**Release:** 1.2.1' "$ROOT/README.md"
 grep -Fq 'OpenVPN 2.6+' "$ROOT/README.md"
 
 # Public documentation and help use one descriptive example-name set.

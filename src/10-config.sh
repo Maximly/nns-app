@@ -30,7 +30,7 @@ reexec_as_root_if_needed() {
         list|status|start|stop|run)
             sudo_args+=( -n )
             ;;
-        install|remove|add|purge|gateway)
+        install|remove|add|purge|gateway|remote|link)
             ;;
         *)
             die "Unknown command '$cmd'."
@@ -89,23 +89,23 @@ load_cfg() {
 
 cfg_set() {
     local app=$1 key=$2 value=$3
-    local file tmp
+    local file tmp quoted line found=0
     file=$(cfg_file "$app")
     tmp=$(mktemp "${file}.XXXXXX")
 
-    awk -v key="$key" -v value="$value" '
-        BEGIN { done=0 }
-        $0 ~ ("^" key "=") {
-            printf "%s=\"%s\"\n", key, value
-            done=1
-            next
-        }
-        { print }
-        END {
-            if (!done)
-                printf "%s=\"%s\"\n", key, value
-        }
-    ' "$file" >"$tmp"
+    # Config files are sourced by Bash after strict owner/mode checks. Store
+    # values using Bash's reversible shell quoting and avoid passing that
+    # quoting through sed/awk escape processing.
+    printf -v quoted '%q' "$value"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "$key="* ]]; then
+            printf '%s=%s\n' "$key" "$quoted"
+            found=1
+        else
+            printf '%s\n' "$line"
+        fi
+    done <"$file" >"$tmp"
+    (( found )) || printf '%s=%s\n' "$key" "$quoted" >>"$tmp"
 
     install -o root -g root -m 0644 "$tmp" "$file"
     rm -f "$tmp"
@@ -227,7 +227,7 @@ runtime_via_for_app() {
 }
 
 vpn_route_iface() {
-    local app=$1 ns type dev expected
+    local app=$1 ns type dev expected upstream
     ns=$(cfg_read_value "$app" NS_NAME 2>/dev/null || true)
     [[ -n "$ns" ]] || return 1
     type=$(vpn_type_for_app "$app" 2>/dev/null || true)
@@ -245,10 +245,18 @@ vpn_route_iface() {
             ip netns exec "$ns" wg show "$expected" >/dev/null 2>&1 || return 1
             dev=$expected
             ;;
+        inherit)
+            dev=$(cfg_read_value "$app" VETH_NS 2>/dev/null || true)
+            upstream=$(runtime_via_for_app "$app" 2>/dev/null || true)
+            [[ -n "$dev" && "$upstream" != host ]] || return 1
+            ip -n "$ns" link show dev "$dev" up >/dev/null 2>&1 || return 1
+            vpn_route_ready "$upstream" || return 1
+            ;;
         *) return 1 ;;
     esac
 
-    printf '%s\n' "$dev"
+    printf '%s
+' "$dev"
 }
 
 vpn_route_ready() {

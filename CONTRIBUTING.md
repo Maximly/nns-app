@@ -27,7 +27,7 @@ location, host, or personal names into public help, comments, tests, or docs.
 
 ## Trust boundaries
 
-- App, gateway, and client configuration files are root-owned.
+- App, gateway, client, and remote configuration files are root-owned.
 - Configuration files are sourced only after owner and mode validation.
 - Every supported variable is reset before a file is sourced.
 - Imported VPN profiles are untrusted input.
@@ -35,6 +35,8 @@ location, host, or personal names into public help, comments, tests, or docs.
   process confinement, or exposing management interfaces are rejected.
 - WireGuard hook directives are rejected.
 - Generated private keys use mode `0600` or `0640` as appropriate.
+- `.nnslink` archives are untrusted input and must be allow-listed by member name and type before extraction.
+- Remote SSH targets are structured data, never shell fragments; host keys remain pinned in a dedicated root-owned `known_hosts` file.
 
 Adding a sourced field requires updating the corresponding reset and validation
 function.
@@ -51,14 +53,27 @@ NNS namespace. Forwarding and NAT in the upstream namespace are restricted to
 its active tunnel interface. A downstream app must never fall back to the
 upstream namespace's ordinary host-facing veth.
 
+An inherit-only app uses the same child veth topology but has no inner VPN
+endpoint or tunnel. Its OUTPUT policy may use only its child veth, and the
+upstream namespace remains responsible for tunnel-only forwarding and NAT.
+Inherit mode must reject a host upstream, must report readiness through the
+upstream data path, and must remain bound to `nns-online@<upstream>.service`.
+
 `UPSTREAM_APP` forms a directed acyclic graph. Keep both configuration-time
 cycle detection and defensive visited sets in lifecycle traversal.
 
 ## Managed gateway data path
 
-The gateway OpenVPN server listens in the remote host namespace so the
+The gateway control listener remains in the remote host namespace so the
 encrypted client connection uses the host's normal public ingress and egress
-route.
+route. In direct mode this is the OpenVPN listener. In stunnel or Cloak mode,
+the public listener is the wrapper and OpenVPN must bind only to its allocated
+loopback TCP port.
+
+Transport configuration is regenerated from root-owned gateway/client state.
+Cloak's allowed UID set must include active clients only. A wrapper and its
+OpenVPN process are one lifecycle: failure of either must terminate the other
+so systemd can restart a coherent pair.
 
 Decrypted packets arriving on the server TUN are selected by an `ip rule` that
 matches all of these owned attributes:
@@ -93,6 +108,25 @@ nns-app configs, live `ip rule` output, live table contents, and
 Cleanup must remove only exact resources owned by the object being stopped.
 Broad table flushes, priority-only rule deletion, and untagged shared firewall
 rules are prohibited.
+
+## Remote management and bundles
+
+SSH is a management plane only. `remote connect`, `sync`, and `rotate` may
+retrieve profiles over SSH, but a started local app must connect directly to
+the gateway public endpoint without an SSH tunnel or live control session.
+
+Remote commands must:
+
+- use `BatchMode=yes` and a dedicated pinned `known_hosts` file;
+- quote each nns-app argument as data before constructing the restricted remote command;
+- require root or non-interactive `sudo -n` on the remote host;
+- keep SSH credentials and identity paths out of exported VPN profiles;
+- write imported profile and transport state into root-owned local storage.
+
+`.nnslink` format changes require an explicit manifest version. Never extract
+an archive with a broad tar command or accept arbitrary filenames, links,
+devices, absolute paths, or parent traversal. Plain `.ovpn` export is valid
+only for direct gateways because wrappers require additional state.
 
 ## Locking
 

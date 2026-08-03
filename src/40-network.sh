@@ -250,17 +250,29 @@ netns_up() {
     host_ip=${HOST_ADDR%/*}
     profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
     vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
-    [[ -n "$vpn_type" ]] || die "Cannot determine VPN backend for '$app'. Re-add its profile."
-    if [[ "$vpn_type" == wireguard ]]; then
-        tunnel_iface=$(wireguard_iface_name "$app")
-    else
-        tunnel_iface='tun+'
+    [[ -n "$vpn_type" ]] || die "Cannot determine VPN backend for '$app'. Re-add its profile or configure inherit."
+    case "$vpn_type" in
+        wireguard) tunnel_iface=$(wireguard_iface_name "$app") ;;
+        inherit)
+            [[ "$via_app" != host ]] || die "Inherit backend '$app' requires an upstream NNS app."
+            tunnel_iface=$VETH_NS
+            ;;
+        openvpn) tunnel_iface='tun+' ;;
+        *) die "Unsupported VPN backend '$vpn_type'." ;;
+    esac
+    if [[ "$vpn_type" != inherit ]]; then
+        [[ -n "$DEFAULT_PROFILE" && -f "$profile" ]] ||
+            die "No usable default profile is configured for '$app'."
     fi
-    [[ -n "$DEFAULT_PROFILE" && -f "$profile" ]] ||
-        die "No usable default profile is configured for '$app'."
 
     install -d -o root -g root -m 0755 "$RUN_DIR"
-    resolve_profile_endpoints "$profile" "$endpoints_file"         "${upstream_ns:-host}"
+    case "$vpn_type:${TRANSPORT_TYPE:-direct}" in
+        inherit:*) : >"$endpoints_file" ;;
+        openvpn:stunnel|openvpn:cloak)
+            resolve_transport_endpoint "$app" "$endpoints_file" "${upstream_ns:-host}"
+            ;;
+        *) resolve_profile_endpoints "$profile" "$endpoints_file" "${upstream_ns:-host}" ;;
+    esac
     chmod 0600 "$endpoints_file"
 
     if [[ "$via_app" == host ]]; then

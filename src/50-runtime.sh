@@ -52,27 +52,45 @@ wireguard_exec() {
 
 vpn_exec() {
     require_root
-    local app=$1 type profile
+    local app=$1 type profile marker
     validate_app_name "$app"
     load_cfg "$app"
 
-    [[ -n "$DEFAULT_PROFILE" ]] || die "No default profile is configured for '$app'."
-    profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
-    [[ -f "$profile" ]] || die "Default profile does not exist: $profile"
     ip netns list | awk '{print $1}' | grep -Fxq "$NS_NAME" ||
         die "Namespace '$NS_NAME' is not running."
-
     type=$(vpn_type_for_app "$app" 2>/dev/null || true)
     [[ -n "$type" ]] || die "Cannot determine VPN backend for '$app'."
 
+    if [[ "$type" == inherit ]]; then
+        [[ -z "$DEFAULT_PROFILE" ]] || warn "Ignoring profile '$DEFAULT_PROFILE' for inherit backend '$app'."
+        marker="inherit:${UPSTREAM_APP:-host}"
+    else
+        [[ -n "$DEFAULT_PROFILE" ]] || die "No default profile is configured for '$app'."
+        profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
+        [[ -f "$profile" ]] || die "Default profile does not exist: $profile"
+        marker=$DEFAULT_PROFILE
+    fi
+
     install -d -o root -g root -m 0755 "$RUN_DIR"
-    printf '%s\n' "$DEFAULT_PROFILE" >"$RUN_DIR/${app}.profile"
-    printf '%s\n' "$type" >"$RUN_DIR/${app}.type"
+    printf '%s
+' "$marker" >"$RUN_DIR/${app}.profile"
+    printf '%s
+' "$type" >"$RUN_DIR/${app}.type"
     chmod 0644 "$RUN_DIR/${app}.profile" "$RUN_DIR/${app}.type"
 
     case "$type" in
-        openvpn) openvpn_exec "$app" "$profile" ;;
+        openvpn)
+            case "${TRANSPORT_TYPE:-direct}" in
+                direct|"") openvpn_exec "$app" "$profile" ;;
+                stunnel|cloak) transport_client_exec "$app" "$profile" ;;
+                *) die "Unsupported local transport '${TRANSPORT_TYPE}'." ;;
+            esac
+            ;;
         wireguard) wireguard_exec "$app" "$profile" ;;
+        inherit)
+            trap 'exit 0' TERM INT HUP
+            while :; do sleep 3600 & wait $! || true; done
+            ;;
         *) die "Unsupported VPN backend '$type'." ;;
     esac
 }
@@ -110,40 +128,49 @@ start_app() {
     local app=$1
     local ignore_start_error=${2:-off}
     local via_override=${3:-__default__}
+    local vpn_type profile_marker
     validate_app_name "$app"
     load_cfg "$app"
-    [[ -n "$DEFAULT_PROFILE" ]] || die "No profile configured. Use: nns-app add $app profile.ovpn|wireguard.conf"
-    [[ -f "$(profiles_dir "$app")/$DEFAULT_PROFILE" ]] ||
-        die "Configured profile '$DEFAULT_PROFILE' is missing."
-    local vpn_type
     vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
-    [[ -n "$vpn_type" ]] || die "Cannot determine VPN backend for '$app'. Re-add its profile."
+    [[ -n "$vpn_type" ]] || die "Cannot determine VPN backend for '$app'. Re-add its profile or configure --backend inherit."
+
+    if [[ "$vpn_type" == inherit ]]; then
+        profile_marker="inherit:${UPSTREAM_APP:-host}"
+    else
+        [[ -n "$DEFAULT_PROFILE" ]] || die "No profile configured. Use: nns-app add $app profile.ovpn|wireguard.conf"
+        [[ -f "$(profiles_dir "$app")/$DEFAULT_PROFILE" ]] ||
+            die "Configured profile '$DEFAULT_PROFILE' is missing."
+        profile_marker=$DEFAULT_PROFILE
+    fi
 
     local desired_via current_via="host"
     desired_via=$(effective_via_for_app "$app" "$via_override")
+    if [[ "$vpn_type" == inherit && "$desired_via" == host ]]; then
+        die "Inherit backend '$app' requires an upstream NNS app."
+    fi
     if [[ "$desired_via" != host ]]; then
         ensure_upstream_ready "$app" "$desired_via" >/dev/null
     fi
+    [[ "$vpn_type" != inherit ]] || profile_marker="inherit:${desired_via}"
 
     local current=""
     [[ -f "$RUN_DIR/${app}.profile" ]] && current=$(<"$RUN_DIR/${app}.profile")
     if app_is_started "$app"; then
         current_via=$(runtime_via_for_app "$app")
     fi
-    if app_is_started "$app" && [[ "$current" == "$DEFAULT_PROFILE" && "$current_via" == "$desired_via" ]]; then
-        log "'$app' is already started with '$DEFAULT_PROFILE' via $desired_via."
+    if app_is_started "$app" && [[ "$current" == "$profile_marker" && "$current_via" == "$desired_via" ]]; then
+        log "'$app' is already started with '$profile_marker' via $desired_via."
         return 0
     fi
 
     if app_is_started "$app" || systemctl is-active --quiet "nns-netns@${app}.service"; then
         stop_app "$app"
-        # Recursive dependent shutdown loads other app configs into this shell.
-        # Reload the original app before continuing its restart sequence.
         load_cfg "$app"
     fi
 
     install -d -o root -g root -m 0755 "$RUN_DIR"
-    printf '%s\n' "$desired_via" >"$RUN_DIR/${app}.via"
+    printf '%s
+' "$desired_via" >"$RUN_DIR/${app}.via"
     chmod 0600 "$RUN_DIR/${app}.via"
 
     if bool_on "$AUTOSTART"; then
@@ -173,8 +200,8 @@ start_app() {
     fi
 
     if ! systemctl start "nns-openvpn@${app}.service"; then
-        warn "Failed to start the VPN backend for '$app'."
-        warn "Recent VPN-service log:"
+        warn "Failed to start the network backend for '$app'."
+        warn "Recent backend-service log:"
         journalctl -u "nns-openvpn@${app}.service" -n 40 \
             -o cat --no-pager >&2 2>/dev/null || true
         stop_app "$app"
@@ -194,20 +221,20 @@ start_app() {
         ext=$(ip netns exec "$NS_NAME" curl -4fsS \
               --connect-timeout 1 --max-time 1 \
               "$EXTERNAL_IP_URL" 2>/dev/null || true)
-        log "Started '$app' with '$DEFAULT_PROFILE' ($(vpn_type_label "$vpn_type")) via $desired_via.${ext:+ External IP: $ext}"
+        log "Started '$app' with '$profile_marker' ($(vpn_type_label "$vpn_type")) via $desired_via.${ext:+ External IP: $ext}"
         return 0
     fi
 
     if bool_on "$ignore_start_error"; then
         warn "'$app' is not online yet; -i ignored the readiness error."
-        warn "The namespace and VPN service were left running via $desired_via."
+        warn "The namespace and backend service were left running via $desired_via."
         warn "Check later with: nns-app list"
         return 0
     fi
 
-    warn "'$app' failed: the VPN data path was not online within ${timeout}s."
-    warn "Stopping the failed VPN instance instead of leaving it reconnecting."
-    warn "Recent VPN backend log:"
+    warn "'$app' failed: the data path was not online within ${timeout}s."
+    warn "Stopping the failed instance instead of leaving it reconnecting."
+    warn "Recent backend log:"
     journalctl -u "nns-openvpn@${app}.service" -n 20 \
         -o cat --no-pager >&2 2>/dev/null || true
     stop_app "$app"

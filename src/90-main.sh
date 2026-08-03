@@ -102,7 +102,7 @@ main() {
             if (( $# == 1 )); then
                 install_engine
             else
-                local install_app_name=$2 install_via="__default__"
+                local install_app_name=$2 install_via="__default__" install_backend="__default__"
                 shift 2
                 while (( $# > 0 )); do
                     case "$1" in
@@ -115,12 +115,28 @@ main() {
                             install_via=${1#--via=}
                             shift
                             ;;
+                        --backend)
+                            (( $# >= 2 )) || die "--backend requires 'inherit'."
+                            install_backend=$2
+                            shift 2
+                            ;;
+                        --backend=*)
+                            install_backend=${1#--backend=}
+                            shift
+                            ;;
                         *)
-                            die "Usage: nns-app install <app_name> [--via <upstream-app>|host]"
+                            die "Usage: nns-app install <app_name> [--backend inherit] [--via <upstream-app>|host]"
                             ;;
                     esac
                 done
-                install_app "$install_app_name" "$install_via"
+                case "$install_backend" in
+                    __default__) install_app "$install_app_name" "$install_via" ;;
+                    inherit)
+                        install_app "$install_app_name" "$install_via"
+                        set_inherit_backend "$install_app_name" "$install_via"
+                        ;;
+                    *) die "Unsupported app backend '$install_backend'; only 'inherit' is valid without a profile." ;;
+                esac
             fi
             ;;
         remove)
@@ -175,7 +191,11 @@ main() {
             else
                 [[ $# -eq 3 ]] ||
                     die "Options are valid only with: nns-app add <app_name> any [country] [--refresh] [--via <upstream-app>|host]"
-                add_profile "$2" "$3"
+                if [[ "$3" == *.nnslink ]]; then
+                    nnslink_import "$2" "$3"
+                else
+                    add_profile "$2" "$3"
+                fi
             fi
             ;;
         start)
@@ -193,7 +213,7 @@ main() {
                 create)
                     (( $# >= 3 )) ||
                         die "Usage: nns-app gateway create <name> --via <app> --listen tcp|udp:<port> --public <host>:<port> [--pool CIDR] [--dns \"IP ...\"]"
-                    local gw_name=$3 gw_via="" gw_listen="" gw_public="" gw_pool="" gw_dns="1.1.1.1 9.9.9.9"
+                    local gw_name=$3 gw_via="" gw_listen="" gw_public="" gw_pool="" gw_dns="1.1.1.1 9.9.9.9" gw_transport="direct" gw_server_name=""
                     shift 3
                     while (( $# > 0 )); do
                         case "$1" in
@@ -222,6 +242,16 @@ main() {
                                 gw_dns=$2; shift 2 ;;
                             --dns=*)
                                 gw_dns=${1#--dns=}; shift ;;
+                            --transport)
+                                (( $# >= 2 )) || die "--transport requires direct, stunnel or cloak."
+                                gw_transport=$2; shift 2 ;;
+                            --transport=*)
+                                gw_transport=${1#--transport=}; shift ;;
+                            --server-name)
+                                (( $# >= 2 )) || die "--server-name requires a Cloak decoy hostname."
+                                gw_server_name=$2; shift 2 ;;
+                            --server-name=*)
+                                gw_server_name=${1#--server-name=}; shift ;;
                             *)
                                 die "Unknown gateway create option '$1'."
                                 ;;
@@ -229,7 +259,7 @@ main() {
                     done
                     [[ -n "$gw_via" && -n "$gw_listen" && -n "$gw_public" ]] ||
                         die "gateway create requires --via, --listen and --public."
-                    gateway_create "$gw_name" "$gw_via" "$gw_listen" "$gw_public" "$gw_pool" "$gw_dns"
+                    gateway_create "$gw_name" "$gw_via" "$gw_listen" "$gw_public" "$gw_pool" "$gw_dns" "$gw_transport" "$gw_server_name"
                     ;;
                 start)
                     [[ $# -eq 3 ]] || die "Usage: nns-app gateway start <gateway_name>"
@@ -253,7 +283,7 @@ main() {
                     ;;
                 client)
                     (( $# >= 3 )) ||
-                        die "Usage: nns-app gateway client <add|list|export|revoke> ..."
+                        die "Usage: nns-app gateway client <add|list|export|rotate|revoke> ..."
                     case "$3" in
                         add)
                             [[ $# -eq 5 ]] ||
@@ -268,7 +298,7 @@ main() {
                         export)
                             (( $# >= 6 )) ||
                                 die "Usage: nns-app gateway client export <gateway_name> <client_name> --output <file.ovpn>"
-                            local export_gateway=$4 export_client=$5 export_output=""
+                            local export_gateway=$4 export_client=$5 export_output="" export_format="ovpn"
                             shift 5
                             while (( $# > 0 )); do
                                 case "$1" in
@@ -277,13 +307,23 @@ main() {
                                         export_output=$2; shift 2 ;;
                                     --output=*)
                                         export_output=${1#--output=}; shift ;;
+                                    --format)
+                                        (( $# >= 2 )) || die "--format requires ovpn or nnslink."
+                                        export_format=$2; shift 2 ;;
+                                    --format=*)
+                                        export_format=${1#--format=}; shift ;;
                                     *)
                                         die "Unknown gateway client export option '$1'."
                                         ;;
                                 esac
                             done
                             [[ -n "$export_output" ]] || die "--output is required."
-                            gateway_client_export "$export_gateway" "$export_client" "$export_output"
+                            gateway_client_export "$export_gateway" "$export_client" "$export_output" "$export_format"
+                            ;;
+                        rotate)
+                            [[ $# -eq 5 ]] ||
+                                die "Usage: nns-app gateway client rotate <gateway_name> <client_name>"
+                            gateway_client_rotate "$4" "$5"
                             ;;
                         revoke)
                             [[ $# -eq 5 ]] ||
@@ -298,6 +338,76 @@ main() {
                 *)
                     die "Unknown gateway command '$2'."
                     ;;
+            esac
+            ;;
+        link)
+            [[ $# -eq 4 && "$2" == import ]] ||
+                die "Usage: nns-app link import <app_name> <bundle.nnslink>"
+            nnslink_import "$3" "$4"
+            ;;
+        remote)
+            (( $# >= 3 )) || die "Usage: nns-app remote <add|connect|sync|rotate|status> ..."
+            case "$2" in
+                add)
+                    local remote_alias=$3 remote_target="" remote_port=22 remote_identity=""
+                    shift 3
+                    while (( $# > 0 )); do
+                        case "$1" in
+                            --ssh)
+                                (( $# >= 2 )) || die "--ssh requires [user@]host."
+                                remote_target=$2; shift 2 ;;
+                            --ssh=*) remote_target=${1#--ssh=}; shift ;;
+                            --port)
+                                (( $# >= 2 )) || die "--port requires a number."
+                                remote_port=$2; shift 2 ;;
+                            --port=*) remote_port=${1#--port=}; shift ;;
+                            --identity)
+                                (( $# >= 2 )) || die "--identity requires a private-key path."
+                                remote_identity=$2; shift 2 ;;
+                            --identity=*) remote_identity=${1#--identity=}; shift ;;
+                            *) die "Unknown remote add option '$1'." ;;
+                        esac
+                    done
+                    [[ -n "$remote_target" ]] || die "remote add requires --ssh <user@host>."
+                    remote_add "$remote_alias" "$remote_target" "$remote_port" "$remote_identity"
+                    ;;
+                connect)
+                    local remote_ref=$3 remote_client="" remote_name="" remote_backend="openvpn"
+                    shift 3
+                    while (( $# > 0 )); do
+                        case "$1" in
+                            --client)
+                                (( $# >= 2 )) || die "--client requires a client name."
+                                remote_client=$2; shift 2 ;;
+                            --client=*) remote_client=${1#--client=}; shift ;;
+                            --name)
+                                (( $# >= 2 )) || die "--name requires a local app name."
+                                remote_name=$2; shift 2 ;;
+                            --name=*) remote_name=${1#--name=}; shift ;;
+                            --backend)
+                                (( $# >= 2 )) || die "--backend requires openvpn."
+                                remote_backend=$2; shift 2 ;;
+                            --backend=*) remote_backend=${1#--backend=}; shift ;;
+                            *) die "Unknown remote connect option '$1'." ;;
+                        esac
+                    done
+                    [[ -n "$remote_client" && -n "$remote_name" ]] ||
+                        die "remote connect requires --client and --name."
+                    remote_connect "$remote_ref" "$remote_client" "$remote_name" "$remote_backend"
+                    ;;
+                sync)
+                    [[ $# -eq 3 ]] || die "Usage: nns-app remote sync <local_app>"
+                    remote_sync "$3"
+                    ;;
+                rotate)
+                    [[ $# -eq 3 ]] || die "Usage: nns-app remote rotate <local_app>"
+                    remote_rotate "$3"
+                    ;;
+                status)
+                    [[ $# -eq 3 ]] || die "Usage: nns-app remote status <local_app|alias>"
+                    remote_status "$3"
+                    ;;
+                *) die "Unknown remote command '$2'." ;;
             esac
             ;;
         run)

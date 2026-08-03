@@ -21,7 +21,7 @@
 # Author: Maxim Lyadvinsky
 #
 # Public commands:
-#   install [<app_name> [--via <upstream-app>|host]]
+#   install [<app_name> [--backend inherit] [--via <upstream-app>|host]]
 #   remove  <app_name>
 #   purge
 #   list
@@ -32,7 +32,10 @@
 #   stop    <app_name>
 #   run     <app_name> <command> [args...]
 #   gateway create <gateway> --via <app> --listen tcp|udp:<port>
-#                  --public <host>:<port> [--pool <IPv4-CIDR>]
+#                  --public <host>:<port> [--transport direct|stunnel|cloak]
+#                  [--server-name <cloak-decoy-host>]
+#   remote add|connect|sync|rotate|status ...
+#   link import <app> <bundle.nnslink>
 #   gateway start|stop|status|list|remove ...
 #   gateway client add|list|export|revoke ...
 #
@@ -42,7 +45,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.1.27"
+readonly VERSION="1.2.1"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -69,6 +72,7 @@ else
 fi
 readonly GATEWAY_BASE_DIR="$BASE_DIR/gateways"
 readonly GATEWAY_RUN_BASE="$RUN_DIR/gateways"
+readonly REMOTE_BASE_DIR="$BASE_DIR/remotes"
 readonly VPNGATE_API_URL="https://www.vpngate.net/api/iphone/"
 readonly CACHE_DIR="/var/cache/nns-app"
 readonly STATE_DIR="/var/lib/nns-app"
@@ -156,11 +160,17 @@ reset_app_cfg_vars() {
     DNS_SERVERS="" DISABLE_IPV6="" DISABLE_DCO="" PROFILE_FIXUPS=""
     READY_TIMEOUT="" EXTERNAL_IP_URL="" NS_NAME="" NS_CIDR=""
     HOST_ADDR="" NS_ADDR="" VETH_HOST="" VETH_NS=""
+    TRANSPORT_TYPE="" TRANSPORT_REMOTE_HOST="" TRANSPORT_REMOTE_PORT=""
+    TRANSPORT_LOCAL_PORT="" TRANSPORT_CONFIG=""
+    REMOTE_ALIAS="" REMOTE_GATEWAY="" REMOTE_CLIENT=""
+    REMOTE_PROFILE_GENERATION="" REMOTE_SERVER_FINGERPRINT=""
 }
 
 reset_gateway_cfg_vars() {
     GATEWAY_NAME="" GATEWAY_BACKEND="" VIA_APP=""
     LISTEN_PROTO="" LISTEN_PORT="" PUBLIC_HOST="" PUBLIC_PORT=""
+    TRANSPORT="" OPENVPN_LISTEN_PROTO="" OPENVPN_LISTEN_PORT=""
+    TRANSPORT_SERVER_NAME="" TRANSPORT_PUBLIC_KEY="" TRANSPORT_PRIVATE_KEY=""
     CLIENT_POOL="" DNS_SERVERS="" TRANSIT_CIDR=""
     TRANSIT_HOST_ADDR="" TRANSIT_NS_ADDR="" GATEWAY_TUN=""
     GATEWAY_VETH_HOST="" GATEWAY_VETH_NS="" ROUTE_TABLE=""
@@ -171,6 +181,7 @@ reset_gateway_cfg_vars() {
 
 reset_gateway_client_vars() {
     CLIENT_NAME="" STATUS="" CERT_SERIAL="" CREATED_AT="" REVOKED_AT=""
+    GENERATION="" CLOAK_UID=""
 }
 
 format_duration() {
@@ -209,7 +220,7 @@ show_version() {
 usage() {
     cat <<'USAGE'
 Usage:
-  nns-app install [app_name [--via <upstream-app>|host]]
+  nns-app install [app_name [--backend inherit] [--via <upstream-app>|host]]
   nns-app remove  <app_name>
   nns-app purge
   nns-app list
@@ -224,6 +235,8 @@ Usage:
                   --listen <tcp|udp>:<port>
                   --public <host>:<port>
                   [--pool <IPv4-CIDR>] [--dns "<IPv4> ..."]
+                  [--transport direct|stunnel|cloak]
+                  [--server-name <cloak-decoy-host>]
   nns-app gateway start  <gateway_name>
   nns-app gateway stop   <gateway_name>
   nns-app gateway status <gateway_name>
@@ -231,14 +244,24 @@ Usage:
   nns-app gateway remove <gateway_name>
   nns-app gateway client add    <gateway_name> <client_name>
   nns-app gateway client list   <gateway_name>
-  nns-app gateway client export <gateway_name> <client_name> --output <file.ovpn>
+  nns-app gateway client export <gateway_name> <client_name>
+                  [--format ovpn|nnslink] --output <file|->
+  nns-app gateway client rotate <gateway_name> <client_name>
   nns-app gateway client revoke <gateway_name> <client_name>
+
+  nns-app link import <app_name> <bundle.nnslink>
+  nns-app remote add <alias> --ssh <user@host> [--port <port>] [--identity <file>]
+  nns-app remote connect <alias>:<gateway> --client <name> --name <local_app>
+  nns-app remote sync   <local_app>
+  nns-app remote rotate <local_app>
+  nns-app remote status <local_app|alias>
 
 Examples:
   sudo ./nns-app.sh install
   sudo nns-app install my-upstream-vpn
   sudo nns-app add my-upstream-vpn ~/my-base-profile.ovpn
   sudo nns-app install my-private-app --via my-upstream-vpn
+  sudo nns-app install my-shared-app --backend inherit --via my-remote-exit
   sudo nns-app add my-private-app ~/my-app-profile.ovpn
   sudo nns-app add my-private-app ~/my-wireguard-profile.conf
   sudo nns-app add my-private-app any US --via my-upstream-vpn
@@ -295,7 +318,7 @@ reexec_as_root_if_needed() {
         list|status|start|stop|run)
             sudo_args+=( -n )
             ;;
-        install|remove|add|purge|gateway)
+        install|remove|add|purge|gateway|remote|link)
             ;;
         *)
             die "Unknown command '$cmd'."
@@ -354,23 +377,23 @@ load_cfg() {
 
 cfg_set() {
     local app=$1 key=$2 value=$3
-    local file tmp
+    local file tmp quoted line found=0
     file=$(cfg_file "$app")
     tmp=$(mktemp "${file}.XXXXXX")
 
-    awk -v key="$key" -v value="$value" '
-        BEGIN { done=0 }
-        $0 ~ ("^" key "=") {
-            printf "%s=\"%s\"\n", key, value
-            done=1
-            next
-        }
-        { print }
-        END {
-            if (!done)
-                printf "%s=\"%s\"\n", key, value
-        }
-    ' "$file" >"$tmp"
+    # Config files are sourced by Bash after strict owner/mode checks. Store
+    # values using Bash's reversible shell quoting and avoid passing that
+    # quoting through sed/awk escape processing.
+    printf -v quoted '%q' "$value"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "$key="* ]]; then
+            printf '%s=%s\n' "$key" "$quoted"
+            found=1
+        else
+            printf '%s\n' "$line"
+        fi
+    done <"$file" >"$tmp"
+    (( found )) || printf '%s=%s\n' "$key" "$quoted" >>"$tmp"
 
     install -o root -g root -m 0644 "$tmp" "$file"
     rm -f "$tmp"
@@ -492,7 +515,7 @@ runtime_via_for_app() {
 }
 
 vpn_route_iface() {
-    local app=$1 ns type dev expected
+    local app=$1 ns type dev expected upstream
     ns=$(cfg_read_value "$app" NS_NAME 2>/dev/null || true)
     [[ -n "$ns" ]] || return 1
     type=$(vpn_type_for_app "$app" 2>/dev/null || true)
@@ -510,10 +533,18 @@ vpn_route_iface() {
             ip netns exec "$ns" wg show "$expected" >/dev/null 2>&1 || return 1
             dev=$expected
             ;;
+        inherit)
+            dev=$(cfg_read_value "$app" VETH_NS 2>/dev/null || true)
+            upstream=$(runtime_via_for_app "$app" 2>/dev/null || true)
+            [[ -n "$dev" && "$upstream" != host ]] || return 1
+            ip -n "$ns" link show dev "$dev" up >/dev/null 2>&1 || return 1
+            vpn_route_ready "$upstream" || return 1
+            ;;
         *) return 1 ;;
     esac
 
-    printf '%s\n' "$dev"
+    printf '%s
+' "$dev"
 }
 
 vpn_route_ready() {
@@ -769,10 +800,11 @@ refresh_managed_unit_metadata() {
         write_gateway_unit_dropin "$gateway"
         gateway_write_openssl_config "$gateway" "$(gateway_dir "$gateway")"
         gateway_write_server_config "$gateway"
+        gateway_write_transport_config "$gateway"
         systemctl enable --now "nns-gateway-crl-refresh@${gateway}.timer" \
             >/dev/null 2>&1 || true
         if systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
-            warn "Gateway '$gateway' is running; restart it to activate the 1.1 data-plane rules."
+            warn "Gateway '$gateway' is running; restart it to activate refreshed gateway and transport settings."
         fi
         release_lock "gateway-$gateway"
     done
@@ -786,7 +818,7 @@ install_engine() {
     install_engine_files
     install -d -o root -g root -m 0755 \
         "$BASE_DIR" "$RUN_DIR" "$CACHE_DIR" "$STATE_DIR" \
-        "$GATEWAY_BASE_DIR" "$GATEWAY_RUN_BASE" "$LOCK_DIR"
+        "$GATEWAY_BASE_DIR" "$GATEWAY_RUN_BASE" "$REMOTE_BASE_DIR" "$LOCK_DIR"
     refresh_managed_unit_metadata
     release_lock global
 
@@ -944,7 +976,7 @@ install_app() {
     install_engine_files
     install -d -o root -g root -m 0755 \
         "$BASE_DIR" "$RUN_DIR" "$CACHE_DIR" "$STATE_DIR" \
-        "$GATEWAY_BASE_DIR" "$GATEWAY_RUN_BASE" "$LOCK_DIR"
+        "$GATEWAY_BASE_DIR" "$GATEWAY_RUN_BASE" "$REMOTE_BASE_DIR" "$LOCK_DIR"
 
     local dir file user net_data cidr host_addr ns_addr veth_data veth_host veth_ns
     dir=$(cfg_dir "$app")
@@ -1019,6 +1051,21 @@ PROFILE_FIXUPS="on"
 READY_TIMEOUT="5"
 EXTERNAL_IP_URL="https://api.ipify.org"
 
+# Optional local transport for .nnslink profiles. These values are managed by
+# `nns-app link import` / `nns-app remote sync`.
+TRANSPORT_TYPE="direct"
+TRANSPORT_REMOTE_HOST=""
+TRANSPORT_REMOTE_PORT=""
+TRANSPORT_LOCAL_PORT=""
+TRANSPORT_CONFIG=""
+
+# SSH management-plane metadata. The VPN data path never depends on SSH.
+REMOTE_ALIAS=""
+REMOTE_GATEWAY=""
+REMOTE_CLIENT=""
+REMOTE_PROFILE_GENERATION=""
+REMOTE_SERVER_FINGERPRINT=""
+
 # Engine-owned namespace network. Never copy these values to another environment.
 NS_NAME="nns-$app"
 NS_CIDR="$cidr"
@@ -1064,8 +1111,9 @@ vpn_type_for_app() {
     local app=$1 configured profile file detected
     configured=$(cfg_read_value "$app" VPN_TYPE 2>/dev/null || true)
     case "$configured" in
-        openvpn|wireguard)
-            printf '%s\n' "$configured"
+        openvpn|wireguard|inherit)
+            printf '%s
+' "$configured"
             return 0
             ;;
         "") ;;
@@ -1077,14 +1125,20 @@ vpn_type_for_app() {
     file="$(profiles_dir "$app")/$profile"
     detected=$(profile_type_from_file "$file" 2>/dev/null || true)
     [[ -n "$detected" ]] || return 1
-    printf '%s\n' "$detected"
+    printf '%s
+' "$detected"
 }
 
 vpn_type_label() {
     case "$1" in
-        openvpn) printf 'OpenVPN\n' ;;
-        wireguard) printf 'WireGuard\n' ;;
-        *) printf 'unknown\n' ;;
+        openvpn) printf 'OpenVPN
+' ;;
+        wireguard) printf 'WireGuard
+' ;;
+        inherit) printf 'Inherit
+' ;;
+        *) printf 'unknown
+' ;;
     esac
 }
 
@@ -1614,6 +1668,7 @@ add_profile() {
 
     install -o root -g root -m 0600 "$tmp" "$dest"
     rm -f "$tmp"
+    clear_app_transport_metadata "$app"
     cfg_set "$app" DEFAULT_PROFILE "$name"
     cfg_set "$app" VPN_TYPE "$type"
 
@@ -2512,17 +2567,29 @@ netns_up() {
     host_ip=${HOST_ADDR%/*}
     profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
     vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
-    [[ -n "$vpn_type" ]] || die "Cannot determine VPN backend for '$app'. Re-add its profile."
-    if [[ "$vpn_type" == wireguard ]]; then
-        tunnel_iface=$(wireguard_iface_name "$app")
-    else
-        tunnel_iface='tun+'
+    [[ -n "$vpn_type" ]] || die "Cannot determine VPN backend for '$app'. Re-add its profile or configure inherit."
+    case "$vpn_type" in
+        wireguard) tunnel_iface=$(wireguard_iface_name "$app") ;;
+        inherit)
+            [[ "$via_app" != host ]] || die "Inherit backend '$app' requires an upstream NNS app."
+            tunnel_iface=$VETH_NS
+            ;;
+        openvpn) tunnel_iface='tun+' ;;
+        *) die "Unsupported VPN backend '$vpn_type'." ;;
+    esac
+    if [[ "$vpn_type" != inherit ]]; then
+        [[ -n "$DEFAULT_PROFILE" && -f "$profile" ]] ||
+            die "No usable default profile is configured for '$app'."
     fi
-    [[ -n "$DEFAULT_PROFILE" && -f "$profile" ]] ||
-        die "No usable default profile is configured for '$app'."
 
     install -d -o root -g root -m 0755 "$RUN_DIR"
-    resolve_profile_endpoints "$profile" "$endpoints_file"         "${upstream_ns:-host}"
+    case "$vpn_type:${TRANSPORT_TYPE:-direct}" in
+        inherit:*) : >"$endpoints_file" ;;
+        openvpn:stunnel|openvpn:cloak)
+            resolve_transport_endpoint "$app" "$endpoints_file" "${upstream_ns:-host}"
+            ;;
+        *) resolve_profile_endpoints "$profile" "$endpoints_file" "${upstream_ns:-host}" ;;
+    esac
     chmod 0600 "$endpoints_file"
 
     if [[ "$via_app" == host ]]; then
@@ -2765,27 +2832,45 @@ wireguard_exec() {
 
 vpn_exec() {
     require_root
-    local app=$1 type profile
+    local app=$1 type profile marker
     validate_app_name "$app"
     load_cfg "$app"
 
-    [[ -n "$DEFAULT_PROFILE" ]] || die "No default profile is configured for '$app'."
-    profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
-    [[ -f "$profile" ]] || die "Default profile does not exist: $profile"
     ip netns list | awk '{print $1}' | grep -Fxq "$NS_NAME" ||
         die "Namespace '$NS_NAME' is not running."
-
     type=$(vpn_type_for_app "$app" 2>/dev/null || true)
     [[ -n "$type" ]] || die "Cannot determine VPN backend for '$app'."
 
+    if [[ "$type" == inherit ]]; then
+        [[ -z "$DEFAULT_PROFILE" ]] || warn "Ignoring profile '$DEFAULT_PROFILE' for inherit backend '$app'."
+        marker="inherit:${UPSTREAM_APP:-host}"
+    else
+        [[ -n "$DEFAULT_PROFILE" ]] || die "No default profile is configured for '$app'."
+        profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
+        [[ -f "$profile" ]] || die "Default profile does not exist: $profile"
+        marker=$DEFAULT_PROFILE
+    fi
+
     install -d -o root -g root -m 0755 "$RUN_DIR"
-    printf '%s\n' "$DEFAULT_PROFILE" >"$RUN_DIR/${app}.profile"
-    printf '%s\n' "$type" >"$RUN_DIR/${app}.type"
+    printf '%s
+' "$marker" >"$RUN_DIR/${app}.profile"
+    printf '%s
+' "$type" >"$RUN_DIR/${app}.type"
     chmod 0644 "$RUN_DIR/${app}.profile" "$RUN_DIR/${app}.type"
 
     case "$type" in
-        openvpn) openvpn_exec "$app" "$profile" ;;
+        openvpn)
+            case "${TRANSPORT_TYPE:-direct}" in
+                direct|"") openvpn_exec "$app" "$profile" ;;
+                stunnel|cloak) transport_client_exec "$app" "$profile" ;;
+                *) die "Unsupported local transport '${TRANSPORT_TYPE}'." ;;
+            esac
+            ;;
         wireguard) wireguard_exec "$app" "$profile" ;;
+        inherit)
+            trap 'exit 0' TERM INT HUP
+            while :; do sleep 3600 & wait $! || true; done
+            ;;
         *) die "Unsupported VPN backend '$type'." ;;
     esac
 }
@@ -2823,40 +2908,49 @@ start_app() {
     local app=$1
     local ignore_start_error=${2:-off}
     local via_override=${3:-__default__}
+    local vpn_type profile_marker
     validate_app_name "$app"
     load_cfg "$app"
-    [[ -n "$DEFAULT_PROFILE" ]] || die "No profile configured. Use: nns-app add $app profile.ovpn|wireguard.conf"
-    [[ -f "$(profiles_dir "$app")/$DEFAULT_PROFILE" ]] ||
-        die "Configured profile '$DEFAULT_PROFILE' is missing."
-    local vpn_type
     vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
-    [[ -n "$vpn_type" ]] || die "Cannot determine VPN backend for '$app'. Re-add its profile."
+    [[ -n "$vpn_type" ]] || die "Cannot determine VPN backend for '$app'. Re-add its profile or configure --backend inherit."
+
+    if [[ "$vpn_type" == inherit ]]; then
+        profile_marker="inherit:${UPSTREAM_APP:-host}"
+    else
+        [[ -n "$DEFAULT_PROFILE" ]] || die "No profile configured. Use: nns-app add $app profile.ovpn|wireguard.conf"
+        [[ -f "$(profiles_dir "$app")/$DEFAULT_PROFILE" ]] ||
+            die "Configured profile '$DEFAULT_PROFILE' is missing."
+        profile_marker=$DEFAULT_PROFILE
+    fi
 
     local desired_via current_via="host"
     desired_via=$(effective_via_for_app "$app" "$via_override")
+    if [[ "$vpn_type" == inherit && "$desired_via" == host ]]; then
+        die "Inherit backend '$app' requires an upstream NNS app."
+    fi
     if [[ "$desired_via" != host ]]; then
         ensure_upstream_ready "$app" "$desired_via" >/dev/null
     fi
+    [[ "$vpn_type" != inherit ]] || profile_marker="inherit:${desired_via}"
 
     local current=""
     [[ -f "$RUN_DIR/${app}.profile" ]] && current=$(<"$RUN_DIR/${app}.profile")
     if app_is_started "$app"; then
         current_via=$(runtime_via_for_app "$app")
     fi
-    if app_is_started "$app" && [[ "$current" == "$DEFAULT_PROFILE" && "$current_via" == "$desired_via" ]]; then
-        log "'$app' is already started with '$DEFAULT_PROFILE' via $desired_via."
+    if app_is_started "$app" && [[ "$current" == "$profile_marker" && "$current_via" == "$desired_via" ]]; then
+        log "'$app' is already started with '$profile_marker' via $desired_via."
         return 0
     fi
 
     if app_is_started "$app" || systemctl is-active --quiet "nns-netns@${app}.service"; then
         stop_app "$app"
-        # Recursive dependent shutdown loads other app configs into this shell.
-        # Reload the original app before continuing its restart sequence.
         load_cfg "$app"
     fi
 
     install -d -o root -g root -m 0755 "$RUN_DIR"
-    printf '%s\n' "$desired_via" >"$RUN_DIR/${app}.via"
+    printf '%s
+' "$desired_via" >"$RUN_DIR/${app}.via"
     chmod 0600 "$RUN_DIR/${app}.via"
 
     if bool_on "$AUTOSTART"; then
@@ -2886,8 +2980,8 @@ start_app() {
     fi
 
     if ! systemctl start "nns-openvpn@${app}.service"; then
-        warn "Failed to start the VPN backend for '$app'."
-        warn "Recent VPN-service log:"
+        warn "Failed to start the network backend for '$app'."
+        warn "Recent backend-service log:"
         journalctl -u "nns-openvpn@${app}.service" -n 40 \
             -o cat --no-pager >&2 2>/dev/null || true
         stop_app "$app"
@@ -2907,20 +3001,20 @@ start_app() {
         ext=$(ip netns exec "$NS_NAME" curl -4fsS \
               --connect-timeout 1 --max-time 1 \
               "$EXTERNAL_IP_URL" 2>/dev/null || true)
-        log "Started '$app' with '$DEFAULT_PROFILE' ($(vpn_type_label "$vpn_type")) via $desired_via.${ext:+ External IP: $ext}"
+        log "Started '$app' with '$profile_marker' ($(vpn_type_label "$vpn_type")) via $desired_via.${ext:+ External IP: $ext}"
         return 0
     fi
 
     if bool_on "$ignore_start_error"; then
         warn "'$app' is not online yet; -i ignored the readiness error."
-        warn "The namespace and VPN service were left running via $desired_via."
+        warn "The namespace and backend service were left running via $desired_via."
         warn "Check later with: nns-app list"
         return 0
     fi
 
-    warn "'$app' failed: the VPN data path was not online within ${timeout}s."
-    warn "Stopping the failed VPN instance instead of leaving it reconnecting."
-    warn "Recent VPN backend log:"
+    warn "'$app' failed: the data path was not online within ${timeout}s."
+    warn "Stopping the failed instance instead of leaving it reconnecting."
+    warn "Recent backend log:"
     journalctl -u "nns-openvpn@${app}.service" -n 20 \
         -o cat --no-pager >&2 2>/dev/null || true
     stop_app "$app"
@@ -3147,6 +3241,13 @@ validate_gateway_client_name() {
         die "Invalid client name '$name'. Use 1-48 letters, digits, '.', '_' or '-'."
 }
 
+validate_transport_server_name() {
+    local name=${1:-}
+    (( ${#name} <= 253 )) &&
+        [[ "$name" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]] ||
+        die "Invalid transport server name '$name'. Use a valid DNS hostname."
+}
+
 gateway_dir()          { printf '%s/%s\n' "$GATEWAY_BASE_DIR" "$1"; }
 gateway_cfg_file()     { printf '%s/%s/gateway.cfg\n' "$GATEWAY_BASE_DIR" "$1"; }
 gateway_pki_dir()      { printf '%s/%s/pki\n' "$GATEWAY_BASE_DIR" "$1"; }
@@ -3179,6 +3280,18 @@ load_gateway_cfg() {
         die "GATEWAY_NAME mismatch in $file."
     [[ "${GATEWAY_BACKEND:-}" == openvpn ]] ||
         die "Unsupported gateway backend '${GATEWAY_BACKEND:-}'."
+    TRANSPORT=${TRANSPORT:-direct}
+    OPENVPN_LISTEN_PROTO=${OPENVPN_LISTEN_PROTO:-$LISTEN_PROTO}
+    OPENVPN_LISTEN_PORT=${OPENVPN_LISTEN_PORT:-$LISTEN_PORT}
+    TRANSPORT_SERVER_NAME=${TRANSPORT_SERVER_NAME:-$PUBLIC_HOST}
+    case "$TRANSPORT" in
+        direct|stunnel|cloak) ;;
+        *) die "Unsupported gateway transport '$TRANSPORT'." ;;
+    esac
+    validate_transport_server_name "$TRANSPORT_SERVER_NAME"
+    if [[ "$TRANSPORT" == cloak && "$TRANSPORT_SERVER_NAME" == "$PUBLIC_HOST" ]]; then
+        die "Cloak's --server-name must differ from the gateway public host to avoid a redirection loop."
+    fi
     [[ -n "${VIA_APP:-}" ]] || die "VIA_APP is missing in $file."
     [[ "${ROUTE_TABLE:-}" =~ ^[0-9]+$ &&
        "${RULE_PRIORITY:-}" =~ ^[0-9]+$ ]] ||
@@ -3517,7 +3630,7 @@ gateway_write_server_config() {
         output=$(mktemp "$root/server.conf.XXXXXX")
     fi
     pki="$root/pki"
-    [[ "$LISTEN_PROTO" == tcp ]] &&
+    [[ "$OPENVPN_LISTEN_PROTO" == tcp ]] &&
         proto_option=tcp-server || proto_option=udp
 
     read -r network netmask < <(
@@ -3535,7 +3648,8 @@ PY_GATEWAY_POOL
         printf 'mode server\n'
         printf 'tls-server\n'
         printf 'proto %s\n' "$proto_option"
-        printf 'port %s\n' "$LISTEN_PORT"
+        printf 'port %s\n' "$OPENVPN_LISTEN_PORT"
+        [[ "${TRANSPORT:-direct}" == direct ]] || printf 'local 127.0.0.1\n'
         printf 'dev %s\n' "$GATEWAY_TUN"
         printf 'topology subnet\n'
         printf 'server %s %s\n' "$network" "$netmask"
@@ -3587,7 +3701,7 @@ PY_GATEWAY_POOL
 }
 
 gateway_validate_staging() {
-    local gateway=$1 root=$2 pki="$2/pki"
+    local gateway=$1 root=$2 pki="$2/pki" transport
     [[ -s "$root/gateway.cfg" && -s "$root/server.conf" ]] || return 1
     [[ -s "$pki/ca.crt" && -s "$pki/server.crt" &&
        -s "$pki/server.key" ]] || return 1
@@ -3599,6 +3713,22 @@ gateway_validate_staging() {
         -noout -checkend 1 >/dev/null 2>&1 || return 1
     grep -Eq '^tls-crypt-v2[[:space:]]+' "$root/server.conf" || return 1
     grep -Eq '^up[[:space:]]+' "$root/server.conf" || return 1
+    transport=$(awk -F= '/^TRANSPORT=/{gsub(/^"|"$/, "", $2); print $2; exit}' "$root/gateway.cfg")
+    case "${transport:-direct}" in
+        direct) ;;
+        stunnel)
+            [[ -s "$root/transport/server.conf" &&
+               -s "$root/transport/ca.crt" &&
+               -s "$root/transport/server-chain.crt" &&
+               -s "$root/transport/server.key" ]] || return 1
+            ;;
+        cloak)
+            [[ -s "$root/transport/server.json" &&
+               -s "$root/transport/public.key" &&
+               -s "$root/transport/private.key" ]] || return 1
+            ;;
+        *) return 1 ;;
+    esac
 }
 
 gateway_create() {
@@ -3606,10 +3736,19 @@ gateway_create() {
     local gateway=$1 via_app=$2 listen=$3 public=$4
     local requested_pool=${5:-}
     local dns_input=${6:-"1.1.1.1 9.9.9.9"}
+    local transport=${7:-direct}
+    local transport_server_name=${8:-}
     local staging=""
 
     validate_gateway_name "$gateway"
     validate_app_name "$via_app"
+    case "$transport" in direct|stunnel|cloak) ;; *) die "Unsupported transport '$transport'." ;; esac
+    if [[ "$transport" == cloak ]]; then
+        transport_server_name=${transport_server_name:-www.bing.com}
+        validate_transport_server_name "$transport_server_name"
+    elif [[ -n "$transport_server_name" ]]; then
+        die "--server-name is valid only with --transport cloak."
+    fi
     [[ ! -f "$(cfg_file "$gateway")" ]] ||
         die "An NNS app named '$gateway' already exists."
     [[ -f "$(cfg_file "$via_app")" ]] ||
@@ -3621,6 +3760,7 @@ gateway_create() {
     acquire_lock "gateway-$gateway"
 
     local listen_proto listen_port public_host public_port
+    local openvpn_listen_proto openvpn_listen_port
     local client_pool transit_cidr transit_host_addr transit_ns_addr
     local route_table rule_priority gateway_tun veth_host veth_ns
     local host_fwd host_mangle ns_fwd ns_nat ns_mangle dns_servers
@@ -3629,6 +3769,21 @@ gateway_create() {
         <<<"$(parse_gateway_listen "$listen")"
     IFS='|' read -r public_host public_port \
         <<<"$(parse_public_endpoint "$public")"
+    if [[ "$transport" == cloak ]]; then
+        [[ "$transport_server_name" != "$public_host" ]] ||
+            die "Cloak --server-name must differ from the gateway public host."
+    else
+        transport_server_name=$public_host
+    fi
+    if [[ "$transport" == direct ]]; then
+        openvpn_listen_proto=$listen_proto
+        openvpn_listen_port=$listen_port
+    else
+        [[ "$listen_proto" == tcp ]] ||
+            die "Transport '$transport' requires a TCP public listener."
+        openvpn_listen_proto=tcp
+        openvpn_listen_port=$(gateway_allocate_backend_port "$gateway")
+    fi
     IFS='|' read -r \
         client_pool transit_cidr transit_host_addr transit_ns_addr \
         <<<"$(allocate_gateway_networks "$requested_pool")"
@@ -3654,10 +3809,14 @@ GATEWAY_NAME="$gateway"
 GATEWAY_BACKEND="openvpn"
 VIA_APP="$via_app"
 
+TRANSPORT="$transport"
 LISTEN_PROTO="$listen_proto"
 LISTEN_PORT="$listen_port"
 PUBLIC_HOST="$public_host"
 PUBLIC_PORT="$public_port"
+OPENVPN_LISTEN_PROTO="$openvpn_listen_proto"
+OPENVPN_LISTEN_PORT="$openvpn_listen_port"
+TRANSPORT_SERVER_NAME="$transport_server_name"
 CLIENT_POOL="$client_pool"
 DNS_SERVERS="$dns_servers"
 
@@ -3680,8 +3839,10 @@ GATEWAY_CONFIG_EOF
     chown root:root "$staging/gateway.cfg"
     chmod 0644 "$staging/gateway.cfg"
 
-    if ! gateway_generate_pki "$gateway" "$staging" ||
+    if ! gateway_prepare_transport "$gateway" "$staging" "$transport" ||
+       ! gateway_generate_pki "$gateway" "$staging" ||
        ! gateway_write_server_config "$gateway" "$staging" ||
+       ! gateway_write_transport_config "$gateway" "$staging" ||
        ! gateway_validate_staging "$gateway" "$staging"; then
         rm -rf "$staging"
         release_lock "gateway-$gateway"
@@ -3691,7 +3852,8 @@ GATEWAY_CONFIG_EOF
 
     mv "$staging" "$(gateway_dir "$gateway")"
     if ! gateway_write_openssl_config "$gateway" "$(gateway_dir "$gateway")" ||
-       ! gateway_write_server_config "$gateway" "$(gateway_dir "$gateway")"; then
+       ! gateway_write_server_config "$gateway" "$(gateway_dir "$gateway")" ||
+       ! gateway_write_transport_config "$gateway" "$(gateway_dir "$gateway")"; then
         rm -rf "$(gateway_dir "$gateway")"
         release_lock "gateway-$gateway"
         release_lock global
@@ -3705,8 +3867,9 @@ GATEWAY_CONFIG_EOF
     release_lock "gateway-$gateway"
     release_lock global
 
-    log "Created managed OpenVPN gateway '$gateway'."
+    log "Created managed OpenVPN gateway '$gateway' with '$transport' transport."
     log "Public endpoint: $public_host:$public_port/$listen_proto"
+    [[ "$transport" == direct ]] || log "Private OpenVPN listener: 127.0.0.1:$openvpn_listen_port/tcp"
     log "Client pool:     $client_pool"
     log "Remote exit:     $via_app"
     warn "Ensure the host firewall and upstream NAT/router allow $listen_proto port $listen_port."
@@ -4069,7 +4232,11 @@ gateway_server_exec() {
     load_gateway_cfg "$gateway"
     config=$(gateway_server_config "$gateway")
     [[ -f "$config" ]] || die "Gateway server config is missing: $config"
-    exec /usr/sbin/openvpn --config "$config"
+    case "${TRANSPORT:-direct}" in
+        direct) exec /usr/sbin/openvpn --config "$config" ;;
+        stunnel|cloak) gateway_transport_server_exec "$gateway" ;;
+        *) die "Unsupported gateway transport '$TRANSPORT'." ;;
+    esac
 }
 
 gateway_start() {
@@ -4082,6 +4249,7 @@ gateway_start() {
 
     write_gateway_unit_dropin "$gateway"
     gateway_write_server_config "$gateway"
+    gateway_write_transport_config "$gateway"
     systemctl daemon-reload
     systemctl enable --now "nns-gateway-crl-refresh@${gateway}.timer" \
         >/dev/null 2>&1 || true
@@ -4222,7 +4390,7 @@ gateway_ca_restore() {
 gateway_client_add() {
     require_root
     local gateway=$1 client=$2 pki final staging backup
-    local metadata cert_serial="" rc=0
+    local metadata cert_serial="" cloak_uid="" generation=1 rc=0 restart=no
 
     validate_gateway_name "$gateway"
     validate_gateway_client_name "$client"
@@ -4285,12 +4453,17 @@ gateway_client_add() {
     if (( rc == 0 )); then
         rm -f "$staging/client.csr" || rc=1
     fi
+    if (( rc == 0 )) && [[ "${TRANSPORT:-direct}" == cloak ]]; then
+        cloak_uid=$(gateway_cloak_new_uid) || rc=1
+    fi
     if (( rc == 0 )); then
         cat >"$staging/client.cfg" <<CLIENT_CFG_EOF || rc=1
 CLIENT_NAME="$client"
 STATUS="active"
 CERT_SERIAL="$cert_serial"
 CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+GENERATION="$generation"
+CLOAK_UID="$cloak_uid"
 CLIENT_CFG_EOF
     fi
 
@@ -4317,11 +4490,26 @@ CLIENT_CFG_EOF
     fi
 
     rm -rf "$backup"
+    if [[ "${TRANSPORT:-direct}" == cloak ]]; then
+        gateway_write_transport_config "$gateway"
+        if [[ "${NNS_SUPPRESS_GATEWAY_RESTART:-0}" != 1 ]] &&
+           systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
+            restart=yes
+        fi
+    fi
     release_lock "gateway-$gateway"
 
+    if [[ "$restart" == yes ]]; then
+        systemctl restart "nns-gateway@${gateway}.service" ||
+            warn "Client '$client' was added, but gateway '$gateway' failed to restart."
+    fi
     log "Added client '$client' to gateway '$gateway'."
     log "Export it with:"
-    log "  sudo nns-app gateway client export $gateway $client --output ~/$gateway-$client.ovpn"
+    if [[ "${TRANSPORT:-direct}" == direct ]]; then
+        log "  sudo nns-app gateway client export $gateway $client --output ~/$gateway-$client.ovpn"
+    else
+        log "  sudo nns-app gateway client export $gateway $client --format nnslink --output ~/$gateway-$client.nnslink"
+    fi
 }
 
 gateway_client_load() {
@@ -4343,82 +4531,71 @@ gateway_client_load() {
     reset_gateway_client_vars
     # shellcheck disable=SC1090
     source "$file"
+    GENERATION=${GENERATION:-1}
+    CLOAK_UID=${CLOAK_UID:-}
     [[ "${CLIENT_NAME:-}" == "$client" ]] ||
         die "CLIENT_NAME mismatch in $file."
 }
 
 gateway_client_export() {
     require_root
-    local gateway=$1 client=$2 output=$3 cdir pki tmp proto owner
+    local gateway=$1 client=$2 output=$3 format=${4:-ovpn}
+    local tmp owner group
     validate_gateway_name "$gateway"
     validate_gateway_client_name "$client"
+    case "$format" in ovpn|nnslink) ;; *) die "Unsupported export format '$format'." ;; esac
     acquire_lock "gateway-$gateway" shared
     load_gateway_cfg "$gateway"
     gateway_client_load "$gateway" "$client"
     [[ "${STATUS:-}" == active ]] ||
         die "Client '$client' is revoked and cannot be exported."
-
     [[ -n "$output" ]] || die "--output is required."
-    output=$(readlink -m "$output")
-    [[ ! -e "$output" ]] || die "Output already exists: $output"
-    [[ -d "$(dirname "$output")" ]] || die "Output directory does not exist: $(dirname "$output")"
 
-    cdir=$(gateway_client_dir "$gateway" "$client")
-    pki=$(gateway_pki_dir "$gateway")
-    tmp=$(mktemp)
-
-    if [[ "$LISTEN_PROTO" == tcp ]]; then
-        proto=tcp-client
-    else
-        proto=udp
+    if [[ "$output" != - ]]; then
+        output=$(readlink -m "$output")
+        [[ ! -e "$output" ]] || die "Output already exists: $output"
+        [[ -d "$(dirname "$output")" ]] || die "Output directory does not exist: $(dirname "$output")"
     fi
 
-    {
-        printf '# nns-app managed gateway profile: %s / %s\n' "$gateway" "$client"
-        printf 'client\n'
-        printf 'dev tun\n'
-        printf 'proto %s\n' "$proto"
-        printf 'remote %s %s\n' "$PUBLIC_HOST" "$PUBLIC_PORT"
-        printf 'nobind\n'
-        printf 'persist-key\n'
-        printf 'persist-tun\n'
-        printf 'auth-nocache\n'
-        printf 'remote-cert-tls server\n'
-        printf 'verify-x509-name %s name\n' "$SERVER_CN"
-        printf 'tls-version-min 1.2\n'
-        printf 'data-ciphers AES-256-GCM:CHACHA20-POLY1305:AES-128-GCM\n'
-        printf 'auth SHA256\n'
-        printf 'allow-compression no\n'
-        printf 'disable-dco\n'
-        if [[ "$LISTEN_PROTO" == udp ]]; then
-            printf 'explicit-exit-notify 2\n'
+    if [[ "$format" == ovpn ]]; then
+        [[ "${TRANSPORT:-direct}" == direct ]] ||
+            die "Gateway transport '$TRANSPORT' requires --format nnslink."
+        tmp=$(mktemp)
+        gateway_write_client_profile_file "$gateway" "$client" "$tmp" public
+        if [[ "$output" == - ]]; then
+            cat "$tmp"
+        else
+            owner=${SUDO_USER:-root}
+            if [[ "$owner" != root ]] && id "$owner" >/dev/null 2>&1; then
+                group=$(id -gn "$owner")
+                install -o "$owner" -g "$group" -m 0600 "$tmp" "$output"
+            else
+                install -o root -g root -m 0600 "$tmp" "$output"
+            fi
         fi
-        printf 'verb 3\n'
-        printf '\n<ca>\n'
-        cat "$pki/ca.crt"
-        printf '</ca>\n\n<cert>\n'
-        cat "$cdir/client.crt"
-        printf '</cert>\n\n<key>\n'
-        cat "$cdir/client.key"
-        printf '</key>\n\n<tls-crypt-v2>\n'
-        cat "$cdir/tls-crypt-v2-client.key"
-        printf '</tls-crypt-v2>\n'
-    } >"$tmp"
-
-    owner=${SUDO_USER:-root}
-    if [[ "$owner" != root ]] && id "$owner" >/dev/null 2>&1; then
-        install -o "$owner" -g "$(id -gn "$owner")" -m 0600 "$tmp" "$output"
+        rm -f "$tmp"
     else
-        install -o root -g root -m 0600 "$tmp" "$output"
+        if [[ "$output" == - ]]; then
+            gateway_write_nnslink_bundle "$gateway" "$client" -
+        else
+            tmp=$(mktemp)
+            gateway_write_nnslink_bundle "$gateway" "$client" "$tmp"
+            owner=${SUDO_USER:-root}
+            if [[ "$owner" != root ]] && id "$owner" >/dev/null 2>&1; then
+                group=$(id -gn "$owner")
+                install -o "$owner" -g "$group" -m 0600 "$tmp" "$output"
+            else
+                install -o root -g root -m 0600 "$tmp" "$output"
+            fi
+            rm -f "$tmp"
+        fi
     fi
-    rm -f "$tmp"
     release_lock "gateway-$gateway"
 
-    log "Exported client '$client' from gateway '$gateway'."
-    log "Profile: $output"
-    log "Import on the local box with:"
-    log "  sudo nns-app install remote-$gateway"
-    log "  sudo nns-app add remote-$gateway $output"
+    if [[ "$output" != - ]]; then
+        log "Exported client '$client' from gateway '$gateway' as $format."
+        log "Output: $output"
+    fi
 }
 
 gateway_client_revoke() {
@@ -4487,6 +4664,7 @@ gateway_client_revoke() {
 
     rm -f "$tmp"
     rm -rf "$backup"
+    [[ "${TRANSPORT:-direct}" != cloak ]] || gateway_write_transport_config "$gateway"
     systemctl is-active --quiet "nns-gateway@${gateway}.service" &&
         restart=yes
     release_lock "gateway-$gateway"
@@ -4570,12 +4748,9 @@ PY_GATEWAY_STATUS
 
 gateway_listener_ready() {
     local pid=$1 proto_flag
-    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
-    [[ "$LISTEN_PROTO" == tcp ]] &&
-        proto_flag=lntp || proto_flag=lnup
-
+    [[ "$LISTEN_PROTO" == tcp ]] && proto_flag=lnt || proto_flag=lnu
     ss -H -"$proto_flag" 2>/dev/null |
-        grep -Eq "[:.]${LISTEN_PORT}[[:space:]].*pid=${pid},"
+        grep -Eq "[:.]${LISTEN_PORT}[[:space:]]"
 }
 
 gateway_policy_ready() {
@@ -4724,6 +4899,7 @@ gateway_status() {
     printf 'Health:            %s\n' "$health"
     printf 'Diagnosis:         %s\n' "$diagnosis"
     printf 'Backend:           OpenVPN server\n'
+    printf 'Transport:         %s\n' "${TRANSPORT:-direct}"
     printf 'Public endpoint:   %s:%s/%s\n' \
         "$PUBLIC_HOST" "$PUBLIC_PORT" "$LISTEN_PROTO"
     printf 'Local listener:    0.0.0.0:%s/%s (%s; pid=%s)\n' \
@@ -4823,6 +4999,1058 @@ gateway_remove() {
 }
 
 
+# nns-app source module: inherit-only application environments, transport
+# bundles and SSH-based remote gateway management.
+
+app_transport_dir() { printf '%s/%s/transport\n' "$BASE_DIR" "$1"; }
+remote_dir()         { printf '%s/%s\n' "$REMOTE_BASE_DIR" "$1"; }
+remote_cfg_file()    { printf '%s/%s/remote.cfg\n' "$REMOTE_BASE_DIR" "$1"; }
+remote_known_hosts() { printf '%s/%s/known_hosts\n' "$REMOTE_BASE_DIR" "$1"; }
+
+validate_remote_alias() {
+    local alias=${1:-}
+    [[ "$alias" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]] ||
+        die "Invalid remote alias '$alias'. Use 1-32 letters, digits, '.', '_' or '-'."
+}
+
+validate_ssh_target() {
+    local target=${1:-}
+    [[ "$target" =~ ^([A-Za-z0-9._-]+@)?([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])$ ]] ||
+        die "Invalid SSH target '$target'. Use [user@]host without shell options."
+}
+
+clear_app_transport_metadata() {
+    local app=$1 dir
+    [[ -f "$(cfg_file "$app")" ]] || return 0
+    dir=$(app_transport_dir "$app")
+    rm -rf "$dir"
+    cfg_set "$app" TRANSPORT_TYPE direct
+    cfg_set "$app" TRANSPORT_REMOTE_HOST ""
+    cfg_set "$app" TRANSPORT_REMOTE_PORT ""
+    cfg_set "$app" TRANSPORT_LOCAL_PORT ""
+    cfg_set "$app" TRANSPORT_CONFIG ""
+}
+
+set_inherit_backend() {
+    require_root
+    local app=$1 via=${2:-__default__} selected was_started=no
+    validate_app_name "$app"
+    load_cfg "$app"
+    selected=$(effective_via_for_app "$app" "$via")
+    [[ "$selected" != host ]] ||
+        die "The inherit backend requires --via <upstream-app>; it cannot inherit the host uplink."
+
+    if app_is_started "$app" || systemctl is-active --quiet "nns-netns@${app}.service"; then
+        was_started=yes
+        stop_app "$app"
+        load_cfg "$app"
+    fi
+
+    cfg_set "$app" VPN_TYPE inherit
+    cfg_set "$app" DEFAULT_PROFILE ""
+    cfg_set "$app" UPSTREAM_APP "$selected"
+    clear_app_transport_metadata "$app"
+    write_app_unit_dropin "$app"
+    systemctl daemon-reload
+    log "Configured '$app' as an inherit-only environment via '$selected'."
+    if [[ "$was_started" == yes ]]; then
+        start_app "$app" off "$selected"
+    fi
+}
+
+transport_binary_for_type() {
+    case "$1" in
+        direct|"") return 1 ;;
+        stunnel) command -v stunnel4 2>/dev/null || command -v stunnel 2>/dev/null ;;
+        cloak) command -v ck-client 2>/dev/null ;;
+        *) return 1 ;;
+    esac
+}
+
+transport_client_exec() {
+    local app=$1 profile=$2 type binary wrapper_pid vpn_pid rc=0
+    load_cfg "$app"
+    type=${TRANSPORT_TYPE:-direct}
+    [[ "$type" == stunnel || "$type" == cloak ]] ||
+        die "Unsupported local transport '$type'."
+    [[ -n "$TRANSPORT_CONFIG" && -f "$TRANSPORT_CONFIG" ]] ||
+        die "Transport config is missing for '$app'. Re-import its .nnslink bundle."
+    binary=$(transport_binary_for_type "$type" || true)
+    [[ -n "$binary" ]] ||
+        die "Transport '$type' is not installed (required client binary is missing)."
+
+    transport_cleanup() {
+        [[ -z "${vpn_pid:-}" ]] || kill "$vpn_pid" 2>/dev/null || true
+        [[ -z "${wrapper_pid:-}" ]] || kill "$wrapper_pid" 2>/dev/null || true
+        wait "${vpn_pid:-0}" "${wrapper_pid:-0}" 2>/dev/null || true
+    }
+    trap 'exit 0' TERM INT HUP
+    trap transport_cleanup EXIT
+
+    case "$type" in
+        stunnel)
+            ip netns exec "$NS_NAME" "$binary" "$TRANSPORT_CONFIG" &
+            wrapper_pid=$!
+            ;;
+        cloak)
+            ip netns exec "$NS_NAME" "$binary" \
+                -c "$TRANSPORT_CONFIG" \
+                -s "$TRANSPORT_REMOTE_HOST" \
+                -p "$TRANSPORT_REMOTE_PORT" \
+                -i 127.0.0.1 \
+                -l "$TRANSPORT_LOCAL_PORT" &
+            wrapper_pid=$!
+            ;;
+    esac
+
+    local deadline=$((SECONDS + 5))
+    while (( SECONDS < deadline )); do
+        kill -0 "$wrapper_pid" 2>/dev/null ||
+            die "The $type client exited before opening its local listener."
+        if ip netns exec "$NS_NAME" ss -H -lnt 2>/dev/null |
+           grep -Eq "127\\.0\\.0\\.1:${TRANSPORT_LOCAL_PORT}([[:space:]]|$)"; then
+            break
+        fi
+        sleep 0.1
+    done
+    ip netns exec "$NS_NAME" ss -H -lnt 2>/dev/null |
+        grep -Eq "127\\.0\\.0\\.1:${TRANSPORT_LOCAL_PORT}([[:space:]]|$)" ||
+        die "The $type client did not open 127.0.0.1:${TRANSPORT_LOCAL_PORT}."
+
+    ip netns exec "$NS_NAME" /usr/sbin/openvpn \
+        --config "$profile" --dns-updown disable --disable-dco &
+    vpn_pid=$!
+
+    wait -n "$wrapper_pid" "$vpn_pid" || rc=$?
+    kill "$wrapper_pid" "$vpn_pid" 2>/dev/null || true
+    wait "$wrapper_pid" "$vpn_pid" 2>/dev/null || true
+    (( rc == 0 )) || return "$rc"
+    die "The transported OpenVPN service exited unexpectedly."
+}
+
+resolve_transport_endpoint() {
+    local app=$1 output=$2 namespace=${3:-host}
+    load_cfg "$app"
+    [[ -n "${TRANSPORT_REMOTE_HOST:-}" &&
+       "${TRANSPORT_REMOTE_PORT:-}" =~ ^[1-9][0-9]{0,4}$ ]] ||
+        die "Transport endpoint metadata is incomplete for '$app'."
+
+    python3 - "$TRANSPORT_REMOTE_HOST" "$TRANSPORT_REMOTE_PORT" "$output" \
+        3< <(if [[ "$namespace" == host ]]; then
+                getent ahostsv4 "$TRANSPORT_REMOTE_HOST" 2>/dev/null || true
+             else
+                ip netns exec "$namespace" getent ahostsv4 "$TRANSPORT_REMOTE_HOST" 2>/dev/null || true
+             fi) <<'PY_TRANSPORT_ENDPOINT'
+import ipaddress
+import os
+import sys
+
+host, port, output = sys.argv[1:]
+addresses = []
+try:
+    addresses.append(str(ipaddress.IPv4Address(host)))
+except ipaddress.AddressValueError:
+    for line in os.fdopen(3):
+        fields = line.split()
+        if not fields:
+            continue
+        try:
+            ip = str(ipaddress.IPv4Address(fields[0]))
+        except ipaddress.AddressValueError:
+            continue
+        if ip not in addresses:
+            addresses.append(ip)
+if not addresses:
+    raise SystemExit(f"cannot resolve transport host {host!r} to IPv4")
+with open(output, "w", encoding="ascii") as fh:
+    for ip in addresses:
+        fh.write(f"{ip}|{port}|tcp\n")
+PY_TRANSPORT_ENDPOINT
+}
+
+nnslink_manifest_read() {
+    local bundle=$1 extract_dir=$2
+    python3 - "$bundle" "$extract_dir" <<'PY_NNSLINK_READ'
+import json
+import os
+import pathlib
+import sys
+import tarfile
+
+bundle = pathlib.Path(sys.argv[1])
+out = pathlib.Path(sys.argv[2])
+allowed = {"manifest.json", "client.ovpn", "stunnel-ca.pem", "cloak-client.json"}
+if not bundle.is_file() or bundle.stat().st_size > 8 * 1024 * 1024:
+    raise SystemExit("invalid or unexpectedly large .nnslink bundle")
+out.mkdir(mode=0o700, parents=True, exist_ok=True)
+with tarfile.open(bundle, "r:gz") as tf:
+    members = tf.getmembers()
+    total = 0
+    for member in members:
+        p = pathlib.PurePosixPath(member.name)
+        if member.name not in allowed or p.is_absolute() or ".." in p.parts:
+            raise SystemExit(f"unsafe or unexpected bundle member: {member.name}")
+        if not member.isfile() or member.issym() or member.islnk():
+            raise SystemExit(f"unsupported bundle member type: {member.name}")
+        total += member.size
+    if total > 4 * 1024 * 1024:
+        raise SystemExit("expanded .nnslink bundle is unexpectedly large")
+    for member in members:
+        source = tf.extractfile(member)
+        if source is None:
+            raise SystemExit(f"cannot read bundle member: {member.name}")
+        target = out / member.name
+        target.write_bytes(source.read())
+        os.chmod(target, 0o600)
+manifest_path = out / "manifest.json"
+profile_path = out / "client.ovpn"
+if not manifest_path.is_file() or not profile_path.is_file():
+    raise SystemExit("bundle must contain manifest.json and client.ovpn")
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+required = {
+    "format": "nnslink",
+    "version": 1,
+    "backend": "openvpn",
+}
+for key, value in required.items():
+    if manifest.get(key) != value:
+        raise SystemExit(f"unsupported manifest {key}: {manifest.get(key)!r}")
+transport = manifest.get("transport")
+if transport not in {"direct", "stunnel", "cloak"}:
+    raise SystemExit(f"unsupported transport: {transport!r}")
+import re
+
+name_rules = {
+    "gateway": re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$"),
+    "client": re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$"),
+}
+for key, rule in name_rules.items():
+    value = manifest.get(key)
+    if not isinstance(value, str) or not rule.fullmatch(value):
+        raise SystemExit(f"invalid manifest field: {key}")
+host = manifest.get("public_host")
+if (not isinstance(host, str) or len(host) > 253 or
+        not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", host) or
+        host.endswith((".", "-")) or ".." in host):
+    raise SystemExit("invalid manifest field: public_host")
+for key in ("public_port", "local_port", "generation"):
+    value = manifest.get(key)
+    if not isinstance(value, int) or value < 1 or value > (65535 if key != "generation" else 2**31-1):
+        raise SystemExit(f"invalid manifest field: {key}")
+if transport == "stunnel" and not (out / "stunnel-ca.pem").is_file():
+    raise SystemExit("stunnel bundle is missing stunnel-ca.pem")
+if transport == "cloak":
+    cloak_path = out / "cloak-client.json"
+    if not cloak_path.is_file():
+        raise SystemExit("cloak bundle is missing cloak-client.json")
+    try:
+        cloak = json.loads(cloak_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"invalid Cloak client configuration: {exc}")
+    expected_keys = {
+        "Transport", "ProxyMethod", "EncryptionMethod", "UID", "PublicKey",
+        "ServerName", "NumConn", "BrowserSig", "StreamTimeout",
+    }
+    if not isinstance(cloak, dict) or set(cloak) != expected_keys:
+        raise SystemExit("unsupported Cloak client configuration fields")
+    if cloak.get("Transport") != "direct" or cloak.get("ProxyMethod") != "openvpn":
+        raise SystemExit("Cloak bundle is not configured for direct OpenVPN transport")
+    if cloak.get("EncryptionMethod") not in {
+        "chacha20-poly1305", "aes-256-gcm", "aes-128-gcm"
+    }:
+        raise SystemExit("unsupported Cloak encryption method")
+    if cloak.get("BrowserSig") not in {"chrome", "firefox", "safari"}:
+        raise SystemExit("unsupported Cloak browser signature")
+    if not isinstance(cloak.get("NumConn"), int) or not 1 <= cloak["NumConn"] <= 16:
+        raise SystemExit("invalid Cloak connection count")
+    if not isinstance(cloak.get("StreamTimeout"), int) or not 1 <= cloak["StreamTimeout"] <= 86400:
+        raise SystemExit("invalid Cloak stream timeout")
+    server_name = cloak.get("ServerName")
+    if (not isinstance(server_name, str) or len(server_name) > 253 or
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", server_name) or
+            server_name.endswith((".", "-")) or ".." in server_name):
+        raise SystemExit("invalid Cloak server name")
+    import base64
+    import binascii
+    for key, decoded_size in (("UID", 16), ("PublicKey", 32)):
+        value = cloak.get(key)
+        if not isinstance(value, str):
+            raise SystemExit(f"invalid Cloak {key}")
+        try:
+            decoded = base64.b64decode(value, validate=True)
+        except (ValueError, binascii.Error):
+            raise SystemExit(f"invalid Cloak {key}")
+        if len(decoded) != decoded_size:
+            raise SystemExit(f"invalid Cloak {key} length")
+for key in ("gateway", "client", "backend", "transport", "public_host", "public_port", "local_port", "generation"):
+    print(f"{key.upper()}={json.dumps(manifest[key], separators=(',', ':'))}")
+PY_NNSLINK_READ
+}
+
+nnslink_import() {
+    require_root
+    local app=$1 bundle=$2 expected_gateway=${3:-} expected_client=${4:-}
+    local temp manifest_values
+    local GATEWAY CLIENT BACKEND TRANSPORT PUBLIC_HOST PUBLIC_PORT LOCAL_PORT GENERATION
+    validate_app_name "$app"
+    [[ -f "$(cfg_file "$app")" ]] ||
+        die "NNS app '$app' is not installed. Run: sudo nns-app install $app"
+    bundle=$(readlink -f "$bundle")
+    [[ "$bundle" == *.nnslink ]] || warn "Importing a bundle without the .nnslink suffix."
+
+    temp=$(mktemp -d)
+    manifest_values=$(nnslink_manifest_read "$bundle" "$temp/extracted") ||
+        die "Cannot validate .nnslink bundle '$bundle'."
+    while IFS='=' read -r key value; do
+        case "$key" in
+            GATEWAY|CLIENT|BACKEND|TRANSPORT|PUBLIC_HOST|PUBLIC_PORT|LOCAL_PORT|GENERATION)
+                printf -v "$key" '%s' "$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()))' <<<"$value")"
+                ;;
+        esac
+    done <<<"$manifest_values"
+
+    [[ -z "$expected_gateway" || "$GATEWAY" == "$expected_gateway" ]] ||
+        die ".nnslink gateway '$GATEWAY' does not match expected '$expected_gateway'."
+    [[ -z "$expected_client" || "$CLIENT" == "$expected_client" ]] ||
+        die ".nnslink client '$CLIENT' does not match expected '$expected_client'."
+    [[ "$BACKEND" == openvpn ]] || die "Only OpenVPN .nnslink bundles are supported."
+
+    # Validate optional runtime dependencies and pinned material before
+    # replacing the app's currently working profile.
+    local tdir config binary
+    case "$TRANSPORT" in
+        direct) ;;
+        stunnel)
+            binary=$(transport_binary_for_type stunnel || true)
+            [[ -n "$binary" ]] || die "Install stunnel before importing this bundle."
+            openssl x509 -in "$temp/extracted/stunnel-ca.pem" -noout >/dev/null 2>&1 ||
+                die "The .nnslink stunnel CA is not a valid X.509 certificate."
+            ;;
+        cloak)
+            binary=$(transport_binary_for_type cloak || true)
+            [[ -n "$binary" ]] || die "Install ck-client before importing this bundle."
+            ;;
+    esac
+
+    add_profile "$app" "$temp/extracted/client.ovpn"
+    tdir=$(app_transport_dir "$app")
+    install -d -o root -g root -m 0700 "$tdir"
+    case "$TRANSPORT" in
+        direct)
+            config=""
+            ;;
+        stunnel)
+            install -o root -g root -m 0644 \
+                "$temp/extracted/stunnel-ca.pem" "$tdir/server-ca.pem"
+            config="$tdir/client.conf"
+            cat >"$config" <<STUNNEL_CLIENT_EOF
+foreground = yes
+client = yes
+verifyChain = yes
+CAfile = $tdir/server-ca.pem
+sslVersionMin = TLSv1.2
+
+[nnslink]
+accept = 127.0.0.1:$LOCAL_PORT
+connect = $PUBLIC_HOST:$PUBLIC_PORT
+checkHost = $PUBLIC_HOST
+sni = $PUBLIC_HOST
+STUNNEL_CLIENT_EOF
+            if [[ "$PUBLIC_HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                sed -i "s/^checkHost = /checkIP = /; /^sni = /d" "$config"
+            fi
+            chmod 0600 "$config"
+            ;;
+        cloak)
+            config="$tdir/client.json"
+            install -o root -g root -m 0600 \
+                "$temp/extracted/cloak-client.json" "$config"
+            ;;
+    esac
+
+    cfg_set "$app" TRANSPORT_TYPE "$TRANSPORT"
+    if [[ "$TRANSPORT" == direct ]]; then
+        cfg_set "$app" TRANSPORT_REMOTE_HOST ""
+        cfg_set "$app" TRANSPORT_REMOTE_PORT ""
+        cfg_set "$app" TRANSPORT_LOCAL_PORT ""
+        cfg_set "$app" TRANSPORT_CONFIG ""
+    else
+        cfg_set "$app" TRANSPORT_REMOTE_HOST "$PUBLIC_HOST"
+        cfg_set "$app" TRANSPORT_REMOTE_PORT "$PUBLIC_PORT"
+        cfg_set "$app" TRANSPORT_LOCAL_PORT "$LOCAL_PORT"
+        cfg_set "$app" TRANSPORT_CONFIG "$config"
+    fi
+
+    NNSLINK_GATEWAY=$GATEWAY
+    NNSLINK_CLIENT=$CLIENT
+    NNSLINK_GENERATION=$GENERATION
+    NNSLINK_TRANSPORT=$TRANSPORT
+    rm -rf "$temp"
+    log "Imported $TRANSPORT .nnslink profile for '$app' ($GATEWAY/$CLIENT generation $GENERATION)."
+}
+
+load_remote_cfg() {
+    local alias=$1 file owner mode mode_octal
+    validate_remote_alias "$alias"
+    file=$(remote_cfg_file "$alias")
+    [[ -f "$file" ]] || die "Remote '$alias' is not registered."
+    owner=$(stat -c '%u' "$file")
+    mode=$(stat -c '%a' "$file")
+    mode_octal=$((8#$mode))
+    [[ "$owner" == 0 && $((mode_octal & 0077)) == 0 ]] ||
+        die "Unsafe remote config permissions on $file."
+    SSH_TARGET="" SSH_PORT="" SSH_IDENTITY="" SSH_HOST_FINGERPRINT=""
+    # shellcheck disable=SC1090
+    source "$file"
+    [[ -n "$SSH_TARGET" && "$SSH_PORT" =~ ^[1-9][0-9]{0,4}$ ]] ||
+        die "Remote config '$file' is incomplete."
+}
+
+remote_ssh_args() {
+    local alias=$1
+    load_remote_cfg "$alias"
+    REMOTE_SSH_ARGS=(
+        ssh -o BatchMode=yes -o ConnectTimeout=10
+        -o StrictHostKeyChecking=yes
+        -o "UserKnownHostsFile=$(remote_known_hosts "$alias")"
+        -p "$SSH_PORT"
+    )
+    [[ -z "$SSH_IDENTITY" ]] || REMOTE_SSH_ARGS+=( -i "$SSH_IDENTITY" -o IdentitiesOnly=yes )
+    REMOTE_SSH_ARGS+=( "$SSH_TARGET" )
+}
+
+remote_command() {
+    local alias=$1; shift
+    remote_ssh_args "$alias"
+    local quoted=() arg
+    for arg in "$@"; do
+        printf -v arg '%q' "$arg"
+        quoted+=("$arg")
+    done
+    local payload
+    printf -v payload 'if [ "$(id -u)" -eq 0 ]; then exec nns-app %s; else exec sudo -n nns-app %s; fi' \
+        "${quoted[*]}" "${quoted[*]}"
+    "${REMOTE_SSH_ARGS[@]}" "$payload"
+}
+
+remote_add() {
+    require_root
+    local alias=$1 target=$2 port=${3:-22} identity=${4:-}
+    validate_remote_alias "$alias"
+    validate_ssh_target "$target"
+    [[ "$port" =~ ^[1-9][0-9]{0,4}$ && "$port" -le 65535 ]] || die "Invalid SSH port '$port'."
+    if [[ -n "$identity" ]]; then
+        identity=$(readlink -f "$identity")
+        [[ -f "$identity" ]] || die "SSH identity file not found: $identity"
+    fi
+    [[ ! -e "$(remote_cfg_file "$alias")" ]] || die "Remote '$alias' already exists."
+
+    local dir known cfg tmp fingerprint version_output
+    dir=$(remote_dir "$alias")
+    known=$(remote_known_hosts "$alias")
+    cfg=$(remote_cfg_file "$alias")
+    install -d -o root -g root -m 0700 "$dir"
+    touch "$known"; chown root:root "$known"; chmod 0600 "$known"
+
+    local -a args=(ssh -o BatchMode=yes -o ConnectTimeout=10
+        -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$known" -p "$port")
+    [[ -z "$identity" ]] || args+=( -i "$identity" -o IdentitiesOnly=yes )
+    args+=( "$target" 'if [ "$(id -u)" -eq 0 ]; then exec nns-app --version; else exec sudo -n nns-app --version; fi' )
+    version_output=$("${args[@]}") || {
+        rm -rf "$dir"
+        die "Cannot verify nns-app on remote '$target' using non-interactive SSH/sudo."
+    }
+    python3 - "$version_output" <<'PY_REMOTE_VERSION' || {
+import re
+import sys
+
+match = re.search(r"(?m)^nns-app[ \t]+([0-9]+)\.([0-9]+)\.([0-9]+)[ \t]*$", sys.argv[1])
+if match is None or tuple(map(int, match.groups())) < (1, 2, 0):
+    raise SystemExit(1)
+PY_REMOTE_VERSION
+        rm -rf "$dir"
+        die "Remote '$target' must run nns-app 1.2.0 or newer."
+    }
+    fingerprint=$(ssh-keygen -lf "$known" -E sha256 2>/dev/null | awk 'NR==1 {print $2}')
+    [[ -n "$fingerprint" ]] || { rm -rf "$dir"; die "Could not record the SSH host-key fingerprint."; }
+
+    tmp=$(mktemp)
+    {
+        printf 'SSH_TARGET=%q\n' "$target"
+        printf 'SSH_PORT=%q\n' "$port"
+        printf 'SSH_IDENTITY=%q\n' "$identity"
+        printf 'SSH_HOST_FINGERPRINT=%q\n' "$fingerprint"
+    } >"$tmp"
+    install -o root -g root -m 0600 "$tmp" "$cfg"
+    rm -f "$tmp"
+    log "Registered remote '$alias' ($target, host key $fingerprint)."
+}
+
+parse_remote_ref() {
+    local ref=$1
+    [[ "$ref" == *:* ]] || die "Remote gateway must be written as <remote>:<gateway>."
+    REMOTE_REF_ALIAS=${ref%%:*}
+    REMOTE_REF_GATEWAY=${ref#*:}
+    validate_remote_alias "$REMOTE_REF_ALIAS"
+    validate_gateway_name "$REMOTE_REF_GATEWAY"
+}
+
+remote_import_bundle() {
+    local alias=$1 gateway=$2 client=$3 app=$4 bundle=$5
+    local was_started=no restart_via=__default__
+    if app_is_started "$app" || systemctl is-active --quiet "nns-netns@${app}.service"; then
+        was_started=yes
+        restart_via=$(runtime_via_for_app "$app" 2>/dev/null || printf '__default__')
+    fi
+
+    nnslink_import "$app" "$bundle" "$gateway" "$client"
+    cfg_set "$app" REMOTE_ALIAS "$alias"
+    cfg_set "$app" REMOTE_GATEWAY "$gateway"
+    cfg_set "$app" REMOTE_CLIENT "$client"
+    cfg_set "$app" REMOTE_PROFILE_GENERATION "$NNSLINK_GENERATION"
+    load_remote_cfg "$alias"
+    cfg_set "$app" REMOTE_SERVER_FINGERPRINT "$SSH_HOST_FINGERPRINT"
+
+    # Endpoint routes and kill-switch rules are created with the namespace, so
+    # replacing a live bundle requires a full namespace restart rather than
+    # only restarting OpenVPN.
+    if [[ "$was_started" == yes ]]; then
+        stop_app "$app"
+        start_app "$app" off "$restart_via"
+        log "Restarted '$app' to apply synchronized endpoint and transport state."
+    fi
+}
+
+remote_connect() {
+    require_root
+    local ref=$1 client=$2 app=$3 backend=${4:-openvpn} temp
+    parse_remote_ref "$ref"
+    [[ "$backend" == openvpn ]] || die "Only the OpenVPN gateway backend is currently supported."
+    validate_gateway_client_name "$client"
+    validate_app_name "$app"
+    load_remote_cfg "$REMOTE_REF_ALIAS"
+
+    remote_command "$REMOTE_REF_ALIAS" gateway client add "$REMOTE_REF_GATEWAY" "$client"
+    temp=$(mktemp --suffix=.nnslink)
+    remote_command "$REMOTE_REF_ALIAS" gateway client export \
+        "$REMOTE_REF_GATEWAY" "$client" --format nnslink --output - >"$temp"
+    [[ -s "$temp" ]] || die "Remote gateway returned an empty .nnslink bundle."
+    if [[ ! -f "$(cfg_file "$app")" ]]; then
+        install_app "$app" __default__
+    fi
+    remote_import_bundle "$REMOTE_REF_ALIAS" "$REMOTE_REF_GATEWAY" "$client" "$app" "$temp"
+    rm -f "$temp"
+    log "Connected local app '$app' to $REMOTE_REF_ALIAS:$REMOTE_REF_GATEWAY as '$client'."
+}
+
+load_app_remote_metadata() {
+    local app=$1
+    load_cfg "$app"
+    [[ -n "${REMOTE_ALIAS:-}" && -n "${REMOTE_GATEWAY:-}" && -n "${REMOTE_CLIENT:-}" ]] ||
+        die "App '$app' is not managed by an nns-app remote."
+}
+
+remote_sync() {
+    require_root
+    local app=$1 temp alias gateway client
+    load_app_remote_metadata "$app"
+    alias=$REMOTE_ALIAS gateway=$REMOTE_GATEWAY client=$REMOTE_CLIENT
+    temp=$(mktemp --suffix=.nnslink)
+    remote_command "$alias" gateway client export "$gateway" "$client" \
+        --format nnslink --output - >"$temp"
+    remote_import_bundle "$alias" "$gateway" "$client" "$app" "$temp"
+    rm -f "$temp"
+    log "Synchronized '$app' from '$alias:$gateway'."
+}
+
+remote_rotate() {
+    require_root
+    local app=$1 alias gateway client
+    load_app_remote_metadata "$app"
+    alias=$REMOTE_ALIAS gateway=$REMOTE_GATEWAY client=$REMOTE_CLIENT
+    remote_command "$alias" gateway client rotate "$gateway" "$client"
+    remote_sync "$app"
+    log "Rotated and synchronized credentials for '$app'."
+}
+
+remote_status() {
+    require_root
+    local target=$1 alias gateway client generation fingerprint
+    if [[ -f "$(cfg_file "$target")" ]]; then
+        load_app_remote_metadata "$target"
+        alias=$REMOTE_ALIAS gateway=$REMOTE_GATEWAY client=$REMOTE_CLIENT
+        generation=${REMOTE_PROFILE_GENERATION:-unknown}
+        fingerprint=${REMOTE_SERVER_FINGERPRINT:-unknown}
+        printf 'Local app:          %s\n' "$target"
+        printf 'Remote:             %s\n' "$alias"
+        printf 'Gateway/client:     %s/%s\n' "$gateway" "$client"
+        printf 'Profile generation: %s\n' "$generation"
+        printf 'Pinned SSH key:     %s\n' "$fingerprint"
+        printf '\nRemote gateway status:\n'
+        remote_command "$alias" gateway status "$gateway"
+    else
+        alias=$target
+        load_remote_cfg "$alias"
+        printf 'Remote:         %s\n' "$alias"
+        printf 'SSH target:     %s:%s\n' "$SSH_TARGET" "$SSH_PORT"
+        printf 'Pinned host key:%s\n' " $SSH_HOST_FINGERPRINT"
+        printf 'Connectivity:   '
+        if remote_command "$alias" --version >/dev/null 2>&1; then
+            printf 'online\n'
+        else
+            printf 'offline\n'
+            return 1
+        fi
+    fi
+}
+
+gateway_transport_dir() {
+    local gateway=$1 root=${2:-$(gateway_dir "$gateway")}
+    printf '%s/transport\n' "$root"
+}
+
+gateway_allocate_backend_port() {
+    local gateway=$1 crc start port dir used
+    crc=$(printf 'transport:%s' "$gateway" | cksum | awk '{print $1}')
+    start=$((20000 + crc % 8000))
+    for ((used=0; used<8000; used++)); do
+        port=$((20000 + (start - 20000 + used) % 8000))
+        if ! grep -RhsE '^OPENVPN_LISTEN_PORT=' "$GATEWAY_BASE_DIR"/*/gateway.cfg 2>/dev/null |
+             grep -Eq "=\"?${port}\"?$" &&
+           ! ss -H -lntun 2>/dev/null | grep -Eq "[:.]${port}[[:space:]]"; then
+            printf '%s\n' "$port"
+            return 0
+        fi
+    done
+    die "No free private OpenVPN transport port remains."
+}
+
+gateway_transport_binary() {
+    case "$1" in
+        stunnel) command -v stunnel4 2>/dev/null || command -v stunnel 2>/dev/null ;;
+        cloak) command -v ck-server 2>/dev/null ;;
+        direct) return 1 ;;
+        *) return 1 ;;
+    esac
+}
+
+gateway_prepare_transport() {
+    local gateway=$1 root=$2 transport=$3 tdir binary keys public_key private_key san
+    reset_gateway_cfg_vars
+    # shellcheck disable=SC1090
+    source "$root/gateway.cfg"
+    tdir=$(gateway_transport_dir "$gateway" "$root")
+    install -d -o root -g root -m 0700 "$tdir"
+    case "$transport" in
+        direct) ;;
+        stunnel)
+            binary=$(gateway_transport_binary stunnel || true)
+            [[ -n "$binary" ]] || die "stunnel transport requires stunnel4 (or stunnel) to be installed."
+            openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 \
+                -out "$tdir/ca.key" >/dev/null 2>&1
+            openssl req -x509 -new -sha256 -days 3650 \
+                -key "$tdir/ca.key" -subj "/CN=nns-app $gateway transport CA" \
+                -out "$tdir/ca.crt" >/dev/null 2>&1
+            openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 \
+                -out "$tdir/server.key" >/dev/null 2>&1
+            if [[ "$PUBLIC_HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                san="IP:$PUBLIC_HOST"
+            else
+                san="DNS:$PUBLIC_HOST"
+            fi
+            cat >"$tdir/server-ext.cnf" <<STUNNEL_EXT_EOF
+basicConstraints=CA:FALSE
+keyUsage=digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=$san
+STUNNEL_EXT_EOF
+            openssl req -new -sha256 -key "$tdir/server.key" \
+                -subj "/CN=$PUBLIC_HOST" -out "$tdir/server.csr" >/dev/null 2>&1
+            openssl x509 -req -sha256 -days 825 \
+                -in "$tdir/server.csr" -CA "$tdir/ca.crt" -CAkey "$tdir/ca.key" \
+                -CAcreateserial -extfile "$tdir/server-ext.cnf" \
+                -out "$tdir/server.crt" >/dev/null 2>&1
+            cat "$tdir/server.crt" "$tdir/ca.crt" >"$tdir/server-chain.crt"
+            rm -f "$tdir/server.csr" "$tdir/server-ext.cnf" "$tdir/ca.srl"
+            chown -R root:root "$tdir"
+            chmod 0600 "$tdir/ca.key" "$tdir/server.key"
+            chmod 0644 "$tdir/ca.crt" "$tdir/server.crt" "$tdir/server-chain.crt"
+            ;;
+        cloak)
+            binary=$(gateway_transport_binary cloak || true)
+            [[ -n "$binary" ]] || die "cloak transport requires ck-server to be installed."
+            keys=$("$binary" -key 2>/dev/null || "$binary" -k 2>/dev/null || true)
+            local -a cloak_keys=()
+            mapfile -t cloak_keys < <(python3 - "$keys" <<'PY_CLOAK_KEYS'
+import base64
+import binascii
+import sys
+
+parts = [part.strip() for part in sys.argv[1].strip().split(",")]
+if len(parts) != 2:
+    raise SystemExit(1)
+for value in parts:
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error):
+        raise SystemExit(1)
+    if len(raw) != 32:
+        raise SystemExit(1)
+    print(value)
+PY_CLOAK_KEYS
+            )
+            (( ${#cloak_keys[@]} == 2 )) ||
+                die "ck-server did not return a valid public/private key pair."
+            public_key=${cloak_keys[0]}
+            private_key=${cloak_keys[1]}
+            printf '%s\n' "$public_key" >"$tdir/public.key"
+            printf '%s\n' "$private_key" >"$tdir/private.key"
+            chown -R root:root "$tdir"
+            chmod 0600 "$tdir/private.key"
+            chmod 0644 "$tdir/public.key"
+            ;;
+        *) die "Unsupported gateway transport '$transport'." ;;
+    esac
+}
+
+gateway_cloak_active_uids_json() {
+    local gateway=$1 root=${2:-$(gateway_dir "$gateway")} dir cfg uid status first=1
+    printf '['
+    shopt -s nullglob
+    for dir in "$root/clients"/*; do
+        cfg="$dir/client.cfg"
+        [[ -f "$cfg" ]] || continue
+        status=$(awk -F= '/^STATUS=/{gsub(/^"|"$/, "", $2); print $2; exit}' "$cfg")
+        uid=$(awk -F= '/^CLOAK_UID=/{sub(/^[^=]*=/, ""); gsub(/^"|"$/, ""); print; exit}' "$cfg")
+        [[ "$status" == active && -n "$uid" ]] || continue
+        (( first )) || printf ','
+        python3 -c 'import json,sys; print(json.dumps(sys.argv[1]), end="")' "$uid"
+        first=0
+    done
+    printf ']'
+}
+
+gateway_write_transport_config() {
+    local gateway=$1 root=${2:-$(gateway_dir "$gateway")} tdir output private_key public_key uids
+    if [[ "$root" == "$(gateway_dir "$gateway")" ]]; then
+        load_gateway_cfg "$gateway"
+    else
+        reset_gateway_cfg_vars
+        # shellcheck disable=SC1090
+        source "$root/gateway.cfg"
+        TRANSPORT=${TRANSPORT:-direct}
+        OPENVPN_LISTEN_PROTO=${OPENVPN_LISTEN_PROTO:-$LISTEN_PROTO}
+        OPENVPN_LISTEN_PORT=${OPENVPN_LISTEN_PORT:-$LISTEN_PORT}
+    fi
+    tdir=$(gateway_transport_dir "$gateway" "$root")
+    case "${TRANSPORT:-direct}" in
+        direct) return 0 ;;
+        stunnel)
+            output="$tdir/server.conf"
+            cat >"$output" <<STUNNEL_SERVER_EOF
+foreground = yes
+client = no
+cert = $tdir/server-chain.crt
+key = $tdir/server.key
+sslVersionMin = TLSv1.2
+
+[nnslink]
+accept = 0.0.0.0:$LISTEN_PORT
+connect = 127.0.0.1:$OPENVPN_LISTEN_PORT
+STUNNEL_SERVER_EOF
+            chmod 0600 "$output"
+            ;;
+        cloak)
+            private_key=$(<"$tdir/private.key")
+            public_key=$(<"$tdir/public.key")
+            uids=$(gateway_cloak_active_uids_json "$gateway" "$root")
+            python3 - "$tdir/server.json" "$LISTEN_PORT" "$OPENVPN_LISTEN_PORT" \
+                "$PUBLIC_HOST" "$private_key" "$uids" <<'PY_CLOAK_SERVER'
+import json,sys
+path, public_port, backend_port, server_name, private_key, uids = sys.argv[1:]
+config = {
+    "ProxyBook": {"openvpn": ["tcp", f"127.0.0.1:{backend_port}"]},
+    "BindAddr": [f":{public_port}"],
+    "BypassUID": json.loads(uids),
+    "RedirAddr": f"{server_name}:443",
+    "PrivateKey": private_key,
+    "AdminUID": "",
+}
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(config, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+PY_CLOAK_SERVER
+            chmod 0600 "$tdir/server.json"
+            ;;
+    esac
+}
+
+gateway_transport_server_exec() {
+    local gateway=$1 type binary config openvpn_pid wrapper_pid rc=0
+    load_gateway_cfg "$gateway"
+    type=${TRANSPORT:-direct}
+    [[ "$type" == stunnel || "$type" == cloak ]] || die "No wrapper transport configured."
+    binary=$(gateway_transport_binary "$type" || true)
+    [[ -n "$binary" ]] || die "Gateway transport binary for '$type' is missing."
+    gateway_write_transport_config "$gateway"
+    config=$(gateway_server_config "$gateway")
+
+    gateway_transport_cleanup() {
+        [[ -z "${openvpn_pid:-}" ]] || kill "$openvpn_pid" 2>/dev/null || true
+        [[ -z "${wrapper_pid:-}" ]] || kill "$wrapper_pid" 2>/dev/null || true
+        wait "${openvpn_pid:-0}" "${wrapper_pid:-0}" 2>/dev/null || true
+    }
+    trap 'exit 0' TERM INT HUP
+    trap gateway_transport_cleanup EXIT
+
+    /usr/sbin/openvpn --config "$config" &
+    openvpn_pid=$!
+    case "$type" in
+        stunnel) "$binary" "$(gateway_transport_dir "$gateway")/server.conf" & ;;
+        cloak) "$binary" -c "$(gateway_transport_dir "$gateway")/server.json" & ;;
+    esac
+    wrapper_pid=$!
+    wait -n "$openvpn_pid" "$wrapper_pid" || rc=$?
+    kill "$openvpn_pid" "$wrapper_pid" 2>/dev/null || true
+    wait "$openvpn_pid" "$wrapper_pid" 2>/dev/null || true
+    (( rc == 0 )) || return "$rc"
+    die "A gateway transport process exited unexpectedly."
+}
+
+gateway_cloak_new_uid() {
+    local binary uid
+    binary=$(gateway_transport_binary cloak || true)
+    [[ -n "$binary" ]] || return 1
+    uid=$("$binary" -uid 2>/dev/null || "$binary" -u 2>/dev/null || true)
+    uid=${uid##*$'\n'}
+    python3 - "$uid" <<'PY_CLOAK_UID'
+import base64
+import binascii
+import sys
+
+value = sys.argv[1].strip()
+try:
+    raw = base64.b64decode(value, validate=True)
+except (ValueError, binascii.Error):
+    raise SystemExit(1)
+if len(raw) != 16:
+    raise SystemExit(1)
+print(value)
+PY_CLOAK_UID
+}
+
+gateway_write_client_profile_file() {
+    local gateway=$1 client=$2 output=$3 target_mode=${4:-public}
+    local cdir pki proto remote_host remote_port
+    load_gateway_cfg "$gateway"
+    gateway_client_load "$gateway" "$client"
+    cdir=$(gateway_client_dir "$gateway" "$client")
+    pki=$(gateway_pki_dir "$gateway")
+
+    if [[ "$target_mode" == local ]]; then
+        proto=tcp-client
+        remote_host=127.0.0.1
+        remote_port=11940
+    else
+        [[ "$LISTEN_PROTO" == tcp ]] && proto=tcp-client || proto=udp
+        remote_host=$PUBLIC_HOST
+        remote_port=$PUBLIC_PORT
+    fi
+
+    {
+        printf '# nns-app managed gateway profile: %s / %s\n' "$gateway" "$client"
+        printf 'client\n'
+        printf 'dev tun\n'
+        printf 'proto %s\n' "$proto"
+        printf 'remote %s %s\n' "$remote_host" "$remote_port"
+        printf 'nobind\n'
+        printf 'persist-key\n'
+        printf 'persist-tun\n'
+        printf 'auth-nocache\n'
+        printf 'remote-cert-tls server\n'
+        printf 'verify-x509-name %s name\n' "$SERVER_CN"
+        printf 'tls-version-min 1.2\n'
+        printf 'data-ciphers AES-256-GCM:CHACHA20-POLY1305:AES-128-GCM\n'
+        printf 'auth SHA256\n'
+        printf 'allow-compression no\n'
+        printf 'disable-dco\n'
+        if [[ "$target_mode" == public && "$LISTEN_PROTO" == udp ]]; then
+            printf 'explicit-exit-notify 2\n'
+        fi
+        printf 'verb 3\n'
+        printf '\n<ca>\n'; cat "$pki/ca.crt"; printf '</ca>\n'
+        printf '\n<cert>\n'; cat "$cdir/client.crt"; printf '</cert>\n'
+        printf '\n<key>\n'; cat "$cdir/client.key"; printf '</key>\n'
+        printf '\n<tls-crypt-v2>\n'; cat "$cdir/tls-crypt-v2-client.key"; printf '</tls-crypt-v2>\n'
+    } >"$output"
+    chmod 0600 "$output"
+}
+
+gateway_write_nnslink_bundle() {
+    local gateway=$1 client=$2 output=$3 temp transport local_port=11940 tdir public_key
+    load_gateway_cfg "$gateway"
+    gateway_client_load "$gateway" "$client"
+    transport=${TRANSPORT:-direct}
+    temp=$(mktemp -d)
+
+    if [[ "$transport" == direct ]]; then
+        gateway_write_client_profile_file "$gateway" "$client" "$temp/client.ovpn" public
+    else
+        gateway_write_client_profile_file "$gateway" "$client" "$temp/client.ovpn" local
+    fi
+    tdir=$(gateway_transport_dir "$gateway")
+    case "$transport" in
+        direct) ;;
+        stunnel)
+            install -m 0644 "$tdir/ca.crt" "$temp/stunnel-ca.pem"
+            ;;
+        cloak)
+            [[ -n "$CLOAK_UID" ]] || die "Cloak client '$client' has no UID; rotate it before export."
+            public_key=$(<"$tdir/public.key")
+            python3 - "$temp/cloak-client.json" "$CLOAK_UID" "$public_key" \
+                "$TRANSPORT_SERVER_NAME" <<'PY_CLOAK_CLIENT'
+import json,sys
+path, uid, public_key, server_name = sys.argv[1:]
+config = {
+    "Transport": "direct",
+    "ProxyMethod": "openvpn",
+    "EncryptionMethod": "chacha20-poly1305",
+    "UID": uid,
+    "PublicKey": public_key,
+    "ServerName": server_name,
+    "NumConn": 4,
+    "BrowserSig": "chrome",
+    "StreamTimeout": 300,
+}
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(config, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+PY_CLOAK_CLIENT
+            chmod 0600 "$temp/cloak-client.json"
+            ;;
+    esac
+
+    python3 - "$temp/manifest.json" "$gateway" "$client" "$transport" \
+        "$PUBLIC_HOST" "$PUBLIC_PORT" "$local_port" "${GENERATION:-1}" <<'PY_NNSLINK_MANIFEST'
+import json,sys
+path, gateway, client, transport, host, port, local_port, generation = sys.argv[1:]
+data = {
+    "format": "nnslink",
+    "version": 1,
+    "gateway": gateway,
+    "client": client,
+    "generation": int(generation),
+    "backend": "openvpn",
+    "transport": transport,
+    "public_host": host,
+    "public_port": int(port),
+    "local_port": int(local_port),
+}
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+PY_NNSLINK_MANIFEST
+    chmod 0600 "$temp/manifest.json"
+
+    python3 - "$temp" "$output" <<'PY_NNSLINK_WRITE'
+import gzip
+import io
+import os
+import pathlib
+import sys
+import tarfile
+
+root = pathlib.Path(sys.argv[1])
+target = sys.argv[2]
+names = ["manifest.json", "client.ovpn", "stunnel-ca.pem", "cloak-client.json"]
+buffer = io.BytesIO()
+with tarfile.open(fileobj=buffer, mode="w") as tf:
+    for name in names:
+        path = root / name
+        if not path.exists():
+            continue
+        data = path.read_bytes()
+        info = tarfile.TarInfo(name)
+        info.size = len(data)
+        info.mode = 0o600
+        info.uid = info.gid = 0
+        info.uname = info.gname = "root"
+        info.mtime = 0
+        tf.addfile(info, io.BytesIO(data))
+payload = gzip.compress(buffer.getvalue(), compresslevel=9, mtime=0)
+if target == "-":
+    sys.stdout.buffer.write(payload)
+else:
+    pathlib.Path(target).write_bytes(payload)
+    os.chmod(target, 0o600)
+PY_NNSLINK_WRITE
+    rm -rf "$temp"
+}
+
+gateway_client_rotate() {
+    require_root
+    local gateway=$1 client=$2 pki final old backup generation rc=0 tmp
+    validate_gateway_name "$gateway"
+    validate_gateway_client_name "$client"
+    acquire_lock "gateway-$gateway"
+    load_gateway_cfg "$gateway"
+    gateway_client_load "$gateway" "$client"
+    [[ "${STATUS:-}" == active ]] || die "Client '$client' is revoked and cannot be rotated."
+    generation=$(( ${GENERATION:-1} + 1 ))
+    pki=$(gateway_pki_dir "$gateway")
+    final=$(gateway_client_dir "$gateway" "$client")
+    old=$(mktemp -d "$(gateway_clients_dir "$gateway")/.${client}.old.XXXXXX")
+    rmdir "$old"
+    backup=$(mktemp -d "$(gateway_dir "$gateway")/.ca-db.XXXXXX")
+    gateway_ca_snapshot "$pki" "$backup" || {
+        rm -rf "$backup"
+        release_lock "gateway-$gateway"
+        die "Failed to snapshot the gateway CA database."
+    }
+    mv "$final" "$old"
+
+    if ! ( NNS_SUPPRESS_GATEWAY_RESTART=1 gateway_client_add "$gateway" "$client" ) >/dev/null 2>&1; then
+        gateway_ca_restore "$pki" "$backup" || true
+        rm -rf "$final"
+        mv "$old" "$final"
+        rm -rf "$backup"
+        release_lock "gateway-$gateway"
+        die "Failed to issue replacement credentials for '$client'."
+    fi
+
+    openssl ca -batch -config "$pki/openssl.cnf" \
+        -revoke "$old/client.crt" >/dev/null 2>&1 || rc=1
+    (( rc != 0 )) || gateway_generate_crl_at "$pki" || rc=1
+    if (( rc != 0 )); then
+        rm -rf "$final"
+        gateway_ca_restore "$pki" "$backup" || true
+        mv "$old" "$final"
+        rm -rf "$backup"
+        release_lock "gateway-$gateway"
+        die "Failed to revoke the previous certificate; rotation was rolled back."
+    fi
+
+    tmp=$(mktemp)
+    awk -v generation="$generation" '
+        /^GENERATION=/ { print "GENERATION=\"" generation "\""; done=1; next }
+        { print }
+        END { if (!done) print "GENERATION=\"" generation "\""" }
+    ' "$final/client.cfg" >"$tmp"
+    install -o root -g root -m 0600 "$tmp" "$final/client.cfg"
+    rm -f "$tmp"
+    rm -rf "$old" "$backup"
+
+    gateway_write_transport_config "$gateway"
+    local restart=no
+    systemctl is-active --quiet "nns-gateway@${gateway}.service" && restart=yes
+    release_lock "gateway-$gateway"
+    if [[ "$restart" == yes ]]; then
+        systemctl restart "nns-gateway@${gateway}.service" ||
+            warn "Client '$client' was rotated, but gateway '$gateway' failed to restart."
+    fi
+    log "Rotated client '$client' on gateway '$gateway' to generation $generation."
+}
+
 # nns-app source module: command execution and detailed status reporting.
 mount_type_at() {
     local path=$1
@@ -4861,6 +6089,11 @@ prepare_namespaced_desktop_mounts() {
     fi
 }
 
+namespace_ref_id() {
+    local path=$1
+    stat -Lc '%d:%i' -- "$path" 2>/dev/null
+}
+
 run_user_exec() {
     require_root
     local app=$1
@@ -4872,9 +6105,13 @@ run_user_exec() {
     # Refuse direct invocation: this helper is valid only after `ip netns exec`
     # has entered the application environment's network namespace.
     local current_netns expected_netns
-    current_netns=$(readlink /proc/self/ns/net)
-    expected_netns=$(readlink "/run/netns/$NS_NAME")
-    [[ -n "$current_netns" && "$current_netns" == "$expected_netns" ]] ||
+    if ! current_netns=$(namespace_ref_id /proc/self/ns/net); then
+        die "Cannot identify the current network namespace."
+    fi
+    if ! expected_netns=$(namespace_ref_id "/run/netns/$NS_NAME"); then
+        die "Cannot identify the configured namespace '$NS_NAME'."
+    fi
+    [[ "$current_netns" == "$expected_netns" ]] ||
         die "_run-user is not inside the expected namespace '$NS_NAME'."
 
     prepare_namespaced_desktop_mounts
@@ -5025,12 +6262,12 @@ status_app() {
     configured_via=$(effective_via_for_app "$app" __default__)
     runtime_via=$(runtime_via_for_app "$app" 2>/dev/null || printf '%s' "$configured_via")
 
-    if [[ -n "$profile_name" ]]; then
+    type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    type_label=$(vpn_type_label "${type:-unknown}")
+    if [[ "$type" == inherit ]]; then
+        profile_name="inherited:${configured_via}"
+    elif [[ -n "$profile_name" ]]; then
         profile_file="$(profiles_dir "$app")/$profile_name"
-        if [[ -f "$profile_file" ]]; then
-            type=$(vpn_type_for_app "$app" 2>/dev/null || true)
-            type_label=$(vpn_type_label "${type:-unknown}")
-        fi
     fi
 
     ns_state=$(systemctl is-active "$ns_unit" 2>/dev/null || true)
@@ -5094,7 +6331,8 @@ status_app() {
         case "$type" in
             openvpn) diagnosis=$(openvpn_status_diagnosis "$vpn_log") ;;
             wireguard) diagnosis="WireGuard is running, but its interface or full-tunnel route is not ready." ;;
-            *) diagnosis="The VPN service is active, but no usable tunnel route exists." ;;
+            inherit) diagnosis="The inherited upstream data path is not ready." ;;
+            *) diagnosis="The network backend is active, but no usable route exists." ;;
         esac
     elif [[ -n "$external_ip" || "$ping_ok" == yes ]]; then
         health="ONLINE"
@@ -5108,6 +6346,7 @@ status_app() {
         case "$type" in
             openvpn) diagnosis=$(openvpn_status_diagnosis "$vpn_log") ;;
             wireguard) diagnosis="The WireGuard interface exists, but the Internet data-path probe failed." ;;
+            inherit) diagnosis="The upstream route exists, but the inherited Internet data-path probe failed." ;;
             *) diagnosis="The tunnel exists, but the Internet data-path probe failed." ;;
         esac
     fi
@@ -5127,6 +6366,9 @@ status_app() {
     printf 'Diagnosis:         %s\n' "$diagnosis"
     printf 'Profile:           %s\n' "${profile_name:-not configured}"
     printf 'Backend:           %s\n' "$type_label"
+    if [[ "$type" == openvpn ]]; then
+        printf 'Transport:         %s\n' "${TRANSPORT_TYPE:-direct}"
+    fi
     printf 'Configured via:    %s\n' "$configured_via"
     printf 'Runtime via:       %s\n' "$runtime_via"
     if [[ "$runtime_via" != host ]]; then
@@ -5146,6 +6388,11 @@ status_app() {
     printf 'Tunnel IPv4:       %s\n' "${local_ip:-not assigned}"
     printf 'External IPv4:     %s\n' "${external_ip:-unavailable}"
     printf 'Ping data path:    %s\n' "$ping_ok"
+
+    if [[ "$type" == openvpn && "${TRANSPORT_TYPE:-direct}" != direct ]]; then
+        printf 'Transport endpoint:%s:%s/tcp\n' "$TRANSPORT_REMOTE_HOST" "$TRANSPORT_REMOTE_PORT"
+        printf 'Local wrapper:     127.0.0.1:%s\n' "$TRANSPORT_LOCAL_PORT"
+    fi
 
     if [[ -n "$profile_file" && -f "$profile_file" ]]; then
         printf 'Profile file:      %s\n' "$profile_file"
@@ -5243,9 +6490,13 @@ list_apps() {
 
         load_cfg "$app"
         profile=${DEFAULT_PROFILE:-none}
-        profile=${profile%.ovpn}
-        profile=${profile%.conf}
         type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+        if [[ "$type" == inherit ]]; then
+            profile="inherited"
+        else
+            profile=${profile%.ovpn}
+            profile=${profile%.conf}
+        fi
         type_label=$(vpn_type_label "${type:-unknown}")
         status=stopped
         via=$(effective_via_for_app "$app" __default__)
@@ -5383,7 +6634,7 @@ main() {
             if (( $# == 1 )); then
                 install_engine
             else
-                local install_app_name=$2 install_via="__default__"
+                local install_app_name=$2 install_via="__default__" install_backend="__default__"
                 shift 2
                 while (( $# > 0 )); do
                     case "$1" in
@@ -5396,12 +6647,28 @@ main() {
                             install_via=${1#--via=}
                             shift
                             ;;
+                        --backend)
+                            (( $# >= 2 )) || die "--backend requires 'inherit'."
+                            install_backend=$2
+                            shift 2
+                            ;;
+                        --backend=*)
+                            install_backend=${1#--backend=}
+                            shift
+                            ;;
                         *)
-                            die "Usage: nns-app install <app_name> [--via <upstream-app>|host]"
+                            die "Usage: nns-app install <app_name> [--backend inherit] [--via <upstream-app>|host]"
                             ;;
                     esac
                 done
-                install_app "$install_app_name" "$install_via"
+                case "$install_backend" in
+                    __default__) install_app "$install_app_name" "$install_via" ;;
+                    inherit)
+                        install_app "$install_app_name" "$install_via"
+                        set_inherit_backend "$install_app_name" "$install_via"
+                        ;;
+                    *) die "Unsupported app backend '$install_backend'; only 'inherit' is valid without a profile." ;;
+                esac
             fi
             ;;
         remove)
@@ -5456,7 +6723,11 @@ main() {
             else
                 [[ $# -eq 3 ]] ||
                     die "Options are valid only with: nns-app add <app_name> any [country] [--refresh] [--via <upstream-app>|host]"
-                add_profile "$2" "$3"
+                if [[ "$3" == *.nnslink ]]; then
+                    nnslink_import "$2" "$3"
+                else
+                    add_profile "$2" "$3"
+                fi
             fi
             ;;
         start)
@@ -5474,7 +6745,7 @@ main() {
                 create)
                     (( $# >= 3 )) ||
                         die "Usage: nns-app gateway create <name> --via <app> --listen tcp|udp:<port> --public <host>:<port> [--pool CIDR] [--dns \"IP ...\"]"
-                    local gw_name=$3 gw_via="" gw_listen="" gw_public="" gw_pool="" gw_dns="1.1.1.1 9.9.9.9"
+                    local gw_name=$3 gw_via="" gw_listen="" gw_public="" gw_pool="" gw_dns="1.1.1.1 9.9.9.9" gw_transport="direct" gw_server_name=""
                     shift 3
                     while (( $# > 0 )); do
                         case "$1" in
@@ -5503,6 +6774,16 @@ main() {
                                 gw_dns=$2; shift 2 ;;
                             --dns=*)
                                 gw_dns=${1#--dns=}; shift ;;
+                            --transport)
+                                (( $# >= 2 )) || die "--transport requires direct, stunnel or cloak."
+                                gw_transport=$2; shift 2 ;;
+                            --transport=*)
+                                gw_transport=${1#--transport=}; shift ;;
+                            --server-name)
+                                (( $# >= 2 )) || die "--server-name requires a Cloak decoy hostname."
+                                gw_server_name=$2; shift 2 ;;
+                            --server-name=*)
+                                gw_server_name=${1#--server-name=}; shift ;;
                             *)
                                 die "Unknown gateway create option '$1'."
                                 ;;
@@ -5510,7 +6791,7 @@ main() {
                     done
                     [[ -n "$gw_via" && -n "$gw_listen" && -n "$gw_public" ]] ||
                         die "gateway create requires --via, --listen and --public."
-                    gateway_create "$gw_name" "$gw_via" "$gw_listen" "$gw_public" "$gw_pool" "$gw_dns"
+                    gateway_create "$gw_name" "$gw_via" "$gw_listen" "$gw_public" "$gw_pool" "$gw_dns" "$gw_transport" "$gw_server_name"
                     ;;
                 start)
                     [[ $# -eq 3 ]] || die "Usage: nns-app gateway start <gateway_name>"
@@ -5534,7 +6815,7 @@ main() {
                     ;;
                 client)
                     (( $# >= 3 )) ||
-                        die "Usage: nns-app gateway client <add|list|export|revoke> ..."
+                        die "Usage: nns-app gateway client <add|list|export|rotate|revoke> ..."
                     case "$3" in
                         add)
                             [[ $# -eq 5 ]] ||
@@ -5549,7 +6830,7 @@ main() {
                         export)
                             (( $# >= 6 )) ||
                                 die "Usage: nns-app gateway client export <gateway_name> <client_name> --output <file.ovpn>"
-                            local export_gateway=$4 export_client=$5 export_output=""
+                            local export_gateway=$4 export_client=$5 export_output="" export_format="ovpn"
                             shift 5
                             while (( $# > 0 )); do
                                 case "$1" in
@@ -5558,13 +6839,23 @@ main() {
                                         export_output=$2; shift 2 ;;
                                     --output=*)
                                         export_output=${1#--output=}; shift ;;
+                                    --format)
+                                        (( $# >= 2 )) || die "--format requires ovpn or nnslink."
+                                        export_format=$2; shift 2 ;;
+                                    --format=*)
+                                        export_format=${1#--format=}; shift ;;
                                     *)
                                         die "Unknown gateway client export option '$1'."
                                         ;;
                                 esac
                             done
                             [[ -n "$export_output" ]] || die "--output is required."
-                            gateway_client_export "$export_gateway" "$export_client" "$export_output"
+                            gateway_client_export "$export_gateway" "$export_client" "$export_output" "$export_format"
+                            ;;
+                        rotate)
+                            [[ $# -eq 5 ]] ||
+                                die "Usage: nns-app gateway client rotate <gateway_name> <client_name>"
+                            gateway_client_rotate "$4" "$5"
                             ;;
                         revoke)
                             [[ $# -eq 5 ]] ||
@@ -5579,6 +6870,76 @@ main() {
                 *)
                     die "Unknown gateway command '$2'."
                     ;;
+            esac
+            ;;
+        link)
+            [[ $# -eq 4 && "$2" == import ]] ||
+                die "Usage: nns-app link import <app_name> <bundle.nnslink>"
+            nnslink_import "$3" "$4"
+            ;;
+        remote)
+            (( $# >= 3 )) || die "Usage: nns-app remote <add|connect|sync|rotate|status> ..."
+            case "$2" in
+                add)
+                    local remote_alias=$3 remote_target="" remote_port=22 remote_identity=""
+                    shift 3
+                    while (( $# > 0 )); do
+                        case "$1" in
+                            --ssh)
+                                (( $# >= 2 )) || die "--ssh requires [user@]host."
+                                remote_target=$2; shift 2 ;;
+                            --ssh=*) remote_target=${1#--ssh=}; shift ;;
+                            --port)
+                                (( $# >= 2 )) || die "--port requires a number."
+                                remote_port=$2; shift 2 ;;
+                            --port=*) remote_port=${1#--port=}; shift ;;
+                            --identity)
+                                (( $# >= 2 )) || die "--identity requires a private-key path."
+                                remote_identity=$2; shift 2 ;;
+                            --identity=*) remote_identity=${1#--identity=}; shift ;;
+                            *) die "Unknown remote add option '$1'." ;;
+                        esac
+                    done
+                    [[ -n "$remote_target" ]] || die "remote add requires --ssh <user@host>."
+                    remote_add "$remote_alias" "$remote_target" "$remote_port" "$remote_identity"
+                    ;;
+                connect)
+                    local remote_ref=$3 remote_client="" remote_name="" remote_backend="openvpn"
+                    shift 3
+                    while (( $# > 0 )); do
+                        case "$1" in
+                            --client)
+                                (( $# >= 2 )) || die "--client requires a client name."
+                                remote_client=$2; shift 2 ;;
+                            --client=*) remote_client=${1#--client=}; shift ;;
+                            --name)
+                                (( $# >= 2 )) || die "--name requires a local app name."
+                                remote_name=$2; shift 2 ;;
+                            --name=*) remote_name=${1#--name=}; shift ;;
+                            --backend)
+                                (( $# >= 2 )) || die "--backend requires openvpn."
+                                remote_backend=$2; shift 2 ;;
+                            --backend=*) remote_backend=${1#--backend=}; shift ;;
+                            *) die "Unknown remote connect option '$1'." ;;
+                        esac
+                    done
+                    [[ -n "$remote_client" && -n "$remote_name" ]] ||
+                        die "remote connect requires --client and --name."
+                    remote_connect "$remote_ref" "$remote_client" "$remote_name" "$remote_backend"
+                    ;;
+                sync)
+                    [[ $# -eq 3 ]] || die "Usage: nns-app remote sync <local_app>"
+                    remote_sync "$3"
+                    ;;
+                rotate)
+                    [[ $# -eq 3 ]] || die "Usage: nns-app remote rotate <local_app>"
+                    remote_rotate "$3"
+                    ;;
+                status)
+                    [[ $# -eq 3 ]] || die "Usage: nns-app remote status <local_app|alias>"
+                    remote_status "$3"
+                    ;;
+                *) die "Unknown remote command '$2'." ;;
             esac
             ;;
         run)

@@ -17,8 +17,9 @@ vpn_type_for_app() {
     local app=$1 configured profile file detected
     configured=$(cfg_read_value "$app" VPN_TYPE 2>/dev/null || true)
     case "$configured" in
-        openvpn|wireguard)
-            printf '%s\n' "$configured"
+        openvpn|wireguard|inherit)
+            printf '%s
+' "$configured"
             return 0
             ;;
         "") ;;
@@ -30,14 +31,20 @@ vpn_type_for_app() {
     file="$(profiles_dir "$app")/$profile"
     detected=$(profile_type_from_file "$file" 2>/dev/null || true)
     [[ -n "$detected" ]] || return 1
-    printf '%s\n' "$detected"
+    printf '%s
+' "$detected"
 }
 
 vpn_type_label() {
     case "$1" in
-        openvpn) printf 'OpenVPN\n' ;;
-        wireguard) printf 'WireGuard\n' ;;
-        *) printf 'unknown\n' ;;
+        openvpn) printf 'OpenVPN
+' ;;
+        wireguard) printf 'WireGuard
+' ;;
+        inherit) printf 'Inherit
+' ;;
+        *) printf 'unknown
+' ;;
     esac
 }
 
@@ -567,6 +574,7 @@ add_profile() {
 
     install -o root -g root -m 0600 "$tmp" "$dest"
     rm -f "$tmp"
+    clear_app_transport_metadata "$app"
     cfg_set "$app" DEFAULT_PROFILE "$name"
     cfg_set "$app" VPN_TYPE "$type"
 

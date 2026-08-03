@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.2.1
+
+- Fixed `nns-app run` exiting silently before launching the command. The internal namespace guard used `readlink` on `/run/netns/<name>`, but iproute2 stores named namespaces as mounted namespace references rather than symbolic links.
+- Namespace identity is now compared through the followed namespace filesystem device and inode, with explicit diagnostics when either reference cannot be inspected.
+- Added regression coverage for namespace-reference identity and rejection of the broken `readlink /run/netns/...` pattern.
+
+## 1.2.0
+
+- Added `VPN_TYPE="inherit"` and `install <app> --backend inherit --via <upstream>` for isolated child namespaces that share one existing nns-app tunnel without starting another VPN client.
+- Kept inherit children inside the existing systemd dependency graph, readiness checks, dependent shutdown, exact veth rules, and upstream tunnel-only forwarding/NAT path.
+- Added SSH remote registration and management: `remote add`, `remote connect`, `remote sync`, `remote rotate`, and `remote status`.
+- Pinned each remote SSH host key in a root-owned per-remote `known_hosts` file; management requires batch SSH and non-interactive remote sudo, while the runtime VPN path remains independent of SSH.
+- Added generation-aware transactional gateway client rotation, including new client certificate, private key, TLS Crypt v2 key, and Cloak UID where applicable.
+- Added gateway transports `direct`, `stunnel`, and `cloak`. Wrapped gateways expose the transport publicly and bind the OpenVPN server to a private loopback TCP port; Cloak supports a validated, non-looping decoy hostname through `--server-name`.
+- Added versioned `.nnslink` export/import bundles containing a self-contained OpenVPN profile plus the minimum transport configuration and trust material.
+- Added strict bundle validation against path traversal, links, devices, unknown members, oversized payloads, unsafe manifest metadata, malformed Cloak settings, invalid stunnel CA material, and unsupported versions/transports.
+- Added transport-aware endpoint pinning and kill-switch rules in local namespaces, explicit Cloak remote-host/port invocation, plus supervised startup/teardown of the wrapper and OpenVPN processes.
+- `remote sync` and `remote rotate` now rebuild a running local namespace after importing changed endpoint or transport state.
+- Extended app/gateway status, help, README, contributor invariants, and tests for inherit, remote management, transport state, and `.nnslink` safety.
+
 ## 1.1.27
 
 - Replaced root-specific and `Downloads` profile paths in README and command

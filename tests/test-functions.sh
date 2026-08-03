@@ -24,6 +24,14 @@ fail() {
 [[ "$(format_duration 60)" == 1m ]] || fail 'format_duration minute'
 [[ "$(format_duration 3660)" == '1h 1m' ]] || fail 'format_duration hour'
 
+current_ns_id=$(namespace_ref_id /proc/self/ns/net)
+[[ -n "$current_ns_id" ]] || fail 'current namespace identity'
+[[ "$current_ns_id" == "$(namespace_ref_id /proc/self/ns/net)" ]] ||
+    fail 'stable namespace identity'
+if namespace_ref_id "$TEST_TMP/missing-netns" >/dev/null 2>&1; then
+    fail 'missing namespace reference was accepted'
+fi
+
 IFS='|' read -r tun host ns host_fwd host_mangle ns_fwd ns_nat ns_mangle \
     <<<"$(make_gateway_names my-relay)"
 [[ -n "$tun" && -n "$host" && -n "$ns" ]] || fail 'gateway interface names'
@@ -112,5 +120,87 @@ rm -f "$tmp_pki/newcerts/1000.pem"
 gateway_ca_restore "$tmp_pki" "$tmp_backup"
 [[ "$(<"$tmp_pki/index.txt")" == V ]] || fail 'CA index restore'
 [[ -f "$tmp_pki/newcerts/1000.pem" ]] || fail 'CA newcerts restore'
+
+
+[[ "$(vpn_type_label inherit)" == Inherit ]] || fail 'inherit backend label'
+
+validate_ssh_target 'maxim@example.net'
+validate_ssh_target '[2001:db8::1]'
+if ( validate_ssh_target '-oProxyCommand=bad' ) >/dev/null 2>&1; then
+    fail 'unsafe SSH target accepted'
+fi
+
+bundle_dir="$TEST_TMP/bundle"
+mkdir -p "$bundle_dir"
+printf '%s\n' 'client' 'dev tun' 'proto tcp-client' 'remote 127.0.0.1 11940' >"$bundle_dir/client.ovpn"
+cat >"$bundle_dir/manifest.json" <<'EOF_MANIFEST'
+{
+  "format": "nnslink",
+  "version": 1,
+  "gateway": "my-relay",
+  "client": "my-linux-client",
+  "generation": 2,
+  "backend": "openvpn",
+  "transport": "direct",
+  "public_host": "vpn.example.net",
+  "public_port": 443,
+  "local_port": 11940
+}
+EOF_MANIFEST
+python3 - "$bundle_dir" "$TEST_TMP/valid.nnslink" <<'PY_TEST_BUNDLE'
+import pathlib,sys,tarfile
+root=pathlib.Path(sys.argv[1])
+with tarfile.open(sys.argv[2], 'w:gz') as tf:
+    tf.add(root/'manifest.json', arcname='manifest.json')
+    tf.add(root/'client.ovpn', arcname='client.ovpn')
+PY_TEST_BUNDLE
+manifest_output=$(nnslink_manifest_read "$TEST_TMP/valid.nnslink" "$TEST_TMP/extracted")
+grep -Fq 'TRANSPORT="direct"' <<<"$manifest_output" || fail 'nnslink transport parsing'
+grep -Fq 'GENERATION=2' <<<"$manifest_output" || fail 'nnslink generation parsing'
+
+python3 - "$TEST_TMP/unsafe.nnslink" <<'PY_TEST_UNSAFE'
+import io,tarfile,sys
+with tarfile.open(sys.argv[1], 'w:gz') as tf:
+    data=b'bad'
+    info=tarfile.TarInfo('../escape')
+    info.size=len(data)
+    tf.addfile(info, io.BytesIO(data))
+PY_TEST_UNSAFE
+if nnslink_manifest_read "$TEST_TMP/unsafe.nnslink" "$TEST_TMP/unsafe-out" >/dev/null 2>&1; then
+    fail 'unsafe nnslink path accepted'
+fi
+
+validate_transport_server_name 'www.bing.com'
+if ( validate_transport_server_name 'vpn..example.net' ) >/dev/null 2>&1; then
+    fail 'invalid Cloak decoy hostname accepted'
+fi
+
+malicious_dir="$TEST_TMP/malicious-bundle"
+mkdir -p "$malicious_dir"
+cp "$bundle_dir/client.ovpn" "$malicious_dir/client.ovpn"
+cat >"$malicious_dir/manifest.json" <<'EOF_MALICIOUS_MANIFEST'
+{
+  "format": "nnslink",
+  "version": 1,
+  "gateway": "bad\";touch /tmp/nns-injected;#",
+  "client": "my-linux-client",
+  "generation": 1,
+  "backend": "openvpn",
+  "transport": "direct",
+  "public_host": "vpn.example.net",
+  "public_port": 443,
+  "local_port": 11940
+}
+EOF_MALICIOUS_MANIFEST
+python3 - "$malicious_dir" "$TEST_TMP/malicious.nnslink" <<'PY_TEST_MALICIOUS'
+import pathlib,sys,tarfile
+root=pathlib.Path(sys.argv[1])
+with tarfile.open(sys.argv[2], 'w:gz') as tf:
+    tf.add(root/'manifest.json', arcname='manifest.json')
+    tf.add(root/'client.ovpn', arcname='client.ovpn')
+PY_TEST_MALICIOUS
+if nnslink_manifest_read "$TEST_TMP/malicious.nnslink" "$TEST_TMP/malicious-out" >/dev/null 2>&1; then
+    fail 'unsafe nnslink manifest metadata accepted'
+fi
 
 echo 'Function tests passed.'

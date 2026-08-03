@@ -21,7 +21,7 @@
 # Author: Maxim Lyadvinsky
 #
 # Public commands:
-#   install [<app_name> [--via <upstream-app>|host]]
+#   install [<app_name> [--backend inherit] [--via <upstream-app>|host]]
 #   remove  <app_name>
 #   purge
 #   list
@@ -32,7 +32,10 @@
 #   stop    <app_name>
 #   run     <app_name> <command> [args...]
 #   gateway create <gateway> --via <app> --listen tcp|udp:<port>
-#                  --public <host>:<port> [--pool <IPv4-CIDR>]
+#                  --public <host>:<port> [--transport direct|stunnel|cloak]
+#                  [--server-name <cloak-decoy-host>]
+#   remote add|connect|sync|rotate|status ...
+#   link import <app> <bundle.nnslink>
 #   gateway start|stop|status|list|remove ...
 #   gateway client add|list|export|revoke ...
 #
@@ -42,7 +45,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.1.27"
+readonly VERSION="1.2.1"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -69,6 +72,7 @@ else
 fi
 readonly GATEWAY_BASE_DIR="$BASE_DIR/gateways"
 readonly GATEWAY_RUN_BASE="$RUN_DIR/gateways"
+readonly REMOTE_BASE_DIR="$BASE_DIR/remotes"
 readonly VPNGATE_API_URL="https://www.vpngate.net/api/iphone/"
 readonly CACHE_DIR="/var/cache/nns-app"
 readonly STATE_DIR="/var/lib/nns-app"
@@ -156,11 +160,17 @@ reset_app_cfg_vars() {
     DNS_SERVERS="" DISABLE_IPV6="" DISABLE_DCO="" PROFILE_FIXUPS=""
     READY_TIMEOUT="" EXTERNAL_IP_URL="" NS_NAME="" NS_CIDR=""
     HOST_ADDR="" NS_ADDR="" VETH_HOST="" VETH_NS=""
+    TRANSPORT_TYPE="" TRANSPORT_REMOTE_HOST="" TRANSPORT_REMOTE_PORT=""
+    TRANSPORT_LOCAL_PORT="" TRANSPORT_CONFIG=""
+    REMOTE_ALIAS="" REMOTE_GATEWAY="" REMOTE_CLIENT=""
+    REMOTE_PROFILE_GENERATION="" REMOTE_SERVER_FINGERPRINT=""
 }
 
 reset_gateway_cfg_vars() {
     GATEWAY_NAME="" GATEWAY_BACKEND="" VIA_APP=""
     LISTEN_PROTO="" LISTEN_PORT="" PUBLIC_HOST="" PUBLIC_PORT=""
+    TRANSPORT="" OPENVPN_LISTEN_PROTO="" OPENVPN_LISTEN_PORT=""
+    TRANSPORT_SERVER_NAME="" TRANSPORT_PUBLIC_KEY="" TRANSPORT_PRIVATE_KEY=""
     CLIENT_POOL="" DNS_SERVERS="" TRANSIT_CIDR=""
     TRANSIT_HOST_ADDR="" TRANSIT_NS_ADDR="" GATEWAY_TUN=""
     GATEWAY_VETH_HOST="" GATEWAY_VETH_NS="" ROUTE_TABLE=""
@@ -171,6 +181,7 @@ reset_gateway_cfg_vars() {
 
 reset_gateway_client_vars() {
     CLIENT_NAME="" STATUS="" CERT_SERIAL="" CREATED_AT="" REVOKED_AT=""
+    GENERATION="" CLOAK_UID=""
 }
 
 format_duration() {
@@ -209,7 +220,7 @@ show_version() {
 usage() {
     cat <<'USAGE'
 Usage:
-  nns-app install [app_name [--via <upstream-app>|host]]
+  nns-app install [app_name [--backend inherit] [--via <upstream-app>|host]]
   nns-app remove  <app_name>
   nns-app purge
   nns-app list
@@ -224,6 +235,8 @@ Usage:
                   --listen <tcp|udp>:<port>
                   --public <host>:<port>
                   [--pool <IPv4-CIDR>] [--dns "<IPv4> ..."]
+                  [--transport direct|stunnel|cloak]
+                  [--server-name <cloak-decoy-host>]
   nns-app gateway start  <gateway_name>
   nns-app gateway stop   <gateway_name>
   nns-app gateway status <gateway_name>
@@ -231,14 +244,24 @@ Usage:
   nns-app gateway remove <gateway_name>
   nns-app gateway client add    <gateway_name> <client_name>
   nns-app gateway client list   <gateway_name>
-  nns-app gateway client export <gateway_name> <client_name> --output <file.ovpn>
+  nns-app gateway client export <gateway_name> <client_name>
+                  [--format ovpn|nnslink] --output <file|->
+  nns-app gateway client rotate <gateway_name> <client_name>
   nns-app gateway client revoke <gateway_name> <client_name>
+
+  nns-app link import <app_name> <bundle.nnslink>
+  nns-app remote add <alias> --ssh <user@host> [--port <port>] [--identity <file>]
+  nns-app remote connect <alias>:<gateway> --client <name> --name <local_app>
+  nns-app remote sync   <local_app>
+  nns-app remote rotate <local_app>
+  nns-app remote status <local_app|alias>
 
 Examples:
   sudo ./nns-app.sh install
   sudo nns-app install my-upstream-vpn
   sudo nns-app add my-upstream-vpn ~/my-base-profile.ovpn
   sudo nns-app install my-private-app --via my-upstream-vpn
+  sudo nns-app install my-shared-app --backend inherit --via my-remote-exit
   sudo nns-app add my-private-app ~/my-app-profile.ovpn
   sudo nns-app add my-private-app ~/my-wireguard-profile.conf
   sudo nns-app add my-private-app any US --via my-upstream-vpn

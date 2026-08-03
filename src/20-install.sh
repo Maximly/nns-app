@@ -172,10 +172,11 @@ refresh_managed_unit_metadata() {
         write_gateway_unit_dropin "$gateway"
         gateway_write_openssl_config "$gateway" "$(gateway_dir "$gateway")"
         gateway_write_server_config "$gateway"
+        gateway_write_transport_config "$gateway"
         systemctl enable --now "nns-gateway-crl-refresh@${gateway}.timer" \
             >/dev/null 2>&1 || true
         if systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
-            warn "Gateway '$gateway' is running; restart it to activate the 1.1 data-plane rules."
+            warn "Gateway '$gateway' is running; restart it to activate refreshed gateway and transport settings."
         fi
         release_lock "gateway-$gateway"
     done
@@ -189,7 +190,7 @@ install_engine() {
     install_engine_files
     install -d -o root -g root -m 0755 \
         "$BASE_DIR" "$RUN_DIR" "$CACHE_DIR" "$STATE_DIR" \
-        "$GATEWAY_BASE_DIR" "$GATEWAY_RUN_BASE" "$LOCK_DIR"
+        "$GATEWAY_BASE_DIR" "$GATEWAY_RUN_BASE" "$REMOTE_BASE_DIR" "$LOCK_DIR"
     refresh_managed_unit_metadata
     release_lock global
 
@@ -347,7 +348,7 @@ install_app() {
     install_engine_files
     install -d -o root -g root -m 0755 \
         "$BASE_DIR" "$RUN_DIR" "$CACHE_DIR" "$STATE_DIR" \
-        "$GATEWAY_BASE_DIR" "$GATEWAY_RUN_BASE" "$LOCK_DIR"
+        "$GATEWAY_BASE_DIR" "$GATEWAY_RUN_BASE" "$REMOTE_BASE_DIR" "$LOCK_DIR"
 
     local dir file user net_data cidr host_addr ns_addr veth_data veth_host veth_ns
     dir=$(cfg_dir "$app")
@@ -421,6 +422,21 @@ DISABLE_DCO="off"
 PROFILE_FIXUPS="on"
 READY_TIMEOUT="5"
 EXTERNAL_IP_URL="https://api.ipify.org"
+
+# Optional local transport for .nnslink profiles. These values are managed by
+# `nns-app link import` / `nns-app remote sync`.
+TRANSPORT_TYPE="direct"
+TRANSPORT_REMOTE_HOST=""
+TRANSPORT_REMOTE_PORT=""
+TRANSPORT_LOCAL_PORT=""
+TRANSPORT_CONFIG=""
+
+# SSH management-plane metadata. The VPN data path never depends on SSH.
+REMOTE_ALIAS=""
+REMOTE_GATEWAY=""
+REMOTE_CLIENT=""
+REMOTE_PROFILE_GENERATION=""
+REMOTE_SERVER_FINGERPRINT=""
 
 # Engine-owned namespace network. Never copy these values to another environment.
 NS_NAME="nns-$app"

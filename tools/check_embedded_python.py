@@ -4,9 +4,7 @@
 from __future__ import annotations
 
 import re
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 
@@ -35,13 +33,8 @@ def main() -> int:
             raise SystemExit(f"unterminated embedded Python heredoc: {tag}")
 
         found += 1
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / f"{found}-{tag}.py"
-            source.write_text("\n".join(body) + "\n", encoding="utf-8")
-            subprocess.run(
-                [sys.executable, "-m", "py_compile", str(source)],
-                check=True,
-            )
+        source = "\n".join(body) + "\n"
+        compile(source, f"embedded-{found}-{tag}.py", "exec")
         index += 1
 
     if found == 0:

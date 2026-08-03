@@ -4,9 +4,9 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.1.27  
+**Release:** 1.2.1  
 **Supported platform:** Ubuntu with systemd and iptables  
-**VPN backends:** OpenVPN 2.6+ and WireGuard
+**VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
 
 The release includes both the modular source tree and a pre-built,
 single-file installer: `nns-app-install.sh`.
@@ -17,9 +17,12 @@ single-file installer: `nns-app-install.sh`.
 - OpenVPN and WireGuard client profiles.
 - Per-environment DNS, routes, firewall state, tunnel state, and kill switch.
 - Local VPN chaining through `--via <upstream-app>`.
+- Inherit-only child namespaces that share one upstream tunnel without opening another VPN session.
 - Detailed `status` output with focused failure logs.
 - Snap desktop-application support inside private mount namespaces.
 - Managed remote OpenVPN gateways routed through a selected remote nns-app exit.
+- SSH-based remote enrollment, synchronization, credential rotation, and status.
+- Direct, stunnel, and Cloak gateway transports with portable `.nnslink` bundles.
 - Unique client certificates and TLS Crypt v2 keys for gateway clients.
 - Collision-safe network, routing-table, and policy-priority allocation.
 - Dedicated, tagged gateway firewall chains.
@@ -42,7 +45,8 @@ The examples use descriptive placeholders consistently:
 | `my-remote-exit` | The nns-app environment on the remote Linux box that provides egress |
 | `my-relay` | The managed gateway exposed by the remote Linux box |
 | `my-linux-client` | One unique gateway client identity for a local Linux box |
-| `my-remote-profile.ovpn` | The self-contained profile exported by the remote gateway |
+| `my-remote-profile.ovpn` | A direct self-contained profile exported by the remote gateway |
+| `my-remote-link.nnslink` | A gateway profile plus transport metadata and pinned transport material |
 | `my-remote-vpn` | The local nns-app environment that imports the remote profile |
 
 Replace these names with labels that describe your own applications, profiles,
@@ -107,6 +111,7 @@ src/
   40-network.sh      endpoints, firewall rules, and namespace lifecycle
   50-runtime.sh      VPN execution and app start/stop lifecycle
   60-gateway.sh      gateway PKI, routing, firewall, and client management
+  65-link-remote.sh   inherit sharing, .nnslink transport, and SSH management
   70-run-status.sh   application execution and status reporting
   90-main.sh         public and internal command dispatch
 
@@ -175,6 +180,34 @@ falling back to the upstream namespace's host-facing veth.
 `my-app-a -> my-app-b -> my-app-a`. Generated systemd drop-ins order downstream
 namespaces after `nns-online@<upstream>.service` and bind their lifecycle to it.
 
+### Inherit-only local sharing
+
+An inherit-only child has its own namespace, resolver, process boundary, and
+kill switch, but does not start OpenVPN or WireGuard itself:
+
+```text
+application
+  -> nns-my-shared-app
+  -> veth inside nns-my-remote-vpn
+  -> my-remote-vpn tunnel
+  -> Internet
+```
+
+Create it with:
+
+```bash
+sudo nns-app install my-shared-app \
+    --backend inherit \
+    --via my-remote-vpn
+nns-app start my-shared-app
+nns-app run my-shared-app firefox --no-remote
+```
+
+The child OUTPUT policy permits its veth, while the upstream namespace permits
+forwarding only into its verified tunnel. If the upstream stops, systemd binds
+the child lifecycle to it and the forwarding/NAT path disappears; no host-uplink
+fallback is installed. Inherit mode deliberately rejects `--via host`.
+
 ### Managed remote gateway
 
 ```text
@@ -221,6 +254,13 @@ The installer checks or installs these Ubuntu packages:
 - Python 3
 - `util-linux` (`setpriv` and `flock`)
 
+Optional transports require a locally installed binary on both ends:
+
+- `stunnel4` (or `stunnel`) for `--transport stunnel`;
+- `ck-server` on the gateway and `ck-client` on clients for `--transport cloak`.
+
+The installer never downloads transport binaries from third-party release pages.
+
 ## Install and create an application environment
 
 Install or refresh the engine:
@@ -243,7 +283,7 @@ Installed paths:
 ```
 
 `nns-openvpn@.service` is retained as the compatibility unit name, but it
-manages either an OpenVPN or WireGuard client backend.
+manages OpenVPN, WireGuard, a transported OpenVPN client, or an inherit-only keeper process.
 
 Create an environment:
 
@@ -462,6 +502,13 @@ nns-app status my-remote-vpn
 nns-app run my-remote-vpn curl -4 https://api.ipify.org
 ```
 
+Rotate a client to a new certificate, private key, TLS Crypt v2 key, and
+transport identity generation:
+
+```bash
+sudo nns-app gateway client rotate my-relay my-linux-client
+```
+
 Revoke a lost client identity:
 
 ```bash
@@ -481,6 +528,96 @@ sudo nns-app gateway remove my-relay
 
 The gateway does not automatically open the host firewall or configure an
 external router. Permit or forward the selected TCP/UDP port separately.
+
+### DPI-resistant gateway transports
+
+Direct mode remains the default:
+
+```bash
+sudo nns-app gateway create my-relay \
+    --via my-remote-exit \
+    --listen tcp:443 \
+    --public vpn.example.net:443 \
+    --transport direct
+```
+
+For a TLS wrapper:
+
+```bash
+sudo nns-app gateway create my-relay \
+    --via my-remote-exit \
+    --listen tcp:443 \
+    --public vpn.example.net:443 \
+    --transport stunnel
+```
+
+For Cloak:
+
+```bash
+sudo nns-app gateway create my-relay \
+    --via my-remote-exit \
+    --listen tcp:443 \
+    --public vpn.example.net:443 \
+    --transport cloak \
+    --server-name www.bing.com
+```
+
+Wrapped gateways bind OpenVPN to a private loopback port and expose only the
+transport listener publicly. Cloak uses `www.bing.com` as its default decoy
+server name; override it with `--server-name`, and keep it different from the
+gateway's own public hostname to prevent a redirection loop. Export wrapped
+gateways as `.nnslink`; a plain `.ovpn` cannot carry the wrapper configuration:
+
+```bash
+sudo nns-app gateway client export my-relay my-linux-client \
+    --format nnslink \
+    --output ~/my-remote-link.nnslink
+
+sudo nns-app install my-remote-vpn
+sudo nns-app link import my-remote-vpn ~/my-remote-link.nnslink
+```
+
+A bundle contains a versioned JSON manifest, the self-contained OpenVPN profile,
+and only the transport material required by that client. Imports reject links,
+devices, absolute paths, parent traversal, unknown files, oversized content,
+unsafe metadata, malformed Cloak settings, invalid stunnel trust material, and
+unsupported manifest versions. The managed client starts the transport in the
+application namespace before OpenVPN and stops both when either process fails.
+
+### SSH remote management
+
+Register a remote host once. Both machines must run nns-app 1.2.0 or newer.
+The first connection records its SSH host key; subsequent commands require that
+pinned key and non-interactive SSH/sudo:
+
+```bash
+sudo nns-app remote add edge1 --ssh maxim@vpn.example.net
+```
+
+Create a unique remote client and import its bundle locally:
+
+```bash
+sudo nns-app remote connect edge1:my-relay \
+    --client my-linux-client \
+    --name my-remote-vpn
+```
+
+Refresh the local bundle without changing credentials, rotate the remote
+certificate/key generation, or inspect both management and gateway state:
+
+```bash
+sudo nns-app remote sync my-remote-vpn
+sudo nns-app remote rotate my-remote-vpn
+sudo nns-app remote status my-remote-vpn
+```
+
+When `remote sync` or `remote rotate` replaces a bundle for a running local app,
+nns-app restarts the complete namespace so endpoint routes and kill-switch rules
+are rebuilt from the synchronized transport metadata.
+
+SSH is used only for enrollment and management. The running OpenVPN/stunnel/Cloak
+data path connects directly to the gateway public endpoint and continues without
+an SSH session.
 
 ## Gateway security
 
@@ -526,6 +663,16 @@ DISABLE_DCO="off"
 PROFILE_FIXUPS="on"
 READY_TIMEOUT="5"
 EXTERNAL_IP_URL="https://api.ipify.org"
+TRANSPORT_TYPE="direct"
+TRANSPORT_REMOTE_HOST=""
+TRANSPORT_REMOTE_PORT=""
+TRANSPORT_LOCAL_PORT=""
+TRANSPORT_CONFIG=""
+REMOTE_ALIAS=""
+REMOTE_GATEWAY=""
+REMOTE_CLIENT=""
+REMOTE_PROFILE_GENERATION=""
+REMOTE_SERVER_FINGERPRINT=""
 ```
 
 Configuration files are root-owned and rejected when group/world writable.
