@@ -42,7 +42,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.1.26"
+readonly VERSION="1.1.27"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -237,10 +237,10 @@ Usage:
 Examples:
   sudo ./nns-app.sh install
   sudo nns-app install my-upstream-vpn
-  sudo nns-app add my-upstream-vpn ~/Downloads/my-base-profile.ovpn
+  sudo nns-app add my-upstream-vpn ~/my-base-profile.ovpn
   sudo nns-app install my-private-app --via my-upstream-vpn
-  sudo nns-app add my-private-app ~/Downloads/my-app-profile.ovpn
-  sudo nns-app add my-private-app ~/Downloads/my-wireguard-profile.conf
+  sudo nns-app add my-private-app ~/my-app-profile.ovpn
+  sudo nns-app add my-private-app ~/my-wireguard-profile.conf
   sudo nns-app add my-private-app any US --via my-upstream-vpn
   nns-app start my-private-app
   nns-app start -i my-private-app --via my-upstream-vpn
@@ -257,7 +257,7 @@ Examples:
       --public vpn.example.net:443
   sudo nns-app gateway client add my-relay my-linux-client
   sudo nns-app gateway client export my-relay my-linux-client \
-      --output /root/my-remote-profile.ovpn
+      --output ~/my-remote-profile.ovpn
   sudo nns-app gateway start my-relay
 USAGE
 }

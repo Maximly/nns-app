@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.1.26  
+**Release:** 1.1.27  
 **Supported platform:** Ubuntu with systemd and iptables  
 **VPN backends:** OpenVPN 2.6+ and WireGuard
 
@@ -47,6 +47,13 @@ The examples use descriptive placeholders consistently:
 
 Replace these names with labels that describe your own applications, profiles,
 servers, and clients.
+
+Paths beginning with `~` refer to the invoking user's home directory. The shell
+expands `~` before `sudo` starts `nns-app`, so a command such as
+`sudo nns-app add my-private-app ~/my-base-profile.ovpn` reads the profile from
+the current user's home, not from `/root`. Imported profiles are copied into
+root-owned nns-app storage. Gateway exports are written with mode `0600` and,
+when invoked through `sudo`, ownership is returned to the invoking user.
 
 ## Build or use the pre-built installer
 
@@ -247,13 +254,13 @@ sudo nns-app install my-private-app
 Import an OpenVPN profile:
 
 ```bash
-sudo nns-app add my-private-app ~/Downloads/my-base-profile.ovpn
+sudo nns-app add my-private-app ~/my-base-profile.ovpn
 ```
 
 Or import a WireGuard profile:
 
 ```bash
-sudo nns-app add my-private-app ~/Downloads/my-wireguard-profile.conf
+sudo nns-app add my-private-app ~/my-wireguard-profile.conf
 ```
 
 Start and use the environment:
@@ -310,7 +317,7 @@ Create and start an upstream VPN environment:
 
 ```bash
 sudo nns-app install my-upstream-vpn
-sudo nns-app add my-upstream-vpn ~/Downloads/my-base-profile.ovpn
+sudo nns-app add my-upstream-vpn ~/my-base-profile.ovpn
 nns-app start -i my-upstream-vpn
 nns-app status my-upstream-vpn
 ```
@@ -320,7 +327,7 @@ upstream:
 
 ```bash
 sudo nns-app install my-private-app --via my-upstream-vpn
-sudo nns-app add my-private-app ~/Downloads/my-app-profile.ovpn
+sudo nns-app add my-private-app ~/my-app-profile.ovpn
 nns-app start -i my-private-app
 nns-app status my-private-app
 ```
@@ -392,7 +399,7 @@ provide the gateway's final Internet exit:
 
 ```bash
 sudo nns-app install my-remote-exit
-sudo nns-app add my-remote-exit /root/my-base-profile.ovpn
+sudo nns-app add my-remote-exit ~/my-base-profile.ovpn
 nns-app start -i my-remote-exit
 nns-app status my-remote-exit
 ```
@@ -433,7 +440,7 @@ Create one client identity per local machine:
 ```bash
 sudo nns-app gateway client add my-relay my-linux-client
 sudo nns-app gateway client export my-relay my-linux-client \
-    --output /root/my-remote-profile.ovpn
+    --output ~/my-remote-profile.ovpn
 ```
 
 Start and inspect the remote gateway:
@@ -449,7 +456,7 @@ Transfer the exported profile over an authenticated channel. On the local box:
 
 ```bash
 sudo nns-app install my-remote-vpn
-sudo nns-app add my-remote-vpn ./my-remote-profile.ovpn
+sudo nns-app add my-remote-vpn ~/my-remote-profile.ovpn
 nns-app start -i my-remote-vpn
 nns-app status my-remote-vpn
 nns-app run my-remote-vpn curl -4 https://api.ipify.org

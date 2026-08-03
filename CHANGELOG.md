@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.1.27
+
+- Replaced root-specific and `Downloads` profile paths in README and command
+  help examples with paths in the invoking user's home directory, such as
+  `~/my-base-profile.ovpn` and `~/my-remote-profile.ovpn`.
+- Documented that the shell expands `~` before `sudo`, imported profiles are
+  copied into root-owned managed storage, and exported gateway profiles are
+  returned to the invoking user with mode `0600`.
+- Updated gateway client-enrollment guidance to export profiles directly to
+  the invoking user's home directory.
+- Added static regression checks that reject `/root/` and desktop-specific
+  `~/Downloads/` paths in public documentation, command help, or the generated
+  installer.
+- No networking, routing, VPN, firewall, systemd, or PKI behavior changed.
+
 ## 1.1.26
 
 - Fixed unprivileged `make test`: function tests now use a private temporary

@@ -9,7 +9,7 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fq 'nns-app 1.1.26' <<<"$version"
+grep -Fq 'nns-app 1.1.27' <<<"$version"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -43,7 +43,7 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 1.1.26' "$ROOT/README.md"
+grep -Fq '**Release:** 1.1.27' "$ROOT/README.md"
 grep -Fq 'OpenVPN 2.6+' "$ROOT/README.md"
 
 # Public documentation and help use one descriptive example-name set.
@@ -59,6 +59,22 @@ done
 
 if grep -Eqi 'experimental release|status:[[:space:]]*experimental' "$ROOT/README.md"; then
     echo 'stale experimental notice found in README' >&2
+    exit 1
+fi
+
+if grep -Fq '/root/' \
+    "$ROOT/README.md" \
+    "$ROOT/src/00-preamble.sh" \
+    "$INSTALLER"; then
+    echo 'root-specific path found in public documentation or help' >&2
+    exit 1
+fi
+
+if grep -Fq '~/Downloads/' \
+    "$ROOT/README.md" \
+    "$ROOT/src/00-preamble.sh" \
+    "$INSTALLER"; then
+    echo 'desktop-specific Downloads path found in public documentation or help' >&2
     exit 1
 fi
 

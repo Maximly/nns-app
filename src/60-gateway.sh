@@ -1185,7 +1185,7 @@ CLIENT_CFG_EOF
 
     log "Added client '$client' to gateway '$gateway'."
     log "Export it with:"
-    log "  sudo nns-app gateway client export $gateway $client --output /path/to/$gateway-$client.ovpn"
+    log "  sudo nns-app gateway client export $gateway $client --output ~/$gateway-$client.ovpn"
 }
 
 gateway_client_load() {
