@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# nns-app - manage per-application VPN network namespaces on Ubuntu.
+#
+# Copyright (C) 2026 Maxim Lyadvinsky
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program. If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+# nns-app source module: preamble, constants, logging and process helpers.
+# Author: Maxim Lyadvinsky
+#
+# Public commands:
+#   install [<app_name> [--via <upstream-app>|host]]
+#   remove  <app_name>
+#   purge
+#   list
+#   status  <app_name>
+#   add     <app_name> <profile.ovpn|wireguard.conf>
+#   add     <app_name> any [country] [--refresh] [--via <upstream-app>|host]
+#   start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
+#   stop    <app_name>
+#   run     <app_name> <command> [args...]
+#   gateway create <gateway> --via <app> --listen tcp|udp:<port>
+#                  --public <host>:<port> [--pool <IPv4-CIDR>]
+#   gateway start|stop|status|list|remove ...
+#   gateway client add|list|export|revoke ...
+#
+# The script installs itself as /usr/local/sbin/nns_app.sh and creates the
+# convenience symlink /usr/local/bin/nns-app.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+readonly VERSION="1.1.25"
+readonly PROGRAM_NAME="nns-app"
+readonly AUTHOR="Maxim Lyadvinsky"
+readonly LICENSE_ID="GPL-3.0-or-later"
+readonly ENGINE_PATH="/usr/local/sbin/nns_app.sh"
+readonly USER_PATH="/usr/local/bin/nns-app"
+readonly BASE_DIR="/etc/nns-app"
+readonly RUN_DIR="/run/nns-app"
+readonly NETNS_UNIT="/etc/systemd/system/nns-netns@.service"
+readonly VPN_UNIT="/etc/systemd/system/nns-openvpn@.service"
+readonly GATEWAY_UNIT="/etc/systemd/system/nns-gateway@.service"
+readonly ONLINE_UNIT="/etc/systemd/system/nns-online@.service"
+readonly GATEWAY_CRL_SERVICE="/etc/systemd/system/nns-gateway-crl-refresh@.service"
+readonly GATEWAY_CRL_TIMER="/etc/systemd/system/nns-gateway-crl-refresh@.timer"
+readonly SYSTEMD_UNIT_DIR="/etc/systemd/system"
+readonly LOCK_DIR="/run/lock/nns-app"
+readonly GATEWAY_BASE_DIR="$BASE_DIR/gateways"
+readonly GATEWAY_RUN_BASE="$RUN_DIR/gateways"
+readonly VPNGATE_API_URL="https://www.vpngate.net/api/iphone/"
+readonly CACHE_DIR="/var/cache/nns-app"
+readonly STATE_DIR="/var/lib/nns-app"
+readonly VPNGATE_CACHE_FILE="$CACHE_DIR/vpngate.csv"
+# Candidate profiles are live-tested before import, so the large VPN Gate
+# CSV does not need to be downloaded every few minutes.
+readonly VPNGATE_CACHE_TTL=172800
+readonly VPNGATE_PROBE_TIMEOUT=6
+readonly VPNGATE_PROBE_ATTEMPTS=10
+
+log()  { printf '%s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+
+declare -Ag NNS_LOCK_FDS=()
+declare -Ag NNS_LOCK_DEPTH=()
+
+acquire_lock() {
+    local key=$1 mode=${2:-exclusive} safe fd
+    safe=${key//[^A-Za-z0-9_.-]/_}
+    install -d -o root -g root -m 0755 "$LOCK_DIR"
+
+    if [[ -n "${NNS_LOCK_FDS[$safe]-}" ]]; then
+        NNS_LOCK_DEPTH[$safe]=$(( ${NNS_LOCK_DEPTH[$safe]:-1} + 1 ))
+        return 0
+    fi
+
+    exec {fd}>"$LOCK_DIR/$safe.lock"
+    if [[ "$mode" == shared ]]; then
+        flock -s "$fd"
+    else
+        flock -x "$fd"
+    fi
+    NNS_LOCK_FDS[$safe]=$fd
+    NNS_LOCK_DEPTH[$safe]=1
+}
+
+release_lock() {
+    local key=$1 safe fd depth
+    safe=${key//[^A-Za-z0-9_.-]/_}
+    fd=${NNS_LOCK_FDS[$safe]-}
+    [[ -n "$fd" ]] || return 0
+
+    depth=${NNS_LOCK_DEPTH[$safe]:-1}
+    if (( depth > 1 )); then
+        NNS_LOCK_DEPTH[$safe]=$((depth - 1))
+        return 0
+    fi
+
+    flock -u "$fd" || true
+    eval "exec ${fd}>&-"
+    unset "NNS_LOCK_FDS[$safe]" "NNS_LOCK_DEPTH[$safe]"
+}
+
+reset_app_cfg_vars() {
+    APP_NAME="" APP_USER="" DEFAULT_PROFILE="" VPN_TYPE=""
+    KILLSWITCH="" AUTOSTART="" UPSTREAM_APP="" WAN_IFACE=""
+    DNS_SERVERS="" DISABLE_IPV6="" DISABLE_DCO="" PROFILE_FIXUPS=""
+    READY_TIMEOUT="" EXTERNAL_IP_URL="" NS_NAME="" NS_CIDR=""
+    HOST_ADDR="" NS_ADDR="" VETH_HOST="" VETH_NS=""
+}
+
+reset_gateway_cfg_vars() {
+    GATEWAY_NAME="" GATEWAY_BACKEND="" VIA_APP=""
+    LISTEN_PROTO="" LISTEN_PORT="" PUBLIC_HOST="" PUBLIC_PORT=""
+    CLIENT_POOL="" DNS_SERVERS="" TRANSIT_CIDR=""
+    TRANSIT_HOST_ADDR="" TRANSIT_NS_ADDR="" GATEWAY_TUN=""
+    GATEWAY_VETH_HOST="" GATEWAY_VETH_NS="" ROUTE_TABLE=""
+    RULE_PRIORITY="" SERVER_CN="" HOST_FWD_CHAIN=""
+    HOST_MANGLE_CHAIN="" NS_FWD_CHAIN="" NS_NAT_CHAIN=""
+    NS_MANGLE_CHAIN=""
+}
+
+reset_gateway_client_vars() {
+    CLIENT_NAME="" STATUS="" CERT_SERIAL="" CREATED_AT="" REVOKED_AT=""
+}
+
+format_duration() {
+    local seconds=${1:-0}
+    [[ "$seconds" =~ ^[0-9]+$ ]] || seconds=0
+
+    if (( seconds >= 86400 )); then
+        local days=$((seconds / 86400))
+        local hours=$(((seconds % 86400) / 3600))
+        if (( hours > 0 )); then
+            printf '%dd %dh' "$days" "$hours"
+        else
+            printf '%dd' "$days"
+        fi
+    elif (( seconds >= 3600 )); then
+        local hours=$((seconds / 3600))
+        local minutes=$(((seconds % 3600) / 60))
+        if (( minutes > 0 )); then
+            printf '%dh %dm' "$hours" "$minutes"
+        else
+            printf '%dh' "$hours"
+        fi
+    elif (( seconds >= 60 )); then
+        printf '%dm' "$((seconds / 60))"
+    else
+        printf '%ds' "$seconds"
+    fi
+}
+
+show_version() {
+    printf '%s %s\n' "$PROGRAM_NAME" "$VERSION"
+    printf 'Author:  %s\n' "$AUTHOR"
+    printf 'License: %s\n' "$LICENSE_ID"
+}
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  nns-app install [app_name [--via <upstream-app>|host]]
+  nns-app remove  <app_name>
+  nns-app purge
+  nns-app list
+  nns-app status  <app_name>
+  nns-app add     <app_name> <profile.ovpn|wireguard.conf>
+  nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
+  nns-app start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
+  nns-app stop    <app_name>
+  nns-app run     <app_name> <command> [arguments...]
+
+  nns-app gateway create <gateway_name> --via <app_name>
+                  --listen <tcp|udp>:<port>
+                  --public <host>:<port>
+                  [--pool <IPv4-CIDR>] [--dns "<IPv4> ..."]
+  nns-app gateway start  <gateway_name>
+  nns-app gateway stop   <gateway_name>
+  nns-app gateway status <gateway_name>
+  nns-app gateway list
+  nns-app gateway remove <gateway_name>
+  nns-app gateway client add    <gateway_name> <client_name>
+  nns-app gateway client list   <gateway_name>
+  nns-app gateway client export <gateway_name> <client_name> --output <file.ovpn>
+  nns-app gateway client revoke <gateway_name> <client_name>
+
+Examples:
+  sudo ./nns-app.sh install
+  sudo nns-app install my-upstream-vpn
+  sudo nns-app add my-upstream-vpn ~/Downloads/my-base-profile.ovpn
+  sudo nns-app install my-private-app --via my-upstream-vpn
+  sudo nns-app add my-private-app ~/Downloads/my-app-profile.ovpn
+  sudo nns-app add my-private-app ~/Downloads/my-wireguard-profile.conf
+  sudo nns-app add my-private-app any US --via my-upstream-vpn
+  nns-app start my-private-app
+  nns-app start -i my-private-app --via my-upstream-vpn
+  nns-app run my-private-app curl -4 https://api.ipify.org
+  nns-app run my-private-app firefox --no-remote
+  sudo nns-app purge
+  nns-app list
+  nns-app status my-private-app
+
+  # On a remote Linux box where `my-remote-exit` is already online:
+  sudo nns-app gateway create my-relay \
+      --via my-remote-exit \
+      --listen tcp:443 \
+      --public vpn.example.net:443
+  sudo nns-app gateway client add my-relay my-linux-client
+  sudo nns-app gateway client export my-relay my-linux-client \
+      --output /root/my-remote-profile.ovpn
+  sudo nns-app gateway start my-relay
+USAGE
+}
+

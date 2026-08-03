@@ -1,630 +1,649 @@
 # nns-app
 
-`nns-app` runs selected Linux applications inside dedicated network namespaces and connects each namespace through an isolated network transport.
+`nns-app` runs selected Linux applications in dedicated network namespaces and
+connects each namespace through OpenVPN or WireGuard without replacing the
+host's default route or DNS configuration.
 
-A browser, messenger, crawler, build tool, or another process can use its own VPN without replacing the host's default route or DNS configuration. Each named environment has separate routes, DNS, firewall state, tunnel state, and a kill switch.
+**Release:** 1.1.25  
+**Supported platform:** Ubuntu with systemd and iptables  
+**VPN backends:** OpenVPN 2.6+ and WireGuard
 
-> **Release:** 1.0.22  
-> **Status:** experimental  
-> **Current backends:** OpenVPN and WireGuard  
-> **Planned backends:** AmneziaWG and provider-specific transports
+The release includes both the modular source tree and a pre-built,
+single-file installer: `nns-app-install.sh`.
 
-## Main features
+## Highlights
 
-- One Linux network namespace per named application environment.
-- Optional namespace chaining with `--via <upstream-app>`.
-- Host networking and host DNS remain unchanged.
-- Namespace-only resolver configuration under `/etc/netns/`.
-- Kill switch blocks direct fallback to the host uplink.
-- Applications run as the configured desktop user, not as root.
-- systemd manages namespace and VPN-backend lifecycles.
-- Self-contained OpenVPN and WireGuard profiles can be imported.
-- A public OpenVPN relay can be selected automatically with `add ... any`.
-- VPN Gate metadata is cached for two days with stale-cache fallback.
-- Namespace and OpenVPN service startup failures print their own recent logs.
-- Two-letter VPN Gate country filters now match country codes exactly.
-- Restarting after an incomplete namespace setup safely rebuilds endpoint runtime files.
-- `./nns-app.sh install` now installs or refreshes the engine without creating an app.
-- Repeated `add <name> any` calls rotate through the top 20 matching VPN Gate relays.
-- VPN Gate candidates must complete a short OpenVPN handshake before import.
-- `nns-app run` prepares cgroup2 and securityfs inside its private mount namespace so Snap GUI applications can start.
-- Runtime `--via` creates a real veth/NAT chain through another active NNS VPN.
-- WireGuard supports full-tunnel IPv4 provider profiles, endpoint pinning, kill-switch rules, status reporting, and chained upstream/downstream operation.
-- `nns-app status <name>` reports profile, backend, services, endpoint, tunnel, upstream, handshake, traffic, and focused diagnostics.
-- Strict five-second startup failure handling.
-- Optional `-i` asynchronous start mode leaves a slow connection running.
+- One isolated network namespace per named application environment.
+- OpenVPN and WireGuard client profiles.
+- Per-environment DNS, routes, firewall state, tunnel state, and kill switch.
+- Local VPN chaining through `--via <upstream-app>`.
+- Detailed `status` output with focused failure logs.
+- Snap desktop-application support inside private mount namespaces.
+- Managed remote OpenVPN gateways routed through a selected remote nns-app exit.
+- Unique client certificates and TLS Crypt v2 keys for gateway clients.
+- Collision-safe network, routing-table, and policy-priority allocation.
+- Dedicated, tagged gateway firewall chains.
+- Cycle detection and systemd dependencies for chained environments.
+- Weekly atomic CRL renewal for managed gateways.
+- Transactional gateway, client, and PKI changes.
+- Process-wide and per-object locking for administrative operations.
+
+## Names used in the examples
+
+The examples use descriptive placeholders consistently:
+
+| Name | Meaning |
+|---|---|
+| `my-private-app` | A local application environment with its own VPN profile |
+| `my-upstream-vpn` | A local nns-app environment used as another environment's upstream |
+| `my-base-profile.ovpn` | A provider OpenVPN profile imported into an nns-app environment |
+| `my-app-profile.ovpn` | The profile used by a downstream application environment |
+| `my-wireguard-profile.conf` | A provider WireGuard profile imported into an nns-app environment |
+| `my-remote-exit` | The nns-app environment on the remote Linux box that provides egress |
+| `my-relay` | The managed gateway exposed by the remote Linux box |
+| `my-linux-client` | One unique gateway client identity for a local Linux box |
+| `my-remote-profile.ovpn` | The self-contained profile exported by the remote gateway |
+| `my-remote-vpn` | The local nns-app environment that imports the remote profile |
+
+Replace these names with labels that describe your own applications, profiles,
+servers, and clients.
+
+## Build or use the pre-built installer
+
+The repository already contains:
+
+```text
+nns-app-install.sh
+```
+
+Install directly from it:
+
+```bash
+chmod +x nns-app-install.sh
+sudo ./nns-app-install.sh install
+```
+
+To rebuild it from the modular source:
+
+```bash
+./build.sh
+```
+
+The equivalent Make target is:
+
+```bash
+make build
+```
+
+The build syntax-checks every ordered module under `src/`, concatenates the
+modules, validates the combined Bash file, compiles every embedded Python
+helper, and writes a deterministic `nns-app-install.sh` in the project root.
+
+Run the static and helper tests with:
+
+```bash
+make test
+```
+
+## Source layout
+
+```text
+src/
+  00-preamble.sh     metadata, help, common helpers, and locking
+  10-config.sh       configuration loading and upstream-graph validation
+  20-install.sh      dependencies, systemd units, and app provisioning
+  30-profiles.sh     OpenVPN/WireGuard validation and VPN Gate selection
+  40-network.sh      endpoints, firewall rules, and namespace lifecycle
+  50-runtime.sh      VPN execution and app start/stop lifecycle
+  60-gateway.sh      gateway PKI, routing, firewall, and client management
+  70-run-status.sh   application execution and status reporting
+  90-main.sh         public and internal command dispatch
+
+tools/
+  check_embedded_python.py
+
+tests/
+  test-static.sh
+  test-functions.sh
+
+CONTRIBUTING.md      contributor-facing safety and ownership invariants
+CHANGELOG.md
+```
+
+`CONTRIBUTING.md` contains the implementation rules that must remain true when
+changing routing, firewall, PKI, locking, configuration, or lifecycle code.
+The README keeps only the user-facing architecture and operating workflow.
+
+The generated installer remains a single executable file so it can be copied
+to a new Ubuntu host without installing the source tree.
 
 ## Architecture
 
-Direct mode:
-
-```text
-application -> nns-browser -> browser VPN -> host NAT -> host uplink
-```
-
-Chained mode:
+### Direct application environment
 
 ```text
 application
-    -> nns-browser
-    -> inner VPN
-    -> veth into nns-hidemy
-    -> HideMy tunnel
-    -> Internet
+  -> nns-my-private-app
+  -> OpenVPN or WireGuard
+  -> host NAT
+  -> host uplink
 ```
 
-In chained mode the downstream veth is placed directly inside the upstream
-namespace. Forwarding and NAT are installed only from that veth to the
-upstream tunnel interface. If the upstream tunnel disappears, the rule no
-longer matches another interface and the upstream namespace's default-drop
-FORWARD policy prevents fallback to its physical veth.
+The application environment has its own route table and resolver configuration.
+The host route and host DNS remain unchanged.
 
-Before the inner tunnel is online, the downstream namespace may contact only
-the configured inner VPN endpoint and its namespace DNS servers. Protected
-application traffic is accepted only through the inner tunnel interface.
+### Chained application environment
+
+```text
+application
+  -> nns-my-private-app
+  -> application-specific VPN
+  -> veth inside nns-my-upstream-vpn
+  -> upstream VPN tunnel
+  -> Internet
+```
+
+Configure a persistent upstream:
+
+```bash
+sudo nns-app install my-private-app --via my-upstream-vpn
+```
+
+Or override the upstream for one start:
+
+```bash
+nns-app start -i my-private-app --via my-upstream-vpn
+```
+
+Before its own tunnel is ready, the downstream namespace can reach only its
+configured VPN endpoint through the upstream tunnel. If the upstream tunnel
+disappears, forwarding rules stop matching and traffic is dropped instead of
+falling back to the upstream namespace's host-facing veth.
+
+`nns-app` rejects direct and indirect upstream cycles such as
+`my-app-a -> my-app-b -> my-app-a`. Generated systemd drop-ins order downstream
+namespaces after `nns-online@<upstream>.service` and bind their lifecycle to it.
+
+### Managed remote gateway
+
+```text
+local application
+  -> local nns-app OpenVPN client
+  -> remote host OpenVPN listener
+  -> remote gateway TUN
+  -> dedicated policy table
+  -> transit veth
+  -> selected remote nns-app exit
+  -> remote provider tunnel
+  -> Internet
+```
+
+The remote OpenVPN listener remains in the remote host namespace. Only traffic
+arriving from the gateway TUN is policy-routed into the selected nns-app exit.
+Host-generated packets that happen to use an address from the client pool are
+not captured by that rule.
+
+The gateway data path uses:
+
+- a unique `iif <gateway-tun>` policy rule;
+- a dedicated routing table with an explicit blackhole fallback;
+- a dedicated host-to-namespace transit `/30`;
+- dedicated tagged iptables chains;
+- source-restricted forwarding;
+- NAT only through the selected remote VPN tunnel;
+- loose reverse-path filtering only on managed asymmetric interfaces.
 
 ## Requirements
 
-The current release targets Ubuntu with systemd and requires:
+The installer checks or installs these Ubuntu packages:
 
 - Bash
-- OpenVPN
-- wireguard-tools (`wg` and `wg-quick`)
-- iproute2 network namespaces
-- iptables
+- OpenVPN 2.6 or newer
+- `wireguard-tools`
+- `iproute2`
+- `iptables`
 - systemd
 - sudo
 - curl
-- ping
+- `iputils-ping`
 - OpenSSL
-- Python 3 for public-relay profile selection
-- util-linux (`setpriv`)
+- Python 3
+- `util-linux` (`setpriv` and `flock`)
 
-Missing dependencies are installed automatically by `nns-app install` on supported Ubuntu systems.
+## Install and create an application environment
 
-## Installation
-
-Install or refresh the engine itself:
+Install or refresh the engine:
 
 ```bash
-chmod +x nns-app.sh
-sudo ./nns-app.sh install
+sudo ./nns-app-install.sh install
 ```
 
-This installs:
+Installed paths:
 
 ```text
 /usr/local/sbin/nns_app.sh
 /usr/local/bin/nns-app
-```
-
-Create a direct application environment:
-
-```bash
-sudo nns-app install browser
-```
-
-Persistently route it through an already installed upstream app:
-
-```bash
-sudo nns-app install browser --via hidemy
-```
-
-This writes `UPSTREAM_APP="hidemy"` to the app configuration. Use
-`--via host` to restore direct-host mode.
-
-The installer creates or refreshes:
-
-```text
-/usr/local/bin/nns-app
-/usr/local/sbin/nns_app.sh
-/etc/nns-app/<name>/
 /etc/systemd/system/nns-netns@.service
-/etc/systemd/system/nns-openvpn@.service  # legacy filename; manages either backend
-/etc/sudoers.d/nns-app-<name>
+/etc/systemd/system/nns-openvpn@.service
+/etc/systemd/system/nns-online@.service
+/etc/systemd/system/nns-gateway@.service
+/etc/systemd/system/nns-gateway-crl-refresh@.service
+/etc/systemd/system/nns-gateway-crl-refresh@.timer
 ```
 
-Verify the installed version:
+`nns-openvpn@.service` is retained as the compatibility unit name, but it
+manages either an OpenVPN or WireGuard client backend.
+
+Create an environment:
 
 ```bash
-nns-app --version
+sudo nns-app install my-private-app
 ```
 
-Expected:
-
-```text
-nns-app 1.0.21
-Author:  Maxim Lyadvinsky
-License: GPL-3.0-or-later
-```
-
-Running `install` again refreshes the engine, systemd units, and sudoers rules while preserving existing app configuration and imported profiles:
+Import an OpenVPN profile:
 
 ```bash
-sudo ./nns-app.sh install browser
+sudo nns-app add my-private-app ~/Downloads/my-base-profile.ovpn
 ```
 
-## Quick start with an existing profile
-
-OpenVPN:
+Or import a WireGuard profile:
 
 ```bash
-sudo nns-app add browser ~/Downloads/location.ovpn
-nns-app start browser
-nns-app run browser curl -4 https://api.ipify.org
-nns-app run browser firefox --no-remote
+sudo nns-app add my-private-app ~/Downloads/my-wireguard-profile.conf
 ```
 
-WireGuard:
+Start and use the environment:
 
 ```bash
-sudo nns-app add browser ~/Downloads/provider-wireguard.conf
-nns-app start browser
-nns-app run browser curl -4 https://api.ipify.org
+nns-app start my-private-app
+nns-app status my-private-app
+nns-app run my-private-app curl -4 https://api.ipify.org
+nns-app run my-private-app firefox --no-remote
 ```
 
-The backend is detected from profile content and stored as `VPN_TYPE`. Re-adding a profile can switch an existing app between OpenVPN and WireGuard.
-
-Inspect state:
+Stop it:
 
 ```bash
-nns-app list
+nns-app stop my-private-app
 ```
 
-Stop and remove the runtime namespace:
+Remove the environment and its imported profiles:
 
 ```bash
-nns-app stop browser
+sudo nns-app remove my-private-app
 ```
 
-## Find and add a public VPN profile
-
-Use `any` to download the current VPN Gate relay list, select a supported OpenVPN profile, validate it, and add it as the active profile:
-
-```bash
-sudo nns-app add browser any
-```
-
-Optionally filter by a two-letter country code or a country-name fragment:
-
-```bash
-sudo nns-app add browser any JP
-sudo nns-app add browser any Germany
-```
-
-Two-letter values are matched only against VPN Gate's `CountryShort` field.
-For example, `US` cannot match `Russian Federation`. Longer values such as
-`Germany` continue to use case-insensitive country-name matching.
-
-The VPN Gate CSV list is cached in:
-
-```text
-/var/cache/nns-app/vpngate.csv
-```
-
-The cache is reused for two days. A failed refresh falls back to the last
-cached list even when it is older. Live OpenVPN probing protects selection
-from obviously dead entries in an older list. Force a fresh download with:
-
-```bash
-sudo nns-app add browser any DE --refresh
-```
-
-The profile itself is copied into the named app environment, so removing or
-refreshing the server-list cache does not remove previously imported profiles.
-
-Selection uses persistent round-robin state. For each application and country
-filter, nns-app rotates through the 20 highest-ranked matching relays instead of
-selecting the same top-scoring server repeatedly. State files are stored under:
-
-```text
-/var/lib/nns-app/vpngate-<app>-<filter>.last
-```
-
-Delete the corresponding state file to restart rotation from the strongest
-candidate.
-
-Before importing a relay, nns-app quick-checks up to ten round-robin
-candidates. Each candidate receives a six-second OpenVPN control-channel probe.
-A successful TCP socket alone is insufficient; the candidate must reach
-`Peer Connection Initiated` (or full initialization). This avoids rejecting a
-valid server merely because pushed routes and DNS take several more seconds.
-The selector prints the actual candidate-pool size.
-
-When an entire probe batch fails, the round-robin marker advances to the last
-tested relay. A subsequent `add any` call therefore continues with the next
-untested candidates when the pool contains more entries.
-
-Select and probe a public profile through the intended upstream path:
-
-```bash
-sudo nns-app add test any US --via hidemy
-```
-
-Both a required cache refresh and candidate probes use `nns-hidemy`. When the
-command itself is launched through `nns-app run hidemy`, the selector also
-detects that current namespace unless an explicit `--via` overrides it.
-Temporary probe interfaces do not install routes or configure addresses.
-
-The quick check confirms that the relay currently completes OpenVPN negotiation.
-It does not establish that the volunteer relay is trustworthy or that every
-destination will be reachable through it.
-
-The current implementation uses the VPN Gate public relay list. Relays are operated by volunteers and may be slow, unavailable, logged, filtered, or untrusted. This feature is suitable for testing and low-risk HTTPS traffic; it should not be treated as trusted privacy infrastructure.
-
-Profiles downloaded through `any` pass the same validation and managed-copy processing as locally imported profiles.
-
-## Chained startup with `--via`
-
-The persistent upstream from `UPSTREAM_APP` is used by default:
-
-```bash
-nns-app start -i test
-```
-
-Override it for one start without editing configuration:
-
-```bash
-nns-app start -i test --via hidemy
-nns-app start test --via host
-```
-
-The upstream app must already be started, have an active OpenVPN or WireGuard tunnel, and pass its own online check. Multiple downstream apps
-may share one upstream. Stopping an upstream with `nns-app stop` first stops
-its currently attached downstream apps. An unexpected upstream failure cannot
-leak downstream traffic because forwarding is accepted only toward the
-recorded upstream tunnel interface.
-
-`--via` on `add any` controls download/probe routing. `--via` on `start`
-controls the actual runtime topology; using only the former does not chain the
-application namespace.
+`remove` refuses to delete an environment that is still configured as an
+upstream for another application environment or gateway.
 
 ## Startup modes
 
-### Strict start
+Strict start waits for the configured data path:
 
 ```bash
-nns-app start browser
+nns-app start my-private-app
 ```
 
-Strict start waits up to `READY_TIMEOUT`, which defaults to five seconds. A tunnel interface alone is not considered success: `nns-app` also checks that the namespace can pass traffic.
+The default timeout is five seconds unless changed in the application configuration.
+On failure, the VPN service and namespace are stopped.
 
-When the data path is still offline after the deadline, `nns-app`:
-
-1. prints recent VPN-backend log lines;
-2. stops the VPN service;
-3. removes the runtime namespace;
-4. returns a nonzero exit status.
-
-This prevents a failed connection from retrying indefinitely in the background.
-
-### Ignore/asynchronous start
+Asynchronous start returns after the initial launch and leaves a slow
+connection retrying:
 
 ```bash
-nns-app start -i browser
+nns-app start -i my-private-app
 ```
 
-The long form is also accepted:
+Check it later:
 
 ```bash
-nns-app start --ignore-start-error browser
+nns-app status my-private-app
 ```
 
-For compatibility, the option may also follow the app name:
+## Local chaining
+
+Create and start an upstream VPN environment:
 
 ```bash
-nns-app start browser -i
+sudo nns-app install my-upstream-vpn
+sudo nns-app add my-upstream-vpn ~/Downloads/my-base-profile.ovpn
+nns-app start -i my-upstream-vpn
+nns-app status my-upstream-vpn
 ```
 
-With `-i`, `nns-app` uses a short readiness probe and normally returns in about one to two seconds. When the VPN is not online yet, it:
+Create a second environment whose VPN connection must travel through that
+upstream:
 
-- prints a warning;
-- returns success;
-- leaves the namespace and VPN service running;
-- does not stop the failed or slow connection.
+```bash
+sudo nns-app install my-private-app --via my-upstream-vpn
+sudo nns-app add my-private-app ~/Downloads/my-app-profile.ovpn
+nns-app start -i my-private-app
+nns-app status my-private-app
+```
 
-Check progress later:
+A one-start override does not change the saved configuration:
+
+```bash
+nns-app start -i my-private-app --via my-upstream-vpn
+```
+
+Use `--via host` for a one-start direct-host override.
+
+## Public VPN Gate profile selection
+
+Download, rank, probe, and import a public OpenVPN profile:
+
+```bash
+sudo nns-app add my-private-app any
+sudo nns-app add my-private-app any JP
+sudo nns-app add my-private-app any Germany
+```
+
+Force a fresh server list:
+
+```bash
+sudo nns-app add my-private-app any US --refresh
+```
+
+Probe candidates through an upstream environment:
+
+```bash
+sudo nns-app add my-private-app any US --via my-upstream-vpn
+```
+
+VPN Gate is a volunteer network. Profiles can disappear or stop responding
+without notice; use `status` and provider-managed profiles for reliable
+deployments.
+
+## Status commands
+
+List all application environments:
 
 ```bash
 nns-app list
-sudo journalctl -fu nns-openvpn@browser.service
 ```
 
-`-i` ignores only the readiness failure. Invalid configuration, a missing profile, failure to create the namespace, or failure to start systemd services remains an actual error.
+Show a detailed report:
 
-A namespace creation error occurs before OpenVPN is launched. Version 1.0.14
-prints the recent `nns-netns@<name>.service` log automatically in this case;
-`-i` cannot and should not hide this structural failure.
+```bash
+nns-app status my-private-app
+```
 
-Version 1.0.14 also fixes restart cleanup ordering. A stale namespace is removed
-before `/run/nns-app/<name>.endpoints` is generated, preventing cleanup from
-deleting the newly generated endpoint list during the same start operation.
+The report distinguishes `ONLINE`, `OFFLINE`, `STARTING`, `FAILED`, and
+`STOPPED` and includes:
 
-Applications are still protected: with the kill switch enabled, `nns-app run` refuses to launch a command until the tunnel route and data path are usable.
+- active profile and backend;
+- configured and runtime upstream;
+- namespace and backend service state;
+- endpoint and current OpenVPN handshake stage;
+- WireGuard endpoint, handshake age, and transfer totals;
+- tunnel interface and address;
+- external IPv4 and data-path probe;
+- focused cuts from the current systemd invocation on failure.
 
-## Commands
+## Managed remote gateway
 
-| Command | Description |
-|---|---|
-| `nns-app install <name>` | Install or refresh the engine and create a named environment |
-| `nns-app add <name> <profile.ovpn|wireguard.conf>` | Validate and import an OpenVPN or WireGuard profile |
-| `nns-app add <name> any [country] [--refresh] [--via <app>|host]` | Select and probe a VPN Gate profile through the chosen path |
-| `nns-app start <name>` | Start and require a usable data path within the configured timeout |
-| `nns-app start -i <name>` | Start asynchronously; leave a slow/offline service running |
-| `nns-app stop <name>` | Stop the transport and remove the runtime namespace |
-| `nns-app run <name> <command> [args...]` | Run a command in the namespace as the configured user |
-| `nns-app list` | Show state, active profile, tunnel address, and external address |
-| `nns-app status <name>` | Show detailed health, active profile, endpoint, services, handshake, upstream and focused logs |
-| `nns-app remove <name>` | Remove one app environment and its profiles |
-| `nns-app purge` | Remove the engine and all `nns-app` environments |
-| `nns-app --version` | Show version, author, and license |
+On the remote Linux box, first create and start the nns-app environment that will
+provide the gateway's final Internet exit:
 
-App names may contain letters, digits, `.`, `_`, and `-`, with a maximum length of 32 characters.
+```bash
+sudo nns-app install my-remote-exit
+sudo nns-app add my-remote-exit /root/my-base-profile.ovpn
+nns-app start -i my-remote-exit
+nns-app status my-remote-exit
+```
 
-## Per-app configuration
+Create a gateway routed through that exit:
 
-Each environment has a root-owned configuration file:
+```bash
+sudo nns-app gateway create my-relay \
+    --via my-remote-exit \
+    --listen tcp:443 \
+    --public vpn.example.net:443
+```
+
+`--public` is written into exported client profiles. It may differ from the
+local listener when a router forwards another public port.
+
+Optional network and DNS settings:
+
+```bash
+sudo nns-app gateway create my-relay \
+    --via my-remote-exit \
+    --listen udp:443 \
+    --public vpn.example.net:443 \
+    --pool 10.200.40.0/24 \
+    --dns "1.1.1.1 9.9.9.9"
+```
+
+Custom pools are rejected when they overlap:
+
+- live host or namespace routes;
+- existing application networks;
+- existing gateway pools or transit networks;
+- the reserved app range `10.240.0.0/16`;
+- the reserved gateway transit range `10.239.0.0/16`.
+
+Create one client identity per local machine:
+
+```bash
+sudo nns-app gateway client add my-relay my-linux-client
+sudo nns-app gateway client export my-relay my-linux-client \
+    --output /root/my-remote-profile.ovpn
+```
+
+Start and inspect the remote gateway:
+
+```bash
+sudo nns-app gateway start my-relay
+sudo nns-app gateway status my-relay
+sudo nns-app gateway list
+sudo nns-app gateway client list my-relay
+```
+
+Transfer the exported profile over an authenticated channel. On the local box:
+
+```bash
+sudo nns-app install my-remote-vpn
+sudo nns-app add my-remote-vpn ./my-remote-profile.ovpn
+nns-app start -i my-remote-vpn
+nns-app status my-remote-vpn
+nns-app run my-remote-vpn curl -4 https://api.ipify.org
+```
+
+Revoke a lost client identity:
+
+```bash
+sudo nns-app gateway client revoke my-relay my-linux-client
+```
+
+Revocation and CRL generation are transactional. Active gateways are restarted
+after revocation so the client session is disconnected immediately. A systemd
+timer refreshes every gateway CRL weekly; `gateway status` shows its next
+update date.
+
+Remove the gateway and all of its private material:
+
+```bash
+sudo nns-app gateway remove my-relay
+```
+
+The gateway does not automatically open the host firewall or configure an
+external router. Permit or forward the selected TCP/UDP port separately.
+
+## Gateway security
+
+Each managed gateway has:
+
+- a private CA;
+- a unique certificate and private key per client;
+- a unique TLS Crypt v2 client key;
+- TLS Crypt v2 `force-cookie`;
+- TLS 1.2 minimum;
+- AEAD data ciphers;
+- a certificate revocation list;
+- atomic configuration and CRL replacement.
+
+Administrative gateway and PKI operations are serialized with `flock`.
+Gateway creation and client enrollment use staging directories and publish
+their final state only after validation.
+
+Direct OpenVPN with TLS Crypt v2 is harder to fingerprint than a plain
+OpenVPN profile, but it is not indistinguishable from HTTPS. Strong protocol
+filtering may still require a separate camouflage transport.
+
+## App configuration
+
+Each application environment has:
 
 ```text
 /etc/nns-app/<name>/<name>.cfg
 ```
 
-Edit it with:
+Important fields:
 
-```bash
-sudoedit /etc/nns-app/browser/browser.cfg
+```ini
+DEFAULT_PROFILE=""
+VPN_TYPE=""
+KILLSWITCH="on"
+AUTOSTART="off"
+UPSTREAM_APP=""
+WAN_IFACE="auto"
+DNS_SERVERS="1.1.1.1 9.9.9.9"
+DISABLE_IPV6="on"
+DISABLE_DCO="off"
+PROFILE_FIXUPS="on"
+READY_TIMEOUT="5"
+EXTERNAL_IP_URL="https://api.ipify.org"
 ```
 
-Important settings:
+Configuration files are root-owned and rejected when group/world writable.
+All known fields are reset before every load, preventing values from a
+previously loaded application or gateway from leaking into another object.
 
-| Setting | Default | Purpose |
-|---|---:|---|
-| `APP_USER` | installing user | User identity used for launched applications |
-| `DEFAULT_PROFILE` | empty | Active managed VPN profile |
-| `VPN_TYPE` | empty | Set automatically to `openvpn` or `wireguard` |
-| `KILLSWITCH` | `on` | Block direct traffic outside the tunnel |
-| `AUTOSTART` | `off` | Enable the environment at boot |
-| `WAN_IFACE` | `auto` | Host uplink or explicitly selected interface |
-| `DNS_SERVERS` | `1.1.1.1 9.9.9.9` | Namespace-only DNS resolvers |
-| `DISABLE_IPV6` | `on` | Disable IPv6 inside the namespace |
-| `PROFILE_FIXUPS` | `on` | Normalize the managed copy for compatibility |
-| `DISABLE_DCO` | `off` | Explicit OpenVPN DCO policy; ignored for WireGuard |
-| `READY_TIMEOUT` | `5` | Strict-start readiness deadline in seconds |
-| `EXTERNAL_IP_URL` | `https://api.ipify.org` | External-address status endpoint |
-
-The `-i` startup mode intentionally uses its own short probe instead of `READY_TIMEOUT`.
-
-## OpenVPN profile policy
-
-Imported profiles are treated as untrusted input. The current backend accepts a restricted profile subset:
-
-- TUN profiles only; TAP is rejected.
-- Certificates and keys must be embedded in the profile.
-- Interactive password prompts are unsupported.
-- External credential/key paths are rejected.
-- Scripts, plugins, management directives, and other root-executed hooks are rejected.
-- The source profile is never modified.
-- The managed copy is normalized from CRLF/CR to Unix LF line endings before parsing.
-- Parsed VPN endpoint ports and protocols are validated before any iptables rule is created.
-- A root-owned managed copy is stored under `/etc/nns-app/<name>/profiles/`.
-- Vendor-specific directives requiring a patched OpenVPN binary are unsupported by stock Ubuntu OpenVPN.
-
-With `PROFILE_FIXUPS="on"`, managed-copy compatibility processing may:
-
-- add `disable-dco`;
-- permit a detected legacy SHA-1/MD5 certificate chain;
-- add a CBC cipher fallback for a legacy profile.
-
-Disable automatic changes with:
+After manually changing `UPSTREAM_APP`, refresh generated systemd dependencies:
 
 ```bash
-PROFILE_FIXUPS="off"
+sudo nns-app install <name>
 ```
 
-Then re-add the original profile.
+## Profile policy
 
-## WireGuard profile policy
+OpenVPN imports reject root-level directives that can execute scripts, load
+plugins, include arbitrary files, or expose management interfaces. Managed
+copies can add compatibility directives when `PROFILE_FIXUPS="on"`.
 
-Import a provider WireGuard profile with:
+WireGuard imports accept full-tunnel IPv4 client profiles. These directives
+are rejected:
+
+```text
+PreUp
+PostUp
+PreDown
+PostDown
+SaveConfig
+```
+
+Namespace DNS remains authoritative instead of being delegated to `wg-quick`.
+
+## Snap applications
+
+`ip netns exec` creates a private mount namespace for namespace-specific
+resolver files. Snap launchers also require cgroup v2 and securityfs there.
+`nns-app run` mounts those filesystems inside the private command mount
+namespace before dropping to the configured desktop user.
 
 ```bash
-sudo nns-app add browser ~/Downloads/provider.conf
+nns-app run my-private-app firefox --no-remote
 ```
 
-The current WireGuard backend intentionally supports a restricted client
-profile subset:
+The temporary mounts disappear with the command and do not alter the host
+mount table.
 
-- exactly one `[Interface]` followed by one or more `[Peer]` sections;
-- an inline 32-byte base64 `PrivateKey`;
-- at least one IPv4 interface `Address`;
-- IPv4 or hostname `Endpoint` values with UDP ports;
-- full-tunnel IPv4 `AllowedIPs` (`0.0.0.0/0`, or both `/1` halves);
-- `Table = auto` or no `Table` setting;
-- optional `MTU`, `ListenPort`, `FwMark`, `PresharedKey`, and `PersistentKeepalive`.
+## Upgrade
 
-For safety, `PreUp`, `PostUp`, `PreDown`, `PostDown`, `SaveConfig`, unknown
-sections, and unknown options are rejected. IPv6-only endpoints and split-tunnel
-profiles are not supported in this release.
+Install the current pre-built file:
 
-The managed source copy remains under `/etc/nns-app/<name>/profiles/` with mode
-`0600`. At startup, nns-app creates a temporary root-only runtime configuration:
+```bash
+sudo ./nns-app-install.sh install
+```
 
-- profile `DNS` is omitted because namespace DNS is controlled by `DNS_SERVERS`;
-- IPv6 addresses and allowed ranges are omitted when `DISABLE_IPV6="on"`;
-- `wg-quick` creates the interface and routes only inside the app namespace;
-- the endpoint is pinned to the namespace veth and allowed by the kill switch;
-- shutdown runs `wg-quick down` and removes the temporary configuration.
+The installer refreshes systemd templates and generated dependency drop-ins.
+An upgrade from 1.1.24 to 1.1.25 changes documentation, comments, help examples,
+and contributor guidance; it does not change the networking data path.
 
-The existing systemd template keeps its historical filename
-`nns-openvpn@.service` for upgrade compatibility, but its description and
-entry point are backend-neutral and it manages either OpenVPN or WireGuard.
+A gateway still running from 1.0.23 must be restarted once so the current
+policy-rule and dedicated firewall-chain model replaces the legacy rules:
 
-WireGuard does not have a persistent userspace tunnel daemon. nns-app keeps a
-small supervised lifecycle process alive after `wg-quick up` so systemd can
-stop the interface deterministically with the same app commands used for
-OpenVPN.
+```bash
+sudo nns-app gateway stop my-relay
+sudo nns-app gateway start my-relay
+```
 
-## Isolation and security
-
-Every environment receives its own:
-
-- network namespace;
-- loopback interface;
-- veth pair and allocated `/30` network;
-- route table;
-- resolver file;
-- namespace-local firewall;
-- backend-specific OpenVPN process or WireGuard interface lifecycle managed by systemd.
-
-OpenVPN DNS helper integration is disabled, and WireGuard `DNS` entries are omitted from the runtime copy, so imported profiles cannot replace host DNS.
-
-Namespace and tunnel setup require root. `nns-app run` enters the namespace as root and then permanently drops to `APP_USER` with `setpriv` before executing the requested program. Commands are executed directly without `eval` or shell re-parsing.
-
-The installer creates restricted sudoers commands for routine operations. Re-run `install` after upgrading so new command forms such as `status` and `start -i` are added to the sudoers rule.
+The installer prints a warning when it detects a running gateway that requires
+that migration restart.
 
 ## Troubleshooting
 
-Show all environments:
+Application environment:
 
 ```bash
-nns-app list
+nns-app status my-private-app
+sudo journalctl \
+    -u nns-netns@my-private-app.service \
+    -u nns-openvpn@my-private-app.service \
+    -n 150 -o cat --no-pager
 ```
 
-Show a detailed health report for one environment:
+Managed gateway:
 
 ```bash
-nns-app status browser
+sudo nns-app gateway status my-relay
+sudo journalctl \
+    -u nns-gateway@my-relay.service \
+    -n 150 -o cat --no-pager
 ```
 
-`status` distinguishes `ONLINE`, `OFFLINE`, `STARTING`, `FAILED`, and
-`STOPPED`. For a healthy profile it reports the backend, runtime upstream,
-endpoint, tunnel interface, tunnel address, external address, OpenVPN
-handshake state or WireGuard handshake age and transfer counters.
-
-When the profile is not usable, it classifies the most likely failure stage
-and prints focused cuts from the current namespace-service and VPN-service
-invocations rather than dumping the entire journal. Typical diagnoses include:
-
-- endpoint transport not established;
-- TCP connected but no OpenVPN/TLS response;
-- TLS established but OpenVPN initialization incomplete;
-- authentication or certificate rejection;
-- WireGuard interface active but no handshake;
-- tunnel route present but Internet data path unavailable;
-- upstream namespace stopped or not ready.
-
-Follow VPN-backend logs (the unit keeps its legacy name):
+Inspect namespace and WireGuard state:
 
 ```bash
-sudo journalctl -fu nns-openvpn@browser.service
+sudo ip -n nns-my-private-app address
+sudo ip -n nns-my-private-app route show table all
+sudo ip netns exec nns-my-private-app wg show
 ```
 
-Inspect namespace setup:
+Inspect a chained or gateway data path:
 
 ```bash
-sudo journalctl -u nns-netns@browser.service -n 100 --no-pager
+sudo ip rule show
+sudo ip route show table all
+sudo iptables-save
+sudo ip netns exec nns-my-remote-exit iptables-save
 ```
-
-Version 1.0.12 normalizes Windows-style CRLF profiles automatically. On an
-older installation, `proto tcp^M` or `remote ... 443^M` in `cat -v` output can
-make iptables reject the endpoint rule. Re-add the profile after upgrading, or
-temporarily normalize the managed copy with:
-
-```bash
-sudo sed -i 's/\r$//' /etc/nns-app/<name>/profiles/<profile>.ovpn
-```
-
-Inspect interfaces and routes:
-
-```bash
-sudo ip -n nns-browser address
-sudo ip -n nns-browser route
-```
-
-Inspect firewall counters:
-
-```bash
-sudo ip netns exec nns-browser iptables -nvL --line-numbers
-```
-
-Test the data path:
-
-```bash
-nns-app run browser ping -c 3 1.1.1.1
-nns-app run browser curl -4 https://api.ipify.org
-```
-
-A log message such as `Initialization Sequence Completed` proves that OpenVPN initialized its control/data-channel state; it does not by itself prove that the provider is forwarding application traffic. `nns-app` therefore performs a separate namespace data-path probe.
 
 ## Known limitations
 
-- Linux and systemd only.
-- Ubuntu is the primary tested platform.
-- IPv4 is the primary supported path; IPv6 is disabled by default.
-- OpenVPN and full-tunnel IPv4 WireGuard profiles are implemented.
-- Runtime namespaces are removed on normal stop.
-- The most recently added profile becomes active.
-- Firewall management currently uses iptables.
-- Public relays may disappear or change without notice.
-- Provider-side session limits, stale mappings, custom clients, and custom protocol extensions are outside the generic backends' control.
-- GUI applications with single-instance or sandbox policies may need application-specific launch options.
+- IPv4 client data paths only.
+- Ubuntu/systemd/iptables are the supported platform combination.
+- Managed gateways use an OpenVPN server backend only.
+- Gateway enrollment and profile transfer are manual; SSH automation is not
+  included.
+- Router port forwarding and host INPUT firewall changes are not automated.
+- Client and server certificate renewal requires issuing a new client identity
+  or recreating the gateway before certificate expiry.
+- Direct OpenVPN gateway transport is not a full DPI-camouflage protocol.
 
-## Roadmap
+## Contributing
 
-- Further backend abstraction shared by OpenVPN, WireGuard, and future transports.
-- Direct `wg` configuration as an alternative to the current namespace-local `wg-quick` lifecycle.
-- AmneziaWG support.
-- Provider-specific configuration/control-plane helpers.
-- Fast profile switching without destroying the namespace.
-- Explicit profile listing and selection commands.
-- nftables backend with transactional updates.
-- IPv6 tunnel and kill-switch support.
-- Health states separating process, handshake, route, DNS, and Internet readiness.
-- Debian/Ubuntu packaging and automated integration tests.
+Read `CONTRIBUTING.md` before changing networking, firewall, route ownership,
+PKI, locking, or systemd lifecycle code. Run:
+
+```bash
+make test
+```
+
+before committing source or generated-installer changes.
 
 ## License
 
-Copyright © 2026 Maxim Lyadvinsky.
-
-`nns-app` is licensed under the GNU General Public License v3.0 or later (`GPL-3.0-or-later`).
-
-## Snap applications inside an NNS namespace
-
-`ip netns exec` creates a private mount namespace while binding
-`/etc/netns/<namespace>/resolv.conf` over `/etc/resolv.conf`. Snap applications
-need both cgroup v2 and securityfs visible in that mount namespace. Older
-versions of nns-app could therefore fail with:
-
-```text
-internal error, please report: running "firefox" failed:
-cannot find tracking cgroup
-```
-
-Version 1.0.19 mounts `cgroup2` and `securityfs` in the private command mount
-namespace before dropping privileges to the configured application user. The
-mounts disappear when the command exits and do not alter the host mount table.
-
-Example:
-
-```bash
-nns-app run hidemy firefox --no-remote
-```
-
-To inspect the mounts from a namespaced shell:
-
-```bash
-nns-app run hidemy bash
-findmnt /sys/fs/cgroup /sys/kernel/security
-```
-
-
-### WireGuard-specific diagnostics
-
-```bash
-sudo ip netns exec nns-browser wg show
-sudo ip -n nns-browser link show type wireguard
-sudo ip -n nns-browser rule show
-sudo ip -n nns-browser route show table all
-```
-
-A WireGuard interface may exist before it has exchanged a handshake. `nns-app start` and `nns-app run` therefore require a real ping or HTTP data-path probe, not merely the presence of the interface.
+GPL-3.0-or-later. See `LICENSE`.
