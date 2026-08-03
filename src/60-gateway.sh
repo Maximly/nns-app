@@ -393,11 +393,11 @@ gateway_generate_pki() {
 
     chown root:root "$pki/ca.crt" "$pki/server.crt" "$pki/crl.pem" ||
         return 1
-    chown root:nogroup "$pki/server.key" "$pki/tls-crypt-v2-server.key" ||
+    chown root:root "$pki/server.key" "$pki/tls-crypt-v2-server.key" ||
         return 1
     chmod 0644 "$pki/ca.crt" "$pki/server.crt" "$pki/crl.pem" ||
         return 1
-    chmod 0640 "$pki/server.key" "$pki/tls-crypt-v2-server.key" ||
+    chmod 0600 "$pki/server.key" "$pki/tls-crypt-v2-server.key" ||
         return 1
 }
 
@@ -934,6 +934,10 @@ gateway_down_locked() {
     fi
 
     gateway_delete_veth_everywhere "$GATEWAY_VETH_HOST"
+    # A failed OpenVPN startup can leave the uniquely named managed TUN
+    # interface behind.  Remove it before a reconciled retry so the next
+    # process never inherits stale interface state.
+    ip link del "$GATEWAY_TUN" 2>/dev/null || true
     rm -rf "$(gateway_runtime_dir "$gateway")"
 }
 

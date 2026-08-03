@@ -76,7 +76,11 @@ main() {
             ;;
         _gateway-tun-up)
             require_root
-            [[ $# -eq 2 ]] || die "_gateway-tun-up requires gateway_name."
+            # OpenVPN appends its generated TUN arguments after the command
+            # and gateway name configured in --up.  The gateway callback uses
+            # the device environment variable and intentionally ignores those
+            # additional positional arguments.
+            (( $# >= 2 )) || die "_gateway-tun-up requires gateway_name."
             gateway_tun_up "$2"
             exit
             ;;

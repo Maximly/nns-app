@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.5
+
+- Fixed managed gateway startup under OpenVPN: `--up` appends TUN metadata arguments after the configured command arguments, so the internal callback now accepts and ignores those extra values instead of rejecting the valid invocation.
+- Remove stale uniquely named managed TUN interfaces during gateway teardown and before reconciled retries.
+- Tightened managed gateway private-key permissions to root-only, eliminating OpenVPN's group/other-access warning.
+
 ## 1.3.4
 
 - Fixed managed OpenVPN gateways with custom `ngw...` interface names by emitting `dev-type tun` before `dev`.

@@ -46,7 +46,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.4"
+readonly VERSION="1.3.5"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -3954,11 +3954,11 @@ gateway_generate_pki() {
 
     chown root:root "$pki/ca.crt" "$pki/server.crt" "$pki/crl.pem" ||
         return 1
-    chown root:nogroup "$pki/server.key" "$pki/tls-crypt-v2-server.key" ||
+    chown root:root "$pki/server.key" "$pki/tls-crypt-v2-server.key" ||
         return 1
     chmod 0644 "$pki/ca.crt" "$pki/server.crt" "$pki/crl.pem" ||
         return 1
-    chmod 0640 "$pki/server.key" "$pki/tls-crypt-v2-server.key" ||
+    chmod 0600 "$pki/server.key" "$pki/tls-crypt-v2-server.key" ||
         return 1
 }
 
@@ -4495,6 +4495,10 @@ gateway_down_locked() {
     fi
 
     gateway_delete_veth_everywhere "$GATEWAY_VETH_HOST"
+    # A failed OpenVPN startup can leave the uniquely named managed TUN
+    # interface behind.  Remove it before a reconciled retry so the next
+    # process never inherits stale interface state.
+    ip link del "$GATEWAY_TUN" 2>/dev/null || true
     rm -rf "$(gateway_runtime_dir "$gateway")"
 }
 
@@ -7707,7 +7711,11 @@ main() {
             ;;
         _gateway-tun-up)
             require_root
-            [[ $# -eq 2 ]] || die "_gateway-tun-up requires gateway_name."
+            # OpenVPN appends its generated TUN arguments after the command
+            # and gateway name configured in --up.  The gateway callback uses
+            # the device environment variable and intentionally ignores those
+            # additional positional arguments.
+            (( $# >= 2 )) || die "_gateway-tun-up requires gateway_name."
             gateway_tun_up "$2"
             exit
             ;;

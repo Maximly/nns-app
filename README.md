@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.4
+**Release:** 1.3.5
 
 **Supported platform:** Ubuntu with systemd and iptables  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces

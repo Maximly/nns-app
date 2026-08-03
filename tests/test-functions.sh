@@ -79,6 +79,16 @@ dev_type_line=$(grep -nFx 'dev-type tun' "$gateway_cfg_root/server.conf" | cut -
 dev_line=$(grep -nFx 'dev ngwdeadbeef' "$gateway_cfg_root/server.conf" | cut -d: -f1)
 (( dev_type_line < dev_line )) || fail 'dev-type must precede the custom dev line'
 
+# OpenVPN appends tun_dev, tun_mtu, a compatibility zero, local/remote
+# addresses, and init/restart after the configured --up command arguments.
+# The dispatcher must retain the configured gateway name and ignore the rest.
+(
+    require_root() { :; }
+    gateway_tun_up() { [[ "$1" == unit-gateway ]]; }
+    main _gateway-tun-up unit-gateway ngwdeadbeef 1500 0 \
+        10.253.99.1 10.253.99.2 init
+) || fail 'gateway up callback rejected OpenVPN-appended arguments'
+
 lock_key="test-functions-$$"
 acquire_lock "$lock_key"
 acquire_lock "$lock_key"

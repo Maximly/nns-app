@@ -9,7 +9,7 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fq 'nns-app 1.3.4' <<<"$version"
+grep -Fq 'nns-app 1.3.5' <<<"$version"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -102,6 +102,14 @@ grep -Fq 'systemctl stop "nns-gateway@${gateway}.service"' "$INSTALLER" || {
     echo 'failed gateway startup can leave a systemd restart loop running' >&2
     exit 1
 }
+grep -Fq '(( $# >= 2 )) || die "_gateway-tun-up requires gateway_name."' "$INSTALLER" || {
+    echo 'OpenVPN up callback still rejects appended tunnel arguments' >&2
+    exit 1
+}
+grep -Fq 'ip link del "$GATEWAY_TUN"' "$INSTALLER" || {
+    echo 'gateway teardown does not remove a stale managed TUN interface' >&2
+    exit 1
+}
 grep -Fq 'CONTRIBUTING.md' "$ROOT/README.md"
 test -s "$ROOT/CONTRIBUTING.md"
 test ! -e "$ROOT/ARCHITECTURE.md"
@@ -121,7 +129,7 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 1.3.4' "$ROOT/README.md"
+grep -Fq '**Release:** 1.3.5' "$ROOT/README.md"
 grep -Fq 'OpenVPN 2.6+' "$ROOT/README.md"
 
 # Public documentation and help use one descriptive example-name set.
