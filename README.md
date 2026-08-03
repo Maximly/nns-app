@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.5
+**Release:** 1.3.9
 
 **Supported platform:** Ubuntu with systemd and iptables  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
@@ -67,12 +67,12 @@ For the usual case—run a local application through a provider profile that
 must execute on a remote Linux host—the public workflow is only:
 
 ```bash
-nns-app install my-private-app via --remote maxim@mlcloud
+nns-app install my-private-app via --remote user@remote-host
 nns-app add my-private-app ~/my-base-profile.ovpn
 nns-app run my-private-app ping 1.1.1.1
 ```
 
-The compact `--via-remote maxim@mlcloud` form remains accepted as an alias.
+The compact `--via-remote user@remote-host` form remains accepted as an alias.
 
 The first command uses the invoking user's existing SSH access. It confirms and
 pins the host key, installs or upgrades the same nns-app version remotely,
@@ -83,13 +83,15 @@ during this bootstrap.
 The second command validates the self-contained provider profile locally and
 then deploys it remotely. nns-app automatically creates a hidden remote exit,
 a loopback-only managed OpenVPN gateway, a unique client credential, and the
-local `.nnslink` profile. The default data transport is a supervised SSH local
+local `.nnslink` profile. It also starts the local environment and enables both
+ends for boot recovery. The default data transport is a supervised SSH local
 forward through the existing SSH port, so no additional cloud firewall rule or
 public gateway port is needed.
 
-The third command starts the complete local/remote path when it is stopped and
-then executes the requested process inside the local namespace. Normal status,
-synchronization, and credential rotation remain available:
+The third command executes the requested process inside the already running
+local namespace. If the environment was stopped manually, `run` starts it
+again. Normal status, synchronization, and credential rotation remain
+available:
 
 ```bash
 nns-app status my-private-app
@@ -101,12 +103,36 @@ sudo nns-app remote rotate my-private-app
 Requirements for automatic mode:
 
 - use a new or otherwise unconfigured application name; nns-app will not silently convert an existing local-profile environment into a remote one;
-- `ssh maxim@mlcloud` must already work for the invoking user, using a key,
+- `ssh user@remote-host` must already work for the invoking user, using a key,
   agent, or an interactive password during the first bootstrap;
 - the remote SSH endpoint must resolve to IPv4; nns-app's managed data plane is currently IPv4-only;
 - that remote account must be allowed to run `sudo` during bootstrap;
 - provider OpenVPN profiles must contain inline credentials and must not need
   an interactive password, as in local nns-app mode.
+
+Automatic-remote environments use `AUTOSTART="on"`. After either client or
+remote host reboots, systemd recreates the remote provider exit, private
+gateway, local SSH forward, OpenVPN client, online check, and watchdog. Running
+applications themselves do not survive a client reboot.
+
+Removing an automatic-remote app also removes the hidden remote client,
+gateway, provider exit, remote state, and that app's dedicated SSH key:
+
+```bash
+nns-app remove my-private-app
+```
+
+`nns-app purge` performs the same ownership-scoped cleanup for every automatic
+remote before deleting local nns-app state and binaries. If a remote host is
+unreachable, removal fails before local credentials are deleted, so it can be
+retried. Use `--local-only` only when intentionally abandoning remote objects:
+
+```bash
+sudo nns-app purge --local-only
+```
+
+Cleanup does not uninstall the shared nns-app engine or VPN packages from the
+remote host because other clients may still use them.
 
 The lower-level `remote`, `gateway`, `link`, `--transport`, and manual export
 commands remain supported for custom listeners, public direct gateways,
@@ -646,7 +672,7 @@ The first connection records its SSH host key; subsequent commands require that
 pinned key and non-interactive SSH/sudo:
 
 ```bash
-sudo nns-app remote add edge1 --ssh maxim@vpn.example.net
+sudo nns-app remote add edge1 --ssh user@vpn.example.net
 ```
 
 Create a unique remote client and import its bundle locally:
@@ -740,6 +766,11 @@ REMOTE_PROFILE_GENERATION=""
 REMOTE_SERVER_FINGERPRINT=""
 ```
 
+The ordinary local/manual install default is `AUTOSTART="off"`. Simple
+automatic-remote mode changes it to `on` after `install ... via --remote` and
+starts/enables the environment after profile deployment.
+
+
 Configuration files are root-owned and rejected when group/world writable.
 
 ### Adaptive data-path watchdog
@@ -793,17 +824,26 @@ Namespace DNS remains authoritative instead of being delegated to `wg-quick`.
 
 `ip netns exec` creates a private mount namespace for namespace-specific
 resolver files. Snap launchers also require cgroup v2 and securityfs there.
-`nns-app run` detects commands that resolve to Snap and mounts those filesystems
-inside the private command mount namespace before dropping to the configured
-desktop user. Ordinary commands and non-Snap desktop applications skip this
-extra mount preparation.
+`nns-app run` detects direct Snap aliases, the Snap launcher itself, and distro
+transition wrappers such as Ubuntu's `/usr/bin/firefox` wrapper. It mounts those
+filesystems inside the private command mount namespace before dropping to the
+configured desktop user.
+
+Snap can reuse a persistent mount namespace and see the host's
+`127.0.0.53` systemd-resolved stub instead of `/etc/netns/<name>/resolv.conf`.
+For Snap launches, nns-app therefore starts a lazy DNS compatibility proxy on
+`127.0.0.53:53` inside the application network namespace. The proxy forwards
+UDP and TCP DNS to the configured `DNS_SERVERS`, drops privileges after binding,
+and is stopped with the namespace. Ordinary commands and non-Snap desktop
+applications skip both the mount preparation and the proxy.
 
 ```bash
 nns-app run my-private-app firefox --no-remote
 ```
 
 The temporary mounts disappear with the command and do not alter the host
-mount table.
+mount table. The DNS proxy is namespace-local and never changes the host
+resolver configuration.
 
 ## Upgrade
 

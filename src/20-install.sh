@@ -106,6 +106,22 @@ TimeoutStartSec=70s
 WantedBy=multi-user.target
 ONLINE_UNIT_EOF
 
+    cat >"$DNS_PROXY_UNIT" <<'DNS_PROXY_UNIT_EOF'
+[Unit]
+Description=Namespace DNS compatibility proxy for NNS app %i
+Requires=nns-netns@%i.service
+After=nns-netns@%i.service nns-openvpn@%i.service
+BindsTo=nns-netns@%i.service
+PartOf=nns-netns@%i.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/nns_app.sh _dns-proxy %i
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=5s
+DNS_PROXY_UNIT_EOF
+
     cat >"$WATCHDOG_SERVICE" <<'WATCHDOG_SERVICE_EOF'
 [Unit]
 Description=Data-path watchdog for NNS app %i
@@ -178,7 +194,7 @@ Unit=nns-gateway-crl-refresh@%i.service
 WantedBy=timers.target
 CRL_TIMER_EOF
 
-    chmod 0644 "$NETNS_UNIT" "$VPN_UNIT" "$ONLINE_UNIT" \
+    chmod 0644 "$NETNS_UNIT" "$VPN_UNIT" "$ONLINE_UNIT" "$DNS_PROXY_UNIT" \
         "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$GATEWAY_UNIT" \
         "$GATEWAY_CRL_SERVICE" "$GATEWAY_CRL_TIMER"
     systemctl daemon-reload
@@ -493,6 +509,10 @@ REMOTE_OWNER_ID=""
 REMOTE_EXIT_APP=""
 REMOTE_PROFILE_GENERATION=""
 REMOTE_SERVER_FINGERPRINT=""
+# Set after remote cleanup succeeds so a multi-app purge can be retried safely.
+REMOTE_CLEANED="off"
+# Ownership marker used only on hidden remote exits created by automatic mode.
+REMOTE_MANAGED_OWNER_ID=""
 
 # Engine-owned namespace network. Never copy these values to another environment.
 NS_NAME="nns-$app"

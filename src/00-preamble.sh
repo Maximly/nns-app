@@ -46,7 +46,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.5"
+readonly VERSION="1.3.9"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -58,6 +58,7 @@ readonly NETNS_UNIT="/etc/systemd/system/nns-netns@.service"
 readonly VPN_UNIT="/etc/systemd/system/nns-openvpn@.service"
 readonly GATEWAY_UNIT="/etc/systemd/system/nns-gateway@.service"
 readonly ONLINE_UNIT="/etc/systemd/system/nns-online@.service"
+readonly DNS_PROXY_UNIT="/etc/systemd/system/nns-dns@.service"
 readonly WATCHDOG_SERVICE="/etc/systemd/system/nns-watchdog@.service"
 readonly WATCHDOG_TIMER="/etc/systemd/system/nns-watchdog@.timer"
 readonly GATEWAY_CRL_SERVICE="/etc/systemd/system/nns-gateway-crl-refresh@.service"
@@ -170,7 +171,8 @@ reset_app_cfg_vars() {
     TRANSPORT_SSH_KNOWN_HOSTS="" TRANSPORT_SSH_REMOTE_PORT=""
     REMOTE_MODE="" REMOTE_ALIAS="" REMOTE_GATEWAY="" REMOTE_CLIENT=""
     REMOTE_OWNER_ID="" REMOTE_EXIT_APP="" REMOTE_PROFILE_GENERATION=""
-    REMOTE_SERVER_FINGERPRINT=""
+    REMOTE_SERVER_FINGERPRINT="" REMOTE_CLEANED=""
+    REMOTE_MANAGED_OWNER_ID=""
 }
 
 reset_gateway_cfg_vars() {
@@ -183,7 +185,7 @@ reset_gateway_cfg_vars() {
     GATEWAY_VETH_HOST="" GATEWAY_VETH_NS="" ROUTE_TABLE=""
     RULE_PRIORITY="" SERVER_CN="" HOST_FWD_CHAIN=""
     HOST_MANGLE_CHAIN="" NS_FWD_CHAIN="" NS_NAT_CHAIN=""
-    NS_MANGLE_CHAIN=""
+    NS_MANGLE_CHAIN="" REMOTE_MANAGED_OWNER_ID=""
 }
 
 reset_gateway_client_vars() {
@@ -229,8 +231,8 @@ usage() {
 Usage:
   nns-app install [app_name [--backend inherit] [--via <upstream-app>|host]]
   nns-app install <app_name> via --remote <user@host> [--remote-port <port>]
-  nns-app remove  <app_name>
-  nns-app purge
+  nns-app remove  <app_name> [--local-only]
+  nns-app purge [--local-only]
   nns-app list
   nns-app status  <app_name>
   nns-app add     <app_name> <profile.ovpn|wireguard.conf>
@@ -272,7 +274,7 @@ Simple managed-remote mode:
 Examples:
   sudo ./nns-app.sh install
   sudo nns-app install my-upstream-vpn
-  nns-app install my-private-app via --remote maxim@mlcloud
+  nns-app install my-private-app via --remote user@remote-host
   nns-app add my-private-app ~/my-base-profile.ovpn
   nns-app run my-private-app ping 1.1.1.1
   sudo nns-app add my-upstream-vpn ~/my-base-profile.ovpn

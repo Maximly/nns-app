@@ -513,11 +513,13 @@ stop_app_internal() {
     systemctl stop "nns-watchdog@${app}.timer" 2>/dev/null || true
     systemctl stop "nns-watchdog@${app}.service" 2>/dev/null || true
     systemctl stop "nns-online@${app}.service" 2>/dev/null || true
+    systemctl stop "nns-dns@${app}.service" 2>/dev/null || true
     systemctl stop "nns-openvpn@${app}.service" 2>/dev/null || true
     systemctl stop "nns-netns@${app}.service" 2>/dev/null || true
     systemctl reset-failed \
         "nns-watchdog@${app}.service" \
         "nns-online@${app}.service" \
+        "nns-dns@${app}.service" \
         "nns-openvpn@${app}.service" \
         "nns-netns@${app}.service" 2>/dev/null || true
 
@@ -549,12 +551,27 @@ apps_using_upstream() {
     done
 }
 
+remote_alias_used_by_other_app() {
+    local alias=$1 excluded_app=$2 dir app configured_alias
+    shopt -s nullglob
+    for dir in "$BASE_DIR"/*; do
+        [[ -d "$dir" ]] || continue
+        app=$(basename "$dir")
+        [[ "$app" != "$excluded_app" && -f "$(cfg_file "$app")" ]] || continue
+        configured_alias=$(cfg_read_value "$app" REMOTE_ALIAS 2>/dev/null || true)
+        [[ "$configured_alias" == "$alias" ]] && return 0
+    done
+    return 1
+}
+
 remove_app() {
     require_root
-    local app=$1 gateway_dependencies app_dependencies
+    local app=$1 cleanup_mode=${2:-remote}
+    local gateway_dependencies app_dependencies auto_alias=""
     validate_app_name "$app"
     load_cfg "$app"
 
+    auto_alias=${REMOTE_ALIAS:-}
     gateway_dependencies=$(gateways_using_app "$app" | paste -sd ', ' -)
     app_dependencies=$(apps_using_upstream "$app" | paste -sd ', ' -)
     [[ -z "$gateway_dependencies" ]] ||
@@ -562,16 +579,30 @@ remove_app() {
     [[ -z "$app_dependencies" ]] ||
         die "App '$app' is the configured upstream for: $app_dependencies. Reconfigure those apps first."
 
+    if [[ "${REMOTE_MODE:-}" == auto ]]; then
+        if [[ "$cleanup_mode" != local-only ]]; then
+            remote_auto_cleanup_app "$app"
+            load_cfg "$app"
+        else
+            warn "Leaving automatic remote resources for '$app' because --local-only was requested."
+        fi
+    fi
+
     stop_app "$app"
     load_cfg "$app"
-    systemctl disable --now "nns-watchdog@${app}.timer" >/dev/null 2>&1 || true
+    systemctl disable --now "nns-watchdog@${app}.timer" \
+        >/dev/null 2>&1 || true
     systemctl disable \
         "nns-online@${app}.service" \
         "nns-openvpn@${app}.service" \
-        "nns-netns@${app}.service" >/dev/null 2>&1 || true
+        "nns-netns@${app}.service" \
+        >/dev/null 2>&1 || true
 
     rm -f "/etc/sudoers.d/nns-app-${app}"
-    rm -rf "$(app_dropin_dir "$app")" "$(cfg_dir "$app")" "/etc/netns/$NS_NAME"
+    rm -rf \
+        "$(app_dropin_dir "$app")" \
+        "$(cfg_dir "$app")" \
+        "/etc/netns/$NS_NAME"
     rm -f \
         "$RUN_DIR/${app}.env" \
         "$RUN_DIR/${app}.profile" \
@@ -579,6 +610,11 @@ remove_app() {
         "$RUN_DIR/${app}.via" \
         "$(watchdog_state_file "$app")" \
         "$(wireguard_runtime_config_path "$app")"
+
+    if [[ -n "$auto_alias" ]] &&
+       ! remote_alias_used_by_other_app "$auto_alias" "$app"; then
+        rm -rf -- "$(remote_dir "$auto_alias")"
+    fi
     systemctl daemon-reload
     log "Removed NNS app '$app'."
 }
@@ -586,6 +622,7 @@ remove_app() {
 purge_engine() {
     require_root
 
+    local cleanup_mode=${1:-remote}
     local dir app ns pids
     local -a apps=()
     shopt -s nullglob
@@ -599,6 +636,17 @@ purge_engine() {
         [[ -f "$(cfg_file "$app")" ]] || continue
         apps+=("$app")
     done
+
+    # Automatic-remote objects are owned by their local app. Clean them before
+    # deleting local SSH keys and metadata. Failure is fail-closed: local state
+    # remains available so the user can retry when the remote host returns.
+    if [[ "$cleanup_mode" != local-only ]]; then
+        for app in "${apps[@]}"; do
+            remote_auto_cleanup_app "$app"
+        done
+    else
+        warn "Purging local state only; automatic remote exits and gateways are intentionally left in place."
+    fi
 
     # Stop gateways before removing the NNS exits that carry their data path.
     local gateway_dir gateway
@@ -621,6 +669,7 @@ purge_engine() {
         systemctl stop "nns-watchdog@${app}.timer" 2>/dev/null || true
         systemctl stop "nns-watchdog@${app}.service" 2>/dev/null || true
         systemctl stop "nns-online@${app}.service" 2>/dev/null || true
+        systemctl stop "nns-dns@${app}.service" 2>/dev/null || true
         systemctl stop "nns-openvpn@${app}.service" 2>/dev/null || true
     done
     for app in "${apps[@]}"; do
@@ -668,6 +717,7 @@ purge_engine() {
         \( -name 'nns-openvpn@*.service' \
            -o -name 'nns-netns@*.service' \
            -o -name 'nns-online@*.service' \
+           -o -name 'nns-dns@*.service' \
            -o -name 'nns-watchdog@*.service' \
            -o -name 'nns-watchdog@*.timer' \
            -o -name 'nns-gateway@*.service' \
@@ -691,7 +741,7 @@ purge_engine() {
         /etc/systemd/system/nns-watchdog@.timer.d \
         /etc/systemd/system/nns-gateway@.service.d
     rm -f -- \
-        "$VPN_UNIT" "$NETNS_UNIT" "$ONLINE_UNIT" \
+        "$VPN_UNIT" "$NETNS_UNIT" "$ONLINE_UNIT" "$DNS_PROXY_UNIT" \
         "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$GATEWAY_UNIT" \
         "$GATEWAY_CRL_SERVICE" "$GATEWAY_CRL_TIMER"
 
@@ -702,6 +752,9 @@ purge_engine() {
     rm -f -- "$ENGINE_PATH"
 
     log "Purged NNS app engine and all installed NNS apps."
+    if [[ "$cleanup_mode" != local-only ]]; then
+        log "Removed automatic remote exits, gateways, clients, and per-owner SSH keys."
+    fi
     log "Removed: $BASE_DIR, /etc/netns/nns-*, NNS systemd units, NNS sudoers rules, $USER_PATH and $ENGINE_PATH"
 }
 

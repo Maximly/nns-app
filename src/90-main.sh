@@ -56,6 +56,12 @@ main() {
             run_user_exec "$internal_app" "$@"
             exit
             ;;
+        _dns-proxy)
+            require_root
+            [[ $# -eq 2 ]] || die "_dns-proxy requires app_name."
+            dns_proxy_exec "$2"
+            exit
+            ;;
         _gateway-up)
             require_root
             [[ $# -eq 2 ]] || die "_gateway-up requires gateway_name."
@@ -206,12 +212,22 @@ main() {
             fi
             ;;
         remove)
-            [[ $# -eq 2 ]] || die "Usage: nns-app remove <app_name>"
-            remove_app "$2"
+            if [[ $# -eq 2 ]]; then
+                remove_app "$2"
+            elif [[ $# -eq 3 && "$3" == --local-only ]]; then
+                remove_app "$2" local-only
+            else
+                die "Usage: nns-app remove <app_name> [--local-only]"
+            fi
             ;;
         purge)
-            [[ $# -eq 1 ]] || die "Usage: nns-app purge"
-            purge_engine
+            if [[ $# -eq 1 ]]; then
+                purge_engine
+            elif [[ $# -eq 2 && "$2" == --local-only ]]; then
+                purge_engine local-only
+            else
+                die "Usage: nns-app purge [--local-only]"
+            fi
             ;;
         list)
             [[ $# -eq 1 ]] || die "Usage: nns-app list"

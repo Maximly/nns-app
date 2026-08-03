@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.3.9
+
+- Fixed DNS for Firefox and other Snap applications inside nns-app namespaces. Snap can reuse its own mount namespace and see the host `127.0.0.53` resolver instead of the namespace-specific `/etc/resolv.conf`.
+- Added a lazy namespace-local DNS compatibility proxy on `127.0.0.53:53`, started only for Snap/snap-confine launches and stopped with the application namespace.
+- The proxy forwards both UDP and TCP DNS to the app's configured `DNS_SERVERS`, binds as root, then drops permanently to `nobody` so the kill switch cannot leak DNS through the root-only pre-tunnel exception.
+- `status` now reports whether the Snap DNS proxy is active.
+
+## 1.3.8
+
+- `remove` and `purge` now clean automatic-remote objects before deleting local metadata: the owned gateway/client PKI, hidden provider exit, remote state file, and per-owner SSH authorization are removed.
+- Cleanup is ownership-scoped and validates deterministic object relationships and owner markers before deletion; manually managed gateways and apps are not touched.
+- Remote cleanup is fail-closed when the host is unreachable, preserving local keys and metadata for a retry. Added explicit `--local-only` escape hatches for intentional local-only removal.
+- Automatic cleanup upgrades an older remote nns-app engine before invoking the new cleanup operation, and multi-app purge records completed cleanup so retries do not revisit already removed remotes.
+- Removed deployment-specific user names from public examples and regression fixtures.
+
+## 1.3.7
+
+- Fixed Snap applications launched through distro transition wrappers, including Ubuntu's `/usr/bin/firefox`: Snap mount preparation now detects shell wrappers that hand off to `/snap/bin/*`, `snap run`, or `snap-confine`.
+- Kept the lightweight path for ordinary CLI commands, native desktop binaries, and non-Snap scripts.
+- Added regression coverage for direct Snap aliases, transition wrappers, `snap run` wrappers, and ordinary scripts.
+
+## 1.3.6
+
+- Automatic-remote environments now default to `AUTOSTART="on"`; ordinary local/manual environments retain the existing `off` default.
+- A successful automatic-remote profile deployment now starts the local namespace immediately and enables its namespace, SSH/OpenVPN backend, online-check, and watchdog units for boot recovery.
+- Re-running `install <app> via --remote <user@host>` upgrades an already configured automatic-remote environment to the boot-enabled policy and starts it when a client profile is already present.
+- Replaced deployment-specific usernames, hostnames, and provider-profile names in help, README, and tests with generic examples.
+
 ## 1.3.5
 
 - Fixed managed gateway startup under OpenVPN: `--up` appends TUN metadata arguments after the configured command arguments, so the internal callback now accepts and ignores those extra values instead of rejecting the valid invocation.

@@ -1279,6 +1279,11 @@ remote_auto_deploy_internal() {
     if [[ ! -f "$(cfg_file "$exit_app")" ]]; then
         install_app "$exit_app" __default__
     fi
+    load_cfg "$exit_app"
+    [[ -z "${REMOTE_MANAGED_OWNER_ID:-}" ||
+       "$REMOTE_MANAGED_OWNER_ID" == "$owner" ]] ||
+        die "Automatic remote exit '$exit_app' belongs to another owner."
+    cfg_set "$exit_app" REMOTE_MANAGED_OWNER_ID "$owner"
 
     if systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
         gateway_stop "$gateway"
@@ -1302,7 +1307,11 @@ remote_auto_deploy_internal() {
         [[ "$VIA_APP" == "$exit_app" && "${TRANSPORT:-}" == ssh &&
            "$PUBLIC_HOST" == "$ssh_host" && "$PUBLIC_PORT" == "$ssh_port" ]] ||
             die "Existing automatic gateway '$gateway' does not match this deployment."
+        [[ -z "${REMOTE_MANAGED_OWNER_ID:-}" ||
+           "$REMOTE_MANAGED_OWNER_ID" == "$owner" ]] ||
+            die "Automatic gateway '$gateway' belongs to another owner."
     fi
+    gateway_cfg_set "$gateway" REMOTE_MANAGED_OWNER_ID "$owner"
 
     if ! gateway_start "$gateway"; then
         die "Automatic gateway '$gateway' failed to start. The remote provider exit remains configured; rerun nns-app add after upgrading or correcting the gateway."
@@ -1355,6 +1364,103 @@ remote_auto_status_internal() {
     gateway_status "$gateway"
 }
 
+remote_auto_deauthorize_owner() {
+    require_root
+    local owner=$1 user=${SUDO_USER:-} home authorized tmp group marker sudoers
+    validate_remote_owner_id "$owner"
+
+    # Automatic bootstrap keys are per owner. Remove only the key that created
+    # this deployment; other clients using the same remote account remain.
+    if [[ -z "$user" || "$user" == root ||
+          ! "$user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] ||
+       ! id "$user" >/dev/null 2>&1; then
+        warn "Could not identify the remote SSH account; its automatic key was not removed."
+        return 0
+    fi
+    home=$(remote_auto_user_home "$user")
+    [[ -n "$home" ]] || {
+        warn "Could not determine the home directory for '$user'; its automatic key was not removed."
+        return 0
+    }
+    authorized="$home/.ssh/authorized_keys"
+    marker="nns-app-auto-$owner"
+    if [[ -f "$authorized" ]]; then
+        tmp=$(mktemp)
+        awk -v marker="$marker" \
+            'index($0, marker) == 0 { print }' \
+            "$authorized" >"$tmp"
+        group=$(id -gn "$user")
+        install -o "$user" -g "$group" -m 0600 "$tmp" "$authorized"
+        rm -f "$tmp"
+    fi
+
+    # The sudoers rule is shared by all automatic keys for this remote account.
+    # Remove it only after the last such key has gone.
+    sudoers="/etc/sudoers.d/nns-app-remote-auto-${user}"
+    if [[ ! -f "$authorized" ]] ||
+       ! grep -Fq 'nns-app-auto-' "$authorized"; then
+        rm -f -- "$sudoers"
+    fi
+}
+
+remote_auto_cleanup_internal() {
+    require_root
+    local owner=$1 exit_app gateway client state_file marker
+    validate_remote_owner_id "$owner"
+    exit_app=$(remote_auto_exit_name "$owner")
+    gateway=$(remote_auto_gateway_name "$owner")
+    client=$(remote_auto_client_name "$owner")
+    state_file=$(remote_auto_state_file "$owner")
+
+    # A completed deployment has a state file. Older failed deployments can
+    # lack it, so deterministic names are still reconciled, but every existing
+    # object must match the expected owner relationship before removal.
+    if [[ -f "$state_file" ]]; then
+        remote_auto_assert_state "$owner"
+    else
+        warn "Automatic-remote state '$state_file' is absent; cleaning deterministic partial objects."
+    fi
+
+    if [[ -f "$(gateway_cfg_file "$gateway")" ]]; then
+        load_gateway_cfg "$gateway"
+        [[ "$VIA_APP" == "$exit_app" ]] ||
+            die "Refusing to remove gateway '$gateway': it does not use '$exit_app'."
+        [[ -z "${REMOTE_MANAGED_OWNER_ID:-}" ||
+           "$REMOTE_MANAGED_OWNER_ID" == "$owner" ]] ||
+            die "Refusing to remove gateway '$gateway': owner marker mismatch."
+        gateway_remove "$gateway"
+    else
+        systemctl disable --now \
+            "nns-gateway@${gateway}.service" \
+            "nns-gateway-crl-refresh@${gateway}.timer" \
+            >/dev/null 2>&1 || true
+        rm -rf -- \
+            "$(gateway_dropin_dir "$gateway")" \
+            "$(gateway_dir "$gateway")" \
+            "$(gateway_runtime_dir "$gateway")"
+    fi
+
+    if [[ -f "$(cfg_file "$exit_app")" ]]; then
+        load_cfg "$exit_app"
+        marker=${REMOTE_MANAGED_OWNER_ID:-}
+        [[ -z "$marker" || "$marker" == "$owner" ]] ||
+            die "Refusing to remove exit '$exit_app': owner marker mismatch."
+        remove_app "$exit_app" local-only
+    else
+        systemctl disable --now \
+            "nns-watchdog@${exit_app}.timer" \
+            "nns-online@${exit_app}.service" \
+            "nns-openvpn@${exit_app}.service" \
+            "nns-netns@${exit_app}.service" \
+            >/dev/null 2>&1 || true
+    fi
+
+    rm -f -- "$state_file"
+    remote_auto_deauthorize_owner "$owner"
+    systemctl daemon-reload
+    log "Removed automatic remote '$owner': $gateway/$client and $exit_app."
+}
+
 remote_auto_dispatch() {
     require_root
     local action=${1:-}
@@ -1380,6 +1486,10 @@ remote_auto_dispatch() {
         status)
             [[ $# -eq 1 ]] || die "_remote-auto status requires owner."
             remote_auto_status_internal "$1"
+            ;;
+        cleanup)
+            [[ $# -eq 1 ]] || die "_remote-auto cleanup requires owner."
+            remote_auto_cleanup_internal "$1"
             ;;
         *) die "Unsupported automatic-remote operation '$action'." ;;
     esac
@@ -1582,16 +1692,26 @@ remote_auto_install() {
     cfg_set "$app" REMOTE_MODE auto
     cfg_set "$app" REMOTE_ALIAS "$alias"
     cfg_set "$app" REMOTE_OWNER_ID "$owner"
+    cfg_set "$app" REMOTE_CLEANED off
     cfg_set "$app" REMOTE_EXIT_APP "$exit_app"
     cfg_set "$app" REMOTE_GATEWAY "$gateway"
     cfg_set "$app" REMOTE_CLIENT "$client"
     cfg_set "$app" TRANSPORT_SSH_TARGET "$target"
     cfg_set "$app" TRANSPORT_SSH_IDENTITY "$(remote_dir "$alias")/id_ed25519"
     cfg_set "$app" TRANSPORT_SSH_KNOWN_HOSTS "$(remote_known_hosts "$alias")"
+    # Automatic remote environments are intended to reconnect after either
+    # host reboots. The ordinary local/manual install default remains off.
+    cfg_set "$app" AUTOSTART on
 
     log "Configured '$app' for automatic remote execution through '$target'."
-    log "State: pending provider profile; the environment cannot start yet."
-    log "Next: nns-app add $app /path/to/self-contained-profile.ovpn"
+    load_cfg "$app"
+    if [[ -n "${VPN_TYPE:-}" && -n "${DEFAULT_PROFILE:-}" ]]; then
+        start_app "$app" off __default__
+        log "Automatic remote '$app' is started and enabled for boot."
+    else
+        log "State: pending provider profile; autostart will activate after deployment."
+        log "Next: nns-app add $app /path/to/self-contained-profile.ovpn"
+    fi
 }
 
 remote_auto_command_payload() {
@@ -1605,6 +1725,37 @@ remote_auto_command() {
     remote_ssh_args "$alias"
     payload=$(remote_auto_command_payload "$@")
     "${REMOTE_SSH_ARGS[@]}" "$payload"
+}
+
+remote_auto_cleanup_app() {
+    require_root
+    local app=$1 alias owner target port
+    validate_app_name "$app"
+    load_cfg "$app"
+    [[ "${REMOTE_MODE:-}" == auto ]] || return 0
+    bool_on "${REMOTE_CLEANED:-off}" && return 0
+    alias=${REMOTE_ALIAS:-}
+    owner=${REMOTE_OWNER_ID:-}
+    [[ -n "$alias" && -n "$owner" ]] ||
+        die "Automatic remote app '$app' has incomplete cleanup metadata."
+    [[ -f "$(remote_cfg_file "$alias")" ]] ||
+        die "Automatic remote app '$app' has no SSH registration for '$alias'."
+
+    load_remote_cfg "$alias"
+    target=$SSH_TARGET
+    port=$SSH_PORT
+    if ! remote_auto_is_current "$alias" "$target" "$port"; then
+        log "Upgrading automatic-remote support on '$target' before cleanup..."
+        remote_auto_bootstrap "$app" "$target" "$port" "$alias" "$owner"
+        remote_auto_register "$alias" "$target" "$port"             "$(remote_dir "$alias")/id_ed25519"
+    fi
+
+    log "Removing automatic remote resources owned by '$app'..."
+    if ! remote_auto_command "$alias" cleanup "$owner"; then
+        die "Could not clean the automatic remote resources for '$app'. Local configuration was preserved. Retry when the remote host is reachable, or use --local-only to intentionally leave the remote objects."
+    fi
+    cfg_set "$app" REMOTE_CLEANED on
+    log "Automatic remote resources for '$app' were removed."
 }
 
 remote_auto_add_profile() {
@@ -1642,10 +1793,19 @@ remote_auto_add_profile() {
     load_remote_cfg "$alias"
     cfg_set "$app" REMOTE_MODE auto
     cfg_set "$app" REMOTE_OWNER_ID "$owner"
+    cfg_set "$app" REMOTE_CLEANED off
     cfg_set "$app" REMOTE_EXIT_APP "$(remote_auto_exit_name "$owner")"
     cfg_set "$app" READY_TIMEOUT 30
     cfg_set "$app" TRANSPORT_SSH_TARGET "$SSH_TARGET"
     cfg_set "$app" TRANSPORT_SSH_IDENTITY "$SSH_IDENTITY"
     cfg_set "$app" TRANSPORT_SSH_KNOWN_HOSTS "$(remote_known_hosts "$alias")"
-    log "Automatic remote '$app' is ready. Run: nns-app run $app <command>"
+    cfg_set "$app" AUTOSTART on
+
+    # Complete the simple API by bringing the local side online immediately.
+    # start_app enables the namespace, backend, online check, and watchdog
+    # units because AUTOSTART is on; later boots recreate the full SSH/OpenVPN
+    # path without requiring a prior run command.
+    start_app "$app" off __default__
+    log "Automatic remote '$app' is ready, started, and enabled for boot."
+    log "Run commands with: nns-app run $app <command>"
 }

@@ -43,6 +43,34 @@ command_needs_namespaced_snap_mounts /snap/bin/firefox ||
 command_needs_namespaced_snap_mounts /usr/bin/snap ||
     fail 'snap launcher was not detected'
 
+snap_wrapper="$TEST_TMP/firefox-transition-wrapper"
+cat >"$snap_wrapper" <<'EOF_TEST_SNAP_WRAPPER'
+#!/bin/sh
+exec /snap/bin/firefox "$@"
+EOF_TEST_SNAP_WRAPPER
+chmod 0755 "$snap_wrapper"
+command_needs_namespaced_snap_mounts "$snap_wrapper" ||
+    fail 'distro transition wrapper to /snap/bin was not detected'
+
+snap_run_wrapper="$TEST_TMP/chromium-transition-wrapper"
+cat >"$snap_run_wrapper" <<'EOF_TEST_SNAP_RUN_WRAPPER'
+#!/bin/sh
+exec /usr/bin/snap run chromium "$@"
+EOF_TEST_SNAP_RUN_WRAPPER
+chmod 0755 "$snap_run_wrapper"
+command_needs_namespaced_snap_mounts "$snap_run_wrapper" ||
+    fail 'distro transition wrapper using snap run was not detected'
+
+native_script="$TEST_TMP/native-script"
+cat >"$native_script" <<'EOF_TEST_NATIVE_SCRIPT'
+#!/bin/sh
+echo native
+EOF_TEST_NATIVE_SCRIPT
+chmod 0755 "$native_script"
+if command_needs_namespaced_snap_mounts "$native_script"; then
+    fail 'ordinary script incorrectly requires Snap mounts'
+fi
+
 IFS='|' read -r tun host ns host_fwd host_mangle ns_fwd ns_nat ns_mangle \
     <<<"$(make_gateway_names my-relay)"
 [[ -n "$tun" && -n "$host" && -n "$ns" ]] || fail 'gateway interface names'
@@ -63,7 +91,7 @@ LISTEN_PROTO=tcp
 LISTEN_PORT=24443
 OPENVPN_LISTEN_PROTO=tcp
 OPENVPN_LISTEN_PORT=24443
-PUBLIC_HOST=mlcloud
+PUBLIC_HOST=remote-host
 PUBLIC_PORT=22
 CLIENT_POOL=10.253.99.0/24
 DNS_SERVERS='1.1.1.1 9.9.9.9'
@@ -308,7 +336,7 @@ watchdog_state_load test-watchdog
     [[ "$SYSTEMCTL_RESTARTED" == 1 ]] || fail 'armed watchdog did not restart only the backend unit'
 )
 
-validate_ssh_target 'maxim@example.net'
+validate_ssh_target 'user@example.net'
 validate_ssh_target '[2001:db8::1]'
 if ( validate_ssh_target '-oProxyCommand=bad' ) >/dev/null 2>&1; then
     fail 'unsafe SSH target accepted'
@@ -394,11 +422,215 @@ fi
     reexec_as_root_if_needed() { :; }
     install_app() { printf 'install:%s:%s\n' "$1" "$2"; }
     remote_auto_install() { printf 'remote:%s:%s:%s\n' "$1" "$2" "$3"; }
-    output=$(main install my-app via --remote maxim@mlcloud --remote-port 2222)
+    output=$(main install my-app via --remote user@remote-host --remote-port 2222)
     grep -Fq 'install:my-app:__default__' <<<"$output" || fail 'via --remote did not install the local app'
-    grep -Fq 'remote:my-app:maxim@mlcloud:2222' <<<"$output" || fail 'via --remote parser'
-    output=$(main install my-app --via-remote maxim@mlcloud)
-    grep -Fq 'remote:my-app:maxim@mlcloud:22' <<<"$output" || fail '--via-remote alias parser'
+    grep -Fq 'remote:my-app:user@remote-host:2222' <<<"$output" || fail 'via --remote parser'
+    output=$(main install my-app --via-remote user@remote-host)
+    grep -Fq 'remote:my-app:user@remote-host:22' <<<"$output" || fail '--via-remote alias parser'
+)
+
+# Automatic remote mode must opt the local app into boot recovery while the
+# ordinary install default remains unchanged. A pending app records autostart
+# but cannot start until its provider profile has been deployed.
+(
+    require_root() { :; }
+    validate_app_name() { :; }
+    remote_auto_resolve_ssh() { printf '%s\n' 'user@remote-host|22|remote-host'; }
+    remote_auto_owner_id() { printf '%s\n' 0123456789abcdef; }
+    remote_auto_alias() { printf '%s\n' auto-test; }
+    remote_auto_is_current() { return 0; }
+    remote_auto_bootstrap() { fail 'current automatic remote unexpectedly bootstrapped'; }
+    remote_auto_register() { fail 'current automatic remote unexpectedly registered'; }
+    remote_dir() { printf '%s\n' /tmp/nns-auto-test; }
+    remote_known_hosts() { printf '%s\n' /tmp/nns-auto-test/known_hosts; }
+    cfg_set() { printf 'set:%s:%s:%s\n' "$1" "$2" "$3"; }
+    start_app() { printf 'start:%s:%s:%s\n' "$1" "$2" "$3"; }
+    log() { printf 'log:%s\n' "$*"; }
+    load_cfg() {
+        APP_USER=test-user
+        REMOTE_MODE=
+        TRANSPORT_SSH_TARGET=
+        VPN_TYPE=
+        DEFAULT_PROFILE=
+    }
+    output=$(remote_auto_install my-app user@remote-host 22)
+    grep -Fq 'set:my-app:AUTOSTART:on' <<<"$output" ||
+        fail 'pending automatic remote did not enable autostart'
+    if grep -Fq 'start:my-app:' <<<"$output"; then
+        fail 'pending automatic remote attempted to start without a profile'
+    fi
+)
+
+# Reconciliation of an already configured automatic-remote app must enable
+# autostart and start it immediately.
+(
+    require_root() { :; }
+    validate_app_name() { :; }
+    remote_auto_resolve_ssh() { printf '%s\n' 'user@remote-host|22|remote-host'; }
+    remote_auto_owner_id() { printf '%s\n' 0123456789abcdef; }
+    remote_auto_alias() { printf '%s\n' auto-test; }
+    remote_auto_is_current() { return 0; }
+    remote_auto_bootstrap() { fail 'current automatic remote unexpectedly bootstrapped'; }
+    remote_auto_register() { fail 'current automatic remote unexpectedly registered'; }
+    remote_dir() { printf '%s\n' /tmp/nns-auto-test; }
+    remote_known_hosts() { printf '%s\n' /tmp/nns-auto-test/known_hosts; }
+    cfg_set() { printf 'set:%s:%s:%s\n' "$1" "$2" "$3"; }
+    start_app() { printf 'start:%s:%s:%s\n' "$1" "$2" "$3"; }
+    log() { printf 'log:%s\n' "$*"; }
+    load_cfg() {
+        APP_USER=test-user
+        REMOTE_MODE=auto
+        TRANSPORT_SSH_TARGET=user@remote-host
+        VPN_TYPE=openvpn
+        DEFAULT_PROFILE=client.ovpn
+    }
+    output=$(remote_auto_install my-app user@remote-host 22)
+    grep -Fq 'set:my-app:AUTOSTART:on' <<<"$output" ||
+        fail 'configured automatic remote did not enable autostart'
+    grep -Fq 'start:my-app:off:__default__' <<<"$output" ||
+        fail 'configured automatic remote was not started during reconciliation'
+)
+
+# A successful automatic profile deployment must bring the local side online
+# immediately, making boot enablement effective even before the first run.
+(
+    require_root() { :; }
+    validate_app_name() { :; }
+    load_cfg() {
+        REMOTE_MODE=auto
+        REMOTE_ALIAS=auto-test
+        REMOTE_OWNER_ID=0123456789abcdef
+    }
+    profile_type_from_file() { printf '%s\n' openvpn; }
+    validate_ovpn() { :; }
+    profile_name_from_path() { printf '%s\n' my-provider-profile.ovpn; }
+    load_remote_cfg() {
+        SSH_TARGET=user@remote-host
+        SSH_PORT=22
+        SSH_IDENTITY=/tmp/nns-auto-test/id_ed25519
+    }
+    remote_auto_command() {
+        local alias=$1 action=$2
+        shift 2
+        case "$action" in
+            deploy) cat >/dev/null ;;
+            export) printf '%s\n' test-bundle ;;
+            *) fail "unexpected automatic remote action: $action" ;;
+        esac
+    }
+    remote_import_bundle() { :; }
+    remote_known_hosts() { printf '%s\n' /tmp/nns-auto-test/known_hosts; }
+    cfg_set() { printf 'set:%s:%s:%s\n' "$1" "$2" "$3"; }
+    start_app() { printf 'start:%s:%s:%s\n' "$1" "$2" "$3"; }
+    log() { printf 'log:%s\n' "$*"; }
+    profile="$TEST_TMP/my-provider-profile.ovpn"
+    printf '%s\n' client >"$profile"
+    output=$(remote_auto_add_profile my-app "$profile")
+    grep -Fq 'set:my-app:AUTOSTART:on' <<<"$output" ||
+        fail 'automatic deployment did not persist autostart'
+    grep -Fq 'start:my-app:off:__default__' <<<"$output" ||
+        fail 'automatic deployment did not start the local environment'
+)
+
+# Automatic remote cleanup is a first-class remote operation and must preserve
+# the owner argument exactly.
+(
+    require_root() { :; }
+    remote_auto_cleanup_internal() {
+        [[ "$1" == 0123456789abcdef ]] || fail 'cleanup owner was changed'
+        printf 'cleanup:%s\n' "$1"
+    }
+    output=$(remote_auto_dispatch cleanup 0123456789abcdef)
+    grep -Fq 'cleanup:0123456789abcdef' <<<"$output" ||
+        fail 'automatic remote cleanup dispatch'
+)
+
+# Local cleanup upgrades an older remote helper, removes the owned objects, and
+# records completion so a multi-app purge can safely be retried.
+cleanup_remote_cfg="$TEST_TMP/cleanup-remote.cfg"
+printf '%s\n' test >"$cleanup_remote_cfg"
+(
+    require_root() { :; }
+    validate_app_name() { :; }
+    load_cfg() {
+        REMOTE_MODE=auto
+        REMOTE_CLEANED=off
+        REMOTE_ALIAS=auto-cleanup
+        REMOTE_OWNER_ID=0123456789abcdef
+    }
+    remote_cfg_file() { printf '%s\n' "$cleanup_remote_cfg"; }
+    load_remote_cfg() {
+        SSH_TARGET=user@remote-host
+        SSH_PORT=22
+    }
+    remote_auto_is_current() { return 1; }
+    remote_auto_bootstrap() { printf 'bootstrap:%s:%s:%s:%s:%s\n' "$@"; }
+    remote_auto_register() { printf 'register:%s:%s:%s:%s\n' "$@"; }
+    remote_dir() { printf '%s\n' /tmp/auto-cleanup; }
+    remote_auto_command() {
+        [[ "$1" == auto-cleanup && "$2" == cleanup &&
+           "$3" == 0123456789abcdef ]] ||
+            fail 'local automatic cleanup command arguments'
+        printf 'remote-cleanup:%s\n' "$3"
+    }
+    cfg_set() { printf 'set:%s:%s:%s\n' "$1" "$2" "$3"; }
+    log() { printf 'log:%s\n' "$*"; }
+    output=$(remote_auto_cleanup_app my-app)
+    grep -Fq 'bootstrap:my-app:user@remote-host:22:auto-cleanup:0123456789abcdef' <<<"$output" ||
+        fail 'cleanup did not upgrade an older remote helper'
+    grep -Fq 'remote-cleanup:0123456789abcdef' <<<"$output" ||
+        fail 'cleanup command was not sent'
+    grep -Fq 'set:my-app:REMOTE_CLEANED:on' <<<"$output" ||
+        fail 'cleanup completion was not recorded'
+)
+
+# Remote cleanup removes the gateway before its exit and passes local-only to
+# the nested remove operation so it cannot recurse into remote management.
+cleanup_state="$TEST_TMP/remote-auto-state.cfg"
+cleanup_gateway_cfg="$TEST_TMP/remote-gateway.cfg"
+cleanup_exit_cfg="$TEST_TMP/remote-exit.cfg"
+printf '%s\n' state >"$cleanup_state"
+printf '%s\n' gateway >"$cleanup_gateway_cfg"
+printf '%s\n' exit >"$cleanup_exit_cfg"
+(
+    require_root() { :; }
+    remote_auto_state_file() { printf '%s\n' "$cleanup_state"; }
+    remote_auto_assert_state() { :; }
+    gateway_cfg_file() { printf '%s\n' "$cleanup_gateway_cfg"; }
+    cfg_file() { printf '%s\n' "$cleanup_exit_cfg"; }
+    load_gateway_cfg() {
+        VIA_APP=ra-0123456789ab-exit
+        REMOTE_MANAGED_OWNER_ID=0123456789abcdef
+    }
+    gateway_remove() { printf 'gateway-remove:%s\n' "$1"; }
+    load_cfg() { REMOTE_MANAGED_OWNER_ID=0123456789abcdef; }
+    remove_app() { printf 'app-remove:%s:%s\n' "$1" "$2"; }
+    remote_auto_deauthorize_owner() { printf 'deauthorize:%s\n' "$1"; }
+    systemctl() { :; }
+    log() { printf 'log:%s\n' "$*"; }
+    output=$(remote_auto_cleanup_internal 0123456789abcdef)
+    grep -Fq 'gateway-remove:ra-0123456789ab-gw' <<<"$output" ||
+        fail 'remote gateway was not removed'
+    grep -Fq 'app-remove:ra-0123456789ab-exit:local-only' <<<"$output" ||
+        fail 'remote exit was not removed without recursion'
+    grep -Fq 'deauthorize:0123456789abcdef' <<<"$output" ||
+        fail 'per-owner SSH authorization was not removed'
+)
+
+# Public CLI exposes explicit local-only escape hatches; normal remove/purge
+# use ownership-scoped remote cleanup by default.
+(
+    reexec_as_root_if_needed() { :; }
+    remove_app() { printf 'remove:%s:%s\n' "$1" "${2:-remote}"; }
+    purge_engine() { printf 'purge:%s\n' "${1:-remote}"; }
+    output=$(main remove my-app)
+    grep -Fq 'remove:my-app:remote' <<<"$output" || fail 'default remove cleanup mode'
+    output=$(main remove my-app --local-only)
+    grep -Fq 'remove:my-app:local-only' <<<"$output" || fail 'local-only remove parser'
+    output=$(main purge)
+    grep -Fq 'purge:remote' <<<"$output" || fail 'default purge cleanup mode'
+    output=$(main purge --local-only)
+    grep -Fq 'purge:local-only' <<<"$output" || fail 'local-only purge parser'
 )
 
 owner=0123456789abcdef
@@ -421,7 +653,7 @@ cat >"$ssh_bundle_dir/manifest.json" <<'EOF_SSH_MANIFEST'
   "generation": 3,
   "backend": "openvpn",
   "transport": "ssh",
-  "public_host": "mlcloud.example.net",
+  "public_host": "remote.example.net",
   "public_port": 22,
   "local_port": 11940,
   "ssh_remote_port": 24567
@@ -441,7 +673,7 @@ grep -Fq 'SSH_REMOTE_PORT=24567' <<<"$ssh_manifest_output" || fail 'SSH nnslink 
 # Remote command payloads must use literal spaces even though nns-app globally
 # sets IFS to newline/tab. Every argument must survive one remote-shell parse.
 remote_payload=$(remote_auto_command_payload \
-    deploy 0123456789abcdef mlcloud 22 'Norway Sandefjord S23.ovpn')
+    deploy 0123456789abcdef remote-host 22 'my provider profile.ovpn')
 [[ "$remote_payload" != *$'\n'* ]] || fail 'automatic-remote payload contains argument-separating newlines'
 mapfile -d '' -t remote_argv < <(
     PAYLOAD="$remote_payload" python3 - <<'PY_REMOTE_ARGV'
@@ -454,7 +686,7 @@ PY_REMOTE_ARGV
 )
 expected_remote_argv=(
     exec sudo -n /usr/local/sbin/nns_app.sh _remote-auto
-    deploy 0123456789abcdef mlcloud 22 'Norway Sandefjord S23.ovpn'
+    deploy 0123456789abcdef remote-host 22 'my provider profile.ovpn'
 )
 [[ "${remote_argv[*]}" == "${expected_remote_argv[*]}" ]] ||
     fail "automatic-remote payload lost arguments: ${remote_argv[*]}"

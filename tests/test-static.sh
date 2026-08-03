@@ -9,7 +9,7 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fq 'nns-app 1.3.5' <<<"$version"
+grep -Fq 'nns-app 1.3.9' <<<"$version"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -21,8 +21,25 @@ grep -Fq -- '--backend inherit' <<<"$help"
 grep -Fq -- '--transport direct|stunnel|cloak' <<<"$help"
 grep -Fq -- '--server-name <cloak-decoy-host>' <<<"$help"
 grep -Fq -- 'via --remote <user@host>' <<<"$help"
+grep -Fq 'nns-app purge [--local-only]' <<<"$help"
+grep -Fq 'nns-app remove  <app_name> [--local-only]' <<<"$help"
+grep -Fq 'remote_auto_cleanup_internal' "$INSTALLER"
+grep -Fq 'remote_auto_cleanup_app' "$INSTALLER"
+grep -Fq 'remote_auto_command "$alias" cleanup "$owner"' "$INSTALLER"
+grep -Fq 'cfg_set "$app" REMOTE_CLEANED on' "$INSTALLER"
+grep -Fq 'remove_app "$exit_app" local-only' "$INSTALLER"
+grep -Fq 'REMOTE_MANAGED_OWNER_ID' "$INSTALLER"
 grep -Fq 'remote_auto_install' "$INSTALLER"
 grep -Fq 'remote_auto_deploy_internal' "$INSTALLER"
+autostart_sets=$(grep -Fc 'cfg_set "$app" AUTOSTART on' "$INSTALLER")
+(( autostart_sets >= 2 )) || {
+    echo 'automatic-remote install/deploy does not enable boot startup' >&2
+    exit 1
+}
+grep -Fq 'log "Automatic remote '"'"'$app'"'"' is ready, started, and enabled for boot."' "$INSTALLER" || {
+    echo 'automatic-remote deployment does not start the local environment' >&2
+    exit 1
+}
 grep -Fq 'TRANSPORT_SSH_REMOTE_PORT' "$INSTALLER"
 grep -Fq 'ServerAliveInterval=15' "$INSTALLER"
 grep -Fq 'ControlMaster=yes' "$INSTALLER"
@@ -76,11 +93,18 @@ grep -Fq 'write_sudoers_for_app "$app" "$APP_USER"' "$INSTALLER" || {
 }
 
 grep -Fq 'nns-online@.service' "$INSTALLER"
+grep -Fq 'nns-dns@.service' "$INSTALLER"
+grep -Fq '_dns-proxy %i' "$INSTALLER"
+grep -Fq 'ensure_snap_dns_proxy "$app"' "$INSTALLER"
+grep -Fq '127.0.0.53' "$INSTALLER"
+grep -Fq 'os.setuid(nobody.pw_uid)' "$INSTALLER"
+grep -Fq 'Snap DNS proxy:    active on 127.0.0.53:53' "$INSTALLER"
 grep -Fq 'nns-watchdog@.service' "$INSTALLER"
 grep -Fq 'nns-watchdog@.timer' "$INSTALLER"
 grep -Fq '_watchdog %i' "$INSTALLER"
 grep -Fq 'WATCHDOG_MODE="auto"' "$INSTALLER"
 grep -Fq 'nns-gateway-crl-refresh@.timer' "$INSTALLER"
+grep -Fq '"$DNS_PROXY_UNIT"' "$INSTALLER"
 grep -Fq 'systemctl enable --now "nns-gateway-crl-refresh@${gateway}.timer"' "$INSTALLER"
 grep -Fq 'gateway_crl_valid_for "$pki/crl.pem" 1' "$INSTALLER"
 grep -Fq 'gateway_crl_valid_for "$pki/crl.pem" 604800' "$INSTALLER"
@@ -129,7 +153,7 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 1.3.5' "$ROOT/README.md"
+grep -Fq '**Release:** 1.3.9' "$ROOT/README.md"
 grep -Fq 'OpenVPN 2.6+' "$ROOT/README.md"
 
 # Public documentation and help use one descriptive example-name set.
@@ -161,6 +185,15 @@ if grep -Fq '~/Downloads/' \
     "$ROOT/src/00-preamble.sh" \
     "$INSTALLER"; then
     echo 'desktop-specific Downloads path found in public documentation or help' >&2
+    exit 1
+fi
+
+private_pattern='ma''xim@|ml''cloud|ml''host|Sande''fjord|92c3''7155|193[.]200[.]221'
+if grep -Eqi "$private_pattern" \
+    "$ROOT/README.md" \
+    "$ROOT/tests/test-functions.sh" \
+    "$ROOT/src/00-preamble.sh"; then
+    echo 'deployment-specific example data found in public material or tests' >&2
     exit 1
 fi
 

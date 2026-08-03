@@ -91,6 +91,25 @@ gateway_cfg_value() {
     )
 }
 
+gateway_cfg_set() {
+    local gateway=$1 key=$2 value=$3 file tmp quoted line found=0
+    file=$(gateway_cfg_file "$gateway")
+    [[ -f "$file" ]] || die "Gateway '$gateway' is not configured."
+    tmp=$(mktemp "${file}.XXXXXX")
+    printf -v quoted '%q' "$value"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "$key="* ]]; then
+            printf '%s=%s\n' "$key" "$quoted"
+            found=1
+        else
+            printf '%s\n' "$line"
+        fi
+    done <"$file" >"$tmp"
+    (( found )) || printf '%s=%s\n' "$key" "$quoted" >>"$tmp"
+    install -o root -g root -m 0644 "$tmp" "$file"
+    rm -f "$tmp"
+}
+
 make_gateway_names() {
     local gateway=$1 crc hex
     crc=$(printf 'gateway:%s' "$gateway" | cksum | awk '{print $1}')

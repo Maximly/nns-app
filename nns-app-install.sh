@@ -46,7 +46,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.5"
+readonly VERSION="1.3.9"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -58,6 +58,7 @@ readonly NETNS_UNIT="/etc/systemd/system/nns-netns@.service"
 readonly VPN_UNIT="/etc/systemd/system/nns-openvpn@.service"
 readonly GATEWAY_UNIT="/etc/systemd/system/nns-gateway@.service"
 readonly ONLINE_UNIT="/etc/systemd/system/nns-online@.service"
+readonly DNS_PROXY_UNIT="/etc/systemd/system/nns-dns@.service"
 readonly WATCHDOG_SERVICE="/etc/systemd/system/nns-watchdog@.service"
 readonly WATCHDOG_TIMER="/etc/systemd/system/nns-watchdog@.timer"
 readonly GATEWAY_CRL_SERVICE="/etc/systemd/system/nns-gateway-crl-refresh@.service"
@@ -170,7 +171,8 @@ reset_app_cfg_vars() {
     TRANSPORT_SSH_KNOWN_HOSTS="" TRANSPORT_SSH_REMOTE_PORT=""
     REMOTE_MODE="" REMOTE_ALIAS="" REMOTE_GATEWAY="" REMOTE_CLIENT=""
     REMOTE_OWNER_ID="" REMOTE_EXIT_APP="" REMOTE_PROFILE_GENERATION=""
-    REMOTE_SERVER_FINGERPRINT=""
+    REMOTE_SERVER_FINGERPRINT="" REMOTE_CLEANED=""
+    REMOTE_MANAGED_OWNER_ID=""
 }
 
 reset_gateway_cfg_vars() {
@@ -183,7 +185,7 @@ reset_gateway_cfg_vars() {
     GATEWAY_VETH_HOST="" GATEWAY_VETH_NS="" ROUTE_TABLE=""
     RULE_PRIORITY="" SERVER_CN="" HOST_FWD_CHAIN=""
     HOST_MANGLE_CHAIN="" NS_FWD_CHAIN="" NS_NAT_CHAIN=""
-    NS_MANGLE_CHAIN=""
+    NS_MANGLE_CHAIN="" REMOTE_MANAGED_OWNER_ID=""
 }
 
 reset_gateway_client_vars() {
@@ -229,8 +231,8 @@ usage() {
 Usage:
   nns-app install [app_name [--backend inherit] [--via <upstream-app>|host]]
   nns-app install <app_name> via --remote <user@host> [--remote-port <port>]
-  nns-app remove  <app_name>
-  nns-app purge
+  nns-app remove  <app_name> [--local-only]
+  nns-app purge [--local-only]
   nns-app list
   nns-app status  <app_name>
   nns-app add     <app_name> <profile.ovpn|wireguard.conf>
@@ -272,7 +274,7 @@ Simple managed-remote mode:
 Examples:
   sudo ./nns-app.sh install
   sudo nns-app install my-upstream-vpn
-  nns-app install my-private-app via --remote maxim@mlcloud
+  nns-app install my-private-app via --remote user@remote-host
   nns-app add my-private-app ~/my-base-profile.ovpn
   nns-app run my-private-app ping 1.1.1.1
   sudo nns-app add my-upstream-vpn ~/my-base-profile.ovpn
@@ -750,6 +752,22 @@ TimeoutStartSec=70s
 WantedBy=multi-user.target
 ONLINE_UNIT_EOF
 
+    cat >"$DNS_PROXY_UNIT" <<'DNS_PROXY_UNIT_EOF'
+[Unit]
+Description=Namespace DNS compatibility proxy for NNS app %i
+Requires=nns-netns@%i.service
+After=nns-netns@%i.service nns-openvpn@%i.service
+BindsTo=nns-netns@%i.service
+PartOf=nns-netns@%i.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/nns_app.sh _dns-proxy %i
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=5s
+DNS_PROXY_UNIT_EOF
+
     cat >"$WATCHDOG_SERVICE" <<'WATCHDOG_SERVICE_EOF'
 [Unit]
 Description=Data-path watchdog for NNS app %i
@@ -822,7 +840,7 @@ Unit=nns-gateway-crl-refresh@%i.service
 WantedBy=timers.target
 CRL_TIMER_EOF
 
-    chmod 0644 "$NETNS_UNIT" "$VPN_UNIT" "$ONLINE_UNIT" \
+    chmod 0644 "$NETNS_UNIT" "$VPN_UNIT" "$ONLINE_UNIT" "$DNS_PROXY_UNIT" \
         "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$GATEWAY_UNIT" \
         "$GATEWAY_CRL_SERVICE" "$GATEWAY_CRL_TIMER"
     systemctl daemon-reload
@@ -1137,6 +1155,10 @@ REMOTE_OWNER_ID=""
 REMOTE_EXIT_APP=""
 REMOTE_PROFILE_GENERATION=""
 REMOTE_SERVER_FINGERPRINT=""
+# Set after remote cleanup succeeds so a multi-app purge can be retried safely.
+REMOTE_CLEANED="off"
+# Ownership marker used only on hidden remote exits created by automatic mode.
+REMOTE_MANAGED_OWNER_ID=""
 
 # Engine-owned namespace network. Never copy these values to another environment.
 NS_NAME="nns-$app"
@@ -3365,11 +3387,13 @@ stop_app_internal() {
     systemctl stop "nns-watchdog@${app}.timer" 2>/dev/null || true
     systemctl stop "nns-watchdog@${app}.service" 2>/dev/null || true
     systemctl stop "nns-online@${app}.service" 2>/dev/null || true
+    systemctl stop "nns-dns@${app}.service" 2>/dev/null || true
     systemctl stop "nns-openvpn@${app}.service" 2>/dev/null || true
     systemctl stop "nns-netns@${app}.service" 2>/dev/null || true
     systemctl reset-failed \
         "nns-watchdog@${app}.service" \
         "nns-online@${app}.service" \
+        "nns-dns@${app}.service" \
         "nns-openvpn@${app}.service" \
         "nns-netns@${app}.service" 2>/dev/null || true
 
@@ -3401,12 +3425,27 @@ apps_using_upstream() {
     done
 }
 
+remote_alias_used_by_other_app() {
+    local alias=$1 excluded_app=$2 dir app configured_alias
+    shopt -s nullglob
+    for dir in "$BASE_DIR"/*; do
+        [[ -d "$dir" ]] || continue
+        app=$(basename "$dir")
+        [[ "$app" != "$excluded_app" && -f "$(cfg_file "$app")" ]] || continue
+        configured_alias=$(cfg_read_value "$app" REMOTE_ALIAS 2>/dev/null || true)
+        [[ "$configured_alias" == "$alias" ]] && return 0
+    done
+    return 1
+}
+
 remove_app() {
     require_root
-    local app=$1 gateway_dependencies app_dependencies
+    local app=$1 cleanup_mode=${2:-remote}
+    local gateway_dependencies app_dependencies auto_alias=""
     validate_app_name "$app"
     load_cfg "$app"
 
+    auto_alias=${REMOTE_ALIAS:-}
     gateway_dependencies=$(gateways_using_app "$app" | paste -sd ', ' -)
     app_dependencies=$(apps_using_upstream "$app" | paste -sd ', ' -)
     [[ -z "$gateway_dependencies" ]] ||
@@ -3414,16 +3453,30 @@ remove_app() {
     [[ -z "$app_dependencies" ]] ||
         die "App '$app' is the configured upstream for: $app_dependencies. Reconfigure those apps first."
 
+    if [[ "${REMOTE_MODE:-}" == auto ]]; then
+        if [[ "$cleanup_mode" != local-only ]]; then
+            remote_auto_cleanup_app "$app"
+            load_cfg "$app"
+        else
+            warn "Leaving automatic remote resources for '$app' because --local-only was requested."
+        fi
+    fi
+
     stop_app "$app"
     load_cfg "$app"
-    systemctl disable --now "nns-watchdog@${app}.timer" >/dev/null 2>&1 || true
+    systemctl disable --now "nns-watchdog@${app}.timer" \
+        >/dev/null 2>&1 || true
     systemctl disable \
         "nns-online@${app}.service" \
         "nns-openvpn@${app}.service" \
-        "nns-netns@${app}.service" >/dev/null 2>&1 || true
+        "nns-netns@${app}.service" \
+        >/dev/null 2>&1 || true
 
     rm -f "/etc/sudoers.d/nns-app-${app}"
-    rm -rf "$(app_dropin_dir "$app")" "$(cfg_dir "$app")" "/etc/netns/$NS_NAME"
+    rm -rf \
+        "$(app_dropin_dir "$app")" \
+        "$(cfg_dir "$app")" \
+        "/etc/netns/$NS_NAME"
     rm -f \
         "$RUN_DIR/${app}.env" \
         "$RUN_DIR/${app}.profile" \
@@ -3431,6 +3484,11 @@ remove_app() {
         "$RUN_DIR/${app}.via" \
         "$(watchdog_state_file "$app")" \
         "$(wireguard_runtime_config_path "$app")"
+
+    if [[ -n "$auto_alias" ]] &&
+       ! remote_alias_used_by_other_app "$auto_alias" "$app"; then
+        rm -rf -- "$(remote_dir "$auto_alias")"
+    fi
     systemctl daemon-reload
     log "Removed NNS app '$app'."
 }
@@ -3438,6 +3496,7 @@ remove_app() {
 purge_engine() {
     require_root
 
+    local cleanup_mode=${1:-remote}
     local dir app ns pids
     local -a apps=()
     shopt -s nullglob
@@ -3451,6 +3510,17 @@ purge_engine() {
         [[ -f "$(cfg_file "$app")" ]] || continue
         apps+=("$app")
     done
+
+    # Automatic-remote objects are owned by their local app. Clean them before
+    # deleting local SSH keys and metadata. Failure is fail-closed: local state
+    # remains available so the user can retry when the remote host returns.
+    if [[ "$cleanup_mode" != local-only ]]; then
+        for app in "${apps[@]}"; do
+            remote_auto_cleanup_app "$app"
+        done
+    else
+        warn "Purging local state only; automatic remote exits and gateways are intentionally left in place."
+    fi
 
     # Stop gateways before removing the NNS exits that carry their data path.
     local gateway_dir gateway
@@ -3473,6 +3543,7 @@ purge_engine() {
         systemctl stop "nns-watchdog@${app}.timer" 2>/dev/null || true
         systemctl stop "nns-watchdog@${app}.service" 2>/dev/null || true
         systemctl stop "nns-online@${app}.service" 2>/dev/null || true
+        systemctl stop "nns-dns@${app}.service" 2>/dev/null || true
         systemctl stop "nns-openvpn@${app}.service" 2>/dev/null || true
     done
     for app in "${apps[@]}"; do
@@ -3520,6 +3591,7 @@ purge_engine() {
         \( -name 'nns-openvpn@*.service' \
            -o -name 'nns-netns@*.service' \
            -o -name 'nns-online@*.service' \
+           -o -name 'nns-dns@*.service' \
            -o -name 'nns-watchdog@*.service' \
            -o -name 'nns-watchdog@*.timer' \
            -o -name 'nns-gateway@*.service' \
@@ -3543,7 +3615,7 @@ purge_engine() {
         /etc/systemd/system/nns-watchdog@.timer.d \
         /etc/systemd/system/nns-gateway@.service.d
     rm -f -- \
-        "$VPN_UNIT" "$NETNS_UNIT" "$ONLINE_UNIT" \
+        "$VPN_UNIT" "$NETNS_UNIT" "$ONLINE_UNIT" "$DNS_PROXY_UNIT" \
         "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$GATEWAY_UNIT" \
         "$GATEWAY_CRL_SERVICE" "$GATEWAY_CRL_TIMER"
 
@@ -3554,6 +3626,9 @@ purge_engine() {
     rm -f -- "$ENGINE_PATH"
 
     log "Purged NNS app engine and all installed NNS apps."
+    if [[ "$cleanup_mode" != local-only ]]; then
+        log "Removed automatic remote exits, gateways, clients, and per-owner SSH keys."
+    fi
     log "Removed: $BASE_DIR, /etc/netns/nns-*, NNS systemd units, NNS sudoers rules, $USER_PATH and $ENGINE_PATH"
 }
 
@@ -3650,6 +3725,25 @@ gateway_cfg_value() {
         source "$file"
         printf '%s\n' "${!key-}"
     )
+}
+
+gateway_cfg_set() {
+    local gateway=$1 key=$2 value=$3 file tmp quoted line found=0
+    file=$(gateway_cfg_file "$gateway")
+    [[ -f "$file" ]] || die "Gateway '$gateway' is not configured."
+    tmp=$(mktemp "${file}.XXXXXX")
+    printf -v quoted '%q' "$value"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "$key="* ]]; then
+            printf '%s=%s\n' "$key" "$quoted"
+            found=1
+        else
+            printf '%s\n' "$line"
+        fi
+    done <"$file" >"$tmp"
+    (( found )) || printf '%s=%s\n' "$key" "$quoted" >>"$tmp"
+    install -o root -g root -m 0644 "$tmp" "$file"
+    rm -f "$tmp"
 }
 
 make_gateway_names() {
@@ -6674,6 +6768,11 @@ remote_auto_deploy_internal() {
     if [[ ! -f "$(cfg_file "$exit_app")" ]]; then
         install_app "$exit_app" __default__
     fi
+    load_cfg "$exit_app"
+    [[ -z "${REMOTE_MANAGED_OWNER_ID:-}" ||
+       "$REMOTE_MANAGED_OWNER_ID" == "$owner" ]] ||
+        die "Automatic remote exit '$exit_app' belongs to another owner."
+    cfg_set "$exit_app" REMOTE_MANAGED_OWNER_ID "$owner"
 
     if systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
         gateway_stop "$gateway"
@@ -6697,7 +6796,11 @@ remote_auto_deploy_internal() {
         [[ "$VIA_APP" == "$exit_app" && "${TRANSPORT:-}" == ssh &&
            "$PUBLIC_HOST" == "$ssh_host" && "$PUBLIC_PORT" == "$ssh_port" ]] ||
             die "Existing automatic gateway '$gateway' does not match this deployment."
+        [[ -z "${REMOTE_MANAGED_OWNER_ID:-}" ||
+           "$REMOTE_MANAGED_OWNER_ID" == "$owner" ]] ||
+            die "Automatic gateway '$gateway' belongs to another owner."
     fi
+    gateway_cfg_set "$gateway" REMOTE_MANAGED_OWNER_ID "$owner"
 
     if ! gateway_start "$gateway"; then
         die "Automatic gateway '$gateway' failed to start. The remote provider exit remains configured; rerun nns-app add after upgrading or correcting the gateway."
@@ -6750,6 +6853,103 @@ remote_auto_status_internal() {
     gateway_status "$gateway"
 }
 
+remote_auto_deauthorize_owner() {
+    require_root
+    local owner=$1 user=${SUDO_USER:-} home authorized tmp group marker sudoers
+    validate_remote_owner_id "$owner"
+
+    # Automatic bootstrap keys are per owner. Remove only the key that created
+    # this deployment; other clients using the same remote account remain.
+    if [[ -z "$user" || "$user" == root ||
+          ! "$user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] ||
+       ! id "$user" >/dev/null 2>&1; then
+        warn "Could not identify the remote SSH account; its automatic key was not removed."
+        return 0
+    fi
+    home=$(remote_auto_user_home "$user")
+    [[ -n "$home" ]] || {
+        warn "Could not determine the home directory for '$user'; its automatic key was not removed."
+        return 0
+    }
+    authorized="$home/.ssh/authorized_keys"
+    marker="nns-app-auto-$owner"
+    if [[ -f "$authorized" ]]; then
+        tmp=$(mktemp)
+        awk -v marker="$marker" \
+            'index($0, marker) == 0 { print }' \
+            "$authorized" >"$tmp"
+        group=$(id -gn "$user")
+        install -o "$user" -g "$group" -m 0600 "$tmp" "$authorized"
+        rm -f "$tmp"
+    fi
+
+    # The sudoers rule is shared by all automatic keys for this remote account.
+    # Remove it only after the last such key has gone.
+    sudoers="/etc/sudoers.d/nns-app-remote-auto-${user}"
+    if [[ ! -f "$authorized" ]] ||
+       ! grep -Fq 'nns-app-auto-' "$authorized"; then
+        rm -f -- "$sudoers"
+    fi
+}
+
+remote_auto_cleanup_internal() {
+    require_root
+    local owner=$1 exit_app gateway client state_file marker
+    validate_remote_owner_id "$owner"
+    exit_app=$(remote_auto_exit_name "$owner")
+    gateway=$(remote_auto_gateway_name "$owner")
+    client=$(remote_auto_client_name "$owner")
+    state_file=$(remote_auto_state_file "$owner")
+
+    # A completed deployment has a state file. Older failed deployments can
+    # lack it, so deterministic names are still reconciled, but every existing
+    # object must match the expected owner relationship before removal.
+    if [[ -f "$state_file" ]]; then
+        remote_auto_assert_state "$owner"
+    else
+        warn "Automatic-remote state '$state_file' is absent; cleaning deterministic partial objects."
+    fi
+
+    if [[ -f "$(gateway_cfg_file "$gateway")" ]]; then
+        load_gateway_cfg "$gateway"
+        [[ "$VIA_APP" == "$exit_app" ]] ||
+            die "Refusing to remove gateway '$gateway': it does not use '$exit_app'."
+        [[ -z "${REMOTE_MANAGED_OWNER_ID:-}" ||
+           "$REMOTE_MANAGED_OWNER_ID" == "$owner" ]] ||
+            die "Refusing to remove gateway '$gateway': owner marker mismatch."
+        gateway_remove "$gateway"
+    else
+        systemctl disable --now \
+            "nns-gateway@${gateway}.service" \
+            "nns-gateway-crl-refresh@${gateway}.timer" \
+            >/dev/null 2>&1 || true
+        rm -rf -- \
+            "$(gateway_dropin_dir "$gateway")" \
+            "$(gateway_dir "$gateway")" \
+            "$(gateway_runtime_dir "$gateway")"
+    fi
+
+    if [[ -f "$(cfg_file "$exit_app")" ]]; then
+        load_cfg "$exit_app"
+        marker=${REMOTE_MANAGED_OWNER_ID:-}
+        [[ -z "$marker" || "$marker" == "$owner" ]] ||
+            die "Refusing to remove exit '$exit_app': owner marker mismatch."
+        remove_app "$exit_app" local-only
+    else
+        systemctl disable --now \
+            "nns-watchdog@${exit_app}.timer" \
+            "nns-online@${exit_app}.service" \
+            "nns-openvpn@${exit_app}.service" \
+            "nns-netns@${exit_app}.service" \
+            >/dev/null 2>&1 || true
+    fi
+
+    rm -f -- "$state_file"
+    remote_auto_deauthorize_owner "$owner"
+    systemctl daemon-reload
+    log "Removed automatic remote '$owner': $gateway/$client and $exit_app."
+}
+
 remote_auto_dispatch() {
     require_root
     local action=${1:-}
@@ -6775,6 +6975,10 @@ remote_auto_dispatch() {
         status)
             [[ $# -eq 1 ]] || die "_remote-auto status requires owner."
             remote_auto_status_internal "$1"
+            ;;
+        cleanup)
+            [[ $# -eq 1 ]] || die "_remote-auto cleanup requires owner."
+            remote_auto_cleanup_internal "$1"
             ;;
         *) die "Unsupported automatic-remote operation '$action'." ;;
     esac
@@ -6977,16 +7181,26 @@ remote_auto_install() {
     cfg_set "$app" REMOTE_MODE auto
     cfg_set "$app" REMOTE_ALIAS "$alias"
     cfg_set "$app" REMOTE_OWNER_ID "$owner"
+    cfg_set "$app" REMOTE_CLEANED off
     cfg_set "$app" REMOTE_EXIT_APP "$exit_app"
     cfg_set "$app" REMOTE_GATEWAY "$gateway"
     cfg_set "$app" REMOTE_CLIENT "$client"
     cfg_set "$app" TRANSPORT_SSH_TARGET "$target"
     cfg_set "$app" TRANSPORT_SSH_IDENTITY "$(remote_dir "$alias")/id_ed25519"
     cfg_set "$app" TRANSPORT_SSH_KNOWN_HOSTS "$(remote_known_hosts "$alias")"
+    # Automatic remote environments are intended to reconnect after either
+    # host reboots. The ordinary local/manual install default remains off.
+    cfg_set "$app" AUTOSTART on
 
     log "Configured '$app' for automatic remote execution through '$target'."
-    log "State: pending provider profile; the environment cannot start yet."
-    log "Next: nns-app add $app /path/to/self-contained-profile.ovpn"
+    load_cfg "$app"
+    if [[ -n "${VPN_TYPE:-}" && -n "${DEFAULT_PROFILE:-}" ]]; then
+        start_app "$app" off __default__
+        log "Automatic remote '$app' is started and enabled for boot."
+    else
+        log "State: pending provider profile; autostart will activate after deployment."
+        log "Next: nns-app add $app /path/to/self-contained-profile.ovpn"
+    fi
 }
 
 remote_auto_command_payload() {
@@ -7000,6 +7214,37 @@ remote_auto_command() {
     remote_ssh_args "$alias"
     payload=$(remote_auto_command_payload "$@")
     "${REMOTE_SSH_ARGS[@]}" "$payload"
+}
+
+remote_auto_cleanup_app() {
+    require_root
+    local app=$1 alias owner target port
+    validate_app_name "$app"
+    load_cfg "$app"
+    [[ "${REMOTE_MODE:-}" == auto ]] || return 0
+    bool_on "${REMOTE_CLEANED:-off}" && return 0
+    alias=${REMOTE_ALIAS:-}
+    owner=${REMOTE_OWNER_ID:-}
+    [[ -n "$alias" && -n "$owner" ]] ||
+        die "Automatic remote app '$app' has incomplete cleanup metadata."
+    [[ -f "$(remote_cfg_file "$alias")" ]] ||
+        die "Automatic remote app '$app' has no SSH registration for '$alias'."
+
+    load_remote_cfg "$alias"
+    target=$SSH_TARGET
+    port=$SSH_PORT
+    if ! remote_auto_is_current "$alias" "$target" "$port"; then
+        log "Upgrading automatic-remote support on '$target' before cleanup..."
+        remote_auto_bootstrap "$app" "$target" "$port" "$alias" "$owner"
+        remote_auto_register "$alias" "$target" "$port"             "$(remote_dir "$alias")/id_ed25519"
+    fi
+
+    log "Removing automatic remote resources owned by '$app'..."
+    if ! remote_auto_command "$alias" cleanup "$owner"; then
+        die "Could not clean the automatic remote resources for '$app'. Local configuration was preserved. Retry when the remote host is reachable, or use --local-only to intentionally leave the remote objects."
+    fi
+    cfg_set "$app" REMOTE_CLEANED on
+    log "Automatic remote resources for '$app' were removed."
 }
 
 remote_auto_add_profile() {
@@ -7037,12 +7282,21 @@ remote_auto_add_profile() {
     load_remote_cfg "$alias"
     cfg_set "$app" REMOTE_MODE auto
     cfg_set "$app" REMOTE_OWNER_ID "$owner"
+    cfg_set "$app" REMOTE_CLEANED off
     cfg_set "$app" REMOTE_EXIT_APP "$(remote_auto_exit_name "$owner")"
     cfg_set "$app" READY_TIMEOUT 30
     cfg_set "$app" TRANSPORT_SSH_TARGET "$SSH_TARGET"
     cfg_set "$app" TRANSPORT_SSH_IDENTITY "$SSH_IDENTITY"
     cfg_set "$app" TRANSPORT_SSH_KNOWN_HOSTS "$(remote_known_hosts "$alias")"
-    log "Automatic remote '$app' is ready. Run: nns-app run $app <command>"
+    cfg_set "$app" AUTOSTART on
+
+    # Complete the simple API by bringing the local side online immediately.
+    # start_app enables the namespace, backend, online check, and watchdog
+    # units because AUTOSTART is on; later boots recreate the full SSH/OpenVPN
+    # path without requiring a prior run command.
+    start_app "$app" off __default__
+    log "Automatic remote '$app' is ready, started, and enabled for boot."
+    log "Run commands with: nns-app run $app <command>"
 }
 
 # nns-app source module: command execution and detailed status reporting.
@@ -7106,6 +7360,21 @@ run_command_path() {
     printf '%s\n' "$candidate"
 }
 
+path_is_snap_wrapper() {
+    local path=$1 first_line
+    [[ -f "$path" && -r "$path" ]] || return 1
+
+    # Ubuntu transition packages such as /usr/bin/firefox are ordinary shell
+    # wrappers even though the real application is a Snap.  Restrict content
+    # inspection to scripts so an unrelated native ELF binary is never
+    # classified from incidental string data.
+    IFS= read -r first_line <"$path" || true
+    [[ "$first_line" == '#!'* ]] || return 1
+
+    LC_ALL=C head -c 16384 -- "$path" 2>/dev/null |
+        grep -aEq '(/snap/bin/|/var/lib/snapd/snap/bin/|/usr/lib/snapd/snap-confine|/usr/bin/snap([[:space:]]|$)|(^|[[:space:]])snap[[:space:]]+run([[:space:]]|$))'
+}
+
 command_needs_namespaced_snap_mounts() {
     local command_name=$1 candidate canonical
 
@@ -7127,7 +7396,180 @@ command_needs_namespaced_snap_mounts() {
             ;;
     esac
 
+    # Commands such as `firefox` can resolve to a distro-owned transition
+    # wrapper under /usr/bin rather than /snap/bin/firefox.  Detect that
+    # wrapper explicitly so Snap's tracking cgroup and securityfs are prepared
+    # before the wrapper hands control to snap-confine.
+    path_is_snap_wrapper "$candidate" && return 0
+    if [[ -n "$canonical" && "$canonical" != "$candidate" ]]; then
+        path_is_snap_wrapper "$canonical" && return 0
+    fi
+
     return 1
+}
+
+dns_proxy_exec() {
+    require_root
+    local app=$1
+    validate_app_name "$app"
+    load_cfg "$app"
+
+    ip netns list | awk '{print $1}' | grep -Fxq "$NS_NAME" ||
+        die "Namespace '$NS_NAME' does not exist for the DNS compatibility proxy."
+
+    # Snap reuses a persistent mount namespace and can therefore see the
+    # host's systemd-resolved stub (127.0.0.53) instead of the resolver file
+    # bind-mounted by `ip netns exec`.  Run a tiny proxy on that address inside
+    # the application network namespace.  It binds as root, then permanently
+    # drops to nobody before forwarding any packet, so the pre-tunnel
+    # root-only DNS exception cannot leak application DNS around the kill
+    # switch while the VPN is down.
+    exec /usr/sbin/ip netns exec "$NS_NAME" \
+        /usr/bin/python3 - "$DNS_SERVERS" <<'PY_NNS_DNS_PROXY'
+from __future__ import annotations
+
+import ipaddress
+import os
+import pwd
+import signal
+import socket
+import socketserver
+import struct
+import sys
+import threading
+
+LISTEN_ADDRESS = "127.0.0.53"
+LISTEN_PORT = 53
+UPSTREAM_PORT = 53
+QUERY_TIMEOUT = 3.0
+MAX_DNS_PACKET = 65535
+
+upstreams: list[tuple[str, int]] = []
+for item in sys.argv[1].split():
+    try:
+        address = ipaddress.ip_address(item)
+    except ValueError:
+        continue
+    if address.version == 4:
+        upstreams.append((str(address), UPSTREAM_PORT))
+
+if not upstreams:
+    raise SystemExit("nns-app DNS proxy requires at least one IPv4 DNS server")
+
+
+def recv_exact(sock: socket.socket, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise ConnectionError("short DNS-over-TCP read")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def forward_udp(payload: bytes) -> bytes | None:
+    for upstream in upstreams:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(QUERY_TIMEOUT)
+                sock.sendto(payload, upstream)
+                response, _ = sock.recvfrom(MAX_DNS_PACKET)
+                return response
+        except OSError:
+            continue
+    return None
+
+
+def forward_tcp(payload: bytes) -> bytes | None:
+    request = struct.pack("!H", len(payload)) + payload
+    for upstream in upstreams:
+        try:
+            with socket.create_connection(upstream, timeout=QUERY_TIMEOUT) as sock:
+                sock.settimeout(QUERY_TIMEOUT)
+                sock.sendall(request)
+                response_size = struct.unpack("!H", recv_exact(sock, 2))[0]
+                return recv_exact(sock, response_size)
+        except OSError:
+            continue
+    return None
+
+
+class ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class UDPHandler(socketserver.BaseRequestHandler):
+    def handle(self) -> None:
+        payload, server_socket = self.request
+        response = forward_udp(payload)
+        if response is not None:
+            server_socket.sendto(response, self.client_address)
+
+
+class TCPHandler(socketserver.BaseRequestHandler):
+    def handle(self) -> None:
+        try:
+            request_size = struct.unpack("!H", recv_exact(self.request, 2))[0]
+            payload = recv_exact(self.request, request_size)
+            response = forward_tcp(payload)
+            if response is not None:
+                self.request.sendall(struct.pack("!H", len(response)) + response)
+        except (ConnectionError, OSError, struct.error):
+            return
+
+
+udp_server = ThreadingUDPServer((LISTEN_ADDRESS, LISTEN_PORT), UDPHandler)
+tcp_server = ThreadingTCPServer((LISTEN_ADDRESS, LISTEN_PORT), TCPHandler)
+
+nobody = pwd.getpwnam("nobody")
+os.setgroups([])
+os.setgid(nobody.pw_gid)
+os.setuid(nobody.pw_uid)
+
+stop_event = threading.Event()
+for handled_signal in (signal.SIGTERM, signal.SIGINT):
+    signal.signal(handled_signal, lambda _signum, _frame: stop_event.set())
+
+threads = [
+    threading.Thread(target=udp_server.serve_forever, name="nns-dns-udp", daemon=True),
+    threading.Thread(target=tcp_server.serve_forever, name="nns-dns-tcp", daemon=True),
+]
+for thread in threads:
+    thread.start()
+
+print(
+    f"nns-app DNS compatibility proxy listening on {LISTEN_ADDRESS}:{LISTEN_PORT}; "
+    f"upstreams={','.join(address for address, _port in upstreams)}",
+    flush=True,
+)
+
+stop_event.wait()
+udp_server.shutdown()
+tcp_server.shutdown()
+udp_server.server_close()
+tcp_server.server_close()
+PY_NNS_DNS_PROXY
+}
+
+ensure_snap_dns_proxy() {
+    local app=$1 unit="nns-dns@${app}.service"
+
+    if ! systemctl start "$unit"; then
+        journalctl -u "$unit" -n 30 -o cat --no-pager >&2 2>/dev/null || true
+        die "Could not start the namespace DNS compatibility proxy for Snap application '$app'."
+    fi
+    systemctl is-active --quiet "$unit" || {
+        journalctl -u "$unit" -n 30 -o cat --no-pager >&2 2>/dev/null || true
+        die "Namespace DNS compatibility proxy for '$app' is not running."
+    }
 }
 
 namespace_ref_id() {
@@ -7232,6 +7674,13 @@ run_in_app() {
             die "VPN data path for '$app' is not online yet."
     fi
 
+    # Snap keeps its own mount namespace and can bypass the resolver file that
+    # `ip netns exec` bind-mounts.  Start a namespace-local 127.0.0.53 proxy
+    # only for Snap/snap-confine launches; ordinary commands remain unchanged.
+    if command_needs_namespaced_snap_mounts "$1"; then
+        ensure_snap_dns_proxy "$app"
+    fi
+
     # `ip netns exec` supplies the namespace-specific resolver bind. The
     # internal helper prepares Snap-required mounts, then drops permanently to
     # APP_USER without shell re-parsing or eval.
@@ -7324,6 +7773,7 @@ status_app() {
     local upstream_health="not applicable"
     local watchdog_timer_state watchdog_armed watchdog_failures watchdog_limit watchdog_result
     local watchdog_last_restart watchdog_total_restarts watchdog_last_restart_text="never"
+    local dns_proxy_state
 
     configured_via=$(effective_via_for_app "$app" __default__)
     runtime_via=$(runtime_via_for_app "$app" 2>/dev/null || printf '%s' "$configured_via")
@@ -7352,6 +7802,7 @@ status_app() {
     ns_since=$(systemctl show "$ns_unit" -p ActiveEnterTimestamp --value 2>/dev/null || true)
     vpn_since=$(systemctl show "$vpn_unit" -p ActiveEnterTimestamp --value 2>/dev/null || true)
     restarts=$(systemctl show "$vpn_unit" -p NRestarts --value 2>/dev/null || true)
+    dns_proxy_state=$(systemctl is-active "nns-dns@${app}.service" 2>/dev/null || true)
     watchdog_timer_state=$(systemctl is-active "nns-watchdog@${app}.timer" 2>/dev/null || true)
     watchdog_state_load "$app"
     watchdog_armed=$WD_ARMED
@@ -7487,6 +7938,11 @@ status_app() {
     [[ -z "$vpn_since" ]] || printf 'VPN active:        %s\n' "$vpn_since"
     printf 'Kill switch:       %s\n' "${KILLSWITCH:-unknown}"
     printf 'DNS servers:       %s\n' "${DNS_SERVERS:-not configured}"
+    if [[ "$dns_proxy_state" == active ]]; then
+        printf 'Snap DNS proxy:    active on 127.0.0.53:53\n'
+    else
+        printf 'Snap DNS proxy:    inactive; starts on demand\n'
+    fi
     printf 'Tunnel interface:  %s\n' "${route_iface:-not ready}"
     printf 'Tunnel IPv4:       %s\n' "${local_ip:-not assigned}"
     printf 'External IPv4:     %s\n' "${external_ip:-unavailable}"
@@ -7691,6 +8147,12 @@ main() {
             run_user_exec "$internal_app" "$@"
             exit
             ;;
+        _dns-proxy)
+            require_root
+            [[ $# -eq 2 ]] || die "_dns-proxy requires app_name."
+            dns_proxy_exec "$2"
+            exit
+            ;;
         _gateway-up)
             require_root
             [[ $# -eq 2 ]] || die "_gateway-up requires gateway_name."
@@ -7841,12 +8303,22 @@ main() {
             fi
             ;;
         remove)
-            [[ $# -eq 2 ]] || die "Usage: nns-app remove <app_name>"
-            remove_app "$2"
+            if [[ $# -eq 2 ]]; then
+                remove_app "$2"
+            elif [[ $# -eq 3 && "$3" == --local-only ]]; then
+                remove_app "$2" local-only
+            else
+                die "Usage: nns-app remove <app_name> [--local-only]"
+            fi
             ;;
         purge)
-            [[ $# -eq 1 ]] || die "Usage: nns-app purge"
-            purge_engine
+            if [[ $# -eq 1 ]]; then
+                purge_engine
+            elif [[ $# -eq 2 && "$2" == --local-only ]]; then
+                purge_engine local-only
+            else
+                die "Usage: nns-app purge [--local-only]"
+            fi
             ;;
         list)
             [[ $# -eq 1 ]] || die "Usage: nns-app list"

@@ -59,6 +59,21 @@ run_command_path() {
     printf '%s\n' "$candidate"
 }
 
+path_is_snap_wrapper() {
+    local path=$1 first_line
+    [[ -f "$path" && -r "$path" ]] || return 1
+
+    # Ubuntu transition packages such as /usr/bin/firefox are ordinary shell
+    # wrappers even though the real application is a Snap.  Restrict content
+    # inspection to scripts so an unrelated native ELF binary is never
+    # classified from incidental string data.
+    IFS= read -r first_line <"$path" || true
+    [[ "$first_line" == '#!'* ]] || return 1
+
+    LC_ALL=C head -c 16384 -- "$path" 2>/dev/null |
+        grep -aEq '(/snap/bin/|/var/lib/snapd/snap/bin/|/usr/lib/snapd/snap-confine|/usr/bin/snap([[:space:]]|$)|(^|[[:space:]])snap[[:space:]]+run([[:space:]]|$))'
+}
+
 command_needs_namespaced_snap_mounts() {
     local command_name=$1 candidate canonical
 
@@ -80,7 +95,180 @@ command_needs_namespaced_snap_mounts() {
             ;;
     esac
 
+    # Commands such as `firefox` can resolve to a distro-owned transition
+    # wrapper under /usr/bin rather than /snap/bin/firefox.  Detect that
+    # wrapper explicitly so Snap's tracking cgroup and securityfs are prepared
+    # before the wrapper hands control to snap-confine.
+    path_is_snap_wrapper "$candidate" && return 0
+    if [[ -n "$canonical" && "$canonical" != "$candidate" ]]; then
+        path_is_snap_wrapper "$canonical" && return 0
+    fi
+
     return 1
+}
+
+dns_proxy_exec() {
+    require_root
+    local app=$1
+    validate_app_name "$app"
+    load_cfg "$app"
+
+    ip netns list | awk '{print $1}' | grep -Fxq "$NS_NAME" ||
+        die "Namespace '$NS_NAME' does not exist for the DNS compatibility proxy."
+
+    # Snap reuses a persistent mount namespace and can therefore see the
+    # host's systemd-resolved stub (127.0.0.53) instead of the resolver file
+    # bind-mounted by `ip netns exec`.  Run a tiny proxy on that address inside
+    # the application network namespace.  It binds as root, then permanently
+    # drops to nobody before forwarding any packet, so the pre-tunnel
+    # root-only DNS exception cannot leak application DNS around the kill
+    # switch while the VPN is down.
+    exec /usr/sbin/ip netns exec "$NS_NAME" \
+        /usr/bin/python3 - "$DNS_SERVERS" <<'PY_NNS_DNS_PROXY'
+from __future__ import annotations
+
+import ipaddress
+import os
+import pwd
+import signal
+import socket
+import socketserver
+import struct
+import sys
+import threading
+
+LISTEN_ADDRESS = "127.0.0.53"
+LISTEN_PORT = 53
+UPSTREAM_PORT = 53
+QUERY_TIMEOUT = 3.0
+MAX_DNS_PACKET = 65535
+
+upstreams: list[tuple[str, int]] = []
+for item in sys.argv[1].split():
+    try:
+        address = ipaddress.ip_address(item)
+    except ValueError:
+        continue
+    if address.version == 4:
+        upstreams.append((str(address), UPSTREAM_PORT))
+
+if not upstreams:
+    raise SystemExit("nns-app DNS proxy requires at least one IPv4 DNS server")
+
+
+def recv_exact(sock: socket.socket, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise ConnectionError("short DNS-over-TCP read")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def forward_udp(payload: bytes) -> bytes | None:
+    for upstream in upstreams:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(QUERY_TIMEOUT)
+                sock.sendto(payload, upstream)
+                response, _ = sock.recvfrom(MAX_DNS_PACKET)
+                return response
+        except OSError:
+            continue
+    return None
+
+
+def forward_tcp(payload: bytes) -> bytes | None:
+    request = struct.pack("!H", len(payload)) + payload
+    for upstream in upstreams:
+        try:
+            with socket.create_connection(upstream, timeout=QUERY_TIMEOUT) as sock:
+                sock.settimeout(QUERY_TIMEOUT)
+                sock.sendall(request)
+                response_size = struct.unpack("!H", recv_exact(sock, 2))[0]
+                return recv_exact(sock, response_size)
+        except OSError:
+            continue
+    return None
+
+
+class ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class UDPHandler(socketserver.BaseRequestHandler):
+    def handle(self) -> None:
+        payload, server_socket = self.request
+        response = forward_udp(payload)
+        if response is not None:
+            server_socket.sendto(response, self.client_address)
+
+
+class TCPHandler(socketserver.BaseRequestHandler):
+    def handle(self) -> None:
+        try:
+            request_size = struct.unpack("!H", recv_exact(self.request, 2))[0]
+            payload = recv_exact(self.request, request_size)
+            response = forward_tcp(payload)
+            if response is not None:
+                self.request.sendall(struct.pack("!H", len(response)) + response)
+        except (ConnectionError, OSError, struct.error):
+            return
+
+
+udp_server = ThreadingUDPServer((LISTEN_ADDRESS, LISTEN_PORT), UDPHandler)
+tcp_server = ThreadingTCPServer((LISTEN_ADDRESS, LISTEN_PORT), TCPHandler)
+
+nobody = pwd.getpwnam("nobody")
+os.setgroups([])
+os.setgid(nobody.pw_gid)
+os.setuid(nobody.pw_uid)
+
+stop_event = threading.Event()
+for handled_signal in (signal.SIGTERM, signal.SIGINT):
+    signal.signal(handled_signal, lambda _signum, _frame: stop_event.set())
+
+threads = [
+    threading.Thread(target=udp_server.serve_forever, name="nns-dns-udp", daemon=True),
+    threading.Thread(target=tcp_server.serve_forever, name="nns-dns-tcp", daemon=True),
+]
+for thread in threads:
+    thread.start()
+
+print(
+    f"nns-app DNS compatibility proxy listening on {LISTEN_ADDRESS}:{LISTEN_PORT}; "
+    f"upstreams={','.join(address for address, _port in upstreams)}",
+    flush=True,
+)
+
+stop_event.wait()
+udp_server.shutdown()
+tcp_server.shutdown()
+udp_server.server_close()
+tcp_server.server_close()
+PY_NNS_DNS_PROXY
+}
+
+ensure_snap_dns_proxy() {
+    local app=$1 unit="nns-dns@${app}.service"
+
+    if ! systemctl start "$unit"; then
+        journalctl -u "$unit" -n 30 -o cat --no-pager >&2 2>/dev/null || true
+        die "Could not start the namespace DNS compatibility proxy for Snap application '$app'."
+    fi
+    systemctl is-active --quiet "$unit" || {
+        journalctl -u "$unit" -n 30 -o cat --no-pager >&2 2>/dev/null || true
+        die "Namespace DNS compatibility proxy for '$app' is not running."
+    }
 }
 
 namespace_ref_id() {
@@ -185,6 +373,13 @@ run_in_app() {
             die "VPN data path for '$app' is not online yet."
     fi
 
+    # Snap keeps its own mount namespace and can bypass the resolver file that
+    # `ip netns exec` bind-mounts.  Start a namespace-local 127.0.0.53 proxy
+    # only for Snap/snap-confine launches; ordinary commands remain unchanged.
+    if command_needs_namespaced_snap_mounts "$1"; then
+        ensure_snap_dns_proxy "$app"
+    fi
+
     # `ip netns exec` supplies the namespace-specific resolver bind. The
     # internal helper prepares Snap-required mounts, then drops permanently to
     # APP_USER without shell re-parsing or eval.
@@ -277,6 +472,7 @@ status_app() {
     local upstream_health="not applicable"
     local watchdog_timer_state watchdog_armed watchdog_failures watchdog_limit watchdog_result
     local watchdog_last_restart watchdog_total_restarts watchdog_last_restart_text="never"
+    local dns_proxy_state
 
     configured_via=$(effective_via_for_app "$app" __default__)
     runtime_via=$(runtime_via_for_app "$app" 2>/dev/null || printf '%s' "$configured_via")
@@ -305,6 +501,7 @@ status_app() {
     ns_since=$(systemctl show "$ns_unit" -p ActiveEnterTimestamp --value 2>/dev/null || true)
     vpn_since=$(systemctl show "$vpn_unit" -p ActiveEnterTimestamp --value 2>/dev/null || true)
     restarts=$(systemctl show "$vpn_unit" -p NRestarts --value 2>/dev/null || true)
+    dns_proxy_state=$(systemctl is-active "nns-dns@${app}.service" 2>/dev/null || true)
     watchdog_timer_state=$(systemctl is-active "nns-watchdog@${app}.timer" 2>/dev/null || true)
     watchdog_state_load "$app"
     watchdog_armed=$WD_ARMED
@@ -440,6 +637,11 @@ status_app() {
     [[ -z "$vpn_since" ]] || printf 'VPN active:        %s\n' "$vpn_since"
     printf 'Kill switch:       %s\n' "${KILLSWITCH:-unknown}"
     printf 'DNS servers:       %s\n' "${DNS_SERVERS:-not configured}"
+    if [[ "$dns_proxy_state" == active ]]; then
+        printf 'Snap DNS proxy:    active on 127.0.0.53:53\n'
+    else
+        printf 'Snap DNS proxy:    inactive; starts on demand\n'
+    fi
     printf 'Tunnel interface:  %s\n' "${route_iface:-not ready}"
     printf 'Tunnel IPv4:       %s\n' "${local_ip:-not assigned}"
     printf 'External IPv4:     %s\n' "${external_ip:-unavailable}"
