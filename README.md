@@ -89,18 +89,9 @@ forward through the existing SSH port, so no additional cloud firewall rule or
 public gateway port is needed.
 
 The third command executes the requested process inside the already running
-local namespace. If the environment was stopped manually, `run` starts the
-owned remote exit and gateway first, then reconnects the local environment.
-An explicit stop is symmetric:
-
-```bash
-nns-app stop my-private-app
-```
-
-It stops the local client first and then the owned remote gateway and provider
-exit. Use `nns-app stop my-private-app --local-only` only when the remote host
-is unavailable or when leaving the remote side running is intentional. Normal
-status, synchronization, and credential rotation remain available:
+local namespace. If the environment was stopped manually, `run` starts it
+again. Normal status, synchronization, and credential rotation remain
+available:
 
 ```bash
 nns-app status my-private-app
@@ -400,17 +391,21 @@ nns-app start my-private-app
 nns-app status my-private-app
 nns-app run my-private-app curl -4 https://api.ipify.org
 nns-app run my-private-app firefox --no-remote
+nns-app run my-private-app bash
 ```
+
+`run` restores the invoking user’s command-search path after privilege dropping
+and appends the standard `/usr/local/sbin`, `/usr/sbin`, and `/sbin` locations.
+Interactive shells therefore retain user-installed command directories while
+system diagnostics such as `ip`, `ss`, and `ifconfig` remain discoverable. The
+rest of the environment is deliberately allow-listed rather than copied
+wholesale; dangerous loader and shell-startup variables are not inherited.
 
 Stop it:
 
 ```bash
 nns-app stop my-private-app
 ```
-
-For a local/manual environment this stops only local services. For an
-automatic-remote environment it also stops that app's owned remote gateway and
-provider exit. `--local-only` skips the remote lifecycle operation explicitly.
 
 Remove the environment and its imported profiles:
 

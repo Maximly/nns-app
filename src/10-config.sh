@@ -52,6 +52,14 @@ reexec_as_root_if_needed() {
         exit $?
     fi
 
+    # Preserve the invoking user's command-search path under a dedicated
+    # variable before sudo applies secure_path. The root engine never executes
+    # through this value; it is passed back only after setpriv has permanently
+    # dropped to APP_USER.
+    if [[ "$cmd" == run ]]; then
+        export NNS_APP_RUN_PATH=${PATH-}
+    fi
+
     # Do not exec sudo here. Keeping this wrapper process separate avoids
     # replacing an interactive caller and gives normal shells clean SIGINT flow.
     "${sudo_args[@]}" "$target" "$@"

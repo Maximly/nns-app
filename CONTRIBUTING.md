@@ -37,6 +37,7 @@ location, host, or personal names into public help, comments, tests, or docs.
 - Generated private keys use mode `0600` or `0640` as appropriate.
 - `.nnslink` archives are untrusted input and must be allow-listed by member name and type before extraction.
 - Remote SSH targets are structured data, never shell fragments; host keys remain pinned in a dedicated root-owned `known_hosts` file.
+- `nns-app run` carries the caller’s `PATH` through sudo only as `NNS_APP_RUN_PATH`; the root engine never resolves or executes commands through it. The path is applied only after `setpriv` has dropped permanently to `APP_USER`.
 
 Adding a sourced field requires updating the corresponding reset and validation
 function.

@@ -32,6 +32,20 @@ if namespace_ref_id "$TEST_TMP/missing-netns" >/dev/null 2>&1; then
     fail 'missing namespace reference was accepted'
 fi
 
+caller_path='/home/test-user/.local/bin:/opt/test-tools/bin'
+composed_path=$(compose_user_run_path "$caller_path")
+[[ "$composed_path" == "$caller_path:"* ]] ||
+    fail 'caller PATH order was not preserved'
+for required_path in /usr/local/sbin /usr/sbin /sbin /usr/bin /bin /snap/bin; do
+    case ":$composed_path:" in
+        *":$required_path:"*) ;;
+        *) fail "standard command directory missing from run PATH: $required_path" ;;
+    esac
+done
+empty_composed_path=$(compose_user_run_path '')
+[[ "$empty_composed_path" == /usr/local/sbin:* ]] ||
+    fail 'empty caller PATH did not receive the standard system path'
+
 if command_needs_namespaced_snap_mounts ping; then
     fail 'ordinary command incorrectly requires Snap mounts'
 fi

@@ -1,10 +1,10 @@
 # Changelog
 
-## 1.3.10
+## 1.3.11
 
-- Made automatic-remote lifecycle symmetric: `nns-app stop <app>` now stops the local client first, then the owned remote gateway and provider exit; `nns-app start <app>` starts the owned remote exit/gateway before reconciling the local path.
-- Added `nns-app stop <app> --local-only` as an explicit emergency escape hatch when the remote host is unavailable. Normal local/manual apps keep their previous local-only behavior.
-- Remote lifecycle operations validate deterministic ownership markers before touching gateway or exit resources and keep boot enablement intact for reboot recovery.
+- Preserve the invoking user’s `PATH` across the sudo `secure_path` and `env -i` boundaries used by `nns-app run`.
+- Append the standard system sbin/bin locations to the preserved path, so unprivileged diagnostic commands such as `ifconfig`, `ip`, and `ss` remain discoverable inside an interactive shell.
+- Keep the remaining process environment explicitly allow-listed; loader and shell-startup injection variables are still excluded.
 
 ## 1.3.8
 

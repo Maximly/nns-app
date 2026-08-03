@@ -276,6 +276,21 @@ namespace_ref_id() {
     stat -Lc '%d:%i' -- "$path" 2>/dev/null
 }
 
+compose_user_run_path() {
+    # sudo normally replaces PATH with secure_path. Restore the caller's PATH
+    # for the final unprivileged process, then append standard system command
+    # directories so tools such as ip/ifconfig remain discoverable even when
+    # the desktop session supplied a minimal PATH.
+    local caller_path=${1:-}
+    local system_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+
+    if [[ -n "$caller_path" ]]; then
+        printf '%s:%s\n' "$caller_path" "$system_path"
+    else
+        printf '%s\n' "$system_path"
+    fi
+}
+
 run_user_exec() {
     require_root
     local app=$1
@@ -304,19 +319,20 @@ run_user_exec() {
         prepare_namespaced_snap_mounts
     fi
 
-    local uid gid home shell
+    local uid gid home shell run_path
     uid=$(id -u "$APP_USER")
     gid=$(id -g "$APP_USER")
     home=$(getent passwd "$APP_USER" | cut -d: -f6)
     shell=$(getent passwd "$APP_USER" | cut -d: -f7)
     [[ -n "$shell" ]] || shell=/bin/bash
+    run_path=$(compose_user_run_path "${NNS_APP_RUN_PATH:-}")
 
     local env_args=(
         "HOME=$home"
         "USER=$APP_USER"
         "LOGNAME=$APP_USER"
         "SHELL=$shell"
-        "PATH=/usr/local/bin:/usr/bin:/bin:/snap/bin"
+        "PATH=$run_path"
         "XDG_RUNTIME_DIR=/run/user/$uid"
     )
     local name value

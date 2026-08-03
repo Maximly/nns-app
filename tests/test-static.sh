@@ -9,7 +9,7 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fq 'nns-app 1.3.10' <<<"$version"
+grep -Fq 'nns-app 1.3.11' <<<"$version"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -91,6 +91,25 @@ grep -Fq 'write_sudoers_for_app "$app" "$APP_USER"' "$INSTALLER" || {
     echo 'engine upgrade does not refresh existing per-app sudoers rules' >&2
     exit 1
 }
+
+# The caller's command-search path must survive sudo secure_path under a
+# dedicated variable, and it must be applied only in the final user process.
+grep -Fq 'export NNS_APP_RUN_PATH=${PATH-}' "$INSTALLER" || {
+    echo 'run wrapper does not capture the invoking user PATH' >&2
+    exit 1
+}
+grep -Fq 'env_keep += "NNS_APP_RUN_PATH ' "$INSTALLER" || {
+    echo 'sudoers does not preserve the dedicated run PATH variable' >&2
+    exit 1
+}
+grep -Fq 'run_path=$(compose_user_run_path "${NNS_APP_RUN_PATH:-}")' "$INSTALLER" || {
+    echo 'run helper does not restore the caller PATH after privilege dropping' >&2
+    exit 1
+}
+if grep -Fq '"PATH=/usr/local/bin:/usr/bin:/bin:/snap/bin"' "$INSTALLER"; then
+    echo 'run helper still replaces the user PATH with the old minimal path' >&2
+    exit 1
+fi
 
 grep -Fq 'nns-online@.service' "$INSTALLER"
 grep -Fq 'nns-dns@.service' "$INSTALLER"
