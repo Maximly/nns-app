@@ -30,6 +30,10 @@
 #   start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
 #   stop    <app_name>
 #   run     <app_name> <command> [args...]
+#   gateway create <gateway> --via <app> --listen tcp|udp:<port>
+#                  --public <host>:<port> [--pool <IPv4-CIDR>]
+#   gateway start|stop|status|list|remove ...
+#   gateway client add|list|export|revoke ...
 #
 # The script installs itself as /usr/local/sbin/nns_app.sh and creates the
 # convenience symlink /usr/local/bin/nns-app.
@@ -37,7 +41,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.0.22"
+readonly VERSION="1.0.23"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -47,6 +51,9 @@ readonly BASE_DIR="/etc/nns-app"
 readonly RUN_DIR="/run/nns-app"
 readonly NETNS_UNIT="/etc/systemd/system/nns-netns@.service"
 readonly VPN_UNIT="/etc/systemd/system/nns-openvpn@.service"
+readonly GATEWAY_UNIT="/etc/systemd/system/nns-gateway@.service"
+readonly GATEWAY_BASE_DIR="$BASE_DIR/gateways"
+readonly GATEWAY_RUN_BASE="$RUN_DIR/gateways"
 readonly VPNGATE_API_URL="https://www.vpngate.net/api/iphone/"
 readonly CACHE_DIR="/var/cache/nns-app"
 readonly STATE_DIR="/var/lib/nns-app"
@@ -108,6 +115,20 @@ Usage:
   nns-app stop    <app_name>
   nns-app run     <app_name> <command> [arguments...]
 
+  nns-app gateway create <gateway_name> --via <app_name>
+                  --listen <tcp|udp>:<port>
+                  --public <host>:<port>
+                  [--pool <IPv4-CIDR>] [--dns "<IPv4> ..."]
+  nns-app gateway start  <gateway_name>
+  nns-app gateway stop   <gateway_name>
+  nns-app gateway status <gateway_name>
+  nns-app gateway list
+  nns-app gateway remove <gateway_name>
+  nns-app gateway client add    <gateway_name> <client_name>
+  nns-app gateway client list   <gateway_name>
+  nns-app gateway client export <gateway_name> <client_name> --output <file.ovpn>
+  nns-app gateway client revoke <gateway_name> <client_name>
+
 Examples:
   sudo ./nns-app.sh install
   sudo nns-app install hidemy
@@ -122,6 +143,16 @@ Examples:
   sudo nns-app purge
   nns-app list
   nns-app status browser
+
+  # On a remote Linux box whose `exit-eu` app is already online:
+  sudo nns-app gateway create eu-relay \
+      --via exit-eu \
+      --listen tcp:443 \
+      --public vpn.example.net:443
+  sudo nns-app gateway client add eu-relay mlhost
+  sudo nns-app gateway client export eu-relay mlhost \
+      --output /root/eu-relay-mlhost.ovpn
+  sudo nns-app gateway start eu-relay
 USAGE
 }
 
@@ -157,7 +188,7 @@ reexec_as_root_if_needed() {
         list|status|start|stop|run)
             sudo_args+=( -n )
             ;;
-        install|remove|add|purge)
+        install|remove|add|purge|gateway)
             ;;
         *)
             die "Unknown command '$cmd'."
@@ -511,7 +542,28 @@ TimeoutStopSec=25s
 WantedBy=multi-user.target
 VPN_UNIT_EOF
 
-    chmod 0644 "$NETNS_UNIT" "$VPN_UNIT"
+    cat >"$GATEWAY_UNIT" <<'GATEWAY_UNIT_EOF'
+[Unit]
+Description=NNS managed OpenVPN gateway %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/sbin/nns_app.sh _gateway-up %i
+ExecStart=/usr/local/sbin/nns_app.sh _gateway-server %i
+ExecStopPost=/usr/local/sbin/nns_app.sh _gateway-down %i
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target
+GATEWAY_UNIT_EOF
+
+    chmod 0644 "$NETNS_UNIT" "$VPN_UNIT" "$GATEWAY_UNIT"
     systemctl daemon-reload
 }
 
@@ -520,7 +572,7 @@ install_engine() {
 
     ensure_dependencies
     install_engine_files
-    install -d -o root -g root -m 0755         "$BASE_DIR" "$RUN_DIR" "$CACHE_DIR" "$STATE_DIR"
+    install -d -o root -g root -m 0755         "$BASE_DIR" "$RUN_DIR" "$CACHE_DIR" "$STATE_DIR" "$GATEWAY_BASE_DIR" "$GATEWAY_RUN_BASE"
 
     log "Installed nns-app $VERSION."
     log "Command: $USER_PATH"
@@ -591,7 +643,7 @@ install_app() {
 
     ensure_dependencies
     install_engine_files
-    install -d -o root -g root -m 0755         "$BASE_DIR" "$RUN_DIR" "$CACHE_DIR" "$STATE_DIR"
+    install -d -o root -g root -m 0755         "$BASE_DIR" "$RUN_DIR" "$CACHE_DIR" "$STATE_DIR" "$GATEWAY_BASE_DIR" "$GATEWAY_RUN_BASE"
 
     local dir file user net_data cidr host_addr ns_addr veth_data veth_host veth_ns
     dir=$(cfg_dir "$app")
@@ -2559,6 +2611,7 @@ stop_app() {
     validate_app_name "$app"
     load_cfg "$app"
 
+    stop_gateways_via_app "$app"
     stop_dependents "$app"
     systemctl stop "nns-openvpn@${app}.service" 2>/dev/null || true
     systemctl stop "nns-netns@${app}.service" 2>/dev/null || true
@@ -2572,6 +2625,11 @@ remove_app() {
     local app=$1
     validate_app_name "$app"
     load_cfg "$app"
+
+    local gateway_dependencies
+    gateway_dependencies=$(gateways_using_app "$app" | paste -sd ', ' -)
+    [[ -z "$gateway_dependencies" ]] ||
+        die "App '$app' is used by gateway(s): $gateway_dependencies. Remove or reconfigure those gateways first."
 
     stop_app "$app"
     # stop_app may load a dependent app config while unwinding a chain.
@@ -2599,6 +2657,17 @@ purge_engine() {
         app=$(basename "$dir")
         [[ -f "$(cfg_file "$app")" ]] || continue
         apps+=("$app")
+    done
+
+    # Stop managed gateways before their NNS exits disappear.
+    local gateway_dir gateway
+    shopt -s nullglob
+    for gateway_dir in "$GATEWAY_BASE_DIR"/*; do
+        [[ -f "$gateway_dir/gateway.cfg" ]] || continue
+        gateway=$(basename "$gateway_dir")
+        systemctl stop "nns-gateway@${gateway}.service" 2>/dev/null || true
+        ( gateway_down "$gateway" ) >/dev/null 2>&1 || true
+        systemctl disable "nns-gateway@${gateway}.service" >/dev/null 2>&1 || true
     done
 
     # Stop VPN processes first, then namespaces. Do this app by app so that
@@ -2648,13 +2717,14 @@ purge_engine() {
 
     # Remove enabled-instance symlinks before deleting the templates.
     find /etc/systemd/system -type l \
-        \( -name 'nns-openvpn@*.service' -o -name 'nns-netns@*.service' \) \
+        \( -name 'nns-openvpn@*.service' -o -name 'nns-netns@*.service' -o -name 'nns-gateway@*.service' \) \
         -delete 2>/dev/null || true
 
     rm -rf -- \
         /etc/systemd/system/nns-openvpn@.service.d \
-        /etc/systemd/system/nns-netns@.service.d
-    rm -f -- "$VPN_UNIT" "$NETNS_UNIT"
+        /etc/systemd/system/nns-netns@.service.d \
+        /etc/systemd/system/nns-gateway@.service.d
+    rm -f -- "$VPN_UNIT" "$NETNS_UNIT" "$GATEWAY_UNIT"
 
     systemctl daemon-reload
     systemctl reset-failed 2>/dev/null || true
@@ -2664,6 +2734,1012 @@ purge_engine() {
 
     log "Purged NNS app engine and all installed NNS apps."
     log "Removed: $BASE_DIR, /etc/netns/nns-*, NNS systemd units, NNS sudoers rules, $USER_PATH and $ENGINE_PATH"
+}
+
+
+# ---------------------------------------------------------------------------
+# Managed remote OpenVPN gateways
+# ---------------------------------------------------------------------------
+
+validate_gateway_name() {
+    local name=${1:-}
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]] ||
+        die "Invalid gateway name '$name'. Use 1-32 letters, digits, '.', '_' or '-'."
+}
+
+validate_gateway_client_name() {
+    local name=${1:-}
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$ ]] ||
+        die "Invalid client name '$name'. Use 1-48 letters, digits, '.', '_' or '-'."
+}
+
+gateway_dir()          { printf '%s/%s\n' "$GATEWAY_BASE_DIR" "$1"; }
+gateway_cfg_file()     { printf '%s/%s/gateway.cfg\n' "$GATEWAY_BASE_DIR" "$1"; }
+gateway_pki_dir()      { printf '%s/%s/pki\n' "$GATEWAY_BASE_DIR" "$1"; }
+gateway_clients_dir()  { printf '%s/%s/clients\n' "$GATEWAY_BASE_DIR" "$1"; }
+gateway_client_dir()   { printf '%s/%s/clients/%s\n' "$GATEWAY_BASE_DIR" "$1" "$2"; }
+gateway_server_config(){ printf '%s/%s/server.conf\n' "$GATEWAY_BASE_DIR" "$1"; }
+gateway_runtime_dir()  { printf '%s/%s\n' "$GATEWAY_RUN_BASE" "$1"; }
+gateway_runtime_file() { printf '%s/%s/runtime.env\n' "$GATEWAY_RUN_BASE" "$1"; }
+gateway_status_file()  { printf '%s/%s/openvpn-status.log\n' "$GATEWAY_RUN_BASE" "$1"; }
+
+load_gateway_cfg() {
+    local gateway=$1 file owner mode mode_octal
+    validate_gateway_name "$gateway"
+    file=$(gateway_cfg_file "$gateway")
+    [[ -f "$file" ]] || die "Gateway '$gateway' is not configured."
+
+    owner=$(stat -c '%u' "$file")
+    mode=$(stat -c '%a' "$file")
+    [[ "$owner" == 0 ]] || die "Unsafe gateway config owner for $file; expected root."
+    mode_octal=$((8#$mode))
+    (( (mode_octal & 0022) == 0 )) ||
+        die "Unsafe gateway config permissions on $file."
+
+    # shellcheck disable=SC1090
+    source "$file"
+    [[ "${GATEWAY_NAME:-}" == "$gateway" ]] ||
+        die "GATEWAY_NAME mismatch in $file."
+    [[ "${GATEWAY_BACKEND:-}" == openvpn ]] ||
+        die "Unsupported gateway backend '${GATEWAY_BACKEND:-}'."
+    [[ -n "${VIA_APP:-}" ]] || die "VIA_APP is missing in $file."
+}
+
+gateway_cfg_value() {
+    local gateway=$1 key=$2 file
+    file=$(gateway_cfg_file "$gateway")
+    [[ -f "$file" ]] || return 1
+    (
+        set +u
+        # shellcheck disable=SC1090
+        source "$file"
+        printf '%s\n' "${!key-}"
+    )
+}
+
+make_gateway_names() {
+    local gateway=$1 crc hex
+    crc=$(printf 'gateway:%s' "$gateway" | cksum | awk '{print $1}')
+    printf -v hex '%08x' "$crc"
+    printf 'ngw%s|ngh%s|ngn%s\n' "$hex" "$hex" "$hex"
+}
+
+gateway_used_networks() {
+    grep -RhsE '^(NS_CIDR|CLIENT_POOL|TRANSIT_CIDR)=' \
+        "$BASE_DIR"/*/*.cfg "$GATEWAY_BASE_DIR"/*/gateway.cfg 2>/dev/null |
+        sed -E 's/^[A-Z_]+="?([^" ]+)"?.*/\1/' || true
+}
+
+allocate_gateway_networks() {
+    local requested_pool=${1:-} used_file
+    used_file=$(mktemp)
+    gateway_used_networks >"$used_file"
+
+    python3 - "$requested_pool" "$used_file" <<'PY_GATEWAY_NETWORKS'
+import ipaddress
+import sys
+from pathlib import Path
+
+requested = sys.argv[1].strip()
+used = []
+for raw in Path(sys.argv[2]).read_text(errors="replace").splitlines():
+    raw = raw.strip()
+    if not raw:
+        continue
+    try:
+        used.append(ipaddress.ip_network(raw, strict=False))
+    except ValueError:
+        pass
+
+def free(net):
+    return all(not net.overlaps(other) for other in used)
+
+if requested:
+    try:
+        pool = ipaddress.ip_network(requested, strict=True)
+    except ValueError as exc:
+        raise SystemExit(f"invalid client pool: {exc}")
+    if pool.version != 4:
+        raise SystemExit("client pool must be IPv4")
+    if pool.prefixlen < 24 or pool.prefixlen > 29:
+        raise SystemExit("client pool prefix must be /24 through /29")
+    if not pool.is_private:
+        raise SystemExit("client pool must use private IPv4 space")
+    if not free(pool):
+        raise SystemExit(f"client pool {pool} overlaps an existing NNS network")
+else:
+    pool = None
+    for candidate in ipaddress.ip_network("10.253.0.0/16").subnets(new_prefix=24):
+        if free(candidate):
+            pool = candidate
+            break
+    if pool is None:
+        raise SystemExit("no free gateway client /24 remains in 10.253.0.0/16")
+
+used.append(pool)
+transit = None
+for candidate in ipaddress.ip_network("10.239.0.0/16").subnets(new_prefix=30):
+    if free(candidate):
+        transit = candidate
+        break
+if transit is None:
+    raise SystemExit("no free gateway transit /30 remains in 10.239.0.0/16")
+
+hosts = list(transit.hosts())
+print(f"{pool}|{transit}|{hosts[0]}/{transit.prefixlen}|{hosts[1]}/{transit.prefixlen}")
+PY_GATEWAY_NETWORKS
+    local rc=$?
+    rm -f "$used_file"
+    return "$rc"
+}
+
+allocate_gateway_table() {
+    local used idx
+    used=$(grep -Rhs '^ROUTE_TABLE=' "$GATEWAY_BASE_DIR"/*/gateway.cfg 2>/dev/null |
+        sed -E 's/^ROUTE_TABLE="?([0-9]+)"?.*/\1/' || true)
+    for ((idx=22000; idx<23000; idx++)); do
+        if ! grep -Fxq "$idx" <<<"$used"; then
+            printf '%s|%s\n' "$idx" "$((idx - 10000))"
+            return 0
+        fi
+    done
+    die "No free gateway policy-routing table remains."
+}
+
+parse_gateway_listen() {
+    local value=$1 proto port
+    [[ "$value" == *:* ]] || die "--listen must be tcp:<port> or udp:<port>."
+    proto=${value%%:*}
+    port=${value##*:}
+    proto=${proto,,}
+    case "$proto" in tcp|udp) ;; *) die "Gateway listen protocol must be tcp or udp." ;; esac
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) ||
+        die "Gateway listen port must be from 1 through 65535."
+    printf '%s|%s\n' "$proto" "$port"
+}
+
+parse_public_endpoint() {
+    local value=$1 host port
+    [[ "$value" == *:* ]] || die "--public must be host:port."
+    host=${value%:*}
+    port=${value##*:}
+    [[ "$host" =~ ^[A-Za-z0-9.-]+$ ]] && [[ -n "$host" ]] ||
+        die "Gateway public host must be an IPv4 address or DNS name."
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) ||
+        die "Gateway public port must be from 1 through 65535."
+    printf '%s|%s\n' "$host" "$port"
+}
+
+validate_gateway_dns() {
+    local value=$1
+    python3 - "$value" <<'PY_GATEWAY_DNS'
+import ipaddress
+import sys
+items = sys.argv[1].split()
+if not items:
+    raise SystemExit("at least one DNS server is required")
+for item in items:
+    try:
+        addr = ipaddress.ip_address(item)
+    except ValueError as exc:
+        raise SystemExit(f"invalid DNS server {item!r}: {exc}")
+    if addr.version != 4:
+        raise SystemExit("gateway v1 supports IPv4 DNS servers only")
+print(" ".join(items))
+PY_GATEWAY_DNS
+}
+
+gateway_write_openssl_config() {
+    local gateway=$1 dir pki
+    dir=$(gateway_dir "$gateway")
+    pki=$(gateway_pki_dir "$gateway")
+
+    cat >"$pki/openssl.cnf" <<OPENSSL_GATEWAY_EOF
+[ ca ]
+default_ca = CA_default
+
+[ CA_default ]
+dir               = $pki
+database          = \$dir/index.txt
+new_certs_dir     = \$dir/newcerts
+certificate       = \$dir/ca.crt
+serial            = \$dir/serial
+crlnumber         = \$dir/crlnumber
+private_key       = \$dir/private/ca.key
+default_md        = sha256
+default_days      = 825
+default_crl_days  = 30
+policy            = policy_loose
+copy_extensions   = none
+unique_subject    = no
+
+[ policy_loose ]
+countryName             = optional
+stateOrProvinceName     = optional
+localityName            = optional
+organizationName        = optional
+organizationalUnitName  = optional
+commonName              = supplied
+emailAddress            = optional
+
+[ server_cert ]
+basicConstraints = critical,CA:false
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+
+[ client_cert ]
+basicConstraints = critical,CA:false
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = clientAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+OPENSSL_GATEWAY_EOF
+    chmod 0644 "$pki/openssl.cnf"
+}
+
+gateway_generate_pki() {
+    local gateway=$1 pki server_cn
+    pki=$(gateway_pki_dir "$gateway")
+    server_cn="nns-gateway-$gateway"
+
+    install -d -o root -g root -m 0755 "$pki" "$pki/newcerts" "$pki/issued"
+    install -d -o root -g root -m 0700 "$pki/private"
+    : >"$pki/index.txt"
+    printf '1000\n' >"$pki/serial"
+    printf '1000\n' >"$pki/crlnumber"
+
+    gateway_write_openssl_config "$gateway"
+
+    openssl genpkey -algorithm RSA \
+        -pkeyopt rsa_keygen_bits:3072 \
+        -out "$pki/private/ca.key" >/dev/null 2>&1
+    chmod 0600 "$pki/private/ca.key"
+
+    openssl req -x509 -new -sha256 -days 3650 \
+        -key "$pki/private/ca.key" \
+        -subj "/CN=nns-app $gateway gateway CA" \
+        -out "$pki/ca.crt" >/dev/null 2>&1
+
+    openssl genpkey -algorithm RSA \
+        -pkeyopt rsa_keygen_bits:3072 \
+        -out "$pki/server.key" >/dev/null 2>&1
+    openssl req -new -sha256 \
+        -key "$pki/server.key" \
+        -subj "/CN=$server_cn" \
+        -out "$pki/server.csr" >/dev/null 2>&1
+    openssl ca -batch -notext \
+        -config "$pki/openssl.cnf" \
+        -extensions server_cert \
+        -in "$pki/server.csr" \
+        -out "$pki/server.crt" >/dev/null 2>&1
+
+    openvpn --genkey tls-crypt-v2-server "$pki/tls-crypt-v2-server.key"
+    openssl ca -batch -config "$pki/openssl.cnf" \
+        -gencrl -out "$pki/crl.pem" >/dev/null 2>&1
+
+    rm -f "$pki/server.csr"
+    chown root:root "$pki/ca.crt" "$pki/server.crt" "$pki/crl.pem"
+    chown root:nogroup "$pki/server.key" "$pki/tls-crypt-v2-server.key"
+    chmod 0644 "$pki/ca.crt" "$pki/server.crt" "$pki/crl.pem"
+    chmod 0640 "$pki/server.key" "$pki/tls-crypt-v2-server.key"
+}
+
+gateway_write_server_config() {
+    local gateway=$1 config pki proto_option network netmask dns
+    load_gateway_cfg "$gateway"
+    config=$(gateway_server_config "$gateway")
+    pki=$(gateway_pki_dir "$gateway")
+
+    if [[ "$LISTEN_PROTO" == tcp ]]; then
+        proto_option=tcp-server
+    else
+        proto_option=udp
+    fi
+
+    read -r network netmask < <(
+        python3 - "$CLIENT_POOL" <<'PY_GATEWAY_POOL'
+import ipaddress
+import sys
+net = ipaddress.ip_network(sys.argv[1], strict=True)
+print(net.network_address, net.netmask)
+PY_GATEWAY_POOL
+    )
+
+    {
+        printf '# Generated by nns-app. Edit gateway.cfg and recreate instead of editing this file.\n'
+        printf 'mode server\n'
+        printf 'tls-server\n'
+        printf 'proto %s\n' "$proto_option"
+        printf 'port %s\n' "$LISTEN_PORT"
+        printf 'dev %s\n' "$GATEWAY_TUN"
+        printf 'topology subnet\n'
+        printf 'server %s %s\n' "$network" "$netmask"
+        printf 'ca %s\n' "$pki/ca.crt"
+        printf 'cert %s\n' "$pki/server.crt"
+        printf 'key %s\n' "$pki/server.key"
+        printf 'dh none\n'
+        printf 'crl-verify %s\n' "$pki/crl.pem"
+        printf 'tls-crypt-v2 %s force-cookie\n' "$pki/tls-crypt-v2-server.key"
+        printf 'verify-client-cert require\n'
+        printf 'remote-cert-tls client\n'
+        printf 'tls-version-min 1.2\n'
+        printf 'data-ciphers AES-256-GCM:CHACHA20-POLY1305:AES-128-GCM\n'
+        printf 'auth SHA256\n'
+        printf 'allow-compression no\n'
+        printf 'disable-dco\n'
+        printf 'keepalive 10 60\n'
+        printf 'persist-key\n'
+        printf 'persist-tun\n'
+        printf 'user nobody\n'
+        printf 'group nogroup\n'
+        printf 'status %s 5\n' "$(gateway_status_file "$gateway")"
+        printf 'status-version 3\n'
+        printf 'push "redirect-gateway def1 bypass-dhcp"\n'
+        local -a gateway_dns=()
+        IFS=' ' read -r -a gateway_dns <<<"$DNS_SERVERS"
+        for dns in "${gateway_dns[@]}"; do
+            [[ -n "$dns" ]] || continue
+            printf 'push "dhcp-option DNS %s"\n' "$dns"
+        done
+        if [[ "$LISTEN_PROTO" == udp ]]; then
+            printf 'explicit-exit-notify 1\n'
+        fi
+        printf 'verb 3\n'
+        printf 'mute 10\n'
+    } >"$config"
+
+    chown root:nogroup "$config"
+    chmod 0640 "$config"
+}
+
+gateway_create() {
+    require_root
+    local gateway=$1 via_app=$2 listen=$3 public=$4 requested_pool=${5:-} dns_input=${6:-"1.1.1.1 9.9.9.9"}
+    validate_gateway_name "$gateway"
+    validate_app_name "$via_app"
+    [[ ! -f "$(cfg_file "$gateway")" ]] ||
+        die "An NNS app named '$gateway' already exists; use a distinct gateway name."
+    [[ -f "$(cfg_file "$via_app")" ]] ||
+        die "Upstream NNS app '$via_app' is not installed."
+    [[ ! -e "$(gateway_cfg_file "$gateway")" ]] ||
+        die "Gateway '$gateway' already exists."
+
+    local listen_data public_data network_data table_data
+    local listen_proto listen_port public_host public_port
+    local client_pool transit_cidr transit_host_addr transit_ns_addr
+    local route_table rule_priority names gateway_tun veth_host veth_ns dns_servers
+
+    IFS='|' read -r listen_proto listen_port <<<"$(parse_gateway_listen "$listen")"
+    IFS='|' read -r public_host public_port <<<"$(parse_public_endpoint "$public")"
+    IFS='|' read -r client_pool transit_cidr transit_host_addr transit_ns_addr \
+        <<<"$(allocate_gateway_networks "$requested_pool")"
+    IFS='|' read -r route_table rule_priority <<<"$(allocate_gateway_table)"
+    IFS='|' read -r gateway_tun veth_host veth_ns <<<"$(make_gateway_names "$gateway")"
+    dns_servers=$(validate_gateway_dns "$dns_input")
+
+    ensure_dependencies
+    install_engine_files
+    install -d -o root -g root -m 0755 \
+        "$GATEWAY_BASE_DIR" "$GATEWAY_RUN_BASE" "$(gateway_dir "$gateway")"
+    install -d -o root -g root -m 0700 "$(gateway_clients_dir "$gateway")"
+
+    cat >"$(gateway_cfg_file "$gateway")" <<GATEWAY_CONFIG_EOF
+# nns-app managed remote gateway.
+GATEWAY_NAME="$gateway"
+GATEWAY_BACKEND="openvpn"
+VIA_APP="$via_app"
+
+LISTEN_PROTO="$listen_proto"
+LISTEN_PORT="$listen_port"
+PUBLIC_HOST="$public_host"
+PUBLIC_PORT="$public_port"
+CLIENT_POOL="$client_pool"
+DNS_SERVERS="$dns_servers"
+
+TRANSIT_CIDR="$transit_cidr"
+TRANSIT_HOST_ADDR="$transit_host_addr"
+TRANSIT_NS_ADDR="$transit_ns_addr"
+GATEWAY_TUN="$gateway_tun"
+GATEWAY_VETH_HOST="$veth_host"
+GATEWAY_VETH_NS="$veth_ns"
+ROUTE_TABLE="$route_table"
+RULE_PRIORITY="$rule_priority"
+SERVER_CN="nns-gateway-$gateway"
+GATEWAY_CONFIG_EOF
+    chown root:root "$(gateway_cfg_file "$gateway")"
+    chmod 0644 "$(gateway_cfg_file "$gateway")"
+
+    gateway_generate_pki "$gateway"
+    gateway_write_server_config "$gateway"
+
+    log "Created managed OpenVPN gateway '$gateway'."
+    log "Public endpoint: $public_host:$public_port/$listen_proto"
+    log "Listen socket:   0.0.0.0:$listen_port/$listen_proto"
+    log "Client pool:     $client_pool"
+    log "Remote exit:     $via_app"
+    log "Next:"
+    log "  sudo nns-app gateway client add $gateway <client-name>"
+    log "  sudo nns-app gateway client export $gateway <client-name> --output <file.ovpn>"
+    log "  sudo nns-app gateway start $gateway"
+    warn "Ensure the host firewall and upstream NAT/router allow $listen_proto port $listen_port."
+}
+
+gateway_delete_veth_everywhere() {
+    local name=$1 ns
+    ip link del "$name" 2>/dev/null || true
+    while read -r ns _; do
+        [[ -n "$ns" ]] || continue
+        ip -n "$ns" link del "$name" 2>/dev/null || true
+    done < <(ip netns list 2>/dev/null || true)
+}
+
+gateway_host_rules_up() {
+    iptables_add_once filter FORWARD -i "$GATEWAY_TUN" -o "$GATEWAY_VETH_HOST" -j ACCEPT
+    iptables_add_once filter FORWARD -i "$GATEWAY_VETH_HOST" -o "$GATEWAY_TUN" \
+        -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    iptables_add_once mangle FORWARD -i "$GATEWAY_TUN" -o "$GATEWAY_VETH_HOST" \
+        -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+}
+
+gateway_host_rules_down() {
+    iptables_delete_all filter FORWARD -i "$GATEWAY_TUN" -o "$GATEWAY_VETH_HOST" -j ACCEPT
+    iptables_delete_all filter FORWARD -i "$GATEWAY_VETH_HOST" -o "$GATEWAY_TUN" \
+        -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    iptables_delete_all mangle FORWARD -i "$GATEWAY_TUN" -o "$GATEWAY_VETH_HOST" \
+        -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+}
+
+gateway_namespace_rules_up() {
+    local ns=$1 tunnel=$2
+    ip netns exec "$ns" sysctl -q -w net.ipv4.ip_forward=1
+    netns_iptables_add_once "$ns" filter FORWARD \
+        -i "$GATEWAY_VETH_NS" -o "$tunnel" -j ACCEPT
+    netns_iptables_add_once "$ns" filter FORWARD \
+        -i "$tunnel" -o "$GATEWAY_VETH_NS" \
+        -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    netns_iptables_add_once "$ns" nat POSTROUTING \
+        -s "$CLIENT_POOL" -o "$tunnel" -j MASQUERADE
+    netns_iptables_add_once "$ns" mangle FORWARD \
+        -i "$GATEWAY_VETH_NS" -o "$tunnel" -p tcp \
+        --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+}
+
+gateway_namespace_rules_down() {
+    local ns=$1 tunnel=$2
+    netns_iptables_delete_all "$ns" filter FORWARD \
+        -i "$GATEWAY_VETH_NS" -o "$tunnel" -j ACCEPT
+    netns_iptables_delete_all "$ns" filter FORWARD \
+        -i "$tunnel" -o "$GATEWAY_VETH_NS" \
+        -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    netns_iptables_delete_all "$ns" nat POSTROUTING \
+        -s "$CLIENT_POOL" -o "$tunnel" -j MASQUERADE
+    netns_iptables_delete_all "$ns" mangle FORWARD \
+        -i "$GATEWAY_VETH_NS" -o "$tunnel" -p tcp \
+        --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+}
+
+gateway_up() {
+    require_root
+    local gateway=$1 upstream_data upstream_ns upstream_tun
+    local host_ip ns_ip runtime
+    load_gateway_cfg "$gateway"
+
+    upstream_data=$(ensure_upstream_ready "$gateway" "$VIA_APP")
+    IFS='|' read -r upstream_ns upstream_tun <<<"$upstream_data"
+    [[ -n "$upstream_ns" && -n "$upstream_tun" ]] ||
+        die "Gateway upstream '$VIA_APP' has no active tunnel."
+
+    gateway_down "$gateway" >/dev/null 2>&1 || true
+    load_gateway_cfg "$gateway"
+    gateway_delete_veth_everywhere "$GATEWAY_VETH_HOST"
+
+    host_ip=${TRANSIT_HOST_ADDR%/*}
+    ns_ip=${TRANSIT_NS_ADDR%/*}
+    runtime=$(gateway_runtime_file "$gateway")
+
+    install -d -o root -g root -m 0755 "$(gateway_runtime_dir "$gateway")"
+    : >"$(gateway_status_file "$gateway")"
+    chown nobody:nogroup "$(gateway_status_file "$gateway")"
+    chmod 0640 "$(gateway_status_file "$gateway")"
+
+    ip link add "$GATEWAY_VETH_HOST" type veth peer name "$GATEWAY_VETH_NS"
+    ip addr add "$TRANSIT_HOST_ADDR" dev "$GATEWAY_VETH_HOST"
+    ip link set "$GATEWAY_VETH_HOST" up
+    ip link set "$GATEWAY_VETH_NS" netns "$upstream_ns"
+    ip -n "$upstream_ns" addr add "$TRANSIT_NS_ADDR" dev "$GATEWAY_VETH_NS"
+    ip -n "$upstream_ns" link set "$GATEWAY_VETH_NS" up
+    ip -n "$upstream_ns" route replace "$CLIENT_POOL" \
+        via "$host_ip" dev "$GATEWAY_VETH_NS"
+
+    sysctl -q -w net.ipv4.ip_forward=1
+    ip netns exec "$upstream_ns" sysctl -q -w net.ipv4.ip_forward=1
+
+    while ip rule del priority "$RULE_PRIORITY" 2>/dev/null; do :; done
+    ip route flush table "$ROUTE_TABLE" 2>/dev/null || true
+    ip rule add priority "$RULE_PRIORITY" from "$CLIENT_POOL" lookup "$ROUTE_TABLE"
+    ip route add table "$ROUTE_TABLE" default via "$ns_ip" \
+        dev "$GATEWAY_VETH_HOST" metric 10
+    ip route add table "$ROUTE_TABLE" blackhole default metric 32767
+
+    gateway_host_rules_up
+    gateway_namespace_rules_up "$upstream_ns" "$upstream_tun"
+
+    {
+        printf 'UPSTREAM_APP_RUNTIME=%q\n' "$VIA_APP"
+        printf 'UPSTREAM_NS_RUNTIME=%q\n' "$upstream_ns"
+        printf 'UPSTREAM_TUN_RUNTIME=%q\n' "$upstream_tun"
+    } >"$runtime"
+    chown root:root "$runtime"
+    chmod 0600 "$runtime"
+
+    log "Gateway '$gateway' data plane is ready through '$VIA_APP/$upstream_tun'."
+}
+
+gateway_down() {
+    require_root
+    local gateway=$1 runtime upstream_ns="" upstream_tun="" host_ip=""
+    validate_gateway_name "$gateway"
+    [[ -f "$(gateway_cfg_file "$gateway")" ]] || return 0
+    load_gateway_cfg "$gateway"
+
+    runtime=$(gateway_runtime_file "$gateway")
+    if [[ -f "$runtime" ]]; then
+        upstream_ns=$(runtime_read_value "$runtime" UPSTREAM_NS_RUNTIME 2>/dev/null || true)
+        upstream_tun=$(runtime_read_value "$runtime" UPSTREAM_TUN_RUNTIME 2>/dev/null || true)
+    fi
+    if [[ -z "$upstream_ns" ]]; then
+        upstream_ns=$(cfg_read_value "$VIA_APP" NS_NAME 2>/dev/null || true)
+    fi
+    if [[ -z "$upstream_tun" ]]; then
+        upstream_tun=$(vpn_route_iface "$VIA_APP" 2>/dev/null || true)
+    fi
+
+    gateway_host_rules_down || true
+    while ip rule del priority "$RULE_PRIORITY" 2>/dev/null; do :; done
+    ip route flush table "$ROUTE_TABLE" 2>/dev/null || true
+
+    if [[ -n "$upstream_ns" ]] &&
+       ip netns list 2>/dev/null | awk '{print $1}' | grep -Fxq "$upstream_ns"; then
+        [[ -z "$upstream_tun" ]] ||
+            gateway_namespace_rules_down "$upstream_ns" "$upstream_tun" || true
+        ip -n "$upstream_ns" route del "$CLIENT_POOL" 2>/dev/null || true
+        ip -n "$upstream_ns" link del "$GATEWAY_VETH_NS" 2>/dev/null || true
+    fi
+
+    gateway_delete_veth_everywhere "$GATEWAY_VETH_HOST"
+    rm -rf "$(gateway_runtime_dir "$gateway")"
+}
+
+gateway_server_exec() {
+    require_root
+    local gateway=$1 config
+    load_gateway_cfg "$gateway"
+    config=$(gateway_server_config "$gateway")
+    [[ -f "$config" ]] || die "Gateway server config is missing: $config"
+    exec /usr/sbin/openvpn --config "$config"
+}
+
+gateway_start() {
+    require_root
+    local gateway=$1 deadline
+    load_gateway_cfg "$gateway"
+    ensure_upstream_ready "$gateway" "$VIA_APP" >/dev/null
+
+    if systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
+        log "Gateway '$gateway' is already running."
+        return 0
+    fi
+
+    if ! systemctl start "nns-gateway@${gateway}.service"; then
+        warn "Gateway '$gateway' failed to start."
+        journalctl -u "nns-gateway@${gateway}.service" -n 80 \
+            -o cat --no-pager >&2 2>/dev/null || true
+        return 1
+    fi
+
+    deadline=$((SECONDS + 8))
+    while (( SECONDS < deadline )); do
+        if ip link show dev "$GATEWAY_TUN" up >/dev/null 2>&1 &&
+           systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
+            log "Started gateway '$gateway' on $PUBLIC_HOST:$PUBLIC_PORT/$LISTEN_PROTO via $VIA_APP."
+            return 0
+        fi
+        if systemctl is-failed --quiet "nns-gateway@${gateway}.service"; then
+            break
+        fi
+        sleep 0.25
+    done
+
+    warn "Gateway service started but its OpenVPN interface '$GATEWAY_TUN' is not ready."
+    journalctl -u "nns-gateway@${gateway}.service" -n 80 \
+        -o cat --no-pager >&2 2>/dev/null || true
+    return 1
+}
+
+gateway_stop() {
+    require_root
+    local gateway=$1
+    load_gateway_cfg "$gateway"
+    systemctl stop "nns-gateway@${gateway}.service" 2>/dev/null || true
+    systemctl reset-failed "nns-gateway@${gateway}.service" 2>/dev/null || true
+    gateway_down "$gateway" >/dev/null 2>&1 || true
+    log "Stopped gateway '$gateway'."
+}
+
+gateways_using_app() {
+    local app=$1 dir gateway via
+    shopt -s nullglob
+    for dir in "$GATEWAY_BASE_DIR"/*; do
+        [[ -f "$dir/gateway.cfg" ]] || continue
+        gateway=$(basename "$dir")
+        via=$(gateway_cfg_value "$gateway" VIA_APP 2>/dev/null || true)
+        [[ "$via" == "$app" ]] && printf '%s\n' "$gateway"
+    done
+}
+
+stop_gateways_via_app() {
+    local app=$1 gateway
+    while IFS= read -r gateway; do
+        [[ -n "$gateway" ]] || continue
+        if systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
+            warn "Stopping gateway '$gateway' before its upstream app '$app'."
+            gateway_stop "$gateway"
+        fi
+    done < <(gateways_using_app "$app")
+}
+
+gateway_client_add() {
+    require_root
+    local gateway=$1 client=$2 pki cdir metadata cert_serial
+    load_gateway_cfg "$gateway"
+    validate_gateway_client_name "$client"
+    pki=$(gateway_pki_dir "$gateway")
+    cdir=$(gateway_client_dir "$gateway" "$client")
+    [[ ! -e "$cdir" ]] || die "Gateway client '$client' already exists."
+
+    install -d -o root -g root -m 0700 "$cdir"
+
+    openssl genpkey -algorithm RSA \
+        -pkeyopt rsa_keygen_bits:3072 \
+        -out "$cdir/client.key" >/dev/null 2>&1
+    openssl req -new -sha256 \
+        -key "$cdir/client.key" \
+        -subj "/CN=$client" \
+        -out "$cdir/client.csr" >/dev/null 2>&1
+    openssl ca -batch -notext \
+        -config "$pki/openssl.cnf" \
+        -extensions client_cert \
+        -in "$cdir/client.csr" \
+        -out "$cdir/client.crt" >/dev/null 2>&1
+
+    metadata=$(printf '%s' "$client" | base64 -w0)
+    openvpn --tls-crypt-v2 "$pki/tls-crypt-v2-server.key" \
+        --genkey tls-crypt-v2-client "$cdir/tls-crypt-v2-client.key" "$metadata"
+
+    cert_serial=$(openssl x509 -in "$cdir/client.crt" -noout -serial |
+        cut -d= -f2)
+    rm -f "$cdir/client.csr"
+
+    cat >"$cdir/client.cfg" <<CLIENT_CFG_EOF
+CLIENT_NAME="$client"
+STATUS="active"
+CERT_SERIAL="$cert_serial"
+CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+CLIENT_CFG_EOF
+    chown -R root:root "$cdir"
+    chmod 0700 "$cdir"
+    chmod 0600 "$cdir/client.key" "$cdir/tls-crypt-v2-client.key" "$cdir/client.cfg"
+    chmod 0644 "$cdir/client.crt"
+
+    log "Added client '$client' to gateway '$gateway'."
+    log "Export it with:"
+    log "  sudo nns-app gateway client export $gateway $client --output /path/to/$gateway-$client.ovpn"
+}
+
+gateway_client_load() {
+    local gateway=$1 client=$2 cdir file owner mode mode_octal
+    validate_gateway_client_name "$client"
+    cdir=$(gateway_client_dir "$gateway" "$client")
+    file="$cdir/client.cfg"
+    [[ -f "$file" ]] || die "Gateway client '$client' does not exist."
+
+    owner=$(stat -c '%u' "$file")
+    mode=$(stat -c '%a' "$file")
+    [[ "$owner" == 0 ]] || die "Unsafe client config owner for $file."
+    mode_octal=$((8#$mode))
+    (( (mode_octal & 0077) == 0 )) ||
+        die "Unsafe client config permissions on $file."
+    # shellcheck disable=SC1090
+    source "$file"
+    [[ "${CLIENT_NAME:-}" == "$client" ]] ||
+        die "CLIENT_NAME mismatch in $file."
+}
+
+gateway_client_export() {
+    require_root
+    local gateway=$1 client=$2 output=$3 cdir pki tmp proto owner
+    load_gateway_cfg "$gateway"
+    gateway_client_load "$gateway" "$client"
+    [[ "${STATUS:-}" == active ]] ||
+        die "Client '$client' is revoked and cannot be exported."
+
+    [[ -n "$output" ]] || die "--output is required."
+    output=$(readlink -m "$output")
+    [[ ! -e "$output" ]] || die "Output already exists: $output"
+    [[ -d "$(dirname "$output")" ]] || die "Output directory does not exist: $(dirname "$output")"
+
+    cdir=$(gateway_client_dir "$gateway" "$client")
+    pki=$(gateway_pki_dir "$gateway")
+    tmp=$(mktemp)
+
+    if [[ "$LISTEN_PROTO" == tcp ]]; then
+        proto=tcp-client
+    else
+        proto=udp
+    fi
+
+    {
+        printf '# nns-app managed gateway profile: %s / %s\n' "$gateway" "$client"
+        printf 'client\n'
+        printf 'dev tun\n'
+        printf 'proto %s\n' "$proto"
+        printf 'remote %s %s\n' "$PUBLIC_HOST" "$PUBLIC_PORT"
+        printf 'nobind\n'
+        printf 'persist-key\n'
+        printf 'persist-tun\n'
+        printf 'auth-nocache\n'
+        printf 'remote-cert-tls server\n'
+        printf 'verify-x509-name %s name\n' "$SERVER_CN"
+        printf 'tls-version-min 1.2\n'
+        printf 'data-ciphers AES-256-GCM:CHACHA20-POLY1305:AES-128-GCM\n'
+        printf 'auth SHA256\n'
+        printf 'allow-compression no\n'
+        printf 'disable-dco\n'
+        if [[ "$LISTEN_PROTO" == udp ]]; then
+            printf 'explicit-exit-notify 2\n'
+        fi
+        printf 'verb 3\n'
+        printf '\n<ca>\n'
+        cat "$pki/ca.crt"
+        printf '</ca>\n\n<cert>\n'
+        cat "$cdir/client.crt"
+        printf '</cert>\n\n<key>\n'
+        cat "$cdir/client.key"
+        printf '</key>\n\n<tls-crypt-v2>\n'
+        cat "$cdir/tls-crypt-v2-client.key"
+        printf '</tls-crypt-v2>\n'
+    } >"$tmp"
+
+    owner=${SUDO_USER:-root}
+    if [[ "$owner" != root ]] && id "$owner" >/dev/null 2>&1; then
+        install -o "$owner" -g "$(id -gn "$owner")" -m 0600 "$tmp" "$output"
+    else
+        install -o root -g root -m 0600 "$tmp" "$output"
+    fi
+    rm -f "$tmp"
+
+    log "Exported client '$client' from gateway '$gateway'."
+    log "Profile: $output"
+    log "Import on the local box with:"
+    log "  sudo nns-app install remote-$gateway"
+    log "  sudo nns-app add remote-$gateway $output"
+}
+
+gateway_client_revoke() {
+    require_root
+    local gateway=$1 client=$2 cdir pki tmp
+    load_gateway_cfg "$gateway"
+    gateway_client_load "$gateway" "$client"
+    [[ "${STATUS:-}" == active ]] || die "Client '$client' is already revoked."
+
+    cdir=$(gateway_client_dir "$gateway" "$client")
+    pki=$(gateway_pki_dir "$gateway")
+
+    openssl ca -batch -config "$pki/openssl.cnf" \
+        -revoke "$cdir/client.crt" >/dev/null 2>&1
+    openssl ca -batch -config "$pki/openssl.cnf" \
+        -gencrl -out "$pki/crl.pem" >/dev/null 2>&1
+    chmod 0644 "$pki/crl.pem"
+
+    local revoked_at
+    revoked_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    tmp=$(mktemp)
+    awk -v revoked_at="$revoked_at" '
+        /^STATUS=/ { print "STATUS=\"revoked\""; found=1; next }
+        /^REVOKED_AT=/ { next }
+        { print }
+        END {
+            if (!found) print "STATUS=\"revoked\""
+            print "REVOKED_AT=\"" revoked_at "\""
+        }
+    ' "$cdir/client.cfg" >"$tmp"
+    install -o root -g root -m 0600 "$tmp" "$cdir/client.cfg"
+    rm -f "$tmp"
+
+    if systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
+        warn "Restarting gateway '$gateway' to disconnect the revoked certificate immediately."
+        systemctl restart "nns-gateway@${gateway}.service"
+    fi
+    log "Revoked client '$client' on gateway '$gateway'."
+}
+
+gateway_client_list() {
+    require_root
+    local gateway=$1 dir client status serial created
+    load_gateway_cfg "$gateway"
+    printf '%-24s %-10s %-20s %s\n' "Client" "Status" "Serial" "Created"
+    printf '%-24s %-10s %-20s %s\n' "------------------------" "----------" "--------------------" "--------------------"
+    local found=0
+    shopt -s nullglob
+    for dir in "$(gateway_clients_dir "$gateway")"/*; do
+        [[ -f "$dir/client.cfg" ]] || continue
+        client=$(basename "$dir")
+        gateway_client_load "$gateway" "$client"
+        status=${STATUS:-unknown}
+        serial=${CERT_SERIAL:-unknown}
+        created=${CREATED_AT:-unknown}
+        printf '%-24s %-10s %-20s %s\n' "$client" "$status" "$serial" "$created"
+        found=1
+    done
+    (( found )) || log "No clients configured for gateway '$gateway'."
+}
+
+gateway_connected_clients() {
+    local gateway=$1 status_file
+    status_file=$(gateway_status_file "$gateway")
+    [[ -s "$status_file" ]] || return 0
+    python3 - "$status_file" <<'PY_GATEWAY_STATUS'
+import csv
+import sys
+from pathlib import Path
+
+rows = list(csv.reader(Path(sys.argv[1]).read_text(errors="replace").splitlines()))
+header = None
+clients = []
+for row in rows:
+    if not row:
+        continue
+    if row[0] == "HEADER" and len(row) > 2 and row[1] == "CLIENT_LIST":
+        header = row[2:]
+    elif row[0] == "CLIENT_LIST":
+        values = row[1:]
+        if header:
+            item = dict(zip(header, values))
+            clients.append(item)
+        else:
+            clients.append({"Common Name": values[0] if values else "unknown"})
+
+for item in clients:
+    cn = item.get("Common Name", "unknown")
+    real = item.get("Real Address", "-")
+    virtual = item.get("Virtual Address", "-")
+    rx = item.get("Bytes Received", "0")
+    tx = item.get("Bytes Sent", "0")
+    since = item.get("Connected Since", item.get("Connected Since (time_t)", "-"))
+    print(f"{cn}|{real}|{virtual}|{rx}|{tx}|{since}")
+PY_GATEWAY_STATUS
+}
+
+gateway_status() {
+    require_root
+    local gateway=$1 unit state sub result pid restarts health diagnosis
+    local upstream_state="offline" upstream_iface="" upstream_ns=""
+    local listening="no" tunnel="no" connected=0 line
+    load_gateway_cfg "$gateway"
+    unit="nns-gateway@${gateway}.service"
+
+    state=$(systemctl is-active "$unit" 2>/dev/null || true)
+    sub=$(systemctl show "$unit" -p SubState --value 2>/dev/null || true)
+    result=$(systemctl show "$unit" -p Result --value 2>/dev/null || true)
+    pid=$(systemctl show "$unit" -p MainPID --value 2>/dev/null || true)
+    restarts=$(systemctl show "$unit" -p NRestarts --value 2>/dev/null || true)
+
+    if app_is_started "$VIA_APP" && vpn_route_ready "$VIA_APP"; then
+        upstream_state=ready
+        upstream_iface=$(vpn_route_iface "$VIA_APP" 2>/dev/null || true)
+        upstream_ns=$(cfg_read_value "$VIA_APP" NS_NAME 2>/dev/null || true)
+    elif app_is_started "$VIA_APP"; then
+        upstream_state="started but tunnel offline"
+    fi
+
+    ip link show dev "$GATEWAY_TUN" up >/dev/null 2>&1 && tunnel=yes
+    if ss -H -lntup 2>/dev/null | grep -Eq "[:.]${LISTEN_PORT}[[:space:]]"; then
+        listening=yes
+    fi
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && connected=$((connected + 1))
+    done < <(gateway_connected_clients "$gateway")
+
+    if [[ "$state" == failed || "$result" == failed ]]; then
+        health=FAILED
+        diagnosis="The managed OpenVPN gateway service failed."
+    elif [[ "$state" != active ]]; then
+        health=STOPPED
+        diagnosis="The gateway service is not running."
+    elif [[ "$upstream_state" != ready ]]; then
+        health=DEGRADED
+        diagnosis="OpenVPN is running, but the selected remote NNS exit is unavailable."
+    elif [[ "$tunnel" != yes || "$listening" != yes ]]; then
+        health=STARTING
+        diagnosis="The service is active, but its server interface or listen socket is not ready."
+    else
+        health=READY
+        diagnosis="The gateway is listening and client traffic is pinned to the selected NNS exit."
+    fi
+
+    printf 'Gateway:           %s\n' "$gateway"
+    printf 'Health:            %s\n' "$health"
+    printf 'Diagnosis:         %s\n' "$diagnosis"
+    printf 'Backend:           OpenVPN server\n'
+    printf 'Public endpoint:   %s:%s/%s\n' "$PUBLIC_HOST" "$PUBLIC_PORT" "$LISTEN_PROTO"
+    printf 'Local listen:      0.0.0.0:%s/%s (%s)\n' "$LISTEN_PORT" "$LISTEN_PROTO" "$listening"
+    printf 'Client pool:       %s\n' "$CLIENT_POOL"
+    printf 'Remote NNS exit:   %s (%s)\n' "$VIA_APP" "$upstream_state"
+    [[ -z "$upstream_ns" ]] || printf 'Exit namespace:    %s\n' "$upstream_ns"
+    [[ -z "$upstream_iface" ]] || printf 'Exit tunnel:       %s\n' "$upstream_iface"
+    printf 'Server interface:  %s (%s)\n' "$GATEWAY_TUN" "$tunnel"
+    printf 'Service:           %s/%s; result=%s; pid=%s; restarts=%s\n' \
+        "${state:-unknown}" "${sub:-unknown}" "${result:-unknown}" \
+        "${pid:-0}" "${restarts:-0}"
+    printf 'Connected clients: %s\n' "$connected"
+    printf 'Policy table:      %s; rule priority=%s\n' "$ROUTE_TABLE" "$RULE_PRIORITY"
+    printf 'Transit network:   %s\n' "$TRANSIT_CIDR"
+
+    if (( connected > 0 )); then
+        printf '\nActive clients:\n'
+        printf '%-20s %-24s %-16s %-12s %-12s %s\n' \
+            "Name" "Real address" "VPN address" "RX" "TX" "Connected"
+        while IFS='|' read -r cn real virtual rx tx since; do
+            printf '%-20s %-24s %-16s %-12s %-12s %s\n' \
+                "$cn" "$real" "$virtual" \
+                "$(human_bytes "$rx")" "$(human_bytes "$tx")" "$since"
+        done < <(gateway_connected_clients "$gateway")
+    fi
+
+    if [[ "$health" != READY ]]; then
+        local tmp
+        tmp=$(mktemp)
+        unit_current_log "$unit" 200 >"$tmp"
+        print_status_log_cut \
+            "Important gateway log cuts:" "$tmp" \
+            'error|warning|failed|fatal|TLS Error|VERIFY ERROR|AUTH_FAILED|Cannot|Options error|route|iptables|permission|address already in use|Initialization Sequence' 22
+        rm -f "$tmp"
+    fi
+}
+
+gateway_list() {
+    require_root
+    local dir gateway state via endpoint pool found=0
+    printf '%-18s %-10s %-18s %-26s %s\n' \
+        "Gateway" "Status" "Via" "Public endpoint" "Client pool"
+    printf '%-18s %-10s %-18s %-26s %s\n' \
+        "------------------" "----------" "------------------" "--------------------------" "------------------"
+    shopt -s nullglob
+    for dir in "$GATEWAY_BASE_DIR"/*; do
+        [[ -f "$dir/gateway.cfg" ]] || continue
+        gateway=$(basename "$dir")
+        load_gateway_cfg "$gateway"
+        state=$(systemctl is-active "nns-gateway@${gateway}.service" 2>/dev/null || true)
+        [[ "$state" == active ]] || state=stopped
+        endpoint="$PUBLIC_HOST:$PUBLIC_PORT/$LISTEN_PROTO"
+        printf '%-18s %-10s %-18s %-26s %s\n' \
+            "$gateway" "$state" "$VIA_APP" "$endpoint" "$CLIENT_POOL"
+        found=1
+    done
+    (( found )) || log "No managed gateways configured."
+}
+
+gateway_remove() {
+    require_root
+    local gateway=$1
+    load_gateway_cfg "$gateway"
+    gateway_stop "$gateway"
+    systemctl disable "nns-gateway@${gateway}.service" >/dev/null 2>&1 || true
+    rm -rf "$(gateway_dir "$gateway")" "$(gateway_runtime_dir "$gateway")"
+    systemctl daemon-reload
+    log "Removed gateway '$gateway', including its CA and all client private keys."
 }
 
 mount_type_at() {
@@ -3176,6 +4252,24 @@ main() {
             run_user_exec "$internal_app" "$@"
             exit
             ;;
+        _gateway-up)
+            require_root
+            [[ $# -eq 2 ]] || die "_gateway-up requires gateway_name."
+            gateway_up "$2"
+            exit
+            ;;
+        _gateway-server)
+            require_root
+            [[ $# -eq 2 ]] || die "_gateway-server requires gateway_name."
+            gateway_server_exec "$2"
+            exit
+            ;;
+        _gateway-down)
+            require_root
+            [[ $# -eq 2 ]] || die "_gateway-down requires gateway_name."
+            gateway_down "$2"
+            exit
+            ;;
     esac
 
     reexec_as_root_if_needed "$@"
@@ -3269,6 +4363,119 @@ main() {
         stop)
             [[ $# -eq 2 ]] || die "Usage: nns-app stop <app_name>"
             stop_app "$2"
+            ;;
+        gateway)
+            (( $# >= 2 )) || die "Usage: nns-app gateway <create|start|stop|status|list|remove|client> ..."
+            case "$2" in
+                create)
+                    (( $# >= 3 )) ||
+                        die "Usage: nns-app gateway create <name> --via <app> --listen tcp|udp:<port> --public <host>:<port> [--pool CIDR] [--dns \"IP ...\"]"
+                    local gw_name=$3 gw_via="" gw_listen="" gw_public="" gw_pool="" gw_dns="1.1.1.1 9.9.9.9"
+                    shift 3
+                    while (( $# > 0 )); do
+                        case "$1" in
+                            --via)
+                                (( $# >= 2 )) || die "--via requires an NNS app name."
+                                gw_via=$2; shift 2 ;;
+                            --via=*)
+                                gw_via=${1#--via=}; shift ;;
+                            --listen)
+                                (( $# >= 2 )) || die "--listen requires tcp:<port> or udp:<port>."
+                                gw_listen=$2; shift 2 ;;
+                            --listen=*)
+                                gw_listen=${1#--listen=}; shift ;;
+                            --public)
+                                (( $# >= 2 )) || die "--public requires host:port."
+                                gw_public=$2; shift 2 ;;
+                            --public=*)
+                                gw_public=${1#--public=}; shift ;;
+                            --pool)
+                                (( $# >= 2 )) || die "--pool requires an IPv4 CIDR."
+                                gw_pool=$2; shift 2 ;;
+                            --pool=*)
+                                gw_pool=${1#--pool=}; shift ;;
+                            --dns)
+                                (( $# >= 2 )) || die "--dns requires a quoted space-separated IPv4 list."
+                                gw_dns=$2; shift 2 ;;
+                            --dns=*)
+                                gw_dns=${1#--dns=}; shift ;;
+                            *)
+                                die "Unknown gateway create option '$1'."
+                                ;;
+                        esac
+                    done
+                    [[ -n "$gw_via" && -n "$gw_listen" && -n "$gw_public" ]] ||
+                        die "gateway create requires --via, --listen and --public."
+                    gateway_create "$gw_name" "$gw_via" "$gw_listen" "$gw_public" "$gw_pool" "$gw_dns"
+                    ;;
+                start)
+                    [[ $# -eq 3 ]] || die "Usage: nns-app gateway start <gateway_name>"
+                    gateway_start "$3"
+                    ;;
+                stop)
+                    [[ $# -eq 3 ]] || die "Usage: nns-app gateway stop <gateway_name>"
+                    gateway_stop "$3"
+                    ;;
+                status)
+                    [[ $# -eq 3 ]] || die "Usage: nns-app gateway status <gateway_name>"
+                    gateway_status "$3"
+                    ;;
+                list)
+                    [[ $# -eq 2 ]] || die "Usage: nns-app gateway list"
+                    gateway_list
+                    ;;
+                remove)
+                    [[ $# -eq 3 ]] || die "Usage: nns-app gateway remove <gateway_name>"
+                    gateway_remove "$3"
+                    ;;
+                client)
+                    (( $# >= 3 )) ||
+                        die "Usage: nns-app gateway client <add|list|export|revoke> ..."
+                    case "$3" in
+                        add)
+                            [[ $# -eq 5 ]] ||
+                                die "Usage: nns-app gateway client add <gateway_name> <client_name>"
+                            gateway_client_add "$4" "$5"
+                            ;;
+                        list)
+                            [[ $# -eq 4 ]] ||
+                                die "Usage: nns-app gateway client list <gateway_name>"
+                            gateway_client_list "$4"
+                            ;;
+                        export)
+                            (( $# >= 6 )) ||
+                                die "Usage: nns-app gateway client export <gateway_name> <client_name> --output <file.ovpn>"
+                            local export_gateway=$4 export_client=$5 export_output=""
+                            shift 5
+                            while (( $# > 0 )); do
+                                case "$1" in
+                                    --output)
+                                        (( $# >= 2 )) || die "--output requires a path."
+                                        export_output=$2; shift 2 ;;
+                                    --output=*)
+                                        export_output=${1#--output=}; shift ;;
+                                    *)
+                                        die "Unknown gateway client export option '$1'."
+                                        ;;
+                                esac
+                            done
+                            [[ -n "$export_output" ]] || die "--output is required."
+                            gateway_client_export "$export_gateway" "$export_client" "$export_output"
+                            ;;
+                        revoke)
+                            [[ $# -eq 5 ]] ||
+                                die "Usage: nns-app gateway client revoke <gateway_name> <client_name>"
+                            gateway_client_revoke "$4" "$5"
+                            ;;
+                        *)
+                            die "Unknown gateway client command '$3'."
+                            ;;
+                    esac
+                    ;;
+                *)
+                    die "Unknown gateway command '$2'."
+                    ;;
+            esac
             ;;
         run)
             (( $# >= 3 )) || die "Usage: nns-app run <app_name> <command> [arguments...]"
