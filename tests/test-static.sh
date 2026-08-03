@@ -9,7 +9,7 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fq 'nns-app 1.2.4' <<<"$version"
+grep -Fq 'nns-app 1.2.5' <<<"$version"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -68,6 +68,10 @@ grep -Fq 'write_sudoers_for_app "$app" "$APP_USER"' "$INSTALLER" || {
 }
 
 grep -Fq 'nns-online@.service' "$INSTALLER"
+grep -Fq 'nns-watchdog@.service' "$INSTALLER"
+grep -Fq 'nns-watchdog@.timer' "$INSTALLER"
+grep -Fq '_watchdog %i' "$INSTALLER"
+grep -Fq 'WATCHDOG_MODE="auto"' "$INSTALLER"
 grep -Fq 'nns-gateway-crl-refresh@.timer' "$INSTALLER"
 grep -Fq 'systemctl enable --now "nns-gateway-crl-refresh@${gateway}.timer"' "$INSTALLER"
 grep -Fq 'delimiter="\t"' "$INSTALLER"
@@ -94,7 +98,7 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 1.2.4' "$ROOT/README.md"
+grep -Fq '**Release:** 1.2.5' "$ROOT/README.md"
 grep -Fq 'OpenVPN 2.6+' "$ROOT/README.md"
 
 # Public documentation and help use one descriptive example-name set.

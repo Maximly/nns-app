@@ -104,6 +104,33 @@ TimeoutStartSec=70s
 WantedBy=multi-user.target
 ONLINE_UNIT_EOF
 
+    cat >"$WATCHDOG_SERVICE" <<'WATCHDOG_SERVICE_EOF'
+[Unit]
+Description=Data-path watchdog for NNS app %i
+ConditionPathExists=/etc/nns-app/%i/%i.cfg
+After=nns-openvpn@%i.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nns_app.sh _watchdog %i
+TimeoutStartSec=150s
+WATCHDOG_SERVICE_EOF
+
+    cat >"$WATCHDOG_TIMER" <<'WATCHDOG_TIMER_EOF'
+[Unit]
+Description=Periodic data-path watchdog for NNS app %i
+
+[Timer]
+OnActiveSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+RandomizedDelaySec=5s
+Unit=nns-watchdog@%i.service
+
+[Install]
+WantedBy=timers.target
+WATCHDOG_TIMER_EOF
+
     cat >"$GATEWAY_UNIT" <<'GATEWAY_UNIT_EOF'
 [Unit]
 Description=NNS managed OpenVPN gateway %i
@@ -149,7 +176,8 @@ Unit=nns-gateway-crl-refresh@%i.service
 WantedBy=timers.target
 CRL_TIMER_EOF
 
-    chmod 0644 "$NETNS_UNIT" "$VPN_UNIT" "$ONLINE_UNIT" "$GATEWAY_UNIT" \
+    chmod 0644 "$NETNS_UNIT" "$VPN_UNIT" "$ONLINE_UNIT" \
+        "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$GATEWAY_UNIT" \
         "$GATEWAY_CRL_SERVICE" "$GATEWAY_CRL_TIMER"
     systemctl daemon-reload
 }
@@ -168,6 +196,7 @@ refresh_managed_unit_metadata() {
         # Rebuild existing per-app rules on every engine upgrade so additions
         # to the run-time environment allow-list take effect immediately.
         write_sudoers_for_app "$app" "$APP_USER"
+        sync_watchdog_timer "$app"
     done
 
     for dir in "$GATEWAY_BASE_DIR"/*; do
@@ -427,6 +456,15 @@ DISABLE_DCO="off"
 PROFILE_FIXUPS="on"
 READY_TIMEOUT="5"
 EXTERNAL_IP_URL="https://api.ipify.org"
+
+# auto: monitor OpenVPN/WireGuard only while this environment is running.
+# on:   same monitoring policy, explicitly enabled.
+# off:  never start the data-path watchdog for this environment.
+WATCHDOG_MODE="auto"
+# Restart the VPN backend after this many consecutive failed probes.
+WATCHDOG_FAILURES="3"
+# Minimum seconds between watchdog-triggered backend restarts.
+WATCHDOG_COOLDOWN="300"
 
 # Optional local transport for .nnslink profiles. These values are managed by
 # `nns-app link import` / `nns-app remote sync`.

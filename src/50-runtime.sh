@@ -72,10 +72,8 @@ vpn_exec() {
     fi
 
     install -d -o root -g root -m 0755 "$RUN_DIR"
-    printf '%s
-' "$marker" >"$RUN_DIR/${app}.profile"
-    printf '%s
-' "$type" >"$RUN_DIR/${app}.type"
+    printf '%s\n' "$marker" >"$RUN_DIR/${app}.profile"
+    printf '%s\n' "$type" >"$RUN_DIR/${app}.type"
     chmod 0644 "$RUN_DIR/${app}.profile" "$RUN_DIR/${app}.type"
 
     case "$type" in
@@ -123,6 +121,236 @@ wait_online() {
     return 1
 }
 
+watchdog_state_file() {
+    printf '%s/%s.watchdog\n' "$RUN_DIR" "$1"
+}
+
+watchdog_numeric_setting() {
+    local value=$1 fallback=$2 minimum=$3 maximum=$4
+    if [[ "$value" =~ ^[0-9]+$ ]] &&
+       (( value >= minimum && value <= maximum )); then
+        printf '%s\n' "$value"
+    else
+        printf '%s\n' "$fallback"
+    fi
+}
+
+watchdog_enabled_for_type() {
+    local type=$1 mode=${WATCHDOG_MODE:-auto}
+    case "${mode,,}" in
+        off|no|false|0|disabled) return 1 ;;
+        auto|on|yes|true|1|enabled)
+            [[ "$type" == openvpn || "$type" == wireguard ]]
+            ;;
+        *)
+            warn "Invalid WATCHDOG_MODE='$mode'; treating it as auto."
+            [[ "$type" == openvpn || "$type" == wireguard ]]
+            ;;
+    esac
+}
+
+watchdog_state_load() {
+    local app=$1 file
+    file=$(watchdog_state_file "$app")
+    WD_ARMED=0
+    WD_FAILURES=0
+    WD_LAST_RESTART=0
+    WD_TOTAL_RESTARTS=0
+    WD_LAST_CHECK=0
+    WD_LAST_RESULT=never
+    [[ -f "$file" ]] || return 0
+
+    local key value
+    while IFS='=' read -r key value; do
+        case "$key" in
+            ARMED) [[ "$value" == 0 || "$value" == 1 ]] && WD_ARMED=$value ;;
+            FAILURES) [[ "$value" =~ ^[0-9]+$ ]] && WD_FAILURES=$value ;;
+            LAST_RESTART) [[ "$value" =~ ^[0-9]+$ ]] && WD_LAST_RESTART=$value ;;
+            TOTAL_RESTARTS) [[ "$value" =~ ^[0-9]+$ ]] && WD_TOTAL_RESTARTS=$value ;;
+            LAST_CHECK) [[ "$value" =~ ^[0-9]+$ ]] && WD_LAST_CHECK=$value ;;
+            LAST_RESULT) [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] && WD_LAST_RESULT=$value ;;
+        esac
+    done <"$file"
+}
+
+watchdog_state_save() {
+    local app=$1 file dir tmp
+    file=$(watchdog_state_file "$app")
+    dir=${file%/*}
+    if (( EUID == 0 )); then
+        install -d -o root -g root -m 0755 "$dir"
+    else
+        [[ "${NNS_APP_SOURCE_ONLY:-0}" == 1 ]] ||
+            die "Writing watchdog state requires root privileges."
+        install -d -m 0700 "$dir"
+    fi
+    tmp=$(mktemp "${file}.XXXXXX")
+    cat >"$tmp" <<WATCHDOG_STATE_EOF
+ARMED=$WD_ARMED
+FAILURES=$WD_FAILURES
+LAST_RESTART=$WD_LAST_RESTART
+TOTAL_RESTARTS=$WD_TOTAL_RESTARTS
+LAST_CHECK=$WD_LAST_CHECK
+LAST_RESULT=$WD_LAST_RESULT
+WATCHDOG_STATE_EOF
+    if (( EUID == 0 )); then
+        install -o root -g root -m 0600 "$tmp" "$file"
+    else
+        install -m 0600 "$tmp" "$file"
+    fi
+    rm -f "$tmp"
+}
+
+watchdog_mark_online() {
+    local app=$1
+    watchdog_state_load "$app"
+    WD_ARMED=1
+    WD_FAILURES=0
+    WD_LAST_CHECK=$(date +%s)
+    WD_LAST_RESULT=online
+    watchdog_state_save "$app"
+}
+
+watchdog_namespace_exists() {
+    [[ -e "/run/netns/$NS_NAME" ]]
+}
+
+sync_watchdog_timer() {
+    local app=$1 type
+    validate_app_name "$app"
+    load_cfg "$app"
+    type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+
+    if [[ -n "$type" ]] && watchdog_enabled_for_type "$type"; then
+        if bool_on "${AUTOSTART:-off}"; then
+            systemctl enable "nns-watchdog@${app}.timer" >/dev/null 2>&1 || true
+        else
+            systemctl disable "nns-watchdog@${app}.timer" >/dev/null 2>&1 || true
+        fi
+
+        if app_is_started "$app"; then
+            systemctl start "nns-watchdog@${app}.timer" >/dev/null 2>&1 ||
+                warn "Could not start the data-path watchdog timer for '$app'."
+        else
+            systemctl stop "nns-watchdog@${app}.timer" >/dev/null 2>&1 || true
+            systemctl stop "nns-watchdog@${app}.service" >/dev/null 2>&1 || true
+        fi
+    else
+        systemctl disable --now "nns-watchdog@${app}.timer" >/dev/null 2>&1 || true
+        systemctl stop "nns-watchdog@${app}.service" >/dev/null 2>&1 || true
+        rm -f "$(watchdog_state_file "$app")"
+    fi
+}
+
+watchdog_check() {
+    require_root
+    local app=$1 type via failures_limit cooldown now elapsed
+    validate_app_name "$app"
+    acquire_lock "watchdog-$app"
+    load_cfg "$app"
+    type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+
+    if [[ -z "$type" ]] || ! watchdog_enabled_for_type "$type"; then
+        rm -f "$(watchdog_state_file "$app")"
+        release_lock "watchdog-$app"
+        return 0
+    fi
+
+    if ! app_is_started "$app" || ! watchdog_namespace_exists; then
+        rm -f "$(watchdog_state_file "$app")"
+        release_lock "watchdog-$app"
+        return 0
+    fi
+
+    watchdog_state_load "$app"
+    if (( WD_ARMED == 0 )) &&
+       systemctl is-active --quiet "nns-online@${app}.service"; then
+        WD_ARMED=1
+    fi
+    now=$(date +%s)
+    failures_limit=$(watchdog_numeric_setting "${WATCHDOG_FAILURES:-3}" 3 1 20)
+    cooldown=$(watchdog_numeric_setting "${WATCHDOG_COOLDOWN:-300}" 300 30 86400)
+    via=$(runtime_via_for_app "$app" 2>/dev/null || printf 'host')
+
+    # Do not restart a child tunnel while its upstream is unavailable. The
+    # upstream's own watchdog should recover first; the child is checked again
+    # on the next timer tick.
+    if [[ "$via" != host ]] &&
+       { ! app_is_started "$via" || ! wait_online "$via" 2; }; then
+        WD_FAILURES=0
+        WD_LAST_CHECK=$now
+        WD_LAST_RESULT=deferred-upstream
+        watchdog_state_save "$app"
+        release_lock "watchdog-$app"
+        return 0
+    fi
+
+    if wait_online "$app" 4; then
+        WD_ARMED=1
+        WD_FAILURES=0
+        WD_LAST_CHECK=$now
+        WD_LAST_RESULT=online
+        watchdog_state_save "$app"
+        release_lock "watchdog-$app"
+        return 0
+    fi
+
+    if (( WD_ARMED == 0 )); then
+        WD_FAILURES=0
+        WD_LAST_CHECK=$now
+        WD_LAST_RESULT=waiting-initial-online
+        watchdog_state_save "$app"
+        release_lock "watchdog-$app"
+        return 0
+    fi
+
+    WD_FAILURES=$((WD_FAILURES + 1))
+    WD_LAST_CHECK=$now
+    WD_LAST_RESULT=offline
+    if (( WD_FAILURES < failures_limit )); then
+        watchdog_state_save "$app"
+        warn "Watchdog probe for '$app' failed ($WD_FAILURES/$failures_limit); waiting before recovery."
+        release_lock "watchdog-$app"
+        return 0
+    fi
+
+    elapsed=$((now - WD_LAST_RESTART))
+    if (( WD_LAST_RESTART > 0 && elapsed < cooldown )); then
+        WD_LAST_RESULT=cooldown
+        watchdog_state_save "$app"
+        warn "Watchdog for '$app' confirmed an offline data path, but restart cooldown is active for $((cooldown - elapsed))s."
+        release_lock "watchdog-$app"
+        return 0
+    fi
+
+    # Restart only the VPN backend. The application network namespace and all
+    # processes already running inside it remain alive and should regain the
+    # data path when the backend reconnects.
+    warn "Watchdog confirmed '$app' offline after $WD_FAILURES consecutive probes; restarting its $type backend."
+    systemctl stop "nns-online@${app}.service" >/dev/null 2>&1 || true
+    WD_LAST_RESTART=$now
+    WD_TOTAL_RESTARTS=$((WD_TOTAL_RESTARTS + 1))
+    WD_FAILURES=0
+
+    if systemctl restart "nns-openvpn@${app}.service"; then
+        systemctl reset-failed "nns-online@${app}.service" >/dev/null 2>&1 || true
+        if systemctl start "nns-online@${app}.service"; then
+            WD_LAST_RESULT=recovered
+            log "Watchdog restored the data path for '$app'."
+        else
+            WD_LAST_RESULT=restart-offline
+            warn "Watchdog restarted '$app', but its data path did not become online yet."
+        fi
+    else
+        WD_LAST_RESULT=restart-failed
+        warn "Watchdog could not restart the VPN backend for '$app'."
+    fi
+
+    watchdog_state_save "$app"
+    release_lock "watchdog-$app"
+    return 0
+}
+
 start_app() {
     require_root
     local app=$1
@@ -159,6 +387,7 @@ start_app() {
         current_via=$(runtime_via_for_app "$app")
     fi
     if app_is_started "$app" && [[ "$current" == "$profile_marker" && "$current_via" == "$desired_via" ]]; then
+        sync_watchdog_timer "$app"
         log "'$app' is already started with '$profile_marker' via $desired_via."
         return 0
     fi
@@ -169,8 +398,7 @@ start_app() {
     fi
 
     install -d -o root -g root -m 0755 "$RUN_DIR"
-    printf '%s
-' "$desired_via" >"$RUN_DIR/${app}.via"
+    printf '%s\n' "$desired_via" >"$RUN_DIR/${app}.via"
     chmod 0600 "$RUN_DIR/${app}.via"
 
     if bool_on "$AUTOSTART"; then
@@ -208,6 +436,8 @@ start_app() {
         return 1
     fi
 
+    sync_watchdog_timer "$app"
+
     local timeout
     if bool_on "$ignore_start_error"; then
         timeout=1
@@ -221,6 +451,9 @@ start_app() {
         ext=$(ip netns exec "$NS_NAME" curl -4fsS \
               --connect-timeout 1 --max-time 1 \
               "$EXTERNAL_IP_URL" 2>/dev/null || true)
+        if watchdog_enabled_for_type "$vpn_type"; then
+            watchdog_mark_online "$app"
+        fi
         log "Started '$app' with '$profile_marker' ($(vpn_type_label "$vpn_type")) via $desired_via.${ext:+ External IP: $ext}"
         return 0
     fi
@@ -267,10 +500,13 @@ stop_app_internal() {
 
     stop_gateways_via_app "$app"
     stop_dependents "$app"
+    systemctl stop "nns-watchdog@${app}.timer" 2>/dev/null || true
+    systemctl stop "nns-watchdog@${app}.service" 2>/dev/null || true
     systemctl stop "nns-online@${app}.service" 2>/dev/null || true
     systemctl stop "nns-openvpn@${app}.service" 2>/dev/null || true
     systemctl stop "nns-netns@${app}.service" 2>/dev/null || true
     systemctl reset-failed \
+        "nns-watchdog@${app}.service" \
         "nns-online@${app}.service" \
         "nns-openvpn@${app}.service" \
         "nns-netns@${app}.service" 2>/dev/null || true
@@ -279,6 +515,7 @@ stop_app_internal() {
         "$RUN_DIR/${app}.profile" \
         "$RUN_DIR/${app}.type" \
         "$RUN_DIR/${app}.via" \
+        "$(watchdog_state_file "$app")" \
         "$(wireguard_runtime_config_path "$app")"
     log "Stopped '$app'."
 }
@@ -317,6 +554,7 @@ remove_app() {
 
     stop_app "$app"
     load_cfg "$app"
+    systemctl disable --now "nns-watchdog@${app}.timer" >/dev/null 2>&1 || true
     systemctl disable \
         "nns-online@${app}.service" \
         "nns-openvpn@${app}.service" \
@@ -329,6 +567,7 @@ remove_app() {
         "$RUN_DIR/${app}.profile" \
         "$RUN_DIR/${app}.type" \
         "$RUN_DIR/${app}.via" \
+        "$(watchdog_state_file "$app")" \
         "$(wireguard_runtime_config_path "$app")"
     systemctl daemon-reload
     log "Removed NNS app '$app'."
@@ -369,6 +608,8 @@ purge_engine() {
     # systemd invokes the normal cleanup path while the engine and configs
     # still exist.
     for app in "${apps[@]}"; do
+        systemctl stop "nns-watchdog@${app}.timer" 2>/dev/null || true
+        systemctl stop "nns-watchdog@${app}.service" 2>/dev/null || true
         systemctl stop "nns-online@${app}.service" 2>/dev/null || true
         systemctl stop "nns-openvpn@${app}.service" 2>/dev/null || true
     done
@@ -382,6 +623,7 @@ purge_engine() {
         fi
 
         systemctl disable \
+            "nns-watchdog@${app}.timer" \
             "nns-openvpn@${app}.service" \
             "nns-netns@${app}.service" \
             >/dev/null 2>&1 || true
@@ -416,6 +658,8 @@ purge_engine() {
         \( -name 'nns-openvpn@*.service' \
            -o -name 'nns-netns@*.service' \
            -o -name 'nns-online@*.service' \
+           -o -name 'nns-watchdog@*.service' \
+           -o -name 'nns-watchdog@*.timer' \
            -o -name 'nns-gateway@*.service' \
            -o -name 'nns-gateway-crl-refresh@*.service' \
            -o -name 'nns-gateway-crl-refresh@*.timer' \) \
@@ -424,6 +668,8 @@ purge_engine() {
     find /etc/systemd/system -maxdepth 1 -type d \
         \( -name 'nns-netns@*.service.d' \
            -o -name 'nns-online@*.service.d' \
+           -o -name 'nns-watchdog@*.service.d' \
+           -o -name 'nns-watchdog@*.timer.d' \
            -o -name 'nns-gateway@*.service.d' \) \
         -exec rm -rf {} + 2>/dev/null || true
 
@@ -431,9 +677,12 @@ purge_engine() {
         /etc/systemd/system/nns-openvpn@.service.d \
         /etc/systemd/system/nns-netns@.service.d \
         /etc/systemd/system/nns-online@.service.d \
+        /etc/systemd/system/nns-watchdog@.service.d \
+        /etc/systemd/system/nns-watchdog@.timer.d \
         /etc/systemd/system/nns-gateway@.service.d
     rm -f -- \
-        "$VPN_UNIT" "$NETNS_UNIT" "$ONLINE_UNIT" "$GATEWAY_UNIT" \
+        "$VPN_UNIT" "$NETNS_UNIT" "$ONLINE_UNIT" \
+        "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$GATEWAY_UNIT" \
         "$GATEWAY_CRL_SERVICE" "$GATEWAY_CRL_TIMER"
 
     systemctl daemon-reload

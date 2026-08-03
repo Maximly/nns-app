@@ -45,7 +45,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.2.4"
+readonly VERSION="1.2.5"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -57,6 +57,8 @@ readonly NETNS_UNIT="/etc/systemd/system/nns-netns@.service"
 readonly VPN_UNIT="/etc/systemd/system/nns-openvpn@.service"
 readonly GATEWAY_UNIT="/etc/systemd/system/nns-gateway@.service"
 readonly ONLINE_UNIT="/etc/systemd/system/nns-online@.service"
+readonly WATCHDOG_SERVICE="/etc/systemd/system/nns-watchdog@.service"
+readonly WATCHDOG_TIMER="/etc/systemd/system/nns-watchdog@.timer"
 readonly GATEWAY_CRL_SERVICE="/etc/systemd/system/nns-gateway-crl-refresh@.service"
 readonly GATEWAY_CRL_TIMER="/etc/systemd/system/nns-gateway-crl-refresh@.timer"
 readonly SYSTEMD_UNIT_DIR="/etc/systemd/system"
@@ -158,7 +160,8 @@ reset_app_cfg_vars() {
     APP_NAME="" APP_USER="" DEFAULT_PROFILE="" VPN_TYPE=""
     KILLSWITCH="" AUTOSTART="" UPSTREAM_APP="" WAN_IFACE=""
     DNS_SERVERS="" DISABLE_IPV6="" DISABLE_DCO="" PROFILE_FIXUPS=""
-    READY_TIMEOUT="" EXTERNAL_IP_URL="" NS_NAME="" NS_CIDR=""
+    READY_TIMEOUT="" EXTERNAL_IP_URL="" WATCHDOG_MODE=""
+    WATCHDOG_FAILURES="" WATCHDOG_COOLDOWN="" NS_NAME="" NS_CIDR=""
     HOST_ADDR="" NS_ADDR="" VETH_HOST="" VETH_NS=""
     TRANSPORT_TYPE="" TRANSPORT_REMOTE_HOST="" TRANSPORT_REMOTE_PORT=""
     TRANSPORT_LOCAL_PORT="" TRANSPORT_CONFIG=""

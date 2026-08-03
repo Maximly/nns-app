@@ -93,6 +93,12 @@ main() {
                 die "NNS app '$2' did not become online within $3 seconds."
             exit
             ;;
+        _watchdog)
+            require_root
+            [[ $# -eq 2 ]] || die "_watchdog requires app_name."
+            watchdog_check "$2"
+            exit
+            ;;
     esac
 
     reexec_as_root_if_needed "$@"

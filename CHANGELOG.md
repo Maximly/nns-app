@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.5
+
+- Added an adaptive per-environment data-path watchdog for OpenVPN and WireGuard.
+- Start the watchdog timer only while a supported environment is running; inherit-only children defer recovery to their upstream.
+- Arm recovery only after the environment has been online once, then require three consecutive failed namespace probes before restarting only the VPN backend; slow initial connections are not interrupted.
+- Defer child recovery while its configured upstream is offline and enforce a five-minute restart cooldown to avoid restart loops.
+- Added `WATCHDOG_MODE`, `WATCHDOG_FAILURES`, and `WATCHDOG_COOLDOWN` configuration plus watchdog state and restart attempts in `nns-app status`.
+
 ## 1.2.4
 
 - Preserve an explicit allow-list of desktop-session variables across the sudo and `env -i` boundaries used by `nns-app run`.

@@ -135,6 +135,115 @@ gateway_ca_restore "$tmp_pki" "$tmp_backup"
 
 [[ "$(vpn_type_label inherit)" == Inherit ]] || fail 'inherit backend label'
 
+[[ "$(watchdog_numeric_setting 3 9 1 20)" == 3 ]] || fail 'watchdog numeric setting valid'
+[[ "$(watchdog_numeric_setting bad 9 1 20)" == 9 ]] || fail 'watchdog numeric setting fallback'
+WATCHDOG_MODE=auto
+watchdog_enabled_for_type openvpn || fail 'auto watchdog omitted OpenVPN'
+watchdog_enabled_for_type wireguard || fail 'auto watchdog omitted WireGuard'
+if watchdog_enabled_for_type inherit; then
+    fail 'inherit backend incorrectly enables its own watchdog'
+fi
+WATCHDOG_MODE=off
+if watchdog_enabled_for_type openvpn; then
+    fail 'disabled watchdog accepted OpenVPN'
+fi
+WATCHDOG_MODE=auto
+watchdog_state_file() {
+    printf '%s/run/%s.watchdog\n' "$TEST_TMP" "$1"
+}
+mkdir -p "$TEST_TMP/run"
+WD_ARMED=1
+WD_FAILURES=2
+WD_LAST_RESTART=123
+WD_TOTAL_RESTARTS=4
+WD_LAST_CHECK=456
+WD_LAST_RESULT=offline
+watchdog_state_save test-watchdog
+WD_ARMED=0 WD_FAILURES=0 WD_LAST_RESTART=0 WD_TOTAL_RESTARTS=0 WD_LAST_CHECK=0 WD_LAST_RESULT=never
+watchdog_state_load test-watchdog
+[[ "$WD_ARMED:$WD_FAILURES:$WD_LAST_RESTART:$WD_TOTAL_RESTARTS:$WD_LAST_CHECK:$WD_LAST_RESULT" == '1:2:123:4:456:offline' ]] ||
+    fail 'watchdog state round-trip'
+
+
+# Recovery is not allowed until a data path has been verified online once.
+(
+    require_root() { :; }
+    validate_app_name() { :; }
+    acquire_lock() { :; }
+    release_lock() { :; }
+    load_cfg() {
+        NS_NAME=test-watchdog
+        WATCHDOG_MODE=auto
+        WATCHDOG_FAILURES=2
+        WATCHDOG_COOLDOWN=300
+    }
+    vpn_type_for_app() { printf 'openvpn\n'; }
+    app_is_started() { return 0; }
+    watchdog_namespace_exists() { return 0; }
+    runtime_via_for_app() { printf 'host\n'; }
+    wait_online() { return 1; }
+    SYSTEMCTL_RESTARTED=0
+    systemctl() {
+        if [[ "$1" == restart && "${2:-}" == nns-openvpn@test-watchdog.service ]]; then
+            SYSTEMCTL_RESTARTED=1
+        fi
+        case "$1 $2" in
+            'is-active --quiet') return 1 ;;
+        esac
+        return 0
+    }
+    watchdog_state_file() { printf '%s/unarmed.watchdog\n' "$TEST_TMP"; }
+    rm -f "$TEST_TMP/unarmed.watchdog"
+    watchdog_check test-watchdog >/dev/null 2>&1
+    watchdog_state_load test-watchdog
+    [[ "$WD_ARMED:$WD_FAILURES:$WD_LAST_RESULT" == '0:0:waiting-initial-online' ]] ||
+        fail 'unarmed watchdog attempted recovery'
+    [[ "$SYSTEMCTL_RESTARTED" == 0 ]] || fail 'unarmed watchdog restarted the backend'
+)
+
+# Once armed, the threshold restarts only the backend and records the attempt.
+(
+    require_root() { :; }
+    validate_app_name() { :; }
+    acquire_lock() { :; }
+    release_lock() { :; }
+    load_cfg() {
+        NS_NAME=test-watchdog
+        WATCHDOG_MODE=auto
+        WATCHDOG_FAILURES=2
+        WATCHDOG_COOLDOWN=300
+    }
+    vpn_type_for_app() { printf 'openvpn\n'; }
+    app_is_started() { return 0; }
+    watchdog_namespace_exists() { return 0; }
+    runtime_via_for_app() { printf 'host\n'; }
+    wait_online() { return 1; }
+    SYSTEMCTL_RESTARTED=0
+    systemctl() {
+        if [[ "$1" == restart && "${2:-}" == nns-openvpn@test-watchdog.service ]]; then
+            SYSTEMCTL_RESTARTED=1
+        fi
+        case "$1 $2" in
+            'is-active --quiet') return 1 ;;
+        esac
+        return 0
+    }
+    watchdog_state_file() { printf '%s/armed.watchdog\n' "$TEST_TMP"; }
+    rm -f "$TEST_TMP/armed.watchdog"
+    WD_ARMED=1
+    WD_FAILURES=1
+    WD_LAST_RESTART=0
+    WD_TOTAL_RESTARTS=0
+    WD_LAST_CHECK=0
+    WD_LAST_RESULT=offline
+    watchdog_state_save test-watchdog
+    watchdog_check test-watchdog >/dev/null 2>&1
+    watchdog_state_load test-watchdog
+    [[ "$WD_ARMED:$WD_FAILURES:$WD_TOTAL_RESTARTS:$WD_LAST_RESULT" == '1:0:1:recovered' ]] ||
+        fail 'armed watchdog recovery state'
+    [[ "$SYSTEMCTL_RESTARTED" == 1 ]] || fail 'armed watchdog did not restart only the backend unit'
+)
+
 validate_ssh_target 'maxim@example.net'
 validate_ssh_target '[2001:db8::1]'
 if ( validate_ssh_target '-oProxyCommand=bad' ) >/dev/null 2>&1; then

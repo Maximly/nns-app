@@ -151,6 +151,10 @@ is restored on failure.
 - `nns-openvpn@.service` is the compatibility name for the backend-neutral VPN
   process unit.
 - `nns-online@.service` represents a verified app data path.
+- `nns-watchdog@.timer` probes only running OpenVPN/WireGuard environments.
+  Recovery must arm only after a verified online state, require consecutive
+  failures, defer to an offline upstream, honor cooldown, and restart only the
+  backend unit so application processes keep their network namespace.
 - Per-instance drop-ins order chained apps and gateways after the upstream
   online unit and bind their lifecycle to it.
 - `nns-gateway@.service` owns the managed OpenVPN server and gateway data path.

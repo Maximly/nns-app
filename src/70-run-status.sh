@@ -267,6 +267,8 @@ status_app() {
     local tmpdir ns_log vpn_log
     local endpoint_line endpoint_count=0
     local upstream_health="not applicable"
+    local watchdog_timer_state watchdog_armed watchdog_failures watchdog_limit watchdog_result
+    local watchdog_last_restart watchdog_total_restarts watchdog_last_restart_text="never"
 
     configured_via=$(effective_via_for_app "$app" __default__)
     runtime_via=$(runtime_via_for_app "$app" 2>/dev/null || printf '%s' "$configured_via")
@@ -290,6 +292,19 @@ status_app() {
     ns_since=$(systemctl show "$ns_unit" -p ActiveEnterTimestamp --value 2>/dev/null || true)
     vpn_since=$(systemctl show "$vpn_unit" -p ActiveEnterTimestamp --value 2>/dev/null || true)
     restarts=$(systemctl show "$vpn_unit" -p NRestarts --value 2>/dev/null || true)
+    watchdog_timer_state=$(systemctl is-active "nns-watchdog@${app}.timer" 2>/dev/null || true)
+    watchdog_state_load "$app"
+    watchdog_armed=$WD_ARMED
+    watchdog_failures=$WD_FAILURES
+    watchdog_result=$WD_LAST_RESULT
+    watchdog_last_restart=$WD_LAST_RESTART
+    watchdog_total_restarts=$WD_TOTAL_RESTARTS
+    watchdog_limit=$(watchdog_numeric_setting "${WATCHDOG_FAILURES:-3}" 3 1 20)
+    if (( watchdog_last_restart > 0 )); then
+        local watchdog_age=$(( $(date +%s) - watchdog_last_restart ))
+        (( watchdog_age < 0 )) && watchdog_age=0
+        watchdog_last_restart_text="$(format_duration "$watchdog_age") ago"
+    fi
 
     [[ -e "/run/netns/$NS_NAME" ]] && namespace_exists="yes"
 
@@ -389,6 +404,15 @@ status_app() {
     printf 'VPN service:       %s/%s; result=%s; pid=%s; restarts=%s\n' \
         "${vpn_state:-unknown}" "${vpn_sub:-unknown}" "${vpn_result:-unknown}" \
         "${vpn_pid:-0}" "${restarts:-0}"
+    if watchdog_enabled_for_type "$type"; then
+        printf 'Watchdog:          %s; timer=%s; armed=%s; failures=%s/%s; restart attempts=%s\n' \
+            "${WATCHDOG_MODE:-auto}" "${watchdog_timer_state:-inactive}" "$watchdog_armed" \
+            "$watchdog_failures" "$watchdog_limit" "$watchdog_total_restarts"
+        printf 'Watchdog result:   %s; last restart=%s\n' \
+            "$watchdog_result" "$watchdog_last_restart_text"
+    else
+        printf 'Watchdog:          disabled\n'
+    fi
     [[ -z "$ns_since" ]] || printf 'Namespace active:  %s\n' "$ns_since"
     [[ -z "$vpn_since" ]] || printf 'VPN active:        %s\n' "$vpn_since"
     printf 'Kill switch:       %s\n' "${KILLSWITCH:-unknown}"

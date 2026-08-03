@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.2.4  
+**Release:** 1.2.5  
 **Supported platform:** Ubuntu with systemd and iptables  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
 
@@ -19,6 +19,7 @@ single-file installer: `nns-app-install.sh`.
 - Local VPN chaining through `--via <upstream-app>`.
 - Inherit-only child namespaces that share one upstream tunnel without opening another VPN session.
 - Detailed `status` output with focused failure logs.
+- Adaptive data-path watchdog that preserves running application namespaces.
 - Snap desktop-application support inside private mount namespaces.
 - Managed remote OpenVPN gateways routed through a selected remote nns-app exit.
 - SSH-based remote enrollment, synchronization, credential rotation, and status.
@@ -277,6 +278,8 @@ Installed paths:
 /etc/systemd/system/nns-netns@.service
 /etc/systemd/system/nns-openvpn@.service
 /etc/systemd/system/nns-online@.service
+/etc/systemd/system/nns-watchdog@.service
+/etc/systemd/system/nns-watchdog@.timer
 /etc/systemd/system/nns-gateway@.service
 /etc/systemd/system/nns-gateway-crl-refresh@.service
 /etc/systemd/system/nns-gateway-crl-refresh@.timer
@@ -663,6 +666,9 @@ DISABLE_DCO="off"
 PROFILE_FIXUPS="on"
 READY_TIMEOUT="5"
 EXTERNAL_IP_URL="https://api.ipify.org"
+WATCHDOG_MODE="auto"
+WATCHDOG_FAILURES="3"
+WATCHDOG_COOLDOWN="300"
 TRANSPORT_TYPE="direct"
 TRANSPORT_REMOTE_HOST=""
 TRANSPORT_REMOTE_PORT=""
@@ -676,6 +682,26 @@ REMOTE_SERVER_FINGERPRINT=""
 ```
 
 Configuration files are root-owned and rejected when group/world writable.
+
+### Adaptive data-path watchdog
+
+`WATCHDOG_MODE="auto"` starts a lightweight systemd timer only while an
+OpenVPN or WireGuard environment is running. It does not monitor inherit-only
+children because their recovery belongs to the upstream environment.
+
+Every 30 seconds the watchdog checks the real namespace data path. It arms only
+after that environment has been online at least once, so it does not interfere
+with a slow initial VPN connection. A single failed probe does nothing. After
+`WATCHDOG_FAILURES` consecutive failures it restarts only
+`nns-openvpn@<app>.service`; the network namespace and processes already
+running inside it remain alive. `WATCHDOG_COOLDOWN` prevents restart loops.
+When an app is chained through another nns-app environment, recovery is
+deferred while that upstream is offline.
+
+Use `WATCHDOG_MODE="off"` for profiles that must never be restarted
+automatically. `nns-app status <app>` reports the timer, failure count, last
+result, and watchdog-triggered restart attempts.
+
 All known fields are reset before every load, preventing values from a
 previously loaded application or gateway from leaking into another object.
 
