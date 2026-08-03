@@ -163,8 +163,16 @@ run_in_app() {
     validate_app_name "$app"
     load_cfg "$app"
 
-    systemctl is-active --quiet "nns-netns@${app}.service" ||
-        die "'$app' is stopped. Start it first."
+    if ! systemctl is-active --quiet "nns-netns@${app}.service"; then
+        if [[ "${REMOTE_MODE:-}" == auto ]]; then
+            log "Starting automatic remote environment '$app'..."
+            start_app "$app" off __default__ ||
+                die "Automatic remote environment '$app' could not be started."
+            load_cfg "$app"
+        else
+            die "'$app' is stopped. Start it first."
+        fi
+    fi
     ip netns list | awk '{print $1}' | grep -Fxq "$NS_NAME" ||
         die "Namespace '$NS_NAME' does not exist."
 
@@ -274,7 +282,12 @@ status_app() {
     runtime_via=$(runtime_via_for_app "$app" 2>/dev/null || printf '%s' "$configured_via")
 
     type=$(vpn_type_for_app "$app" 2>/dev/null || true)
-    type_label=$(vpn_type_label "${type:-unknown}")
+    if [[ "${REMOTE_MODE:-}" == auto &&
+          ( -z "${DEFAULT_PROFILE:-}" || -z "${VPN_TYPE:-}" ) ]]; then
+        type_label="pending remote deployment"
+    else
+        type_label=$(vpn_type_label "${type:-unknown}")
+    fi
     if [[ "$type" == inherit ]]; then
         profile_name="inherited:${configured_via}"
     elif [[ -n "$profile_name" ]]; then
@@ -328,7 +341,11 @@ status_app() {
         fi
     fi
 
-    if [[ "$ns_state" == failed || "$ns_result" == failed ]]; then
+    if [[ "${REMOTE_MODE:-}" == auto &&
+          ( -z "${DEFAULT_PROFILE:-}" || -z "${VPN_TYPE:-}" ) ]]; then
+        health="PENDING"
+        diagnosis="Remote access is configured, but no provider profile has been deployed. Run: nns-app add $app /path/to/profile.ovpn"
+    elif [[ "$ns_state" == failed || "$ns_result" == failed ]]; then
         health="FAILED"
         diagnosis="Network namespace setup failed."
     elif [[ "$ns_state" != active || "$namespace_exists" != yes ]]; then
@@ -392,6 +409,12 @@ status_app() {
     printf 'Backend:           %s\n' "$type_label"
     if [[ "$type" == openvpn ]]; then
         printf 'Transport:         %s\n' "${TRANSPORT_TYPE:-direct}"
+    fi
+    if [[ "${REMOTE_MODE:-}" == auto ]]; then
+        printf 'Remote mode:       automatic\n'
+        printf 'Remote target:     %s\n' "${TRANSPORT_SSH_TARGET:-unknown}"
+        printf 'Remote exit:       %s\n' "${REMOTE_EXIT_APP:-unknown}"
+        printf 'Remote gateway:    %s/%s\n' "${REMOTE_GATEWAY:-unknown}" "${REMOTE_CLIENT:-unknown}"
     fi
     printf 'Configured via:    %s\n' "$configured_via"
     printf 'Runtime via:       %s\n' "$runtime_via"

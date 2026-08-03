@@ -28,6 +28,10 @@ clear_app_transport_metadata() {
     cfg_set "$app" TRANSPORT_REMOTE_PORT ""
     cfg_set "$app" TRANSPORT_LOCAL_PORT ""
     cfg_set "$app" TRANSPORT_CONFIG ""
+    cfg_set "$app" TRANSPORT_SSH_TARGET ""
+    cfg_set "$app" TRANSPORT_SSH_IDENTITY ""
+    cfg_set "$app" TRANSPORT_SSH_KNOWN_HOSTS ""
+    cfg_set "$app" TRANSPORT_SSH_REMOTE_PORT ""
 }
 
 set_inherit_backend() {
@@ -62,6 +66,7 @@ transport_binary_for_type() {
         direct|"") return 1 ;;
         stunnel) command -v stunnel4 2>/dev/null || command -v stunnel 2>/dev/null ;;
         cloak) command -v ck-client 2>/dev/null ;;
+        ssh) command -v ssh 2>/dev/null ;;
         *) return 1 ;;
     esac
 }
@@ -70,10 +75,12 @@ transport_client_exec() {
     local app=$1 profile=$2 type binary wrapper_pid vpn_pid rc=0
     load_cfg "$app"
     type=${TRANSPORT_TYPE:-direct}
-    [[ "$type" == stunnel || "$type" == cloak ]] ||
+    [[ "$type" == stunnel || "$type" == cloak || "$type" == ssh ]] ||
         die "Unsupported local transport '$type'."
-    [[ -n "$TRANSPORT_CONFIG" && -f "$TRANSPORT_CONFIG" ]] ||
-        die "Transport config is missing for '$app'. Re-import its .nnslink bundle."
+    if [[ "$type" == stunnel || "$type" == cloak ]]; then
+        [[ -n "$TRANSPORT_CONFIG" && -f "$TRANSPORT_CONFIG" ]] ||
+            die "Transport config is missing for '$app'. Re-import its .nnslink bundle."
+    fi
     binary=$(transport_binary_for_type "$type" || true)
     [[ -n "$binary" ]] ||
         die "Transport '$type' is not installed (required client binary is missing)."
@@ -100,9 +107,35 @@ transport_client_exec() {
                 -l "$TRANSPORT_LOCAL_PORT" &
             wrapper_pid=$!
             ;;
+        ssh)
+            validate_ssh_target "$TRANSPORT_SSH_TARGET"
+            [[ -f "$TRANSPORT_SSH_IDENTITY" && ! -L "$TRANSPORT_SSH_IDENTITY" ]] ||
+                die "Automatic-remote SSH identity is missing for '$app'. Re-run install --via-remote."
+            [[ -f "$TRANSPORT_SSH_KNOWN_HOSTS" && ! -L "$TRANSPORT_SSH_KNOWN_HOSTS" ]] ||
+                die "Automatic-remote SSH host-key pin is missing for '$app'. Re-run install --via-remote."
+            [[ "$TRANSPORT_SSH_REMOTE_PORT" =~ ^[1-9][0-9]{0,4}$ &&
+               "$TRANSPORT_SSH_REMOTE_PORT" -le 65535 ]] ||
+                die "Automatic-remote OpenVPN port is invalid for '$app'. Re-add its profile."
+            ip netns exec "$NS_NAME" "$binary" -F /dev/null -N -T \
+                -o BatchMode=yes \
+                -o ExitOnForwardFailure=yes \
+                -o ServerAliveInterval=15 \
+                -o ServerAliveCountMax=3 \
+                -o TCPKeepAlive=yes \
+                -o StrictHostKeyChecking=yes \
+                -o "UserKnownHostsFile=$TRANSPORT_SSH_KNOWN_HOSTS" \
+                -o PasswordAuthentication=no \
+                -o KbdInteractiveAuthentication=no \
+                -o LogLevel=ERROR \
+                -i "$TRANSPORT_SSH_IDENTITY" \
+                -p "$TRANSPORT_REMOTE_PORT" \
+                -L "127.0.0.1:${TRANSPORT_LOCAL_PORT}:127.0.0.1:${TRANSPORT_SSH_REMOTE_PORT}" \
+                "$TRANSPORT_SSH_TARGET" &
+            wrapper_pid=$!
+            ;;
     esac
 
-    local deadline=$((SECONDS + 5))
+    local deadline=$((SECONDS + 10))
     while (( SECONDS < deadline )); do
         kill -0 "$wrapper_pid" 2>/dev/null ||
             die "The $type client exited before opening its local listener."
@@ -215,7 +248,7 @@ for key, value in required.items():
     if manifest.get(key) != value:
         raise SystemExit(f"unsupported manifest {key}: {manifest.get(key)!r}")
 transport = manifest.get("transport")
-if transport not in {"direct", "stunnel", "cloak"}:
+if transport not in {"direct", "stunnel", "cloak", "ssh"}:
     raise SystemExit(f"unsupported transport: {transport!r}")
 import re
 
@@ -236,6 +269,10 @@ for key in ("public_port", "local_port", "generation"):
     value = manifest.get(key)
     if not isinstance(value, int) or value < 1 or value > (65535 if key != "generation" else 2**31-1):
         raise SystemExit(f"invalid manifest field: {key}")
+if transport == "ssh":
+    value = manifest.get("ssh_remote_port")
+    if not isinstance(value, int) or value < 1 or value > 65535:
+        raise SystemExit("invalid manifest field: ssh_remote_port")
 if transport == "stunnel" and not (out / "stunnel-ca.pem").is_file():
     raise SystemExit("stunnel bundle is missing stunnel-ca.pem")
 if transport == "cloak":
@@ -281,7 +318,10 @@ if transport == "cloak":
             raise SystemExit(f"invalid Cloak {key}")
         if len(decoded) != decoded_size:
             raise SystemExit(f"invalid Cloak {key} length")
-for key in ("gateway", "client", "backend", "transport", "public_host", "public_port", "local_port", "generation"):
+keys = ["gateway", "client", "backend", "transport", "public_host", "public_port", "local_port", "generation"]
+if transport == "ssh":
+    keys.append("ssh_remote_port")
+for key in keys:
     print(f"{key.upper()}={json.dumps(manifest[key], separators=(',', ':'))}")
 PY_NNSLINK_READ
 }
@@ -290,7 +330,7 @@ nnslink_import() {
     require_root
     local app=$1 bundle=$2 expected_gateway=${3:-} expected_client=${4:-}
     local temp manifest_values
-    local GATEWAY CLIENT BACKEND TRANSPORT PUBLIC_HOST PUBLIC_PORT LOCAL_PORT GENERATION
+    local GATEWAY CLIENT BACKEND TRANSPORT PUBLIC_HOST PUBLIC_PORT LOCAL_PORT GENERATION SSH_REMOTE_PORT
     validate_app_name "$app"
     [[ -f "$(cfg_file "$app")" ]] ||
         die "NNS app '$app' is not installed. Run: sudo nns-app install $app"
@@ -302,7 +342,7 @@ nnslink_import() {
         die "Cannot validate .nnslink bundle '$bundle'."
     while IFS='=' read -r key value; do
         case "$key" in
-            GATEWAY|CLIENT|BACKEND|TRANSPORT|PUBLIC_HOST|PUBLIC_PORT|LOCAL_PORT|GENERATION)
+            GATEWAY|CLIENT|BACKEND|TRANSPORT|PUBLIC_HOST|PUBLIC_PORT|LOCAL_PORT|GENERATION|SSH_REMOTE_PORT)
                 printf -v "$key" '%s' "$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()))' <<<"$value")"
                 ;;
         esac
@@ -313,6 +353,11 @@ nnslink_import() {
     [[ -z "$expected_client" || "$CLIENT" == "$expected_client" ]] ||
         die ".nnslink client '$CLIENT' does not match expected '$expected_client'."
     [[ "$BACKEND" == openvpn ]] || die "Only OpenVPN .nnslink bundles are supported."
+    if [[ "$TRANSPORT" == ssh ]]; then
+        load_cfg "$app"
+        [[ "${REMOTE_MODE:-}" == auto ]] ||
+            die "SSH-forward .nnslink bundles are internal to install --via-remote; use direct, stunnel or Cloak for manual import."
+    fi
 
     # Validate optional runtime dependencies and pinned material before
     # replacing the app's currently working profile.
@@ -328,6 +373,10 @@ nnslink_import() {
         cloak)
             binary=$(transport_binary_for_type cloak || true)
             [[ -n "$binary" ]] || die "Install ck-client before importing this bundle."
+            ;;
+        ssh)
+            binary=$(transport_binary_for_type ssh || true)
+            [[ -n "$binary" ]] || die "Install openssh-client before importing this bundle."
             ;;
     esac
 
@@ -365,6 +414,9 @@ STUNNEL_CLIENT_EOF
             install -o root -g root -m 0600 \
                 "$temp/extracted/cloak-client.json" "$config"
             ;;
+        ssh)
+            config=""
+            ;;
     esac
 
     cfg_set "$app" TRANSPORT_TYPE "$TRANSPORT"
@@ -379,11 +431,20 @@ STUNNEL_CLIENT_EOF
         cfg_set "$app" TRANSPORT_LOCAL_PORT "$LOCAL_PORT"
         cfg_set "$app" TRANSPORT_CONFIG "$config"
     fi
+    if [[ "$TRANSPORT" == ssh ]]; then
+        cfg_set "$app" TRANSPORT_SSH_REMOTE_PORT "$SSH_REMOTE_PORT"
+    else
+        cfg_set "$app" TRANSPORT_SSH_TARGET ""
+        cfg_set "$app" TRANSPORT_SSH_IDENTITY ""
+        cfg_set "$app" TRANSPORT_SSH_KNOWN_HOSTS ""
+        cfg_set "$app" TRANSPORT_SSH_REMOTE_PORT ""
+    fi
 
     NNSLINK_GATEWAY=$GATEWAY
     NNSLINK_CLIENT=$CLIENT
     NNSLINK_GENERATION=$GENERATION
     NNSLINK_TRANSPORT=$TRANSPORT
+    NNSLINK_SSH_REMOTE_PORT=${SSH_REMOTE_PORT:-}
     rm -rf "$temp"
     log "Imported $TRANSPORT .nnslink profile for '$app' ($GATEWAY/$CLIENT generation $GENERATION)."
 }
@@ -418,17 +479,29 @@ remote_ssh_args() {
     REMOTE_SSH_ARGS+=( "$SSH_TARGET" )
 }
 
-remote_command() {
-    local alias=$1; shift
-    remote_ssh_args "$alias"
-    local quoted=() arg
+shell_join_quoted() {
+    local output="" arg quoted
     for arg in "$@"; do
-        printf -v arg '%q' "$arg"
-        quoted+=("$arg")
+        printf -v quoted '%q' "$arg"
+        if [[ -n "$output" ]]; then
+            output+=" "
+        fi
+        output+="$quoted"
     done
-    local payload
-    printf -v payload 'if [ "$(id -u)" -eq 0 ]; then exec nns-app %s; else exec sudo -n nns-app %s; fi' \
-        "${quoted[*]}" "${quoted[*]}"
+    printf '%s' "$output"
+}
+
+remote_command_payload() {
+    local command
+    command=$(shell_join_quoted nns-app "$@")
+    printf 'if [ "$(id -u)" -eq 0 ]; then exec %s; else exec sudo -n %s; fi' \
+        "$command" "$command"
+}
+
+remote_command() {
+    local alias=$1 payload; shift
+    remote_ssh_args "$alias"
+    payload=$(remote_command_payload "$@")
     "${REMOTE_SSH_ARGS[@]}" "$payload"
 }
 
@@ -509,6 +582,15 @@ remote_import_bundle() {
     cfg_set "$app" REMOTE_PROFILE_GENERATION "$NNSLINK_GENERATION"
     load_remote_cfg "$alias"
     cfg_set "$app" REMOTE_SERVER_FINGERPRINT "$SSH_HOST_FINGERPRINT"
+    # Automatic SSH bundles intentionally omit the private management key.
+    # Restore the local root-owned key and pinned host file before restarting
+    # a live environment after synchronization.
+    load_cfg "$app"
+    if [[ "${REMOTE_MODE:-}" == auto && "${NNSLINK_TRANSPORT:-}" == ssh ]]; then
+        cfg_set "$app" TRANSPORT_SSH_TARGET "$SSH_TARGET"
+        cfg_set "$app" TRANSPORT_SSH_IDENTITY "$SSH_IDENTITY"
+        cfg_set "$app" TRANSPORT_SSH_KNOWN_HOSTS "$(remote_known_hosts "$alias")"
+    fi
 
     # Endpoint routes and kill-switch rules are created with the namespace, so
     # replacing a live bundle requires a full namespace restart rather than
@@ -551,42 +633,70 @@ load_app_remote_metadata() {
 
 remote_sync() {
     require_root
-    local app=$1 temp alias gateway client
+    local app=$1 temp alias gateway client mode owner
     load_app_remote_metadata "$app"
     alias=$REMOTE_ALIAS gateway=$REMOTE_GATEWAY client=$REMOTE_CLIENT
+    mode=${REMOTE_MODE:-}
+    owner=${REMOTE_OWNER_ID:-}
     temp=$(mktemp --suffix=.nnslink)
-    remote_command "$alias" gateway client export "$gateway" "$client" \
-        --format nnslink --output - >"$temp"
+    if [[ "$mode" == auto ]]; then
+        remote_auto_command "$alias" export "$owner" >"$temp"
+    else
+        remote_command "$alias" gateway client export "$gateway" "$client" \
+            --format nnslink --output - >"$temp"
+    fi
     remote_import_bundle "$alias" "$gateway" "$client" "$app" "$temp"
     rm -f "$temp"
+    if [[ "$mode" == auto ]]; then
+        load_remote_cfg "$alias"
+        cfg_set "$app" REMOTE_MODE auto
+        cfg_set "$app" REMOTE_OWNER_ID "$owner"
+        cfg_set "$app" REMOTE_EXIT_APP "$(remote_auto_exit_name "$owner")"
+        cfg_set "$app" TRANSPORT_SSH_TARGET "$SSH_TARGET"
+        cfg_set "$app" TRANSPORT_SSH_IDENTITY "$SSH_IDENTITY"
+        cfg_set "$app" TRANSPORT_SSH_KNOWN_HOSTS "$(remote_known_hosts "$alias")"
+    fi
     log "Synchronized '$app' from '$alias:$gateway'."
 }
 
 remote_rotate() {
     require_root
-    local app=$1 alias gateway client
+    local app=$1 alias gateway client mode owner
     load_app_remote_metadata "$app"
     alias=$REMOTE_ALIAS gateway=$REMOTE_GATEWAY client=$REMOTE_CLIENT
-    remote_command "$alias" gateway client rotate "$gateway" "$client"
+    mode=${REMOTE_MODE:-}
+    owner=${REMOTE_OWNER_ID:-}
+    if [[ "$mode" == auto ]]; then
+        remote_auto_command "$alias" rotate "$owner"
+    else
+        remote_command "$alias" gateway client rotate "$gateway" "$client"
+    fi
     remote_sync "$app"
     log "Rotated and synchronized credentials for '$app'."
 }
 
 remote_status() {
     require_root
-    local target=$1 alias gateway client generation fingerprint
+    local target=$1 alias gateway client generation fingerprint mode owner
     if [[ -f "$(cfg_file "$target")" ]]; then
         load_app_remote_metadata "$target"
         alias=$REMOTE_ALIAS gateway=$REMOTE_GATEWAY client=$REMOTE_CLIENT
+        mode=${REMOTE_MODE:-}
+        owner=${REMOTE_OWNER_ID:-}
         generation=${REMOTE_PROFILE_GENERATION:-unknown}
         fingerprint=${REMOTE_SERVER_FINGERPRINT:-unknown}
         printf 'Local app:          %s\n' "$target"
         printf 'Remote:             %s\n' "$alias"
+        printf 'Mode:               %s\n' "${mode:-manual}"
         printf 'Gateway/client:     %s/%s\n' "$gateway" "$client"
         printf 'Profile generation: %s\n' "$generation"
         printf 'Pinned SSH key:     %s\n' "$fingerprint"
         printf '\nRemote gateway status:\n'
-        remote_command "$alias" gateway status "$gateway"
+        if [[ "$mode" == auto ]]; then
+            remote_auto_command "$alias" status "$owner"
+        else
+            remote_command "$alias" gateway status "$gateway"
+        fi
     else
         alias=$target
         load_remote_cfg "$alias"
@@ -594,7 +704,8 @@ remote_status() {
         printf 'SSH target:     %s:%s\n' "$SSH_TARGET" "$SSH_PORT"
         printf 'Pinned host key:%s\n' " $SSH_HOST_FINGERPRINT"
         printf 'Connectivity:   '
-        if remote_command "$alias" --version >/dev/null 2>&1; then
+        if remote_command "$alias" --version >/dev/null 2>&1 ||
+           remote_auto_command "$alias" version >/dev/null 2>&1; then
             printf 'online\n'
         else
             printf 'offline\n'
@@ -641,7 +752,7 @@ gateway_prepare_transport() {
     tdir=$(gateway_transport_dir "$gateway" "$root")
     install -d -o root -g root -m 0700 "$tdir"
     case "$transport" in
-        direct) ;;
+        direct|ssh) ;;
         stunnel)
             binary=$(gateway_transport_binary stunnel || true)
             [[ -n "$binary" ]] || die "stunnel transport requires stunnel4 (or stunnel) to be installed."
@@ -743,7 +854,7 @@ gateway_write_transport_config() {
     fi
     tdir=$(gateway_transport_dir "$gateway" "$root")
     case "${TRANSPORT:-direct}" in
-        direct) return 0 ;;
+        direct|ssh) return 0 ;;
         stunnel)
             output="$tdir/server.conf"
             cat >"$output" <<STUNNEL_SERVER_EOF
@@ -863,7 +974,6 @@ gateway_write_client_profile_file() {
         printf 'proto %s\n' "$proto"
         printf 'remote %s %s\n' "$remote_host" "$remote_port"
         printf 'nobind\n'
-        printf 'persist-key\n'
         printf 'persist-tun\n'
         printf 'auth-nocache\n'
         printf 'remote-cert-tls server\n'
@@ -903,6 +1013,7 @@ gateway_write_nnslink_bundle() {
         stunnel)
             install -m 0644 "$tdir/ca.crt" "$temp/stunnel-ca.pem"
             ;;
+        ssh) ;;
         cloak)
             [[ -n "$CLOAK_UID" ]] || die "Cloak client '$client' has no UID; rotate it before export."
             public_key=$(<"$tdir/public.key")
@@ -930,9 +1041,10 @@ PY_CLOAK_CLIENT
     esac
 
     python3 - "$temp/manifest.json" "$gateway" "$client" "$transport" \
-        "$PUBLIC_HOST" "$PUBLIC_PORT" "$local_port" "${GENERATION:-1}" <<'PY_NNSLINK_MANIFEST'
+        "$PUBLIC_HOST" "$PUBLIC_PORT" "$local_port" "${GENERATION:-1}" \
+        "$OPENVPN_LISTEN_PORT" <<'PY_NNSLINK_MANIFEST'
 import json,sys
-path, gateway, client, transport, host, port, local_port, generation = sys.argv[1:]
+path, gateway, client, transport, host, port, local_port, generation, remote_port = sys.argv[1:]
 data = {
     "format": "nnslink",
     "version": 1,
@@ -945,6 +1057,8 @@ data = {
     "public_port": int(port),
     "local_port": int(local_port),
 }
+if transport == "ssh":
+    data["ssh_remote_port"] = int(remote_port)
 with open(path, "w", encoding="utf-8") as fh:
     json.dump(data, fh, indent=2, sort_keys=True)
     fh.write("\n")
@@ -1048,4 +1162,490 @@ gateway_client_rotate() {
             warn "Client '$client' was rotated, but gateway '$gateway' failed to restart."
     fi
     log "Rotated client '$client' on gateway '$gateway' to generation $generation."
+}
+
+# Automatic remote mode ------------------------------------------------------
+# The public three-command workflow uses SSH for both bootstrap and a
+# supervised local port forward. The remote OpenVPN gateway is loopback-only,
+# so no cloud firewall or additional public listener is required.
+
+validate_remote_owner_id() {
+    local owner=${1:-}
+    [[ "$owner" =~ ^[a-f0-9]{16}$ ]] ||
+        die "Invalid automatic-remote owner ID '$owner'."
+}
+
+remote_auto_exit_name() {
+    validate_remote_owner_id "$1"
+    printf 'ra-%s-exit\n' "${1:0:12}"
+}
+
+remote_auto_gateway_name() {
+    validate_remote_owner_id "$1"
+    printf 'ra-%s-gw\n' "${1:0:12}"
+}
+
+remote_auto_client_name() {
+    validate_remote_owner_id "$1"
+    printf 'ra-%s-client\n' "${1:0:12}"
+}
+
+remote_auto_state_file() {
+    validate_remote_owner_id "$1"
+    printf '%s/remote-auto/%s.cfg\n' "$STATE_DIR" "$1"
+}
+
+remote_auto_authorize() {
+    require_root
+    local user=$1 hash alias file tmp
+    [[ "$user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] ||
+        die "Invalid remote account name '$user'."
+    id "$user" >/dev/null 2>&1 || die "Remote account '$user' does not exist."
+    hash=$(printf '%s' "$user" | cksum | awk '{print $1}')
+    alias="NNS_APP_REMOTE_AUTO_${hash}"
+    file="/etc/sudoers.d/nns-app-remote-auto-${user}"
+    tmp=$(mktemp)
+    cat >"$tmp" <<REMOTE_AUTO_SUDOERS
+Cmnd_Alias $alias = $ENGINE_PATH _remote-auto *
+$user ALL=(root) NOPASSWD: $alias
+REMOTE_AUTO_SUDOERS
+    visudo -cf "$tmp" >/dev/null || {
+        rm -f "$tmp"
+        die "Generated automatic-remote sudoers rule failed validation."
+    }
+    install -o root -g root -m 0440 "$tmp" "$file"
+    rm -f "$tmp"
+    log "Authorized '$user' for restricted nns-app automatic-remote operations."
+}
+
+remote_auto_write_state() {
+    local owner=$1 exit_app=$2 gateway=$3 client=$4 file tmp
+    file=$(remote_auto_state_file "$owner")
+    install -d -o root -g root -m 0700 "$(dirname "$file")"
+    tmp=$(mktemp)
+    {
+        printf 'OWNER_ID=%q\n' "$owner"
+        printf 'EXIT_APP=%q\n' "$exit_app"
+        printf 'GATEWAY=%q\n' "$gateway"
+        printf 'CLIENT=%q\n' "$client"
+    } >"$tmp"
+    install -o root -g root -m 0600 "$tmp" "$file"
+    rm -f "$tmp"
+}
+
+remote_auto_assert_state() {
+    local owner=$1 expected_exit expected_gateway expected_client file
+    expected_exit=$(remote_auto_exit_name "$owner")
+    expected_gateway=$(remote_auto_gateway_name "$owner")
+    expected_client=$(remote_auto_client_name "$owner")
+    file=$(remote_auto_state_file "$owner")
+    [[ -f "$file" ]] || die "Automatic remote '$owner' is not deployed."
+    local OWNER_ID="" EXIT_APP="" GATEWAY="" CLIENT=""
+    # shellcheck disable=SC1090
+    source "$file"
+    [[ "$OWNER_ID" == "$owner" && "$EXIT_APP" == "$expected_exit" &&
+       "$GATEWAY" == "$expected_gateway" && "$CLIENT" == "$expected_client" ]] ||
+        die "Automatic-remote state '$file' is inconsistent."
+}
+
+remote_auto_deploy_internal() {
+    require_root
+    local owner=$1 ssh_host=$2 ssh_port=$3 profile_name=$4
+    local exit_app gateway client temp temp_dir port
+    validate_remote_owner_id "$owner"
+    [[ "$ssh_host" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] ||
+        die "Invalid automatic-remote SSH host '$ssh_host'."
+    [[ "$ssh_port" =~ ^[1-9][0-9]{0,4}$ && "$ssh_port" -le 65535 ]] ||
+        die "Invalid automatic-remote SSH port '$ssh_port'."
+    [[ "$profile_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] ||
+        die "Invalid remote profile name '$profile_name'."
+
+    exit_app=$(remote_auto_exit_name "$owner")
+    gateway=$(remote_auto_gateway_name "$owner")
+    client=$(remote_auto_client_name "$owner")
+    temp_dir=$(mktemp -d)
+    temp="$temp_dir/$profile_name"
+    trap 'rm -rf "${temp_dir:-}"' EXIT
+    cat >"$temp"
+    [[ -s "$temp" ]] || die "The uploaded VPN profile is empty."
+    local uploaded_type
+    uploaded_type=$(profile_type_from_file "$temp" 2>/dev/null || true)
+    [[ -n "$uploaded_type" ]] || die "The uploaded file is not an OpenVPN or WireGuard profile."
+    case "$uploaded_type" in
+        openvpn) validate_ovpn "$temp" ;;
+        wireguard) validate_wireguard "$temp" ;;
+    esac
+
+    if [[ ! -f "$(cfg_file "$exit_app")" ]]; then
+        install_app "$exit_app" __default__
+    fi
+
+    if systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
+        gateway_stop "$gateway"
+    fi
+    if app_is_started "$exit_app" ||
+       systemctl is-active --quiet "nns-netns@${exit_app}.service"; then
+        stop_app "$exit_app"
+    fi
+
+    add_profile "$exit_app" "$temp"
+    cfg_set "$exit_app" READY_TIMEOUT 60
+    cfg_set "$exit_app" AUTOSTART on
+    start_app "$exit_app" off __default__
+
+    if [[ ! -f "$(gateway_cfg_file "$gateway")" ]]; then
+        port=$(gateway_allocate_backend_port "$gateway")
+        gateway_create "$gateway" "$exit_app" "tcp:$port" \
+            "$ssh_host:$ssh_port" "" "1.1.1.1 9.9.9.9" ssh ""
+    else
+        load_gateway_cfg "$gateway"
+        [[ "$VIA_APP" == "$exit_app" && "${TRANSPORT:-}" == ssh &&
+           "$PUBLIC_HOST" == "$ssh_host" && "$PUBLIC_PORT" == "$ssh_port" ]] ||
+            die "Existing automatic gateway '$gateway' does not match this deployment."
+    fi
+
+    if ! gateway_start "$gateway"; then
+        die "Automatic gateway '$gateway' failed to start. The remote provider exit remains configured; rerun nns-app add after upgrading or correcting the gateway."
+    fi
+    systemctl enable "nns-gateway@${gateway}.service" >/dev/null
+
+    if [[ ! -f "$(gateway_client_dir "$gateway" "$client")/client.cfg" ]]; then
+        gateway_client_add "$gateway" "$client"
+    else
+        gateway_client_load "$gateway" "$client"
+        if [[ "${STATUS:-}" != active ]]; then
+            gateway_client_rotate "$gateway" "$client"
+        fi
+    fi
+    remote_auto_write_state "$owner" "$exit_app" "$gateway" "$client"
+    trap - EXIT
+    rm -rf "$temp_dir"
+    log "Automatic remote '$owner' is ready: $exit_app -> $gateway/$client."
+}
+
+remote_auto_export_internal() {
+    require_root
+    local owner=$1 gateway client
+    remote_auto_assert_state "$owner"
+    gateway=$(remote_auto_gateway_name "$owner")
+    client=$(remote_auto_client_name "$owner")
+    gateway_write_nnslink_bundle "$gateway" "$client" -
+}
+
+remote_auto_rotate_internal() {
+    require_root
+    local owner=$1 gateway client
+    remote_auto_assert_state "$owner"
+    gateway=$(remote_auto_gateway_name "$owner")
+    client=$(remote_auto_client_name "$owner")
+    gateway_client_rotate "$gateway" "$client"
+}
+
+remote_auto_status_internal() {
+    require_root
+    local owner=$1 exit_app gateway client
+    remote_auto_assert_state "$owner"
+    exit_app=$(remote_auto_exit_name "$owner")
+    gateway=$(remote_auto_gateway_name "$owner")
+    client=$(remote_auto_client_name "$owner")
+    printf 'Automatic owner:    %s\n' "$owner"
+    printf 'Remote exit app:    %s\n' "$exit_app"
+    printf 'Remote gateway:     %s\n' "$gateway"
+    printf 'Remote client:      %s\n\n' "$client"
+    gateway_status "$gateway"
+}
+
+remote_auto_dispatch() {
+    require_root
+    local action=${1:-}
+    shift || true
+    case "$action" in
+        version)
+            [[ $# -eq 0 ]] || die "_remote-auto version takes no arguments."
+            printf 'nns-app-remote-auto %s\n' "$VERSION"
+            ;;
+        deploy)
+            [[ $# -eq 4 ]] ||
+                die "_remote-auto deploy requires owner, SSH host, SSH port and profile name."
+            remote_auto_deploy_internal "$@"
+            ;;
+        export)
+            [[ $# -eq 1 ]] || die "_remote-auto export requires owner."
+            remote_auto_export_internal "$1"
+            ;;
+        rotate)
+            [[ $# -eq 1 ]] || die "_remote-auto rotate requires owner."
+            remote_auto_rotate_internal "$1"
+            ;;
+        status)
+            [[ $# -eq 1 ]] || die "_remote-auto status requires owner."
+            remote_auto_status_internal "$1"
+            ;;
+        *) die "Unsupported automatic-remote operation '$action'." ;;
+    esac
+}
+
+remote_auto_owner_id() {
+    local app=$1 target=$2 machine_id
+    machine_id=$(cat /etc/machine-id 2>/dev/null || hostname)
+    printf '%s\0%s\0%s' "$machine_id" "$app" "$target" |
+        sha256sum | cut -c1-16
+}
+
+remote_auto_alias() {
+    local app=$1 owner=$2 stem
+    stem=$(printf 'auto-%s' "$app" | cut -c1-23)
+    printf '%s-%s\n' "$stem" "${owner:0:8}"
+}
+
+remote_auto_user_home() {
+    getent passwd "$1" | awk -F: 'NR==1 {print $6}'
+}
+
+remote_auto_user_exec() {
+    local user=$1; shift
+    local home
+    local -a user_env
+    home=$(remote_auto_user_home "$user")
+    [[ -n "$home" && -d "$home" ]] || die "Cannot determine home directory for '$user'."
+    user_env=(HOME="$home" USER="$user" LOGNAME="$user")
+    if [[ -n "${SSH_AUTH_SOCK:-}" && -S "${SSH_AUTH_SOCK:-}" ]]; then
+        user_env+=(SSH_AUTH_SOCK="$SSH_AUTH_SOCK")
+    fi
+    runuser -u "$user" -- env "${user_env[@]}" "$@"
+}
+
+remote_auto_resolve_ssh() {
+    local user=$1 target=$2 requested_port=${3:-22} cfg host ssh_user port
+    validate_ssh_target "$target"
+    [[ "$requested_port" =~ ^[1-9][0-9]{0,4}$ && "$requested_port" -le 65535 ]] ||
+        die "Invalid SSH port '$requested_port'."
+    cfg=$(remote_auto_user_exec "$user" ssh -G -p "$requested_port" "$target" 2>/dev/null) ||
+        die "Cannot resolve SSH configuration for '$target'."
+    host=$(awk '$1=="hostname" {print $2; exit}' <<<"$cfg")
+    ssh_user=$(awk '$1=="user" {print $2; exit}' <<<"$cfg")
+    port=$(awk '$1=="port" {print $2; exit}' <<<"$cfg")
+    [[ -n "$host" && -n "$ssh_user" && "$port" =~ ^[1-9][0-9]{0,4}$ ]] ||
+        die "SSH configuration for '$target' is incomplete."
+    if [[ "$host" == *:* && "$host" != \[*\] ]]; then
+        host="[$host]"
+    fi
+    validate_ssh_target "$ssh_user@$host"
+    printf '%s|%s|%s\n' "$ssh_user@$host" "$port" "${host#[}"
+}
+
+remote_auto_bootstrap() {
+    local app=$1 target=$2 port=$3 alias=$4 owner=$5
+    local user dir key pub pub_copy remote_tmp remote_pub control_dir control command
+    load_cfg "$app"
+    user=$APP_USER
+    dir=$(remote_dir "$alias")
+    key="$dir/id_ed25519"
+    pub="$key.pub"
+    install -d -o root -g root -m 0700 "$dir"
+    if [[ ! -f "$key" ]]; then
+        ssh-keygen -q -t ed25519 -N '' -C "nns-app-auto-$owner" -f "$key"
+        chown root:root "$key" "$pub"
+        chmod 0600 "$key"
+        chmod 0644 "$pub"
+    fi
+
+    remote_tmp="/tmp/nns-app-auto-${owner}.sh"
+    remote_pub="/tmp/nns-app-auto-${owner}.pub"
+    pub_copy=$(mktemp)
+    install -m 0644 "$pub" "$pub_copy"
+    control_dir=$(mktemp -d "/tmp/nns-app-ssh-${owner}.XXXXXX")
+    chown "$user":"$(id -gn "$user")" "$control_dir"
+    chmod 0700 "$control_dir"
+    control="$control_dir/control"
+
+    remote_auto_bootstrap_cleanup() {
+        remote_auto_user_exec "$user" ssh -O exit \
+            -o "ControlPath=$control" -p "$port" "$target" \
+            >/dev/null 2>&1 || true
+        rm -f "$pub_copy"
+        rm -rf "$control_dir"
+    }
+
+    log "Bootstrapping nns-app on '$target' (SSH and remote sudo may each prompt once)..."
+    if ! remote_auto_user_exec "$user" ssh -N -f \
+        -o ControlMaster=yes -o ControlPersist=120 \
+        -o "ControlPath=$control" \
+        -o StrictHostKeyChecking=accept-new \
+        -p "$port" "$target"; then
+        remote_auto_bootstrap_cleanup
+        die "Cannot establish the bootstrap SSH connection to '$target'."
+    fi
+
+    if ! remote_auto_user_exec "$user" scp \
+        -q -o "ControlPath=$control" -P "$port" \
+        "$ENGINE_PATH" "$target:$remote_tmp"; then
+        remote_auto_bootstrap_cleanup
+        die "Cannot upload nns-app to '$target'."
+    fi
+    if ! remote_auto_user_exec "$user" scp \
+        -q -o "ControlPath=$control" -P "$port" \
+        "$pub_copy" "$target:$remote_pub"; then
+        remote_auto_bootstrap_cleanup
+        die "Cannot upload the automatic-remote public key to '$target'."
+    fi
+
+    printf -v command '%s' "set -e; umask 077; mkdir -p \"\$HOME/.ssh\"; touch \"\$HOME/.ssh/authorized_keys\"; chmod 700 \"\$HOME/.ssh\"; chmod 600 \"\$HOME/.ssh/authorized_keys\"; key=\$(awk '{print \$1\" \"\$2}' '$remote_pub'); grep -Fq \"\$key\" \"\$HOME/.ssh/authorized_keys\" || printf '\\nrestrict,port-forwarding %s nns-app-auto-$owner\\n' \"\$key\" >>\"\$HOME/.ssh/authorized_keys\"; sudo /bin/bash '$remote_tmp' install; sudo /bin/bash '$remote_tmp' _remote-auto-authorize \"\$(id -un)\"; rm -f '$remote_tmp' '$remote_pub'"
+    if ! remote_auto_user_exec "$user" ssh -tt \
+        -o "ControlPath=$control" -p "$port" "$target" "$command"; then
+        remote_auto_user_exec "$user" ssh \
+            -o "ControlPath=$control" -p "$port" "$target" \
+            "rm -f '$remote_tmp' '$remote_pub'" >/dev/null 2>&1 || true
+        remote_auto_bootstrap_cleanup
+        die "Remote nns-app bootstrap failed on '$target'."
+    fi
+    remote_auto_bootstrap_cleanup
+}
+
+remote_auto_register() {
+    local alias=$1 target=$2 port=$3 identity=$4 dir known cfg tmp fingerprint output
+    validate_remote_alias "$alias"
+    validate_ssh_target "$target"
+    dir=$(remote_dir "$alias")
+    known=$(remote_known_hosts "$alias")
+    cfg=$(remote_cfg_file "$alias")
+    install -d -o root -g root -m 0700 "$dir"
+    touch "$known"
+    chown root:root "$known"
+    chmod 0600 "$known"
+    output=$(ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 \
+        -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$known" \
+        -o IdentitiesOnly=yes -i "$identity" -p "$port" "$target" \
+        "sudo -n $ENGINE_PATH _remote-auto version") ||
+        die "The dedicated automatic-remote SSH key or restricted sudo helper is not usable on '$target'."
+    grep -Fq "nns-app-remote-auto $VERSION" <<<"$output" ||
+        die "Remote '$target' did not activate nns-app automatic-remote $VERSION."
+    fingerprint=$(ssh-keygen -lf "$known" -E sha256 2>/dev/null | awk 'NR==1 {print $2}')
+    [[ -n "$fingerprint" ]] || die "Could not pin the SSH host key for '$target'."
+    tmp=$(mktemp)
+    {
+        printf 'SSH_TARGET=%q\n' "$target"
+        printf 'SSH_PORT=%q\n' "$port"
+        printf 'SSH_IDENTITY=%q\n' "$identity"
+        printf 'SSH_HOST_FINGERPRINT=%q\n' "$fingerprint"
+    } >"$tmp"
+    install -o root -g root -m 0600 "$tmp" "$cfg"
+    rm -f "$tmp"
+}
+
+
+remote_auto_is_current() {
+    local alias=$1 target=$2 port=$3 output
+    [[ -f "$(remote_cfg_file "$alias")" &&
+       -f "$(remote_dir "$alias")/id_ed25519" &&
+       -f "$(remote_known_hosts "$alias")" ]] || return 1
+    load_remote_cfg "$alias" || return 1
+    [[ "$SSH_TARGET" == "$target" && "$SSH_PORT" == "$port" ]] || return 1
+    output=$(remote_auto_command "$alias" version 2>/dev/null) || return 1
+    grep -Fq "nns-app-remote-auto $VERSION" <<<"$output"
+}
+
+remote_auto_install() {
+    require_root
+    local app=$1 requested_target=$2 requested_port=${3:-22}
+    local target port host owner alias exit_app gateway client resolved
+    validate_app_name "$app"
+    load_cfg "$app"
+    if [[ "${REMOTE_MODE:-}" != auto &&
+          ( -n "${VPN_TYPE:-}" || -n "${DEFAULT_PROFILE:-}" ) ]]; then
+        die "App '$app' already has a local VPN profile. Use a new app name for via --remote."
+    fi
+    resolved=$(remote_auto_resolve_ssh "$APP_USER" "$requested_target" "$requested_port")
+    IFS='|' read -r target port host <<<"$resolved"
+    host=${host%]}
+    host=${host#[}
+    [[ "$host" != *:* ]] ||
+        die "Automatic remote mode currently requires an SSH host with an IPv4 address or DNS name."
+    owner=$(remote_auto_owner_id "$app" "$target:$port")
+    alias=$(remote_auto_alias "$app" "$owner")
+    exit_app=$(remote_auto_exit_name "$owner")
+    gateway=$(remote_auto_gateway_name "$owner")
+    client=$(remote_auto_client_name "$owner")
+
+    if [[ "${REMOTE_MODE:-}" == auto && -n "${TRANSPORT_SSH_TARGET:-}" &&
+          "$TRANSPORT_SSH_TARGET" != "$target" ]]; then
+        die "App '$app' is already bound to remote '$TRANSPORT_SSH_TARGET'. Use a new app name or remove it first."
+    fi
+
+    if remote_auto_is_current "$alias" "$target" "$port"; then
+        log "Remote '$target' already runs automatic-remote $VERSION; bootstrap is current."
+    else
+        remote_auto_bootstrap "$app" "$requested_target" "$port" "$alias" "$owner"
+        remote_auto_register "$alias" "$target" "$port" "$(remote_dir "$alias")/id_ed25519"
+    fi
+
+    cfg_set "$app" REMOTE_MODE auto
+    cfg_set "$app" REMOTE_ALIAS "$alias"
+    cfg_set "$app" REMOTE_OWNER_ID "$owner"
+    cfg_set "$app" REMOTE_EXIT_APP "$exit_app"
+    cfg_set "$app" REMOTE_GATEWAY "$gateway"
+    cfg_set "$app" REMOTE_CLIENT "$client"
+    cfg_set "$app" TRANSPORT_SSH_TARGET "$target"
+    cfg_set "$app" TRANSPORT_SSH_IDENTITY "$(remote_dir "$alias")/id_ed25519"
+    cfg_set "$app" TRANSPORT_SSH_KNOWN_HOSTS "$(remote_known_hosts "$alias")"
+
+    log "Configured '$app' for automatic remote execution through '$target'."
+    log "State: pending provider profile; the environment cannot start yet."
+    log "Next: nns-app add $app /path/to/self-contained-profile.ovpn"
+}
+
+remote_auto_command_payload() {
+    local command
+    command=$(shell_join_quoted "$ENGINE_PATH" _remote-auto "$@")
+    printf 'exec sudo -n %s' "$command"
+}
+
+remote_auto_command() {
+    local alias=$1 payload; shift
+    remote_ssh_args "$alias"
+    payload=$(remote_auto_command_payload "$@")
+    "${REMOTE_SSH_ARGS[@]}" "$payload"
+}
+
+remote_auto_add_profile() {
+    require_root
+    local app=$1 src=$2 alias owner gateway client temp profile_name host
+    validate_app_name "$app"
+    load_cfg "$app"
+    [[ "${REMOTE_MODE:-}" == auto && -n "$REMOTE_ALIAS" && -n "$REMOTE_OWNER_ID" ]] ||
+        die "App '$app' is not configured for automatic remote mode."
+    src=$(readlink -f "$src")
+    local type
+    type=$(profile_type_from_file "$src" 2>/dev/null || true)
+    [[ -n "$type" ]] || die "Cannot identify '$src' as an OpenVPN or WireGuard profile."
+    case "$type" in
+        openvpn) validate_ovpn "$src" ;;
+        wireguard) validate_wireguard "$src" ;;
+    esac
+    alias=$REMOTE_ALIAS
+    owner=$REMOTE_OWNER_ID
+    gateway=$(remote_auto_gateway_name "$owner")
+    client=$(remote_auto_client_name "$owner")
+    load_remote_cfg "$alias"
+    host=${SSH_TARGET#*@}
+    host=${host#[}; host=${host%]}
+    profile_name=$(profile_name_from_path "$src" "$type")
+
+    log "Deploying '$profile_name' to '$SSH_TARGET' and creating its private gateway..."
+    remote_auto_command "$alias" deploy "$owner" "$host" "$SSH_PORT" "$profile_name" <"$src"
+    temp=$(mktemp --suffix=.nnslink)
+    remote_auto_command "$alias" export "$owner" >"$temp"
+    [[ -s "$temp" ]] || die "Automatic remote returned an empty .nnslink bundle."
+    remote_import_bundle "$alias" "$gateway" "$client" "$app" "$temp"
+    rm -f "$temp"
+
+    load_remote_cfg "$alias"
+    cfg_set "$app" REMOTE_MODE auto
+    cfg_set "$app" REMOTE_OWNER_ID "$owner"
+    cfg_set "$app" REMOTE_EXIT_APP "$(remote_auto_exit_name "$owner")"
+    cfg_set "$app" READY_TIMEOUT 30
+    cfg_set "$app" TRANSPORT_SSH_TARGET "$SSH_TARGET"
+    cfg_set "$app" TRANSPORT_SSH_IDENTITY "$SSH_IDENTITY"
+    cfg_set "$app" TRANSPORT_SSH_KNOWN_HOSTS "$(remote_known_hosts "$alias")"
+    log "Automatic remote '$app' is ready. Run: nns-app run $app <command>"
 }

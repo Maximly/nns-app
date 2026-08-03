@@ -80,7 +80,7 @@ vpn_exec() {
         openvpn)
             case "${TRANSPORT_TYPE:-direct}" in
                 direct|"") openvpn_exec "$app" "$profile" ;;
-                stunnel|cloak) transport_client_exec "$app" "$profile" ;;
+                stunnel|cloak|ssh) transport_client_exec "$app" "$profile" ;;
                 *) die "Unsupported local transport '${TRANSPORT_TYPE}'." ;;
             esac
             ;;
@@ -359,6 +359,16 @@ start_app() {
     local vpn_type profile_marker
     validate_app_name "$app"
     load_cfg "$app"
+
+    # `install <app> via --remote ...` intentionally creates a pending local
+    # environment before `add` deploys the provider profile and imports the
+    # generated client bundle. Report that state explicitly instead of falling
+    # through to the generic backend-detection error.
+    if [[ "${REMOTE_MODE:-}" == auto &&
+          ( -z "${DEFAULT_PROFILE:-}" || -z "${VPN_TYPE:-}" ) ]]; then
+        die "Automatic remote app '$app' is configured, but no provider profile has been deployed. Run: nns-app add $app /path/to/profile.ovpn"
+    fi
+
     vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
     [[ -n "$vpn_type" ]] || die "Cannot determine VPN backend for '$app'. Re-add its profile or configure --backend inherit."
 

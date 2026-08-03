@@ -55,7 +55,7 @@ load_gateway_cfg() {
     OPENVPN_LISTEN_PORT=${OPENVPN_LISTEN_PORT:-$LISTEN_PORT}
     TRANSPORT_SERVER_NAME=${TRANSPORT_SERVER_NAME:-$PUBLIC_HOST}
     case "$TRANSPORT" in
-        direct|stunnel|cloak) ;;
+        direct|stunnel|cloak|ssh) ;;
         *) die "Unsupported gateway transport '$TRANSPORT'." ;;
     esac
     validate_transport_server_name "$TRANSPORT_SERVER_NAME"
@@ -316,6 +316,25 @@ gateway_generate_crl_at() {
     rm -f "$tmp"
 }
 
+# `openssl crl` has no `-checkend` option (that option belongs to
+# `openssl x509`). Parse the CRL's nextUpdate value instead so fresh CRLs are
+# accepted and startup refreshes only when the remaining lifetime is short.
+gateway_crl_valid_for() {
+    local crl=$1 minimum_seconds=${2:-0}
+    local next_update next_epoch now_epoch
+
+    [[ "$minimum_seconds" =~ ^[0-9]+$ ]] || return 1
+    [[ -s "$crl" ]] || return 1
+    next_update=$(openssl crl -in "$crl" -noout -nextupdate 2>/dev/null) ||
+        return 1
+    [[ "$next_update" == nextUpdate=* ]] || return 1
+    next_update=${next_update#nextUpdate=}
+    next_epoch=$(LC_ALL=C date -u -d "$next_update" +%s 2>/dev/null) ||
+        return 1
+    now_epoch=$(date -u +%s) || return 1
+    (( next_epoch - now_epoch > minimum_seconds ))
+}
+
 gateway_crl_refresh() {
     require_root
     local gateway=$1 pki
@@ -420,6 +439,9 @@ PY_GATEWAY_POOL
         printf 'proto %s\n' "$proto_option"
         printf 'port %s\n' "$OPENVPN_LISTEN_PORT"
         [[ "${TRANSPORT:-direct}" == direct ]] || printf 'local 127.0.0.1\n'
+        # The managed interface uses an nns-app-specific name (ngw...), so
+        # OpenVPN cannot infer TUN vs TAP from the device prefix.
+        printf 'dev-type tun\n'
         printf 'dev %s\n' "$GATEWAY_TUN"
         printf 'topology subnet\n'
         printf 'server %s %s\n' "$network" "$netmask"
@@ -437,7 +459,6 @@ PY_GATEWAY_POOL
         printf 'auth SHA256\n'
         printf 'allow-compression no\n'
         printf 'keepalive 10 60\n'
-        printf 'persist-key\n'
         printf 'persist-tun\n'
         printf 'script-security 2\n'
         printf 'up "%s _gateway-tun-up %s"\n' "$ENGINE_PATH" "$gateway"
@@ -479,8 +500,7 @@ gateway_validate_staging() {
        -s "$pki/crl.pem" ]] || return 1
     openssl verify -CAfile "$pki/ca.crt" \
         "$pki/server.crt" >/dev/null 2>&1 || return 1
-    openssl crl -in "$pki/crl.pem" \
-        -noout -checkend 1 >/dev/null 2>&1 || return 1
+    gateway_crl_valid_for "$pki/crl.pem" 1 || return 1
     grep -Eq '^tls-crypt-v2[[:space:]]+' "$root/server.conf" || return 1
     grep -Eq '^up[[:space:]]+' "$root/server.conf" || return 1
     transport=$(awk -F= '/^TRANSPORT=/{gsub(/^"|"$/, "", $2); print $2; exit}' "$root/gateway.cfg")
@@ -497,6 +517,7 @@ gateway_validate_staging() {
                -s "$root/transport/public.key" &&
                -s "$root/transport/private.key" ]] || return 1
             ;;
+        ssh) ;;
         *) return 1 ;;
     esac
 }
@@ -512,7 +533,7 @@ gateway_create() {
 
     validate_gateway_name "$gateway"
     validate_app_name "$via_app"
-    case "$transport" in direct|stunnel|cloak) ;; *) die "Unsupported transport '$transport'." ;; esac
+    case "$transport" in direct|stunnel|cloak|ssh) ;; *) die "Unsupported transport '$transport'." ;; esac
     if [[ "$transport" == cloak ]]; then
         transport_server_name=${transport_server_name:-www.bing.com}
         validate_transport_server_name "$transport_server_name"
@@ -547,6 +568,11 @@ gateway_create() {
     fi
     if [[ "$transport" == direct ]]; then
         openvpn_listen_proto=$listen_proto
+        openvpn_listen_port=$listen_port
+    elif [[ "$transport" == ssh ]]; then
+        [[ "$listen_proto" == tcp ]] ||
+            die "Transport 'ssh' requires a TCP loopback listener."
+        openvpn_listen_proto=tcp
         openvpn_listen_port=$listen_port
     else
         [[ "$listen_proto" == tcp ]] ||
@@ -609,15 +635,23 @@ GATEWAY_CONFIG_EOF
     chown root:root "$staging/gateway.cfg"
     chmod 0644 "$staging/gateway.cfg"
 
-    if ! gateway_prepare_transport "$gateway" "$staging" "$transport" ||
-       ! gateway_generate_pki "$gateway" "$staging" ||
-       ! gateway_write_server_config "$gateway" "$staging" ||
-       ! gateway_write_transport_config "$gateway" "$staging" ||
-       ! gateway_validate_staging "$gateway" "$staging"; then
+    local failed_stage=""
+    if ! gateway_prepare_transport "$gateway" "$staging" "$transport"; then
+        failed_stage="transport preparation"
+    elif ! gateway_generate_pki "$gateway" "$staging"; then
+        failed_stage="PKI generation"
+    elif ! gateway_write_server_config "$gateway" "$staging"; then
+        failed_stage="OpenVPN server configuration"
+    elif ! gateway_write_transport_config "$gateway" "$staging"; then
+        failed_stage="transport configuration"
+    elif ! gateway_validate_staging "$gateway" "$staging"; then
+        failed_stage="staging validation"
+    fi
+    if [[ -n "$failed_stage" ]]; then
         rm -rf "$staging"
         release_lock "gateway-$gateway"
         release_lock global
-        die "Failed to create gateway '$gateway'; staged files were removed."
+        die "Failed to create gateway '$gateway' during $failed_stage; staged files were removed."
     fi
 
     mv "$staging" "$(gateway_dir "$gateway")"
@@ -638,11 +672,18 @@ GATEWAY_CONFIG_EOF
     release_lock global
 
     log "Created managed OpenVPN gateway '$gateway' with '$transport' transport."
-    log "Public endpoint: $public_host:$public_port/$listen_proto"
-    [[ "$transport" == direct ]] || log "Private OpenVPN listener: 127.0.0.1:$openvpn_listen_port/tcp"
+    if [[ "$transport" == ssh ]]; then
+        log "SSH endpoint:    $public_host:$public_port/tcp"
+        log "Private OpenVPN listener: 127.0.0.1:$openvpn_listen_port/tcp"
+    else
+        log "Public endpoint: $public_host:$public_port/$listen_proto"
+        [[ "$transport" == direct ]] || log "Private OpenVPN listener: 127.0.0.1:$openvpn_listen_port/tcp"
+    fi
     log "Client pool:     $client_pool"
     log "Remote exit:     $via_app"
-    warn "Ensure the host firewall and upstream NAT/router allow $listen_proto port $listen_port."
+    if [[ "$transport" != ssh ]]; then
+        warn "Ensure the host firewall and upstream NAT/router allow $listen_proto port $listen_port."
+    fi
 }
 
 iptables_chain_ensure() {
@@ -1003,7 +1044,7 @@ gateway_server_exec() {
     config=$(gateway_server_config "$gateway")
     [[ -f "$config" ]] || die "Gateway server config is missing: $config"
     case "${TRANSPORT:-direct}" in
-        direct) exec /usr/sbin/openvpn --config "$config" ;;
+        direct|ssh) exec /usr/sbin/openvpn --config "$config" ;;
         stunnel|cloak) gateway_transport_server_exec "$gateway" ;;
         *) die "Unsupported gateway transport '$TRANSPORT'." ;;
     esac
@@ -1025,8 +1066,7 @@ gateway_start() {
         >/dev/null 2>&1 || true
 
     pki=$(gateway_pki_dir "$gateway")
-    if ! openssl crl -in "$pki/crl.pem" \
-        -noout -checkend 604800 >/dev/null 2>&1; then
+    if ! gateway_crl_valid_for "$pki/crl.pem" 604800; then
         gateway_crl_refresh "$gateway"
     fi
     release_lock "gateway-$gateway"
@@ -1047,17 +1087,29 @@ gateway_start() {
     while (( SECONDS < deadline )); do
         if ip link show dev "$GATEWAY_TUN" up >/dev/null 2>&1 &&
            systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
-            log "Started gateway '$gateway' on $PUBLIC_HOST:$PUBLIC_PORT/$LISTEN_PROTO via $VIA_APP."
+            if [[ "${TRANSPORT:-direct}" == ssh ]]; then
+                log "Started loopback gateway '$gateway' on 127.0.0.1:$OPENVPN_LISTEN_PORT/tcp via $VIA_APP (SSH endpoint $PUBLIC_HOST:$PUBLIC_PORT)."
+            else
+                log "Started gateway '$gateway' on $PUBLIC_HOST:$PUBLIC_PORT/$LISTEN_PROTO via $VIA_APP."
+            fi
             return 0
         fi
-        systemctl is-failed --quiet "nns-gateway@${gateway}.service" &&
+        if systemctl is-failed --quiet "nns-gateway@${gateway}.service" ||
+           [[ "$(systemctl show -p SubState --value "nns-gateway@${gateway}.service" 2>/dev/null || true)" == auto-restart ]]; then
             break
+        fi
         sleep 0.25
     done
 
-    warn "Gateway service started but its OpenVPN interface '$GATEWAY_TUN' is not ready."
+    warn "Gateway service did not create its OpenVPN interface '$GATEWAY_TUN'."
     journalctl -u "nns-gateway@${gateway}.service" \
         -n 80 -o cat --no-pager >&2 2>/dev/null || true
+
+    # Do not leave an invalid configuration in systemd's restart loop. The
+    # caller can repair/reconcile the gateway and start it again explicitly.
+    systemctl stop "nns-gateway@${gateway}.service" >/dev/null 2>&1 || true
+    systemctl reset-failed "nns-gateway@${gateway}.service" >/dev/null 2>&1 || true
+    gateway_down "$gateway" >/dev/null 2>&1 || true
     return 1
 }
 
@@ -1670,10 +1722,17 @@ gateway_status() {
     printf 'Diagnosis:         %s\n' "$diagnosis"
     printf 'Backend:           OpenVPN server\n'
     printf 'Transport:         %s\n' "${TRANSPORT:-direct}"
-    printf 'Public endpoint:   %s:%s/%s\n' \
-        "$PUBLIC_HOST" "$PUBLIC_PORT" "$LISTEN_PROTO"
-    printf 'Local listener:    0.0.0.0:%s/%s (%s; pid=%s)\n' \
-        "$LISTEN_PORT" "$LISTEN_PROTO" "$listening" "${pid:-0}"
+    if [[ "${TRANSPORT:-direct}" == ssh ]]; then
+        printf 'SSH endpoint:      %s:%s/tcp\n' "$PUBLIC_HOST" "$PUBLIC_PORT"
+        printf 'Local listener:    127.0.0.1:%s/%s (%s; pid=%s)\n' \
+            "$OPENVPN_LISTEN_PORT" "$OPENVPN_LISTEN_PROTO" "$listening" "${pid:-0}"
+    else
+        printf 'Public endpoint:   %s:%s/%s\n' \
+            "$PUBLIC_HOST" "$PUBLIC_PORT" "$LISTEN_PROTO"
+        printf 'Local listener:    %s:%s/%s (%s; pid=%s)\n' \
+            "$([[ "${TRANSPORT:-direct}" == direct ]] && printf '0.0.0.0' || printf '127.0.0.1')" \
+            "$LISTEN_PORT" "$LISTEN_PROTO" "$listening" "${pid:-0}"
+    fi
     printf 'Client pool:       %s\n' "$CLIENT_POOL"
     printf 'Remote NNS exit:   %s (%s)\n' \
         "$VIA_APP" "$upstream_state"

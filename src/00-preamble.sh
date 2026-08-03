@@ -21,7 +21,8 @@
 # Author: Maxim Lyadvinsky
 #
 # Public commands:
-#   install [<app_name> [--backend inherit] [--via <upstream-app>|host]]
+#   install [<app_name> [--backend inherit] [--via <upstream-app>|host]
+#                         [--via-remote <user@host> [--remote-port <port>]]]
 #   remove  <app_name>
 #   purge
 #   list
@@ -45,7 +46,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.2.5"
+readonly VERSION="1.3.4"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -165,8 +166,11 @@ reset_app_cfg_vars() {
     HOST_ADDR="" NS_ADDR="" VETH_HOST="" VETH_NS=""
     TRANSPORT_TYPE="" TRANSPORT_REMOTE_HOST="" TRANSPORT_REMOTE_PORT=""
     TRANSPORT_LOCAL_PORT="" TRANSPORT_CONFIG=""
-    REMOTE_ALIAS="" REMOTE_GATEWAY="" REMOTE_CLIENT=""
-    REMOTE_PROFILE_GENERATION="" REMOTE_SERVER_FINGERPRINT=""
+    TRANSPORT_SSH_TARGET="" TRANSPORT_SSH_IDENTITY=""
+    TRANSPORT_SSH_KNOWN_HOSTS="" TRANSPORT_SSH_REMOTE_PORT=""
+    REMOTE_MODE="" REMOTE_ALIAS="" REMOTE_GATEWAY="" REMOTE_CLIENT=""
+    REMOTE_OWNER_ID="" REMOTE_EXIT_APP="" REMOTE_PROFILE_GENERATION=""
+    REMOTE_SERVER_FINGERPRINT=""
 }
 
 reset_gateway_cfg_vars() {
@@ -224,6 +228,7 @@ usage() {
     cat <<'USAGE'
 Usage:
   nns-app install [app_name [--backend inherit] [--via <upstream-app>|host]]
+  nns-app install <app_name> via --remote <user@host> [--remote-port <port>]
   nns-app remove  <app_name>
   nns-app purge
   nns-app list
@@ -259,9 +264,17 @@ Usage:
   nns-app remote rotate <local_app>
   nns-app remote status <local_app|alias>
 
+Simple managed-remote mode:
+  nns-app install <app_name> via --remote <user@host> [--remote-port <port>]
+  nns-app add <app_name> <self-contained-profile.ovpn|wireguard.conf>
+  nns-app run <app_name> <command> [arguments...]
+
 Examples:
   sudo ./nns-app.sh install
   sudo nns-app install my-upstream-vpn
+  nns-app install my-private-app via --remote maxim@mlcloud
+  nns-app add my-private-app ~/my-base-profile.ovpn
+  nns-app run my-private-app ping 1.1.1.1
   sudo nns-app add my-upstream-vpn ~/my-base-profile.ovpn
   sudo nns-app install my-private-app --via my-upstream-vpn
   sudo nns-app install my-shared-app --backend inherit --via my-remote-exit

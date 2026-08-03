@@ -68,7 +68,9 @@ The gateway control listener remains in the remote host namespace so the
 encrypted client connection uses the host's normal public ingress and egress
 route. In direct mode this is the OpenVPN listener. In stunnel or Cloak mode,
 the public listener is the wrapper and OpenVPN must bind only to its allocated
-loopback TCP port.
+loopback TCP port. In automatic SSH-forward mode, OpenVPN also binds only to an
+allocated loopback TCP port and the already reachable SSH daemon is the sole
+public ingress.
 
 Transport configuration is regenerated from root-owned gateway/client state.
 Cloak's allowed UID set must include active clients only. A wrapper and its
@@ -111,9 +113,17 @@ rules are prohibited.
 
 ## Remote management and bundles
 
-SSH is a management plane only. `remote connect`, `sync`, and `rotate` may
-retrieve profiles over SSH, but a started local app must connect directly to
-the gateway public endpoint without an SSH tunnel or live control session.
+Manual `remote connect`, `sync`, and `rotate` use SSH as a management plane
+only; their started local app connects to the gateway public endpoint without
+a live SSH control session.
+
+Automatic `install <app> via --remote` is the explicit exception: it uses a
+supervised SSH local forward as the transport to a loopback-only remote
+gateway. The automatic transport must use a dedicated root-owned identity,
+pinned host key, non-interactive authentication, `ExitOnForwardFailure`, and
+server-alive failure detection. Internal SSH `.nnslink` bundles must not be
+accepted by generic manual import because they intentionally omit the local
+private identity and host-key file.
 
 Remote commands must:
 

@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.3.4
+
+- Fixed managed OpenVPN gateways with custom `ngw...` interface names by emitting `dev-type tun` before `dev`.
+- Gateway startup now detects systemd auto-restart immediately, prints the relevant journal, and stops the failed unit instead of leaving an endless restart loop.
+- Automatic-remote deployment now reports a precise gateway-start failure while preserving the working remote provider exit for an idempotent retry.
+- Removed obsolete `persist-key` from newly generated managed OpenVPN server and client profiles.
+
+## 1.3.3
+
+- Fixed managed gateway creation always failing during staging: `openssl crl` does not support the certificate-only `-checkend` option, so every freshly generated CRL was rejected even though it was valid.
+- Added a portable CRL lifetime check based on `openssl crl -nextupdate` and GNU `date`; gateway startup now refreshes CRLs only when they are actually close to expiration.
+- Gateway creation now identifies the failed staging phase instead of returning only a generic cleanup error.
+- Automatic-remote uploads now retain the sanitized provider profile name instead of inheriting the random `mktemp` prefix.
+
+## 1.3.2
+
+- Automatic remote environments now report a clear pending-profile state after `install ... via --remote ...` and before `add` deploys a provider profile.
+- `start` and auto-starting `run` now print the exact required `nns-app add <app> <profile>` command instead of the misleading generic backend-detection error.
+- `status` reports `Health: PENDING` and `Backend: pending remote deployment` for this intentional intermediate state.
+
+## 1.3.1
+
+- Fixed automatic remote deployment losing all arguments after `_remote-auto deploy`. The global newline/tab `IFS` made `${array[*]}` join quoted arguments with newlines, so the remote shell executed only the first line. Remote command payloads now use an explicit space-delimited, shell-quoted builder.
+- Fixed app installation executing backticked command names embedded in the generated configuration heredoc, which produced misleading `add`, `link import`, and `remote` errors even though installation continued.
+- Added regression coverage for exact remote argument preservation, spaces and shell metacharacters, and executable-free configuration generation.
+
+## 1.3.0
+
+- Added a three-command automatic remote workflow: `install <app> via --remote <user@host>`, `add <app> <provider-profile>`, and `run <app> <command>`.
+- Bootstrap or upgrade the same nns-app engine on the remote host over the user's existing SSH access, install a dedicated root-owned deployment key, pin the remote host key, and create a restricted `_remote-auto` sudo entry.
+- Deploy the provider OpenVPN or WireGuard profile into a hidden remote exit environment, create and start a private managed OpenVPN gateway, enroll a unique client, and import the generated `.nnslink` locally without exposing the internal objects to the normal workflow.
+- Added an SSH-forward gateway transport. The remote OpenVPN listener binds only to `127.0.0.1`; a supervised local SSH forward uses the already reachable SSH port, so no cloud firewall or extra public listener is required.
+- Automatic remote `run` starts a stopped environment on demand. Existing manual `remote`, `gateway`, transport, and `.nnslink` commands remain available for fine tuning.
+- Extended synchronization, credential rotation, status, configuration metadata, endpoint pinning, tests, and documentation for automatic remote deployments.
+
 ## 1.2.5
 
 - Added an adaptive per-environment data-path watchdog for OpenVPN and WireGuard.

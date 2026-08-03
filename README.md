@@ -4,7 +4,8 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.2.5  
+**Release:** 1.3.4
+
 **Supported platform:** Ubuntu with systemd and iptables  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
 
@@ -22,8 +23,8 @@ single-file installer: `nns-app-install.sh`.
 - Adaptive data-path watchdog that preserves running application namespaces.
 - Snap desktop-application support inside private mount namespaces.
 - Managed remote OpenVPN gateways routed through a selected remote nns-app exit.
-- SSH-based remote enrollment, synchronization, credential rotation, and status.
-- Direct, stunnel, and Cloak gateway transports with portable `.nnslink` bundles.
+- Three-command automatic remote deployment over SSH, plus manual enrollment, synchronization, credential rotation, and status.
+- Direct, SSH-forward, stunnel, and Cloak gateway transports with portable `.nnslink` bundles.
 - Unique client certificates and TLS Crypt v2 keys for gateway clients.
 - Collision-safe network, routing-table, and policy-priority allocation.
 - Dedicated, tagged gateway firewall chains.
@@ -59,6 +60,57 @@ expands `~` before `sudo` starts `nns-app`, so a command such as
 the current user's home, not from `/root`. Imported profiles are copied into
 root-owned nns-app storage. Gateway exports are written with mode `0600` and,
 when invoked through `sudo`, ownership is returned to the invoking user.
+
+## Simple automatic remote mode
+
+For the usual case—run a local application through a provider profile that
+must execute on a remote Linux host—the public workflow is only:
+
+```bash
+nns-app install my-private-app via --remote maxim@mlcloud
+nns-app add my-private-app ~/my-base-profile.ovpn
+nns-app run my-private-app ping 1.1.1.1
+```
+
+The compact `--via-remote maxim@mlcloud` form remains accepted as an alias.
+
+The first command uses the invoking user's existing SSH access. It confirms and
+pins the host key, installs or upgrades the same nns-app version remotely,
+creates a dedicated root-owned SSH key for subsequent unattended operation, and
+installs a restricted remote helper. Remote `sudo` may request a password once
+during this bootstrap.
+
+The second command validates the self-contained provider profile locally and
+then deploys it remotely. nns-app automatically creates a hidden remote exit,
+a loopback-only managed OpenVPN gateway, a unique client credential, and the
+local `.nnslink` profile. The default data transport is a supervised SSH local
+forward through the existing SSH port, so no additional cloud firewall rule or
+public gateway port is needed.
+
+The third command starts the complete local/remote path when it is stopped and
+then executes the requested process inside the local namespace. Normal status,
+synchronization, and credential rotation remain available:
+
+```bash
+nns-app status my-private-app
+sudo nns-app remote status my-private-app
+sudo nns-app remote sync my-private-app
+sudo nns-app remote rotate my-private-app
+```
+
+Requirements for automatic mode:
+
+- use a new or otherwise unconfigured application name; nns-app will not silently convert an existing local-profile environment into a remote one;
+- `ssh maxim@mlcloud` must already work for the invoking user, using a key,
+  agent, or an interactive password during the first bootstrap;
+- the remote SSH endpoint must resolve to IPv4; nns-app's managed data plane is currently IPv4-only;
+- that remote account must be allowed to run `sudo` during bootstrap;
+- provider OpenVPN profiles must contain inline credentials and must not need
+  an interactive password, as in local nns-app mode.
+
+The lower-level `remote`, `gateway`, `link`, `--transport`, and manual export
+commands remain supported for custom listeners, public direct gateways,
+stunnel, Cloak, external PKI, or other fine tuning.
 
 ## Build or use the pre-built installer
 
@@ -674,9 +726,16 @@ TRANSPORT_REMOTE_HOST=""
 TRANSPORT_REMOTE_PORT=""
 TRANSPORT_LOCAL_PORT=""
 TRANSPORT_CONFIG=""
+TRANSPORT_SSH_TARGET=""
+TRANSPORT_SSH_IDENTITY=""
+TRANSPORT_SSH_KNOWN_HOSTS=""
+TRANSPORT_SSH_REMOTE_PORT=""
+REMOTE_MODE=""
 REMOTE_ALIAS=""
 REMOTE_GATEWAY=""
 REMOTE_CLIENT=""
+REMOTE_OWNER_ID=""
+REMOTE_EXIT_APP=""
 REMOTE_PROFILE_GENERATION=""
 REMOTE_SERVER_FINGERPRINT=""
 ```

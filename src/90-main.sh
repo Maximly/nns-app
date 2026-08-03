@@ -93,6 +93,19 @@ main() {
                 die "NNS app '$2' did not become online within $3 seconds."
             exit
             ;;
+        _remote-auto-authorize)
+            require_root
+            [[ $# -eq 2 ]] || die "_remote-auto-authorize requires a remote account name."
+            remote_auto_authorize "$2"
+            exit
+            ;;
+        _remote-auto)
+            require_root
+            (( $# >= 2 )) || die "_remote-auto requires an operation."
+            shift
+            remote_auto_dispatch "$@"
+            exit
+            ;;
         _watchdog)
             require_root
             [[ $# -eq 2 ]] || die "_watchdog requires app_name."
@@ -109,6 +122,7 @@ main() {
                 install_engine
             else
                 local install_app_name=$2 install_via="__default__" install_backend="__default__"
+                local install_remote="" install_remote_port=22
                 shift 2
                 while (( $# > 0 )); do
                     case "$1" in
@@ -121,6 +135,41 @@ main() {
                             install_via=${1#--via=}
                             shift
                             ;;
+                        via)
+                            (( $# >= 2 )) || die "via requires --remote <user@host>."
+                            case "$2" in
+                                --remote)
+                                    (( $# >= 3 )) || die "via --remote requires [user@]host."
+                                    install_remote=$3
+                                    shift 3
+                                    ;;
+                                --remote=*)
+                                    install_remote=${2#--remote=}
+                                    shift 2
+                                    ;;
+                                *)
+                                    die "Only 'via --remote <user@host>' is supported in the automatic remote form."
+                                    ;;
+                            esac
+                            ;;
+                        --via-remote|--remote)
+                            (( $# >= 2 )) || die "$1 requires [user@]host."
+                            install_remote=$2
+                            shift 2
+                            ;;
+                        --via-remote=*|--remote=*)
+                            install_remote=${1#*=}
+                            shift
+                            ;;
+                        --remote-port)
+                            (( $# >= 2 )) || die "--remote-port requires a number."
+                            install_remote_port=$2
+                            shift 2
+                            ;;
+                        --remote-port=*)
+                            install_remote_port=${1#--remote-port=}
+                            shift
+                            ;;
                         --backend)
                             (( $# >= 2 )) || die "--backend requires 'inherit'."
                             install_backend=$2
@@ -131,18 +180,25 @@ main() {
                             shift
                             ;;
                         *)
-                            die "Usage: nns-app install <app_name> [--backend inherit] [--via <upstream-app>|host]"
+                            die "Usage: nns-app install <app_name> via --remote <user@host>"
                             ;;
                     esac
                 done
-                case "$install_backend" in
-                    __default__) install_app "$install_app_name" "$install_via" ;;
-                    inherit)
-                        install_app "$install_app_name" "$install_via"
-                        set_inherit_backend "$install_app_name" "$install_via"
-                        ;;
-                    *) die "Unsupported app backend '$install_backend'; only 'inherit' is valid without a profile." ;;
-                esac
+                if [[ -n "$install_remote" ]]; then
+                    [[ "$install_via" == __default__ && "$install_backend" == __default__ ]] ||
+                        die "--via-remote cannot be combined with --via or --backend."
+                    install_app "$install_app_name" __default__
+                    remote_auto_install "$install_app_name" "$install_remote" "$install_remote_port"
+                else
+                    case "$install_backend" in
+                        __default__) install_app "$install_app_name" "$install_via" ;;
+                        inherit)
+                            install_app "$install_app_name" "$install_via"
+                            set_inherit_backend "$install_app_name" "$install_via"
+                            ;;
+                        *) die "Unsupported app backend '$install_backend'; only 'inherit' is valid without a profile." ;;
+                    esac
+                fi
             fi
             ;;
         remove)
@@ -197,7 +253,12 @@ main() {
             else
                 [[ $# -eq 3 ]] ||
                     die "Options are valid only with: nns-app add <app_name> any [country] [--refresh] [--via <upstream-app>|host]"
-                if [[ "$3" == *.nnslink ]]; then
+                load_cfg "$2"
+                if [[ "${REMOTE_MODE:-}" == auto ]]; then
+                    [[ "$3" != *.nnslink ]] ||
+                        die "Automatic remote mode accepts the provider profile, not a generated .nnslink bundle."
+                    remote_auto_add_profile "$2" "$3"
+                elif [[ "$3" == *.nnslink ]]; then
                     nnslink_import "$2" "$3"
                 else
                     add_profile "$2" "$3"
@@ -265,6 +326,8 @@ main() {
                     done
                     [[ -n "$gw_via" && -n "$gw_listen" && -n "$gw_public" ]] ||
                         die "gateway create requires --via, --listen and --public."
+                    [[ "$gw_transport" != ssh ]] ||
+                        die "Transport 'ssh' is managed internally by install --via-remote."
                     gateway_create "$gw_name" "$gw_via" "$gw_listen" "$gw_public" "$gw_pool" "$gw_dns" "$gw_transport" "$gw_server_name"
                     ;;
                 start)

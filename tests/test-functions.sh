@@ -50,6 +50,35 @@ for chain in "$host_fwd" "$host_mangle" "$ns_fwd" "$ns_nat" "$ns_mangle"; do
     (( ${#chain} <= 28 )) || fail "iptables chain name too long: $chain"
 done
 
+# A custom gateway device name does not begin with tun/tap. OpenVPN therefore
+# requires an explicit dev-type or it rejects the server directive.
+gateway_cfg_root="$TEST_TMP/gateway-config"
+mkdir -p "$gateway_cfg_root/pki"
+cat >"$gateway_cfg_root/gateway.cfg" <<'EOF_TEST_GATEWAY_CFG'
+GATEWAY_NAME=unit-gateway
+GATEWAY_BACKEND=openvpn
+VIA_APP=unit-exit
+TRANSPORT=ssh
+LISTEN_PROTO=tcp
+LISTEN_PORT=24443
+OPENVPN_LISTEN_PROTO=tcp
+OPENVPN_LISTEN_PORT=24443
+PUBLIC_HOST=mlcloud
+PUBLIC_PORT=22
+CLIENT_POOL=10.253.99.0/24
+DNS_SERVERS='1.1.1.1 9.9.9.9'
+GATEWAY_TUN=ngwdeadbeef
+SERVER_CN=nns-gateway-unit-gateway
+EOF_TEST_GATEWAY_CFG
+gateway_write_server_config unit-gateway "$gateway_cfg_root"
+grep -Fxq 'dev-type tun' "$gateway_cfg_root/server.conf" ||
+    fail 'gateway config omitted dev-type tun'
+grep -Fxq 'dev ngwdeadbeef' "$gateway_cfg_root/server.conf" ||
+    fail 'gateway config omitted custom device name'
+dev_type_line=$(grep -nFx 'dev-type tun' "$gateway_cfg_root/server.conf" | cut -d: -f1)
+dev_line=$(grep -nFx 'dev ngwdeadbeef' "$gateway_cfg_root/server.conf" | cut -d: -f1)
+(( dev_type_line < dev_line )) || fail 'dev-type must precede the custom dev line'
+
 lock_key="test-functions-$$"
 acquire_lock "$lock_key"
 acquire_lock "$lock_key"
@@ -117,6 +146,31 @@ gateway_status_file() {
 parsed=$(gateway_connected_clients my-relay)
 expected='my-linux-client|203.0.113.10:41000|10.253.1.2|1234|5678|2026-08-03 09:59:00'
 [[ "$parsed" == "$expected" ]] || fail "status-v3 parser: $parsed"
+
+# CRL validity must be derived from nextUpdate. `openssl crl` has no
+# certificate-style -checkend option.
+(
+    crl="$TEST_TMP/test.crl"
+    printf 'placeholder
+' >"$crl"
+    future=$(date -u -d '+2 hours' '+%b %e %T %Y GMT')
+    past=$(date -u -d '-2 hours' '+%b %e %T %Y GMT')
+    openssl() {
+        printf 'nextUpdate=%s
+' "$future"
+    }
+    gateway_crl_valid_for "$crl" 60 || fail 'future CRL was rejected'
+    if gateway_crl_valid_for "$crl" 10800; then
+        fail 'CRL with insufficient remaining lifetime was accepted'
+    fi
+    openssl() {
+        printf 'nextUpdate=%s
+' "$past"
+    }
+    if gateway_crl_valid_for "$crl" 0; then
+        fail 'expired CRL was accepted'
+    fi
+)
 
 tmp_pki="$TEST_TMP/pki"
 tmp_backup="$TEST_TMP/pki-backup"
@@ -322,5 +376,103 @@ PY_TEST_MALICIOUS
 if nnslink_manifest_read "$TEST_TMP/malicious.nnslink" "$TEST_TMP/malicious-out" >/dev/null 2>&1; then
     fail 'unsafe nnslink manifest metadata accepted'
 fi
+
+
+# Both the human-readable `via --remote` form and the compact legacy alias
+# must route to the same automatic installer without invoking the live system.
+(
+    reexec_as_root_if_needed() { :; }
+    install_app() { printf 'install:%s:%s\n' "$1" "$2"; }
+    remote_auto_install() { printf 'remote:%s:%s:%s\n' "$1" "$2" "$3"; }
+    output=$(main install my-app via --remote maxim@mlcloud --remote-port 2222)
+    grep -Fq 'install:my-app:__default__' <<<"$output" || fail 'via --remote did not install the local app'
+    grep -Fq 'remote:my-app:maxim@mlcloud:2222' <<<"$output" || fail 'via --remote parser'
+    output=$(main install my-app --via-remote maxim@mlcloud)
+    grep -Fq 'remote:my-app:maxim@mlcloud:22' <<<"$output" || fail '--via-remote alias parser'
+)
+
+owner=0123456789abcdef
+[[ "$(remote_auto_exit_name "$owner")" == ra-0123456789ab-exit ]] || fail 'automatic remote exit name'
+[[ "$(remote_auto_gateway_name "$owner")" == ra-0123456789ab-gw ]] || fail 'automatic remote gateway name'
+[[ "$(remote_auto_client_name "$owner")" == ra-0123456789ab-client ]] || fail 'automatic remote client name'
+if ( validate_remote_owner_id '../bad' ) >/dev/null 2>&1; then
+    fail 'unsafe automatic-remote owner ID accepted'
+fi
+
+ssh_bundle_dir="$TEST_TMP/ssh-bundle"
+mkdir -p "$ssh_bundle_dir"
+printf '%s\n' 'client' 'dev tun' 'proto tcp-client' 'remote 127.0.0.1 11940' >"$ssh_bundle_dir/client.ovpn"
+cat >"$ssh_bundle_dir/manifest.json" <<'EOF_SSH_MANIFEST'
+{
+  "format": "nnslink",
+  "version": 1,
+  "gateway": "my-relay",
+  "client": "my-linux-client",
+  "generation": 3,
+  "backend": "openvpn",
+  "transport": "ssh",
+  "public_host": "mlcloud.example.net",
+  "public_port": 22,
+  "local_port": 11940,
+  "ssh_remote_port": 24567
+}
+EOF_SSH_MANIFEST
+python3 - "$ssh_bundle_dir" "$TEST_TMP/ssh-valid.nnslink" <<'PY_TEST_SSH_BUNDLE'
+import pathlib,sys,tarfile
+root=pathlib.Path(sys.argv[1])
+with tarfile.open(sys.argv[2], 'w:gz') as tf:
+    tf.add(root/'manifest.json', arcname='manifest.json')
+    tf.add(root/'client.ovpn', arcname='client.ovpn')
+PY_TEST_SSH_BUNDLE
+ssh_manifest_output=$(nnslink_manifest_read "$TEST_TMP/ssh-valid.nnslink" "$TEST_TMP/ssh-extracted")
+grep -Fq 'TRANSPORT="ssh"' <<<"$ssh_manifest_output" || fail 'SSH nnslink transport parsing'
+grep -Fq 'SSH_REMOTE_PORT=24567' <<<"$ssh_manifest_output" || fail 'SSH nnslink private port parsing'
+
+# Remote command payloads must use literal spaces even though nns-app globally
+# sets IFS to newline/tab. Every argument must survive one remote-shell parse.
+remote_payload=$(remote_auto_command_payload \
+    deploy 0123456789abcdef mlcloud 22 'Norway Sandefjord S23.ovpn')
+[[ "$remote_payload" != *$'\n'* ]] || fail 'automatic-remote payload contains argument-separating newlines'
+mapfile -d '' -t remote_argv < <(
+    PAYLOAD="$remote_payload" python3 - <<'PY_REMOTE_ARGV'
+import os
+import shlex
+import sys
+for arg in shlex.split(os.environ['PAYLOAD']):
+    sys.stdout.buffer.write(arg.encode() + b'\0')
+PY_REMOTE_ARGV
+)
+expected_remote_argv=(
+    exec sudo -n /usr/local/sbin/nns_app.sh _remote-auto
+    deploy 0123456789abcdef mlcloud 22 'Norway Sandefjord S23.ovpn'
+)
+[[ "${remote_argv[*]}" == "${expected_remote_argv[*]}" ]] ||
+    fail "automatic-remote payload lost arguments: ${remote_argv[*]}"
+
+manual_payload=$(remote_command_payload gateway client export \
+    my-relay 'client with spaces' --output '-')
+[[ "$manual_payload" != *$'\n'* ]] || fail 'manual remote payload contains argument-separating newlines'
+[[ "$manual_payload" == *'client\ with\ spaces'* ]] ||
+    fail 'manual remote payload did not shell-quote a spaced argument'
+
+
+# Starting an automatic-remote app before `add` must report the intended
+# pending state rather than a generic missing-backend error.
+(
+    require_root() { :; }
+    validate_app_name() { :; }
+    load_cfg() {
+        REMOTE_MODE=auto
+        DEFAULT_PROFILE=
+        VPN_TYPE=
+    }
+    output=$(start_app pending-remote off __default__ 2>&1) &&
+        fail 'pending automatic-remote app unexpectedly started'
+    grep -Fq "no provider profile has been deployed" <<<"$output" ||
+        fail "pending automatic-remote start message: $output"
+    grep -Fq "nns-app add pending-remote /path/to/profile.ovpn" <<<"$output" ||
+        fail 'pending automatic-remote start omitted recovery command'
+)
+
 
 echo 'Function tests passed.'

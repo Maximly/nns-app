@@ -25,6 +25,8 @@ ensure_dependencies() {
     command -v sudo >/dev/null 2>&1     || missing+=(sudo)
     command -v openssl >/dev/null 2>&1  || missing+=(openssl)
     command -v python3 >/dev/null 2>&1  || missing+=(python3)
+    command -v ssh >/dev/null 2>&1      || missing+=(openssh-client)
+    command -v scp >/dev/null 2>&1      || missing+=(openssh-client)
 
     if (( ${#missing[@]} )); then
         log "Installing required packages: ${missing[*]}"
@@ -429,7 +431,7 @@ install_app() {
 APP_NAME="$app"
 APP_USER="$user"
 DEFAULT_PROFILE=""
-# Empty until a profile is added; `add` sets this to openvpn or wireguard.
+# Empty until a profile is added; the add command sets this to openvpn or wireguard.
 VPN_TYPE=""
 
 # on: application traffic cannot fall back to the host uplink.
@@ -467,17 +469,28 @@ WATCHDOG_FAILURES="3"
 WATCHDOG_COOLDOWN="300"
 
 # Optional local transport for .nnslink profiles. These values are managed by
-# `nns-app link import` / `nns-app remote sync`.
+# nns-app link import / nns-app remote sync.
 TRANSPORT_TYPE="direct"
 TRANSPORT_REMOTE_HOST=""
 TRANSPORT_REMOTE_PORT=""
 TRANSPORT_LOCAL_PORT=""
 TRANSPORT_CONFIG=""
+# Used only by the automatic SSH-forward transport. The dedicated private key
+# and pinned host-key file remain root-owned on the local machine.
+TRANSPORT_SSH_TARGET=""
+TRANSPORT_SSH_IDENTITY=""
+TRANSPORT_SSH_KNOWN_HOSTS=""
+TRANSPORT_SSH_REMOTE_PORT=""
 
-# SSH management-plane metadata. The VPN data path never depends on SSH.
+# SSH management-plane metadata. In manual remote mode the VPN data path does
+# not depend on SSH; automatic remote mode intentionally uses a supervised SSH
+# local forward so no additional inbound cloud port is required.
+REMOTE_MODE=""
 REMOTE_ALIAS=""
 REMOTE_GATEWAY=""
 REMOTE_CLIENT=""
+REMOTE_OWNER_ID=""
+REMOTE_EXIT_APP=""
 REMOTE_PROFILE_GENERATION=""
 REMOTE_SERVER_FINGERPRINT=""
 

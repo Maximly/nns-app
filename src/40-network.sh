@@ -268,7 +268,7 @@ netns_up() {
     install -d -o root -g root -m 0755 "$RUN_DIR"
     case "$vpn_type:${TRANSPORT_TYPE:-direct}" in
         inherit:*) : >"$endpoints_file" ;;
-        openvpn:stunnel|openvpn:cloak)
+        openvpn:stunnel|openvpn:cloak|openvpn:ssh)
             resolve_transport_endpoint "$app" "$endpoints_file" "${upstream_ns:-host}"
             ;;
         *) resolve_profile_endpoints "$profile" "$endpoints_file" "${upstream_ns:-host}" ;;

@@ -9,7 +9,7 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fq 'nns-app 1.2.5' <<<"$version"
+grep -Fq 'nns-app 1.3.4' <<<"$version"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -20,6 +20,14 @@ grep -Fq 'nns-app link import' <<<"$help"
 grep -Fq -- '--backend inherit' <<<"$help"
 grep -Fq -- '--transport direct|stunnel|cloak' <<<"$help"
 grep -Fq -- '--server-name <cloak-decoy-host>' <<<"$help"
+grep -Fq -- 'via --remote <user@host>' <<<"$help"
+grep -Fq 'remote_auto_install' "$INSTALLER"
+grep -Fq 'remote_auto_deploy_internal' "$INSTALLER"
+grep -Fq 'TRANSPORT_SSH_REMOTE_PORT' "$INSTALLER"
+grep -Fq 'ServerAliveInterval=15' "$INSTALLER"
+grep -Fq 'ControlMaster=yes' "$INSTALLER"
+grep -Fq 'openvpn:ssh' "$INSTALLER"
+grep -Fq "Transport 'ssh' is managed internally by install --via-remote." "$INSTALLER"
 grep -Fq 'cfg_set "$app" VPN_TYPE inherit' "$INSTALLER"
 grep -Fq 'TRANSPORT_TYPE' "$INSTALLER"
 grep -Fq 'nnslink_manifest_read' "$INSTALLER"
@@ -74,11 +82,26 @@ grep -Fq '_watchdog %i' "$INSTALLER"
 grep -Fq 'WATCHDOG_MODE="auto"' "$INSTALLER"
 grep -Fq 'nns-gateway-crl-refresh@.timer' "$INSTALLER"
 grep -Fq 'systemctl enable --now "nns-gateway-crl-refresh@${gateway}.timer"' "$INSTALLER"
+grep -Fq 'gateway_crl_valid_for "$pki/crl.pem" 1' "$INSTALLER"
+grep -Fq 'gateway_crl_valid_for "$pki/crl.pem" 604800' "$INSTALLER"
+if grep -Fq -- '-noout -checkend' "$INSTALLER"; then
+    echo 'openssl crl incorrectly uses the x509-only -checkend option' >&2
+    exit 1
+fi
+grep -Fq 'during $failed_stage; staged files were removed' "$INSTALLER"
 grep -Fq 'delimiter="\t"' "$INSTALLER"
 grep -Fq 'iif "$tunnel_dev"' "$INSTALLER"
 grep -Fq 'NNS_APP_SOURCE_ONLY' "$INSTALLER"
 grep -Fq 'NNS_APP_LOCK_DIR' "$INSTALLER"
 grep -Fq 'iif "$GATEWAY_TUN"' "$INSTALLER"
+grep -Fq "printf 'dev-type tun\\n'" "$INSTALLER" || {
+    echo 'managed gateway server config does not declare custom device as TUN' >&2
+    exit 1
+}
+grep -Fq 'systemctl stop "nns-gateway@${gateway}.service"' "$INSTALLER" || {
+    echo 'failed gateway startup can leave a systemd restart loop running' >&2
+    exit 1
+}
 grep -Fq 'CONTRIBUTING.md' "$ROOT/README.md"
 test -s "$ROOT/CONTRIBUTING.md"
 test ! -e "$ROOT/ARCHITECTURE.md"
@@ -98,7 +121,7 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 1.2.5' "$ROOT/README.md"
+grep -Fq '**Release:** 1.3.4' "$ROOT/README.md"
 grep -Fq 'OpenVPN 2.6+' "$ROOT/README.md"
 
 # Public documentation and help use one descriptive example-name set.
@@ -140,5 +163,21 @@ after=$(sha256sum "$INSTALLER" | awk '{print $1}')
     echo 'build is not deterministic' >&2
     exit 1
 }
+
+# An expanded config heredoc must never contain shell command substitutions.
+config_block=$(sed -n '/cat >"$file" <<CONFIG_EOF/,/^CONFIG_EOF$/p' "$ROOT/src/20-install.sh")
+if grep -Fq '`' <<<"$config_block" || grep -Fq '$(' <<<"$config_block"; then
+    echo 'generated app config heredoc contains shell command substitution' >&2
+    exit 1
+fi
+if grep -Fq '"${quoted[*]}"' "$INSTALLER"; then
+    echo 'remote command arguments are joined through global IFS' >&2
+    exit 1
+fi
+grep -Fq 'temp="$temp_dir/$profile_name"' "$INSTALLER" || {
+    echo 'automatic remote upload does not preserve the sanitized profile name' >&2
+    exit 1
+}
+
 
 echo 'Static tests passed.'
