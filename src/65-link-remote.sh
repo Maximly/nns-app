@@ -1248,6 +1248,42 @@ remote_auto_assert_state() {
         die "Automatic-remote state '$file' is inconsistent."
 }
 
+# Owner markers were introduced after the first automatic-remote releases.
+# A legacy deployment can therefore have a valid root-owned state record and
+# deterministic object names, but no marker in the exit/gateway configs. Adopt
+# only that empty legacy state; a conflicting nonempty marker remains fatal.
+remote_auto_reconcile_owner_markers() {
+    require_root
+    local owner=$1 exit_app gateway marker
+    remote_auto_assert_state "$owner"
+    exit_app=$(remote_auto_exit_name "$owner")
+    gateway=$(remote_auto_gateway_name "$owner")
+
+    if [[ -f "$(cfg_file "$exit_app")" ]]; then
+        load_cfg "$exit_app"
+        marker=${REMOTE_MANAGED_OWNER_ID:-}
+        if [[ -z "$marker" ]]; then
+            cfg_set "$exit_app" REMOTE_MANAGED_OWNER_ID "$owner"
+            log "Adopted legacy automatic-remote owner marker for exit '$exit_app'."
+        elif [[ "$marker" != "$owner" ]]; then
+            die "Refusing to adopt exit '$exit_app': owner marker mismatch."
+        fi
+    fi
+
+    if [[ -f "$(gateway_cfg_file "$gateway")" ]]; then
+        load_gateway_cfg "$gateway"
+        [[ "$VIA_APP" == "$exit_app" ]] ||
+            die "Refusing to adopt gateway '$gateway': it does not use '$exit_app'."
+        marker=${REMOTE_MANAGED_OWNER_ID:-}
+        if [[ -z "$marker" ]]; then
+            gateway_cfg_set "$gateway" REMOTE_MANAGED_OWNER_ID "$owner"
+            log "Adopted legacy automatic-remote owner marker for gateway '$gateway'."
+        elif [[ "$marker" != "$owner" ]]; then
+            die "Refusing to adopt gateway '$gateway': owner marker mismatch."
+        fi
+    fi
+}
+
 remote_auto_deploy_internal() {
     require_root
     local owner=$1 ssh_host=$2 ssh_port=$3 profile_name=$4
@@ -1367,7 +1403,7 @@ remote_auto_status_internal() {
 remote_auto_start_internal() {
     require_root
     local owner=$1 exit_app gateway
-    remote_auto_assert_state "$owner"
+    remote_auto_reconcile_owner_markers "$owner"
     exit_app=$(remote_auto_exit_name "$owner")
     gateway=$(remote_auto_gateway_name "$owner")
 
@@ -1401,7 +1437,7 @@ remote_auto_start_internal() {
 remote_auto_stop_internal() {
     require_root
     local owner=$1 exit_app gateway
-    remote_auto_assert_state "$owner"
+    remote_auto_reconcile_owner_markers "$owner"
     exit_app=$(remote_auto_exit_name "$owner")
     gateway=$(remote_auto_gateway_name "$owner")
 

@@ -9,7 +9,7 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fq 'nns-app 1.3.12' <<<"$version"
+grep -Fq 'nns-app 1.3.13' <<<"$version"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -29,6 +29,7 @@ grep -Fq 'remote_auto_command "$alias" cleanup "$owner"' "$INSTALLER"
 grep -Fq 'cfg_set "$app" REMOTE_CLEANED on' "$INSTALLER"
 grep -Fq 'remove_app "$exit_app" local-only' "$INSTALLER"
 grep -Fq 'REMOTE_MANAGED_OWNER_ID' "$INSTALLER"
+grep -Fq 'remote_auto_reconcile_owner_markers' "$INSTALLER"
 grep -Fq 'remote_auto_install' "$INSTALLER"
 grep -Fq 'remote_auto_deploy_internal' "$INSTALLER"
 autostart_sets=$(grep -Fc 'cfg_set "$app" AUTOSTART on' "$INSTALLER")

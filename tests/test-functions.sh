@@ -830,4 +830,55 @@ manual_payload=$(remote_command_payload gateway client export \
 )
 
 
+
+# Legacy automatic-remote objects created before ownership markers existed are
+# adopted only when their state record and deterministic relationship validate.
+(
+    require_root() { :; }
+    remote_auto_assert_state() { [[ "$1" == 0123456789abcdef ]]; }
+    remote_auto_exit_name() { printf '%s\n' ra-0123456789ab-exit; }
+    remote_auto_gateway_name() { printf '%s\n' ra-0123456789ab-gw; }
+    temp=$(mktemp -d)
+    cfg_file() { printf '%s/%s.cfg\n' "$temp" "$1"; }
+    gateway_cfg_file() { printf '%s/%s.cfg\n' "$temp" "$1"; }
+    : >"$(cfg_file ra-0123456789ab-exit)"
+    : >"$(gateway_cfg_file ra-0123456789ab-gw)"
+    load_cfg() { REMOTE_MANAGED_OWNER_ID=; }
+    load_gateway_cfg() {
+        VIA_APP=ra-0123456789ab-exit
+        REMOTE_MANAGED_OWNER_ID=
+    }
+    cfg_set() { printf 'cfg-set:%s:%s:%s\n' "$1" "$2" "$3"; }
+    gateway_cfg_set() { printf 'gw-set:%s:%s:%s\n' "$1" "$2" "$3"; }
+    log() { :; }
+    die() { printf 'die:%s\n' "$*"; return 1; }
+    output=$(remote_auto_reconcile_owner_markers 0123456789abcdef)
+    grep -Fq 'cfg-set:ra-0123456789ab-exit:REMOTE_MANAGED_OWNER_ID:0123456789abcdef' <<<"$output" ||
+        fail 'legacy exit owner marker was not adopted'
+    grep -Fq 'gw-set:ra-0123456789ab-gw:REMOTE_MANAGED_OWNER_ID:0123456789abcdef' <<<"$output" ||
+        fail 'legacy gateway owner marker was not adopted'
+    rm -rf "$temp"
+)
+
+# A nonempty conflicting marker must never be silently rewritten.
+(
+    require_root() { :; }
+    remote_auto_assert_state() { :; }
+    remote_auto_exit_name() { printf '%s\n' ra-0123456789ab-exit; }
+    remote_auto_gateway_name() { printf '%s\n' ra-0123456789ab-gw; }
+    temp=$(mktemp -d)
+    cfg_file() { printf '%s/%s.cfg\n' "$temp" "$1"; }
+    gateway_cfg_file() { printf '%s/%s.cfg\n' "$temp" "$1"; }
+    : >"$(cfg_file ra-0123456789ab-exit)"
+    load_cfg() { REMOTE_MANAGED_OWNER_ID=ffffffffffffffff; }
+    cfg_set() { fail 'conflicting marker was overwritten'; }
+    log() { :; }
+    die() { printf '%s\n' "$*" >&2; exit 1; }
+    output=$(remote_auto_reconcile_owner_markers 0123456789abcdef 2>&1) &&
+        fail 'conflicting owner marker was accepted'
+    grep -Fq 'owner marker mismatch' <<<"$output" ||
+        fail 'conflicting marker did not report mismatch'
+    rm -rf "$temp"
+)
+
 echo 'Function tests passed.'

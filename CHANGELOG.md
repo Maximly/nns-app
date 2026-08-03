@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.13
+
+- Repair automatic-remote deployments created before owner markers were introduced: when the root-owned state file and deterministic exit/gateway relationships validate, backfill only missing ownership markers before `start` or `stop`.
+- Continue to reject any conflicting nonempty owner marker, so the migration cannot adopt another deployment's objects.
+- Fix upgrades of legacy automatic-remote environments that otherwise failed with `owner marker mismatch` immediately after refreshing the remote engine.
+
 ## 1.3.12
 
 - Refuse `stop`, `remove`, and `purge` when invoked from a shell or process already running inside an nns-app network namespace. Previously namespace teardown killed the nested wrapper and sudo process, producing `Terminated`/`Killed` messages before the command could finish cleanly.
