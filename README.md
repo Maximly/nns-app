@@ -970,8 +970,6 @@ sudo ip netns exec nns-my-remote-exit iptables-save
 - IPv4 client data paths only.
 - Ubuntu/systemd/iptables are the supported platform combination.
 - Managed gateways use an OpenVPN server backend only.
-- Gateway enrollment and profile transfer are manual; SSH automation is not
-  included.
 - Router port forwarding and host INPUT firewall changes are not automated.
 - Client and server certificate renewal requires issuing a new client identity
   or recreating the gateway before certificate expiry.
