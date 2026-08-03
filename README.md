@@ -4,10 +4,10 @@
 
 A browser, messenger, crawler, build tool, or another process can use its own VPN without replacing the host's default route or DNS configuration. Each named environment has separate routes, DNS, firewall state, tunnel state, and a kill switch.
 
-> **Release:** 1.0.20  
+> **Release:** 1.0.21  
 > **Status:** experimental  
-> **Current backend:** OpenVPN  
-> **Planned backends:** WireGuard, AmneziaWG, and provider-specific transports
+> **Current backends:** OpenVPN and WireGuard  
+> **Planned backends:** AmneziaWG and provider-specific transports
 
 ## Main features
 
@@ -17,8 +17,8 @@ A browser, messenger, crawler, build tool, or another process can use its own VP
 - Namespace-only resolver configuration under `/etc/netns/`.
 - Kill switch blocks direct fallback to the host uplink.
 - Applications run as the configured desktop user, not as root.
-- systemd manages namespace and OpenVPN lifecycles.
-- Self-contained OpenVPN profiles can be imported.
+- systemd manages namespace and VPN-backend lifecycles.
+- Self-contained OpenVPN and WireGuard profiles can be imported.
 - A public OpenVPN relay can be selected automatically with `add ... any`.
 - VPN Gate metadata is cached for two days with stale-cache fallback.
 - Namespace and OpenVPN service startup failures print their own recent logs.
@@ -29,6 +29,7 @@ A browser, messenger, crawler, build tool, or another process can use its own VP
 - VPN Gate candidates must complete a short OpenVPN handshake before import.
 - `nns-app run` prepares cgroup2 and securityfs inside its private mount namespace so Snap GUI applications can start.
 - Runtime `--via` creates a real veth/NAT chain through another active NNS VPN.
+- WireGuard supports full-tunnel IPv4 provider profiles, endpoint pinning, kill-switch rules, status reporting, and chained upstream/downstream operation.
 - Strict five-second startup failure handling.
 - Optional `-i` asynchronous start mode leaves a slow connection running.
 
@@ -67,6 +68,7 @@ The current release targets Ubuntu with systemd and requires:
 
 - Bash
 - OpenVPN
+- wireguard-tools (`wg` and `wg-quick`)
 - iproute2 network namespaces
 - iptables
 - systemd
@@ -117,7 +119,7 @@ The installer creates or refreshes:
 /usr/local/sbin/nns_app.sh
 /etc/nns-app/<name>/
 /etc/systemd/system/nns-netns@.service
-/etc/systemd/system/nns-openvpn@.service
+/etc/systemd/system/nns-openvpn@.service  # legacy filename; manages either backend
 /etc/sudoers.d/nns-app-<name>
 ```
 
@@ -130,7 +132,7 @@ nns-app --version
 Expected:
 
 ```text
-nns-app 1.0.20
+nns-app 1.0.21
 Author:  Maxim Lyadvinsky
 License: GPL-3.0-or-later
 ```
@@ -143,12 +145,24 @@ sudo ./nns-app.sh install browser
 
 ## Quick start with an existing profile
 
+OpenVPN:
+
 ```bash
 sudo nns-app add browser ~/Downloads/location.ovpn
 nns-app start browser
 nns-app run browser curl -4 https://api.ipify.org
 nns-app run browser firefox --no-remote
 ```
+
+WireGuard:
+
+```bash
+sudo nns-app add browser ~/Downloads/provider-wireguard.conf
+nns-app start browser
+nns-app run browser curl -4 https://api.ipify.org
+```
+
+The backend is detected from profile content and stored as `VPN_TYPE`. Re-adding a profile can switch an existing app between OpenVPN and WireGuard.
 
 Inspect state:
 
@@ -254,8 +268,7 @@ nns-app start -i test --via hidemy
 nns-app start test --via host
 ```
 
-The upstream app must already be started, have a default route through a
-`tun`/`tap` interface, and pass its own online check. Multiple downstream apps
+The upstream app must already be started, have an active OpenVPN or WireGuard tunnel, and pass its own online check. Multiple downstream apps
 may share one upstream. Stopping an upstream with `nns-app stop` first stops
 its currently attached downstream apps. An unexpected upstream failure cannot
 leak downstream traffic because forwarding is accepted only toward the
@@ -277,7 +290,7 @@ Strict start waits up to `READY_TIMEOUT`, which defaults to five seconds. A tunn
 
 When the data path is still offline after the deadline, `nns-app`:
 
-1. prints recent OpenVPN log lines;
+1. prints recent VPN-backend log lines;
 2. stops the VPN service;
 3. removes the runtime namespace;
 4. returns a nonzero exit status.
@@ -333,7 +346,7 @@ Applications are still protected: with the kill switch enabled, `nns-app run` re
 | Command | Description |
 |---|---|
 | `nns-app install <name>` | Install or refresh the engine and create a named environment |
-| `nns-app add <name> <profile.ovpn>` | Validate and import a self-contained OpenVPN profile |
+| `nns-app add <name> <profile.ovpn|wireguard.conf>` | Validate and import an OpenVPN or WireGuard profile |
 | `nns-app add <name> any [country] [--refresh] [--via <app>|host]` | Select and probe a VPN Gate profile through the chosen path |
 | `nns-app start <name>` | Start and require a usable data path within the configured timeout |
 | `nns-app start -i <name>` | Start asynchronously; leave a slow/offline service running |
@@ -365,14 +378,15 @@ Important settings:
 | Setting | Default | Purpose |
 |---|---:|---|
 | `APP_USER` | installing user | User identity used for launched applications |
-| `DEFAULT_PROFILE` | empty | Active OpenVPN profile |
+| `DEFAULT_PROFILE` | empty | Active managed VPN profile |
+| `VPN_TYPE` | empty | Set automatically to `openvpn` or `wireguard` |
 | `KILLSWITCH` | `on` | Block direct traffic outside the tunnel |
 | `AUTOSTART` | `off` | Enable the environment at boot |
 | `WAN_IFACE` | `auto` | Host uplink or explicitly selected interface |
 | `DNS_SERVERS` | `1.1.1.1 9.9.9.9` | Namespace-only DNS resolvers |
 | `DISABLE_IPV6` | `on` | Disable IPv6 inside the namespace |
 | `PROFILE_FIXUPS` | `on` | Normalize the managed copy for compatibility |
-| `DISABLE_DCO` | `off` | Explicit OpenVPN DCO policy |
+| `DISABLE_DCO` | `off` | Explicit OpenVPN DCO policy; ignored for WireGuard |
 | `READY_TIMEOUT` | `5` | Strict-start readiness deadline in seconds |
 | `EXTERNAL_IP_URL` | `https://api.ipify.org` | External-address status endpoint |
 
@@ -407,6 +421,47 @@ PROFILE_FIXUPS="off"
 
 Then re-add the original profile.
 
+## WireGuard profile policy
+
+Import a provider WireGuard profile with:
+
+```bash
+sudo nns-app add browser ~/Downloads/provider.conf
+```
+
+The current WireGuard backend intentionally supports a restricted client
+profile subset:
+
+- exactly one `[Interface]` followed by one or more `[Peer]` sections;
+- an inline 32-byte base64 `PrivateKey`;
+- at least one IPv4 interface `Address`;
+- IPv4 or hostname `Endpoint` values with UDP ports;
+- full-tunnel IPv4 `AllowedIPs` (`0.0.0.0/0`, or both `/1` halves);
+- `Table = auto` or no `Table` setting;
+- optional `MTU`, `ListenPort`, `FwMark`, `PresharedKey`, and `PersistentKeepalive`.
+
+For safety, `PreUp`, `PostUp`, `PreDown`, `PostDown`, `SaveConfig`, unknown
+sections, and unknown options are rejected. IPv6-only endpoints and split-tunnel
+profiles are not supported in this release.
+
+The managed source copy remains under `/etc/nns-app/<name>/profiles/` with mode
+`0600`. At startup, nns-app creates a temporary root-only runtime configuration:
+
+- profile `DNS` is omitted because namespace DNS is controlled by `DNS_SERVERS`;
+- IPv6 addresses and allowed ranges are omitted when `DISABLE_IPV6="on"`;
+- `wg-quick` creates the interface and routes only inside the app namespace;
+- the endpoint is pinned to the namespace veth and allowed by the kill switch;
+- shutdown runs `wg-quick down` and removes the temporary configuration.
+
+The existing systemd template keeps its historical filename
+`nns-openvpn@.service` for upgrade compatibility, but its description and
+entry point are backend-neutral and it manages either OpenVPN or WireGuard.
+
+WireGuard does not have a persistent userspace tunnel daemon. nns-app keeps a
+small supervised lifecycle process alive after `wg-quick up` so systemd can
+stop the interface deterministically with the same app commands used for
+OpenVPN.
+
 ## Isolation and security
 
 Every environment receives its own:
@@ -417,9 +472,9 @@ Every environment receives its own:
 - route table;
 - resolver file;
 - namespace-local firewall;
-- OpenVPN process and systemd service instances.
+- backend-specific OpenVPN process or WireGuard interface lifecycle managed by systemd.
 
-OpenVPN DNS helper integration is disabled so a profile cannot replace host DNS through `systemd-resolved`.
+OpenVPN DNS helper integration is disabled, and WireGuard `DNS` entries are omitted from the runtime copy, so imported profiles cannot replace host DNS.
 
 Namespace and tunnel setup require root. `nns-app run` enters the namespace as root and then permanently drops to `APP_USER` with `setpriv` before executing the requested program. Commands are executed directly without `eval` or shell re-parsing.
 
@@ -433,7 +488,7 @@ Show all environments:
 nns-app list
 ```
 
-Follow OpenVPN logs:
+Follow VPN-backend logs (the unit keeps its legacy name):
 
 ```bash
 sudo journalctl -fu nns-openvpn@browser.service
@@ -481,18 +536,18 @@ A log message such as `Initialization Sequence Completed` proves that OpenVPN in
 - Linux and systemd only.
 - Ubuntu is the primary tested platform.
 - IPv4 is the primary supported path; IPv6 is disabled by default.
-- OpenVPN is the only implemented backend in this release.
+- OpenVPN and full-tunnel IPv4 WireGuard profiles are implemented.
 - Runtime namespaces are removed on normal stop.
 - The most recently added profile becomes active.
 - Firewall management currently uses iptables.
 - Public relays may disappear or change without notice.
-- Provider-side session limits, stale mappings, custom clients, and custom protocol extensions are outside the generic OpenVPN backend's control.
+- Provider-side session limits, stale mappings, custom clients, and custom protocol extensions are outside the generic backends' control.
 - GUI applications with single-instance or sandbox policies may need application-specific launch options.
 
 ## Roadmap
 
-- Transport/backend abstraction shared by OpenVPN, WireGuard, and future transports.
-- Native WireGuard configuration without host-global `wg-quick` side effects.
+- Further backend abstraction shared by OpenVPN, WireGuard, and future transports.
+- Direct `wg` configuration as an alternative to the current namespace-local `wg-quick` lifecycle.
 - AmneziaWG support.
 - Provider-specific configuration/control-plane helpers.
 - Fast profile switching without destroying the namespace.
@@ -536,3 +591,15 @@ To inspect the mounts from a namespaced shell:
 nns-app run hidemy bash
 findmnt /sys/fs/cgroup /sys/kernel/security
 ```
+
+
+### WireGuard-specific diagnostics
+
+```bash
+sudo ip netns exec nns-browser wg show
+sudo ip -n nns-browser link show type wireguard
+sudo ip -n nns-browser rule show
+sudo ip -n nns-browser route show table all
+```
+
+A WireGuard interface may exist before it has exchanged a handshake. `nns-app start` and `nns-app run` therefore require a real ping or HTTP data-path probe, not merely the presence of the interface.

@@ -24,7 +24,7 @@
 #   remove  <app_name>
 #   purge
 #   list
-#   add     <app_name> <profile.ovpn>
+#   add     <app_name> <profile.ovpn|wireguard.conf>
 #   add     <app_name> any [country] [--refresh] [--via <upstream-app>|host]
 #   start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
 #   stop    <app_name>
@@ -36,7 +36,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.0.20"
+readonly VERSION="1.0.21"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -98,7 +98,7 @@ Usage:
   nns-app remove  <app_name>
   nns-app purge
   nns-app list
-  nns-app add     <app_name> <profile.ovpn>
+  nns-app add     <app_name> <profile.ovpn|wireguard.conf>
   nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
   nns-app start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
   nns-app stop    <app_name>
@@ -109,6 +109,7 @@ Examples:
   sudo nns-app install hidemy
   sudo nns-app install browser --via hidemy   # persistent upstream
   sudo nns-app add browser ~/Downloads/NorwayS23.ovpn
+  sudo nns-app add browser ~/Downloads/wg-provider.conf
   sudo nns-app add browser any US --via hidemy
   nns-app start browser
   nns-app start -i browser --via hidemy       # one-start override
@@ -196,6 +197,7 @@ load_cfg() {
     # Newer optional fields must be reset before sourcing an older config;
     # otherwise a value from a previously loaded app could leak into this one.
     UPSTREAM_APP=""
+    VPN_TYPE=""
 
     # shellcheck disable=SC1090
     source "$file"
@@ -328,15 +330,53 @@ runtime_via_for_app() {
     fi
 }
 
+vpn_route_iface() {
+    local app=$1 ns type dev expected
+    ns=$(cfg_read_value "$app" NS_NAME 2>/dev/null || true)
+    [[ -n "$ns" ]] || return 1
+    type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    [[ -n "$type" ]] || return 1
+
+    case "$type" in
+        openvpn)
+            dev=$(ip -n "$ns" -4 route get 1.1.1.1 2>/dev/null |
+                  awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+            [[ "$dev" =~ ^(tun|tap) ]] || return 1
+            ;;
+        wireguard)
+            expected=$(wireguard_iface_name "$app")
+            ip -n "$ns" link show dev "$expected" up >/dev/null 2>&1 || return 1
+            ip netns exec "$ns" wg show "$expected" >/dev/null 2>&1 || return 1
+            dev=$expected
+            ;;
+        *) return 1 ;;
+    esac
+
+    printf '%s\n' "$dev"
+}
+
+vpn_route_ready() {
+    vpn_route_iface "$1" >/dev/null 2>&1
+}
+
+vpn_local_ipv4() {
+    local app=$1 ns dev
+    ns=$(cfg_read_value "$app" NS_NAME 2>/dev/null || true)
+    dev=$(vpn_route_iface "$app" 2>/dev/null || true)
+    [[ -n "$ns" && -n "$dev" ]] || return 1
+    ip -n "$ns" -o -4 addr show dev "$dev" 2>/dev/null |
+        awk '{split($4,a,"/"); print a[1]; exit}'
+}
+
 upstream_tunnel_iface() {
     local upstream=$1 ns dev
     ns=$(cfg_read_value "$upstream" NS_NAME 2>/dev/null || true)
     [[ -n "$ns" ]] || return 1
-    dev=$(ip -n "$ns" -4 route get 1.1.1.1 2>/dev/null |
-          awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
-    [[ "$dev" =~ ^(tun|tap) ]] || return 1
+    dev=$(vpn_route_iface "$upstream" 2>/dev/null || true)
+    [[ -n "$dev" ]] || return 1
     printf '%s|%s\n' "$ns" "$dev"
 }
+
 
 ensure_upstream_ready() {
     local child=$1 upstream=$2 data
@@ -397,6 +437,8 @@ ensure_dependencies() {
     local missing=()
     command -v ip >/dev/null 2>&1       || missing+=(iproute2)
     command -v openvpn >/dev/null 2>&1  || missing+=(openvpn)
+    command -v wg >/dev/null 2>&1       || missing+=(wireguard-tools)
+    command -v wg-quick >/dev/null 2>&1 || missing+=(wireguard-tools)
     command -v iptables >/dev/null 2>&1 || missing+=(iptables)
     command -v curl >/dev/null 2>&1     || missing+=(curl)
     command -v ping >/dev/null 2>&1     || missing+=(iputils-ping)
@@ -447,14 +489,14 @@ NETNS_UNIT_EOF
 
     cat >"$VPN_UNIT" <<'VPN_UNIT_EOF'
 [Unit]
-Description=OpenVPN for NNS app %i
+Description=VPN transport for NNS app %i
 Requires=nns-netns@%i.service
 After=nns-netns@%i.service
 BindsTo=nns-netns@%i.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/sbin/nns_app.sh _openvpn %i
+ExecStart=/usr/local/sbin/nns_app.sh _vpn %i
 Restart=on-failure
 RestartSec=5s
 KillSignal=SIGTERM
@@ -588,6 +630,8 @@ install_app() {
 APP_NAME="$app"
 APP_USER="$user"
 DEFAULT_PROFILE=""
+# Empty for a new app; set automatically to openvpn or wireguard by `add`.
+VPN_TYPE=""
 
 # on: application traffic cannot fall back to the host uplink.
 # off: direct fallback through the host uplink is allowed.
@@ -632,16 +676,330 @@ CONFIG_EOF
     log "Profiles: $(profiles_dir "$app")"
     log "Upstream: ${normalized_via:-host}"
     log "Next:     sudo $USER_PATH add $app /path/to/profile.ovpn"
+    log "          or: sudo $USER_PATH add $app /path/to/wireguard.conf"
     log "          or: sudo $USER_PATH add $app any [country]${normalized_via:+ --via $normalized_via}"
 }
 
+profile_type_from_file() {
+    local file=$1
+    [[ -f "$file" && -s "$file" ]] || return 1
+
+    if grep -Eiq '^[[:space:]]*\[Interface\][[:space:]]*(#.*)?$' "$file" &&
+       grep -Eiq '^[[:space:]]*\[Peer\][[:space:]]*(#.*)?$' "$file"; then
+        printf 'wireguard\n'
+    elif grep -Eiq '^[[:space:]]*remote[[:space:]]+' "$file"; then
+        printf 'openvpn\n'
+    else
+        return 1
+    fi
+}
+
+vpn_type_for_app() {
+    local app=$1 configured profile file detected
+    configured=$(cfg_read_value "$app" VPN_TYPE 2>/dev/null || true)
+    case "$configured" in
+        openvpn|wireguard)
+            printf '%s\n' "$configured"
+            return 0
+            ;;
+        "") ;;
+        *) die "Unsupported VPN_TYPE '$configured' in $(cfg_file "$app")." ;;
+    esac
+
+    profile=$(cfg_read_value "$app" DEFAULT_PROFILE 2>/dev/null || true)
+    [[ -n "$profile" ]] || return 1
+    file="$(profiles_dir "$app")/$profile"
+    detected=$(profile_type_from_file "$file" 2>/dev/null || true)
+    [[ -n "$detected" ]] || return 1
+    printf '%s\n' "$detected"
+}
+
+vpn_type_label() {
+    case "$1" in
+        openvpn) printf 'OpenVPN\n' ;;
+        wireguard) printf 'WireGuard\n' ;;
+        *) printf 'unknown\n' ;;
+    esac
+}
+
+wireguard_iface_name() {
+    local app=$1 crc hex
+    crc=$(printf '%s' "$app" | cksum | awk '{print $1}')
+    printf -v hex '%08x' "$crc"
+    printf 'nwg%s\n' "$hex"
+}
+
+wireguard_runtime_config_path() {
+    local app=$1 iface
+    iface=$(wireguard_iface_name "$app")
+    printf '%s/%s.conf\n' "$RUN_DIR" "$iface"
+}
+
 profile_name_from_path() {
-    local base name
-    base=$(basename "$1")
+    local source=$1 type=$2 base name suffix
+    base=$(basename "$source")
     name=${base%.*}
     name=$(printf '%s' "$name" | sed -E 's/[^A-Za-z0-9._-]+/_/g; s/^_+//; s/_+$//')
     [[ -n "$name" ]] || name="profile"
-    printf '%.64s.ovpn\n' "$name"
+    case "$type" in
+        openvpn) suffix=ovpn ;;
+        wireguard) suffix=conf ;;
+        *) die "Unsupported VPN profile type '$type'." ;;
+    esac
+    printf '%.64s.%s\n' "$name" "$suffix"
+}
+
+validate_wireguard() {
+    local file=$1
+    [[ -f "$file" ]] || die "Profile not found: $file"
+    [[ -s "$file" ]] || die "Profile is empty: $file"
+    (( $(stat -c '%s' "$file") <= 1048576 )) ||
+        die "WireGuard profile is unexpectedly large (>1 MiB)."
+
+    if ! python3 - "$file" <<'PY_WG_VALIDATE'
+import base64
+import binascii
+import ipaddress
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n").decode("utf-8")
+
+allowed_interface = {
+    "privatekey", "address", "dns", "mtu", "table", "listenport", "fwmark"
+}
+allowed_peer = {
+    "publickey", "presharedkey", "allowedips", "endpoint", "persistentkeepalive"
+}
+forbidden = {"preup", "postup", "predown", "postdown", "saveconfig"}
+
+section = None
+interface_count = 0
+peer_count = 0
+private_keys = []
+ipv4_addresses = []
+allowed_networks = []
+endpoint_count = 0
+peer_public = False
+peer_allowed = False
+
+
+def fail(line_no, message):
+    raise SystemExit(f"line {line_no}: {message}")
+
+
+def validate_key(value, line_no, field):
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        fail(line_no, f"{field} is not valid base64")
+    if len(decoded) != 32:
+        fail(line_no, f"{field} must decode to exactly 32 bytes")
+
+
+def finish_peer(line_no):
+    global peer_public, peer_allowed
+    if section == "peer":
+        if not peer_public:
+            fail(line_no, "[Peer] is missing PublicKey")
+        if not peer_allowed:
+            fail(line_no, "[Peer] is missing AllowedIPs")
+    peer_public = False
+    peer_allowed = False
+
+
+lines = text.splitlines()
+for line_no, raw in enumerate(lines, 1):
+    stripped = raw.strip()
+    if not stripped or stripped.startswith("#"):
+        continue
+
+    section_match = re.fullmatch(r"\[\s*([^\]]+)\s*\](?:\s*#.*)?", stripped)
+    if section_match:
+        finish_peer(line_no)
+        name = section_match.group(1).strip().casefold()
+        if name == "interface":
+            interface_count += 1
+            if interface_count != 1 or peer_count:
+                fail(line_no, "exactly one [Interface] must appear before all [Peer] sections")
+            section = "interface"
+        elif name == "peer":
+            if interface_count != 1:
+                fail(line_no, "[Peer] appears before [Interface]")
+            peer_count += 1
+            section = "peer"
+        else:
+            fail(line_no, f"unsupported section [{section_match.group(1)}]")
+        continue
+
+    if section is None:
+        fail(line_no, "setting appears outside a section")
+    if "=" not in raw:
+        fail(line_no, "expected Key = Value")
+
+    key_raw, value_raw = raw.split("=", 1)
+    key = key_raw.strip().casefold()
+    value = value_raw.split("#", 1)[0].strip()
+    if not key or not value:
+        fail(line_no, "empty key or value")
+    if key in forbidden:
+        fail(line_no, f"unsafe or state-changing option '{key_raw.strip()}' is not supported")
+
+    allowed = allowed_interface if section == "interface" else allowed_peer
+    if key not in allowed:
+        fail(line_no, f"unsupported {section} option '{key_raw.strip()}'")
+
+    if section == "interface":
+        if key == "privatekey":
+            validate_key(value, line_no, "PrivateKey")
+            private_keys.append(value)
+        elif key == "address":
+            for item in value.split(","):
+                try:
+                    interface = ipaddress.ip_interface(item.strip())
+                except ValueError as exc:
+                    fail(line_no, f"invalid Address: {exc}")
+                if interface.version == 4:
+                    ipv4_addresses.append(interface)
+        elif key == "dns":
+            # Accepted at import, but ignored at runtime; nns-app owns resolv.conf.
+            pass
+        elif key == "mtu":
+            if not value.isdigit() or not 576 <= int(value) <= 9000:
+                fail(line_no, "MTU must be an integer from 576 through 9000")
+        elif key == "table":
+            if value.casefold() != "auto":
+                fail(line_no, "only Table = auto (or no Table setting) is supported")
+        elif key == "listenport":
+            if not value.isdigit() or not 1 <= int(value) <= 65535:
+                fail(line_no, "ListenPort must be from 1 through 65535")
+    else:
+        if key == "publickey":
+            validate_key(value, line_no, "PublicKey")
+            peer_public = True
+        elif key == "presharedkey":
+            validate_key(value, line_no, "PresharedKey")
+        elif key == "allowedips":
+            networks = []
+            for item in value.split(","):
+                try:
+                    network = ipaddress.ip_network(item.strip(), strict=False)
+                except ValueError as exc:
+                    fail(line_no, f"invalid AllowedIPs: {exc}")
+                networks.append(network)
+                if network.version == 4:
+                    allowed_networks.append(network)
+            if not networks:
+                fail(line_no, "AllowedIPs is empty")
+            peer_allowed = True
+        elif key == "endpoint":
+            endpoint_count += 1
+            if value.startswith("["):
+                fail(line_no, "IPv6 WireGuard endpoints are not supported by this IPv4 NNS release")
+            if ":" not in value:
+                fail(line_no, "Endpoint must be host:port")
+            host, port = value.rsplit(":", 1)
+            if not re.fullmatch(r"[A-Za-z0-9.-]+", host) or not host:
+                fail(line_no, "Endpoint host is invalid")
+            if not port.isdigit() or not 1 <= int(port) <= 65535:
+                fail(line_no, "Endpoint port must be from 1 through 65535")
+        elif key == "persistentkeepalive":
+            if not value.isdigit() or not 0 <= int(value) <= 65535:
+                fail(line_no, "PersistentKeepalive must be from 0 through 65535")
+
+finish_peer(len(lines) + 1)
+
+if interface_count != 1:
+    raise SystemExit("profile must contain exactly one [Interface]")
+if len(private_keys) != 1:
+    raise SystemExit("[Interface] must contain exactly one PrivateKey")
+if not ipv4_addresses:
+    raise SystemExit("[Interface] must contain at least one IPv4 Address")
+if peer_count < 1:
+    raise SystemExit("profile must contain at least one [Peer]")
+if endpoint_count < 1:
+    raise SystemExit("profile must contain at least one IPv4/hostname Endpoint")
+
+full_default = ipaddress.ip_network("0.0.0.0/0") in allowed_networks
+split_default = (
+    ipaddress.ip_network("0.0.0.0/1") in allowed_networks
+    and ipaddress.ip_network("128.0.0.0/1") in allowed_networks
+)
+if not (full_default or split_default):
+    raise SystemExit(
+        "nns-app currently requires a full-tunnel IPv4 WireGuard profile "
+        "(0.0.0.0/0 or both /1 halves in AllowedIPs)"
+    )
+PY_WG_VALIDATE
+    then
+        die "WireGuard profile validation failed."
+    fi
+}
+
+prepare_wireguard_runtime_config() {
+    local source=$1 target=$2 disable_ipv6=${3:-on}
+    python3 - "$source" "$target" "$disable_ipv6" <<'PY_WG_RUNTIME'
+import ipaddress
+import re
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+target = Path(sys.argv[2])
+disable_ipv6 = sys.argv[3].casefold() in {"1", "yes", "true", "on", "enabled"}
+text = source.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n").decode("utf-8")
+
+out = [
+    "# Runtime WireGuard profile generated by nns-app.",
+    "# DNS is managed by /etc/netns/<namespace>/resolv.conf.",
+]
+
+for raw in text.splitlines():
+    stripped = raw.strip()
+    if not stripped or stripped.startswith("#") or stripped.startswith("["):
+        out.append(raw)
+        continue
+    if "=" not in raw:
+        out.append(raw)
+        continue
+
+    key_raw, value_raw = raw.split("=", 1)
+    key = key_raw.strip().casefold()
+    value = value_raw.split("#", 1)[0].strip()
+
+    if key in {"preup", "postup", "predown", "postdown", "saveconfig"}:
+        raise SystemExit(f"unsafe WireGuard option reached runtime: {key_raw.strip()}")
+    if key == "dns":
+        continue
+    if key == "table" and value.casefold() == "auto":
+        # auto is wg-quick's default.
+        continue
+
+    if disable_ipv6 and key in {"address", "allowedips"}:
+        kept = []
+        for item in value.split(","):
+            token = item.strip()
+            if not token:
+                continue
+            try:
+                parsed = ipaddress.ip_interface(token) if key == "address" else ipaddress.ip_network(token, strict=False)
+            except ValueError:
+                kept.append(token)
+                continue
+            if parsed.version == 4:
+                kept.append(token)
+        if not kept:
+            continue
+        out.append(f"{key_raw.strip()} = {', '.join(kept)}")
+        continue
+
+    out.append(raw)
+
+target.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+target.chmod(0o600)
+PY_WG_RUNTIME
 }
 
 validate_ovpn() {
@@ -844,45 +1202,65 @@ add_profile() {
     load_cfg "$app"
 
     src=$(readlink -f "$src")
-    validate_ovpn "$src"
+    local type
+    type=$(profile_type_from_file "$src" 2>/dev/null || true)
+    [[ -n "$type" ]] ||
+        die "Cannot identify '$src' as an OpenVPN or WireGuard profile."
+
+    case "$type" in
+        openvpn) validate_ovpn "$src" ;;
+        wireguard) validate_wireguard "$src" ;;
+        *) die "Unsupported VPN profile type '$type'." ;;
+    esac
 
     local name dest tmp
     local -a applied=()
-    name=$(profile_name_from_path "$src")
+    name=$(profile_name_from_path "$src" "$type")
     dest="$(profiles_dir "$app")/$name"
     tmp=$(mktemp)
 
-    # Never alter the user's downloaded profile. Normalize line endings and
-    # apply compatibility adjustments only to the protected managed copy under
-    # /etc/nns-app. CRLF is common in VPN Gate profiles; leaving the trailing
-    # carriage return would corrupt parsed protocol/port values passed to
-    # iptables during namespace creation.
+    # Never alter the user's source profile. Normalize line endings and apply
+    # backend-specific processing only to the root-owned managed copy.
     cat "$src" >"$tmp"
     sed -i 's/\r$//' "$tmp"
-    validate_ovpn "$tmp"
-    if bool_on "${PROFILE_FIXUPS:-on}"; then
-        apply_profile_fixups "$tmp" applied
-    fi
+
+    case "$type" in
+        openvpn)
+            validate_ovpn "$tmp"
+            if bool_on "${PROFILE_FIXUPS:-on}"; then
+                apply_profile_fixups "$tmp" applied
+            fi
+            ;;
+        wireguard)
+            validate_wireguard "$tmp"
+            ;;
+    esac
 
     install -o root -g root -m 0600 "$tmp" "$dest"
     rm -f "$tmp"
     cfg_set "$app" DEFAULT_PROFILE "$name"
+    cfg_set "$app" VPN_TYPE "$type"
 
-    log "Added profile '$name' to '$app'."
-    if (( ${#applied[@]} )); then
-        log "Applied managed-profile compatibility fixes:"
-        local fix
-        for fix in "${applied[@]}"; do
-            log "  - $fix"
-        done
-    elif bool_on "${PROFILE_FIXUPS:-on}"; then
-        log "No compatibility fixes were needed."
-    else
-        log "Profile fixups are disabled in $(cfg_file "$app")."
+    log "Added $(vpn_type_label "$type") profile '$name' to '$app'."
+    if [[ "$type" == openvpn ]]; then
+        if (( ${#applied[@]} )); then
+            log "Applied managed-profile compatibility fixes:"
+            local fix
+            for fix in "${applied[@]}"; do
+                log "  - $fix"
+            done
+        elif bool_on "${PROFILE_FIXUPS:-on}"; then
+            log "No compatibility fixes were needed."
+        else
+            log "OpenVPN profile fixups are disabled in $(cfg_file "$app")."
+        fi
+    elif grep -Eiq '^[[:space:]]*DNS[[:space:]]*=' "$dest"; then
+        log "WireGuard DNS setting will be ignored at runtime; namespace DNS_SERVERS remains authoritative."
     fi
-    log "Default profile is now '$name'."
+
+    log "Default profile is now '$name' ($(vpn_type_label "$type"))."
     if systemctl is-active --quiet "nns-openvpn@${app}.service"; then
-        warn "'$app' is currently running. Stop and start it to switch profiles."
+        warn "'$app' is currently running. Stop and start it to switch profiles/backends."
     fi
 }
 
@@ -1508,30 +1886,58 @@ PY_SELECT
 
 
 profile_endpoints() {
-    local profile=$1
+    local profile=$1 type
+    type=$(profile_type_from_file "$profile" 2>/dev/null || true)
+    [[ -n "$type" ]] || die "Cannot determine VPN profile type: $profile"
 
-    # Output: host|port|protocol. Ignore inline certificate/key blocks.
-    awk '
-        BEGIN { inblock=0; proto="udp"; port="1194" }
-        { gsub(/\r/, "", $0) }
-        /^[[:space:]]*<[^/][^>]*>[[:space:]]*$/ { inblock=1; next }
-        /^[[:space:]]*<\/[A-Za-z0-9_-]+>[[:space:]]*$/ { inblock=0; next }
-        inblock { next }
-        /^[[:space:]]*[#;]/ { next }
-        {
-            key=tolower($1)
-            if (key == "proto" && NF >= 2) proto=tolower($2)
-            else if (key == "port" && NF >= 2) port=$2
-            else if (key == "remote" && NF >= 2) {
-                rport=(NF >= 3 && $3 != "") ? $3 : port
-                rproto=(NF >= 4 && $4 != "") ? tolower($4) : proto
-                if (rproto ~ /^tcp/) rproto="tcp"
-                else rproto="udp"
-                print $2 "|" rport "|" rproto
-            }
-        }
-    ' "$profile"
+    case "$type" in
+        openvpn)
+            # Output: host|port|protocol. Ignore inline certificate/key blocks.
+            awk '
+                BEGIN { inblock=0; proto="udp"; port="1194" }
+                { gsub(/\r/, "", $0) }
+                /^[[:space:]]*<[^/][^>]*>[[:space:]]*$/ { inblock=1; next }
+                /^[[:space:]]*<\/[A-Za-z0-9_-]+>[[:space:]]*$/ { inblock=0; next }
+                inblock { next }
+                /^[[:space:]]*[#;]/ { next }
+                {
+                    key=tolower($1)
+                    if (key == "proto" && NF >= 2) proto=tolower($2)
+                    else if (key == "port" && NF >= 2) port=$2
+                    else if (key == "remote" && NF >= 2) {
+                        rport=(NF >= 3 && $3 != "") ? $3 : port
+                        rproto=(NF >= 4 && $4 != "") ? tolower($4) : proto
+                        if (rproto ~ /^tcp/) rproto="tcp"
+                        else rproto="udp"
+                        print $2 "|" rport "|" rproto
+                    }
+                }
+            ' "$profile"
+            ;;
+        wireguard)
+            python3 - "$profile" <<'PY_WG_ENDPOINTS'
+import re
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+for raw in text.splitlines():
+    line = raw.split("#", 1)[0].strip()
+    if not line or "=" not in line:
+        continue
+    key, value = line.split("=", 1)
+    if key.strip().casefold() != "endpoint":
+        continue
+    endpoint = value.strip()
+    if endpoint.startswith("["):
+        raise SystemExit("IPv6 WireGuard endpoints are unsupported")
+    host, port = endpoint.rsplit(":", 1)
+    print(f"{host}|{port}|udp")
+PY_WG_ENDPOINTS
+            ;;
+    esac
 }
+
 
 resolve_profile_endpoints() {
     local profile=$1 outfile=$2 resolver_ns=${3:-host}
@@ -1704,7 +2110,7 @@ netns_up() {
     validate_app_name "$app"
     load_cfg "$app"
 
-    local runtime profile endpoints_file via_app host_ip
+    local runtime profile endpoints_file via_app host_ip vpn_type tunnel_iface
     local wan="" upstream_ns="" upstream_tun="" upstream_data=""
     runtime="$RUN_DIR/${app}.env"
     endpoints_file="$RUN_DIR/${app}.endpoints"
@@ -1728,6 +2134,13 @@ netns_up() {
 
     host_ip=${HOST_ADDR%/*}
     profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
+    vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    [[ -n "$vpn_type" ]] || die "Cannot determine VPN backend for '$app'. Re-add its profile."
+    if [[ "$vpn_type" == wireguard ]]; then
+        tunnel_iface=$(wireguard_iface_name "$app")
+    else
+        tunnel_iface='tun+'
+    fi
     [[ -n "$DEFAULT_PROFILE" && -f "$profile" ]] ||
         die "No usable default profile is configured for '$app'."
 
@@ -1740,6 +2153,8 @@ netns_up() {
             printf 'UPLINK_MODE_RUNTIME=%q\n' host
             printf 'WAN_IFACE_RUNTIME=%q\n' "$wan"
             printf 'UPSTREAM_APP_RUNTIME=%q\n' ""
+            printf 'VPN_TYPE_RUNTIME=%q\n' "$vpn_type"
+            printf 'TUNNEL_IFACE_RUNTIME=%q\n' "$tunnel_iface"
         } >"$runtime"
     else
         {
@@ -1748,6 +2163,8 @@ netns_up() {
             printf 'UPSTREAM_APP_RUNTIME=%q\n' "$via_app"
             printf 'UPSTREAM_NS_RUNTIME=%q\n' "$upstream_ns"
             printf 'UPSTREAM_TUN_RUNTIME=%q\n' "$upstream_tun"
+            printf 'VPN_TYPE_RUNTIME=%q\n' "$vpn_type"
+            printf 'TUNNEL_IFACE_RUNTIME=%q\n' "$tunnel_iface"
         } >"$runtime"
     fi
     chmod 0600 "$runtime"
@@ -1770,8 +2187,8 @@ netns_up() {
     ip -n "$NS_NAME" link set "$VETH_NS" up
     ip -n "$NS_NAME" route add default via "$host_ip" dev "$VETH_NS"
 
-    # Keep the inner OpenVPN control channel outside the inner tunnel. For a
-    # chained app this route reaches the endpoint through the upstream VPN.
+    # Keep the VPN control endpoint outside the inner tunnel. For a chained
+    # app this route reaches the endpoint through the upstream VPN.
     local endpoint_ip endpoint_port endpoint_proto
     while IFS='|' read -r endpoint_ip endpoint_port endpoint_proto; do
         ip -n "$NS_NAME" route replace "$endpoint_ip/32" \
@@ -1800,7 +2217,7 @@ netns_up() {
         ip netns exec "$NS_NAME" sysctl -q -w net.ipv6.conf.default.disable_ipv6=1 || true
     fi
 
-    # Namespace-local firewall. Before the inner tunnel exists only OpenVPN's
+    # Namespace-local firewall. Before the inner tunnel exists only the VPN's
     # exact endpoint and root-owned DNS may leave over the veth uplink.
     ip netns exec "$NS_NAME" iptables -w 5 -F
     ip netns exec "$NS_NAME" iptables -w 5 -X
@@ -1840,7 +2257,7 @@ netns_up() {
                 -m owner --uid-owner 0 -j ACCEPT
         done
 
-        ip netns exec "$NS_NAME" iptables -w 5 -A OUTPUT -o 'tun+' -j ACCEPT
+        ip netns exec "$NS_NAME" iptables -w 5 -A OUTPUT -o "$tunnel_iface" -j ACCEPT
     fi
 
     if [[ "$via_app" == host ]]; then
@@ -1848,6 +2265,7 @@ netns_up() {
     else
         log "Namespace '$NS_NAME' is ready on $NS_CIDR via $via_app/$upstream_tun."
     fi
+    log "VPN backend: $(vpn_type_label "$vpn_type"); tunnel interface: $tunnel_iface"
     while IFS='|' read -r endpoint_ip endpoint_port endpoint_proto; do
         log "VPN endpoint: $endpoint_ip:$endpoint_port/$endpoint_proto via $VETH_NS"
     done <"$endpoints_file"
@@ -1903,31 +2321,14 @@ netns_down() {
     ip netns del "$NS_NAME" 2>/dev/null || true
     delete_veth_everywhere "$VETH_HOST"
     rm -rf "/etc/netns/$NS_NAME"
-    rm -f "$runtime" "$RUN_DIR/${app}.via" "$RUN_DIR/${app}.profile" "$RUN_DIR/${app}.endpoints"
+    rm -f "$runtime" "$RUN_DIR/${app}.via" "$RUN_DIR/${app}.profile"         "$RUN_DIR/${app}.type" "$RUN_DIR/${app}.endpoints"         "$(wireguard_runtime_config_path "$app")"
     log "Namespace '$NS_NAME' stopped."
 }
 
 openvpn_exec() {
-    require_root
-    local app=$1
-    validate_app_name "$app"
+    local app=$1 profile=$2
     load_cfg "$app"
 
-    [[ -n "$DEFAULT_PROFILE" ]] || die "No default profile is configured for '$app'."
-    local profile
-    profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
-    [[ -f "$profile" ]] || die "Default profile does not exist: $profile"
-    ip netns list | awk '{print $1}' | grep -Fxq "$NS_NAME" ||
-        die "Namespace '$NS_NAME' is not running."
-
-    install -d -o root -g root -m 0755 "$RUN_DIR"
-    printf '%s\n' "$DEFAULT_PROFILE" >"$RUN_DIR/${app}.profile"
-    chmod 0644 "$RUN_DIR/${app}.profile"
-
-    # Match the known-good original namespace method as closely as possible.
-    # Only disable OpenVPN's systemd-resolved integration so namespace DNS can
-    # never modify the host resolver. The profile itself controls all other
-    # OpenVPN behavior.
     local args=(
         /usr/sbin/openvpn
         --config "$profile"
@@ -1940,6 +2341,68 @@ openvpn_exec() {
     exec /usr/sbin/ip netns exec "$NS_NAME" "${args[@]}"
 }
 
+wireguard_exec() {
+    local app=$1 profile=$2 runtime_config iface wg_quick
+    load_cfg "$app"
+
+    iface=$(wireguard_iface_name "$app")
+    runtime_config=$(wireguard_runtime_config_path "$app")
+    wg_quick=$(command -v wg-quick)
+    [[ -x "$wg_quick" ]] || die "wg-quick is not installed."
+
+    prepare_wireguard_runtime_config \
+        "$profile" "$runtime_config" "${DISABLE_IPV6:-on}"
+
+    wireguard_cleanup() {
+        if ip netns list 2>/dev/null | awk '{print $1}' | grep -Fxq "$NS_NAME"; then
+            ip netns exec "$NS_NAME" "$wg_quick" down "$runtime_config" \
+                >/dev/null 2>&1 || ip -n "$NS_NAME" link del "$iface" 2>/dev/null || true
+        fi
+        rm -f "$runtime_config"
+    }
+
+    trap 'exit 0' TERM INT HUP
+    trap wireguard_cleanup EXIT
+
+    ip netns exec "$NS_NAME" "$wg_quick" up "$runtime_config"
+    log "WireGuard interface '$iface' is active in '$NS_NAME'."
+
+    # Keep this process alive so the existing nns-openvpn@ service template
+    # can manage both long-running OpenVPN and stateful wg-quick lifecycles.
+    while :; do
+        sleep 3600 &
+        wait $! || true
+    done
+}
+
+vpn_exec() {
+    require_root
+    local app=$1 type profile
+    validate_app_name "$app"
+    load_cfg "$app"
+
+    [[ -n "$DEFAULT_PROFILE" ]] || die "No default profile is configured for '$app'."
+    profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
+    [[ -f "$profile" ]] || die "Default profile does not exist: $profile"
+    ip netns list | awk '{print $1}' | grep -Fxq "$NS_NAME" ||
+        die "Namespace '$NS_NAME' is not running."
+
+    type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    [[ -n "$type" ]] || die "Cannot determine VPN backend for '$app'."
+
+    install -d -o root -g root -m 0755 "$RUN_DIR"
+    printf '%s\n' "$DEFAULT_PROFILE" >"$RUN_DIR/${app}.profile"
+    printf '%s\n' "$type" >"$RUN_DIR/${app}.type"
+    chmod 0644 "$RUN_DIR/${app}.profile" "$RUN_DIR/${app}.type"
+
+    case "$type" in
+        openvpn) openvpn_exec "$app" "$profile" ;;
+        wireguard) wireguard_exec "$app" "$profile" ;;
+        *) die "Unsupported VPN backend '$type'." ;;
+    esac
+}
+
+
 app_is_started() {
     systemctl is-active --quiet "nns-openvpn@${1}.service" &&
     systemctl is-active --quiet "nns-netns@${1}.service"
@@ -1951,8 +2414,7 @@ wait_online() {
 
     deadline=$((SECONDS + timeout))
     while (( SECONDS < deadline )); do
-        if ip -n "$NS_NAME" route get 1.1.1.1 2>/dev/null |
-           grep -qE ' dev (tun|tap)[^ ]* '; then
+        if vpn_route_ready "$app"; then
             # A tunnel interface and route are not enough: verify that packets
             # actually traverse the VPN. Keep each probe short so a five-second
             # readiness deadline remains a real five-second deadline.
@@ -1975,9 +2437,12 @@ start_app() {
     local via_override=${3:-__default__}
     validate_app_name "$app"
     load_cfg "$app"
-    [[ -n "$DEFAULT_PROFILE" ]] || die "No profile configured. Use: nns-app add $app profile.ovpn"
+    [[ -n "$DEFAULT_PROFILE" ]] || die "No profile configured. Use: nns-app add $app profile.ovpn|wireguard.conf"
     [[ -f "$(profiles_dir "$app")/$DEFAULT_PROFILE" ]] ||
         die "Configured profile '$DEFAULT_PROFILE' is missing."
+    local vpn_type
+    vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    [[ -n "$vpn_type" ]] || die "Cannot determine VPN backend for '$app'. Re-add its profile."
 
     local desired_via current_via="host"
     desired_via=$(effective_via_for_app "$app" "$via_override")
@@ -2026,8 +2491,8 @@ start_app() {
     fi
 
     if ! systemctl start "nns-openvpn@${app}.service"; then
-        warn "Failed to start OpenVPN for '$app'."
-        warn "Recent OpenVPN-service log:"
+        warn "Failed to start the VPN backend for '$app'."
+        warn "Recent VPN-service log:"
         journalctl -u "nns-openvpn@${app}.service" -n 40 \
             -o cat --no-pager >&2 2>/dev/null || true
         stop_app "$app"
@@ -2047,7 +2512,7 @@ start_app() {
         ext=$(ip netns exec "$NS_NAME" curl -4fsS \
               --connect-timeout 1 --max-time 1 \
               "$EXTERNAL_IP_URL" 2>/dev/null || true)
-        log "Started '$app' with '$DEFAULT_PROFILE' via $desired_via.${ext:+ External IP: $ext}"
+        log "Started '$app' with '$DEFAULT_PROFILE' ($(vpn_type_label "$vpn_type")) via $desired_via.${ext:+ External IP: $ext}"
         return 0
     fi
 
@@ -2060,7 +2525,7 @@ start_app() {
 
     warn "'$app' failed: the VPN data path was not online within ${timeout}s."
     warn "Stopping the failed VPN instance instead of leaving it reconnecting."
-    warn "Recent OpenVPN log:"
+    warn "Recent VPN backend log:"
     journalctl -u "nns-openvpn@${app}.service" -n 20 \
         -o cat --no-pager >&2 2>/dev/null || true
     stop_app "$app"
@@ -2093,7 +2558,7 @@ stop_app() {
     systemctl stop "nns-openvpn@${app}.service" 2>/dev/null || true
     systemctl stop "nns-netns@${app}.service" 2>/dev/null || true
     systemctl reset-failed "nns-openvpn@${app}.service" "nns-netns@${app}.service" 2>/dev/null || true
-    rm -f "$RUN_DIR/${app}.profile" "$RUN_DIR/${app}.via"
+    rm -f "$RUN_DIR/${app}.profile" "$RUN_DIR/${app}.type" "$RUN_DIR/${app}.via"         "$(wireguard_runtime_config_path "$app")"
     log "Stopped '$app'."
 }
 
@@ -2109,7 +2574,7 @@ remove_app() {
     systemctl disable "nns-openvpn@${app}.service" "nns-netns@${app}.service" >/dev/null 2>&1 || true
     rm -f "/etc/sudoers.d/nns-app-${app}"
     rm -rf "$(cfg_dir "$app")" "/etc/netns/$NS_NAME"
-    rm -f "$RUN_DIR/${app}.env" "$RUN_DIR/${app}.profile" "$RUN_DIR/${app}.via"
+    rm -f "$RUN_DIR/${app}.env" "$RUN_DIR/${app}.profile" "$RUN_DIR/${app}.type"         "$RUN_DIR/${app}.via" "$(wireguard_runtime_config_path "$app")"
     systemctl daemon-reload
     log "Removed NNS app '$app'."
 }
@@ -2166,7 +2631,7 @@ purge_engine() {
     done < <(ip netns list 2>/dev/null | awk '{print $1}')
 
     # Remove all files installed by this engine. Do not remove dependency
-    # packages (openvpn, iproute2, iptables, curl, sudo, etc.).
+    # packages (openvpn, wireguard-tools, iproute2, iptables, curl, sudo, etc.).
     rm -rf -- "$BASE_DIR" "$RUN_DIR"
 
     if [[ -d /etc/netns ]]; then
@@ -2297,8 +2762,8 @@ run_in_app() {
     if bool_on "$KILLSWITCH"; then
         systemctl is-active --quiet "nns-openvpn@${app}.service" ||
             die "VPN service for '$app' is not running."
-        ip -n "$NS_NAME" route get 1.1.1.1 2>/dev/null | grep -qE ' dev (tun|tap)[^ ]* ' ||
-            die "VPN tunnel route for '$app' is not ready."
+        vpn_route_ready "$app" ||
+            die "VPN tunnel for '$app' is not ready."
         wait_online "$app" 2 ||
             die "VPN data path for '$app' is not online yet."
     fi
@@ -2314,10 +2779,10 @@ list_apps() {
     require_root
     install -d -o root -g root -m 0755 "$BASE_DIR" "$RUN_DIR"
 
-    printf '%-18s %-9s %-12s %s\n' "Name" "Status" "Via" "Online"
-    printf '%-18s %-9s %-12s %s\n' "------------------" "---------" "------------" "-----------------------------------------------"
+    printf '%-18s %-9s %-11s %-12s %s\n' "Name" "Status" "Backend" "Via" "Online"
+    printf '%-18s %-9s %-11s %-12s %s\n' "------------------" "---------" "-----------" "------------" "-----------------------------------------------"
 
-    local found=0 dir app status profile local_ip external online via
+    local found=0 dir app status profile local_ip external online via type type_label
     shopt -s nullglob
     for dir in "$BASE_DIR"/*; do
         [[ -d "$dir" ]] || continue
@@ -2328,6 +2793,9 @@ list_apps() {
         load_cfg "$app"
         profile=${DEFAULT_PROFILE:-none}
         profile=${profile%.ovpn}
+        profile=${profile%.conf}
+        type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+        type_label=$(vpn_type_label "${type:-unknown}")
         status=stopped
         via=$(effective_via_for_app "$app" __default__)
         online="$profile | -"
@@ -2338,23 +2806,26 @@ list_apps() {
             if [[ "$via" != host ]] && ! app_is_started "$via"; then
                 via="${via}!"
             fi
-            local_ip=$(ip -n "$NS_NAME" -o -4 addr show 2>/dev/null |
-                       awk '$2 ~ /^(tun|tap)/ {split($4,a,"/"); print a[1]; exit}' || true)
+            local_ip=$(vpn_local_ipv4 "$app" 2>/dev/null || true)
             [[ -n "$local_ip" ]] || local_ip="-"
             external=""
-            if ip -n "$NS_NAME" route get 1.1.1.1 2>/dev/null | grep -qE ' dev (tun|tap)[^ ]* '; then
-                external=$(ip netns exec "$NS_NAME" curl -4fsS \
+            if vpn_route_ready "$app"; then
+                local ns
+                ns=$(cfg_read_value "$app" NS_NAME 2>/dev/null || true)
+                external=$(ip netns exec "$ns" curl -4fsS \
                            --connect-timeout 2 --max-time 4 "$EXTERNAL_IP_URL" 2>/dev/null || true)
             fi
             [[ -n "$external" ]] || external="offline"
             online="$profile | $local_ip -> $external"
         fi
 
-        printf '%-18s %-9s %-12s %s\n' "$app" "$status" "$via" "$online"
+        printf '%-18s %-9s %-11s %-12s %s\n' \
+            "$app" "$status" "$type_label" "$via" "$online"
     done
 
     (( found )) || log "No NNS apps installed."
 }
+
 
 main() {
     local cmd=${1:-}
@@ -2392,10 +2863,16 @@ main() {
             netns_down "$2"
             exit
             ;;
+        _vpn)
+            require_root
+            [[ $# -eq 2 ]] || die "_vpn requires app_name."
+            vpn_exec "$2"
+            exit
+            ;;
         _openvpn)
             require_root
             [[ $# -eq 2 ]] || die "_openvpn requires app_name."
-            openvpn_exec "$2"
+            vpn_exec "$2"
             exit
             ;;
         _run-user)
@@ -2450,7 +2927,7 @@ main() {
             ;;
         add)
             (( $# >= 3 )) ||
-                die "Usage: nns-app add <app_name> <profile.ovpn>|any [country] [--refresh] [--via <upstream-app>|host]"
+                die "Usage: nns-app add <app_name> <profile.ovpn|wireguard.conf>|any [country] [--refresh] [--via <upstream-app>|host]"
             if [[ "$3" == any ]]; then
                 local add_app=$2 add_country="" add_refresh="off" add_via="__default__"
                 shift 3
