@@ -407,6 +407,12 @@ Stop it:
 nns-app stop my-private-app
 ```
 
+Run destructive lifecycle commands from the host namespace. If you entered an
+interactive shell with `nns-app run my-private-app bash`, exit that shell first
+(or use another host terminal) before `stop`, `remove`, or `purge`. nns-app
+refuses those commands from inside a managed namespace so teardown cannot kill
+its own wrapper and sudo process.
+
 Remove the environment and its imported profiles:
 
 ```bash

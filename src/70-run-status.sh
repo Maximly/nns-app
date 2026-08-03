@@ -271,11 +271,6 @@ ensure_snap_dns_proxy() {
     }
 }
 
-namespace_ref_id() {
-    local path=$1
-    stat -Lc '%d:%i' -- "$path" 2>/dev/null
-}
-
 compose_user_run_path() {
     # sudo normally replaces PATH with secure_path. Restore the caller's PATH
     # for the final unprivileged process, then append standard system command

@@ -181,9 +181,14 @@ normalize_via() {
     printf '%s\n' "$via"
 }
 
+namespace_ref_id() {
+    local path=$1
+    stat -Lc '%d:%i' -- "$path" 2>/dev/null
+}
+
 current_nns_app() {
     local current dir app ns target
-    current=$(readlink /proc/self/ns/net 2>/dev/null || true)
+    current=$(namespace_ref_id /proc/self/ns/net 2>/dev/null || true)
     [[ -n "$current" ]] || return 1
 
     shopt -s nullglob
@@ -193,13 +198,20 @@ current_nns_app() {
         [[ -f "$(cfg_file "$app")" ]] || continue
         ns=$(cfg_read_value "$app" NS_NAME 2>/dev/null || true)
         [[ -n "$ns" && -e "/run/netns/$ns" ]] || continue
-        target=$(readlink "/run/netns/$ns" 2>/dev/null || true)
-        if [[ "$current" == "$target" ]]; then
+        target=$(namespace_ref_id "/run/netns/$ns" 2>/dev/null || true)
+        if [[ -n "$target" && "$current" == "$target" ]]; then
             printf '%s\n' "$app"
             return 0
         fi
     done
     return 1
+}
+
+assert_destructive_command_from_host() {
+    local operation=$1 current_app
+    current_app=$(current_nns_app 2>/dev/null || true)
+    [[ -z "$current_app" ]] ||
+        die "Cannot $operation from inside nns-app environment '$current_app'. Exit the shell/application started by 'nns-app run $current_app ...', or use another host terminal, and retry."
 }
 
 effective_via_for_app() {

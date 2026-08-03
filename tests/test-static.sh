@@ -9,7 +9,7 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fq 'nns-app 1.3.11' <<<"$version"
+grep -Fq 'nns-app 1.3.12' <<<"$version"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -239,5 +239,19 @@ grep -Fq 'temp="$temp_dir/$profile_name"' "$INSTALLER" || {
     exit 1
 }
 
+
+
+grep -Fq "assert_destructive_command_from_host \"stop '\$app'\"" "$INSTALLER" || {
+    echo 'FAIL: stop does not guard against being invoked inside an nns-app namespace' >&2
+    exit 1
+}
+grep -Fq "assert_destructive_command_from_host \"remove '\$app'\"" "$INSTALLER" || {
+    echo 'FAIL: remove does not guard against being invoked inside an nns-app namespace' >&2
+    exit 1
+}
+grep -Fq 'assert_destructive_command_from_host "purge nns-app"' "$INSTALLER" || {
+    echo 'FAIL: purge does not guard against being invoked inside an nns-app namespace' >&2
+    exit 1
+}
 
 echo 'Static tests passed.'

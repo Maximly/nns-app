@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.12
+
+- Refuse `stop`, `remove`, and `purge` when invoked from a shell or process already running inside an nns-app network namespace. Previously namespace teardown killed the nested wrapper and sudo process, producing `Terminated`/`Killed` messages before the command could finish cleanly.
+- Detect the current nns-app namespace using followed namespace filesystem identity rather than `readlink` on `/run/netns/*` bind mounts.
+- Tell the user to exit the `nns-app run ... bash` shell or use another host terminal before destructive lifecycle operations.
+
 ## 1.3.11
 
 - Preserve the invoking user’s `PATH` across the sudo `secure_path` and `env -i` boundaries used by `nns-app run`.

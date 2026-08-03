@@ -46,7 +46,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.11"
+readonly VERSION="1.3.12"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -487,9 +487,14 @@ normalize_via() {
     printf '%s\n' "$via"
 }
 
+namespace_ref_id() {
+    local path=$1
+    stat -Lc '%d:%i' -- "$path" 2>/dev/null
+}
+
 current_nns_app() {
     local current dir app ns target
-    current=$(readlink /proc/self/ns/net 2>/dev/null || true)
+    current=$(namespace_ref_id /proc/self/ns/net 2>/dev/null || true)
     [[ -n "$current" ]] || return 1
 
     shopt -s nullglob
@@ -499,13 +504,20 @@ current_nns_app() {
         [[ -f "$(cfg_file "$app")" ]] || continue
         ns=$(cfg_read_value "$app" NS_NAME 2>/dev/null || true)
         [[ -n "$ns" && -e "/run/netns/$ns" ]] || continue
-        target=$(readlink "/run/netns/$ns" 2>/dev/null || true)
-        if [[ "$current" == "$target" ]]; then
+        target=$(namespace_ref_id "/run/netns/$ns" 2>/dev/null || true)
+        if [[ -n "$target" && "$current" == "$target" ]]; then
             printf '%s\n' "$app"
             return 0
         fi
     done
     return 1
+}
+
+assert_destructive_command_from_host() {
+    local operation=$1 current_app
+    current_app=$(current_nns_app 2>/dev/null || true)
+    [[ -z "$current_app" ]] ||
+        die "Cannot $operation from inside nns-app environment '$current_app'. Exit the shell/application started by 'nns-app run $current_app ...', or use another host terminal, and retry."
 }
 
 effective_via_for_app() {
@@ -3460,6 +3472,7 @@ remove_app() {
     local app=$1 cleanup_mode=${2:-remote}
     local gateway_dependencies app_dependencies auto_alias=""
     validate_app_name "$app"
+    assert_destructive_command_from_host "remove '$app'"
     load_cfg "$app"
 
     auto_alias=${REMOTE_ALIAS:-}
@@ -3512,6 +3525,7 @@ remove_app() {
 
 purge_engine() {
     require_root
+    assert_destructive_command_from_host "purge nns-app"
 
     local cleanup_mode=${1:-remote}
     local dir app ns pids
@@ -7342,6 +7356,7 @@ stop_app_cli() {
     validate_app_name "$app"
     [[ "$mode" == remote || "$mode" == local-only ]] ||
         die "Unsupported stop mode '$mode'."
+    assert_destructive_command_from_host "stop '$app'"
     load_cfg "$app"
     remote_mode=${REMOTE_MODE:-}
     alias=${REMOTE_ALIAS:-}
@@ -7720,11 +7735,6 @@ ensure_snap_dns_proxy() {
         journalctl -u "$unit" -n 30 -o cat --no-pager >&2 2>/dev/null || true
         die "Namespace DNS compatibility proxy for '$app' is not running."
     }
-}
-
-namespace_ref_id() {
-    local path=$1
-    stat -Lc '%d:%i' -- "$path" 2>/dev/null
 }
 
 compose_user_run_path() {

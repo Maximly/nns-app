@@ -32,6 +32,24 @@ if namespace_ref_id "$TEST_TMP/missing-netns" >/dev/null 2>&1; then
     fail 'missing namespace reference was accepted'
 fi
 
+
+# Destructive lifecycle operations must not tear down the namespace containing
+# their own caller. This commonly happens after `nns-app run my-app bash`.
+(
+    current_nns_app() { printf 'inside-app\n'; }
+    if output=$(assert_destructive_command_from_host "stop 'inside-app'" 2>&1); then
+        fail 'destructive command was allowed from inside an nns-app namespace'
+    fi
+    grep -Fq "Cannot stop 'inside-app' from inside nns-app environment 'inside-app'" <<<"$output" ||
+        fail 'inside-namespace stop diagnostic'
+    grep -Fq "Exit the shell/application started by 'nns-app run inside-app ...'" <<<"$output" ||
+        fail 'inside-namespace stop recovery guidance'
+)
+(
+    current_nns_app() { return 1; }
+    assert_destructive_command_from_host "stop 'host-app'"
+)
+
 caller_path='/home/test-user/.local/bin:/opt/test-tools/bin'
 composed_path=$(compose_user_run_path "$caller_path")
 [[ "$composed_path" == "$caller_path:"* ]] ||
@@ -510,6 +528,7 @@ fi
 (
     require_root() { :; }
     validate_app_name() { :; }
+    assert_destructive_command_from_host() { :; }
     load_cfg() {
         REMOTE_MODE=auto
         REMOTE_ALIAS=auto-test

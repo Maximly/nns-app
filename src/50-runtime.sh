@@ -578,6 +578,7 @@ remove_app() {
     local app=$1 cleanup_mode=${2:-remote}
     local gateway_dependencies app_dependencies auto_alias=""
     validate_app_name "$app"
+    assert_destructive_command_from_host "remove '$app'"
     load_cfg "$app"
 
     auto_alias=${REMOTE_ALIAS:-}
@@ -630,6 +631,7 @@ remove_app() {
 
 purge_engine() {
     require_root
+    assert_destructive_command_from_host "purge nns-app"
 
     local cleanup_mode=${1:-remote}
     local dir app ns pids

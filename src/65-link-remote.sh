@@ -1836,6 +1836,7 @@ stop_app_cli() {
     validate_app_name "$app"
     [[ "$mode" == remote || "$mode" == local-only ]] ||
         die "Unsupported stop mode '$mode'."
+    assert_destructive_command_from_host "stop '$app'"
     load_cfg "$app"
     remote_mode=${REMOTE_MODE:-}
     alias=${REMOTE_ALIAS:-}
