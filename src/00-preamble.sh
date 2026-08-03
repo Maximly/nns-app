@@ -30,7 +30,7 @@
 #   add     <app_name> <profile.ovpn|wireguard.conf>
 #   add     <app_name> any [country] [--refresh] [--via <upstream-app>|host]
 #   start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
-#   stop    <app_name>
+#   stop    <app_name> [--local-only]
 #   run     <app_name> <command> [args...]
 #   gateway create <gateway> --via <app> --listen tcp|udp:<port>
 #                  --public <host>:<port> [--transport direct|stunnel|cloak]
@@ -46,7 +46,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.9"
+readonly VERSION="1.3.10"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -238,7 +238,7 @@ Usage:
   nns-app add     <app_name> <profile.ovpn|wireguard.conf>
   nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
   nns-app start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
-  nns-app stop    <app_name>
+  nns-app stop    <app_name> [--local-only]
   nns-app run     <app_name> <command> [arguments...]
 
   nns-app gateway create <gateway_name> --via <app_name>

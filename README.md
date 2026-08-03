@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.9
+**Release:** 1.3.10
 
 **Supported platform:** Ubuntu with systemd and iptables  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
@@ -89,9 +89,18 @@ forward through the existing SSH port, so no additional cloud firewall rule or
 public gateway port is needed.
 
 The third command executes the requested process inside the already running
-local namespace. If the environment was stopped manually, `run` starts it
-again. Normal status, synchronization, and credential rotation remain
-available:
+local namespace. If the environment was stopped manually, `run` starts the
+owned remote exit and gateway first, then reconnects the local environment.
+An explicit stop is symmetric:
+
+```bash
+nns-app stop my-private-app
+```
+
+It stops the local client first and then the owned remote gateway and provider
+exit. Use `nns-app stop my-private-app --local-only` only when the remote host
+is unavailable or when leaving the remote side running is intentional. Normal
+status, synchronization, and credential rotation remain available:
 
 ```bash
 nns-app status my-private-app
@@ -398,6 +407,10 @@ Stop it:
 ```bash
 nns-app stop my-private-app
 ```
+
+For a local/manual environment this stops only local services. For an
+automatic-remote environment it also stops that app's owned remote gateway and
+provider exit. `--local-only` skips the remote lifecycle operation explicitly.
 
 Remove the environment and its imported profiles:
 
@@ -827,23 +840,15 @@ resolver files. Snap launchers also require cgroup v2 and securityfs there.
 `nns-app run` detects direct Snap aliases, the Snap launcher itself, and distro
 transition wrappers such as Ubuntu's `/usr/bin/firefox` wrapper. It mounts those
 filesystems inside the private command mount namespace before dropping to the
-configured desktop user.
-
-Snap can reuse a persistent mount namespace and see the host's
-`127.0.0.53` systemd-resolved stub instead of `/etc/netns/<name>/resolv.conf`.
-For Snap launches, nns-app therefore starts a lazy DNS compatibility proxy on
-`127.0.0.53:53` inside the application network namespace. The proxy forwards
-UDP and TCP DNS to the configured `DNS_SERVERS`, drops privileges after binding,
-and is stopped with the namespace. Ordinary commands and non-Snap desktop
-applications skip both the mount preparation and the proxy.
+configured desktop user. Ordinary commands and non-Snap desktop applications
+skip this extra mount preparation.
 
 ```bash
 nns-app run my-private-app firefox --no-remote
 ```
 
 The temporary mounts disappear with the command and do not alter the host
-mount table. The DNS proxy is namespace-local and never changes the host
-resolver configuration.
+mount table.
 
 ## Upgrade
 

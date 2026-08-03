@@ -369,6 +369,15 @@ start_app() {
         die "Automatic remote app '$app' is configured, but no provider profile has been deployed. Run: nns-app add $app /path/to/profile.ovpn"
     fi
 
+    # An explicitly started automatic-remote app owns both ends of the path.
+    # Bring the remote provider exit and private gateway online before starting
+    # or reconciling the local SSH/OpenVPN client. The remote operation is
+    # idempotent, so recovery after an earlier explicit stop is transparent.
+    if [[ "${REMOTE_MODE:-}" == auto ]]; then
+        remote_auto_start_app "$app"
+        load_cfg "$app"
+    fi
+
     vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
     [[ -n "$vpn_type" ]] || die "Cannot determine VPN backend for '$app'. Re-add its profile or configure --backend inherit."
 

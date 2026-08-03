@@ -1,11 +1,10 @@
 # Changelog
 
-## 1.3.9
+## 1.3.10
 
-- Fixed DNS for Firefox and other Snap applications inside nns-app namespaces. Snap can reuse its own mount namespace and see the host `127.0.0.53` resolver instead of the namespace-specific `/etc/resolv.conf`.
-- Added a lazy namespace-local DNS compatibility proxy on `127.0.0.53:53`, started only for Snap/snap-confine launches and stopped with the application namespace.
-- The proxy forwards both UDP and TCP DNS to the app's configured `DNS_SERVERS`, binds as root, then drops permanently to `nobody` so the kill switch cannot leak DNS through the root-only pre-tunnel exception.
-- `status` now reports whether the Snap DNS proxy is active.
+- Made automatic-remote lifecycle symmetric: `nns-app stop <app>` now stops the local client first, then the owned remote gateway and provider exit; `nns-app start <app>` starts the owned remote exit/gateway before reconciling the local path.
+- Added `nns-app stop <app> --local-only` as an explicit emergency escape hatch when the remote host is unavailable. Normal local/manual apps keep their previous local-only behavior.
+- Remote lifecycle operations validate deterministic ownership markers before touching gateway or exit resources and keep boot enablement intact for reboot recovery.
 
 ## 1.3.8
 

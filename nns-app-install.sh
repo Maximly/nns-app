@@ -30,7 +30,7 @@
 #   add     <app_name> <profile.ovpn|wireguard.conf>
 #   add     <app_name> any [country] [--refresh] [--via <upstream-app>|host]
 #   start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
-#   stop    <app_name>
+#   stop    <app_name> [--local-only]
 #   run     <app_name> <command> [args...]
 #   gateway create <gateway> --via <app> --listen tcp|udp:<port>
 #                  --public <host>:<port> [--transport direct|stunnel|cloak]
@@ -46,7 +46,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.9"
+readonly VERSION="1.3.10"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -238,7 +238,7 @@ Usage:
   nns-app add     <app_name> <profile.ovpn|wireguard.conf>
   nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
   nns-app start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
-  nns-app stop    <app_name>
+  nns-app stop    <app_name> [--local-only]
   nns-app run     <app_name> <command> [arguments...]
 
   nns-app gateway create <gateway_name> --via <app_name>
@@ -3241,6 +3241,15 @@ start_app() {
     if [[ "${REMOTE_MODE:-}" == auto &&
           ( -z "${DEFAULT_PROFILE:-}" || -z "${VPN_TYPE:-}" ) ]]; then
         die "Automatic remote app '$app' is configured, but no provider profile has been deployed. Run: nns-app add $app /path/to/profile.ovpn"
+    fi
+
+    # An explicitly started automatic-remote app owns both ends of the path.
+    # Bring the remote provider exit and private gateway online before starting
+    # or reconciling the local SSH/OpenVPN client. The remote operation is
+    # idempotent, so recovery after an earlier explicit stop is transparent.
+    if [[ "${REMOTE_MODE:-}" == auto ]]; then
+        remote_auto_start_app "$app"
+        load_cfg "$app"
     fi
 
     vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
@@ -6853,6 +6862,69 @@ remote_auto_status_internal() {
     gateway_status "$gateway"
 }
 
+remote_auto_start_internal() {
+    require_root
+    local owner=$1 exit_app gateway
+    remote_auto_assert_state "$owner"
+    exit_app=$(remote_auto_exit_name "$owner")
+    gateway=$(remote_auto_gateway_name "$owner")
+
+    [[ -f "$(cfg_file "$exit_app")" ]] ||
+        die "Automatic remote exit '$exit_app' is missing."
+    [[ -f "$(gateway_cfg_file "$gateway")" ]] ||
+        die "Automatic remote gateway '$gateway' is missing."
+
+    load_cfg "$exit_app"
+    [[ "${REMOTE_MANAGED_OWNER_ID:-}" == "$owner" ]] ||
+        die "Refusing to start exit '$exit_app': owner marker mismatch."
+    start_app "$exit_app" off __default__
+
+    load_gateway_cfg "$gateway"
+    [[ "$VIA_APP" == "$exit_app" ]] ||
+        die "Refusing to start gateway '$gateway': it does not use '$exit_app'."
+    [[ "${REMOTE_MANAGED_OWNER_ID:-}" == "$owner" ]] ||
+        die "Refusing to start gateway '$gateway': owner marker mismatch."
+    gateway_start "$gateway"
+
+    # Keep boot recovery enabled even after an explicit stop/start cycle.
+    systemctl enable \
+        "nns-netns@${exit_app}.service" \
+        "nns-openvpn@${exit_app}.service" \
+        "nns-online@${exit_app}.service" \
+        "nns-gateway@${gateway}.service" \
+        >/dev/null
+    log "Started automatic remote '$owner': $exit_app -> $gateway."
+}
+
+remote_auto_stop_internal() {
+    require_root
+    local owner=$1 exit_app gateway
+    remote_auto_assert_state "$owner"
+    exit_app=$(remote_auto_exit_name "$owner")
+    gateway=$(remote_auto_gateway_name "$owner")
+
+    if [[ -f "$(gateway_cfg_file "$gateway")" ]]; then
+        load_gateway_cfg "$gateway"
+        [[ "$VIA_APP" == "$exit_app" ]] ||
+            die "Refusing to stop gateway '$gateway': it does not use '$exit_app'."
+        [[ "${REMOTE_MANAGED_OWNER_ID:-}" == "$owner" ]] ||
+            die "Refusing to stop gateway '$gateway': owner marker mismatch."
+        gateway_stop "$gateway"
+    fi
+
+    if [[ -f "$(cfg_file "$exit_app")" ]]; then
+        load_cfg "$exit_app"
+        [[ "${REMOTE_MANAGED_OWNER_ID:-}" == "$owner" ]] ||
+            die "Refusing to stop exit '$exit_app': owner marker mismatch."
+        stop_app "$exit_app"
+    fi
+
+    # Deliberately do not disable the units: AUTOSTART remains the recovery
+    # policy after either host reboots, while this command stops the current
+    # runtime on both machines.
+    log "Stopped automatic remote '$owner': $gateway and $exit_app."
+}
+
 remote_auto_deauthorize_owner() {
     require_root
     local owner=$1 user=${SUDO_USER:-} home authorized tmp group marker sudoers
@@ -6975,6 +7047,14 @@ remote_auto_dispatch() {
         status)
             [[ $# -eq 1 ]] || die "_remote-auto status requires owner."
             remote_auto_status_internal "$1"
+            ;;
+        start)
+            [[ $# -eq 1 ]] || die "_remote-auto start requires owner."
+            remote_auto_start_internal "$1"
+            ;;
+        stop)
+            [[ $# -eq 1 ]] || die "_remote-auto stop requires owner."
+            remote_auto_stop_internal "$1"
             ;;
         cleanup)
             [[ $# -eq 1 ]] || die "_remote-auto cleanup requires owner."
@@ -7214,6 +7294,68 @@ remote_auto_command() {
     remote_ssh_args "$alias"
     payload=$(remote_auto_command_payload "$@")
     "${REMOTE_SSH_ARGS[@]}" "$payload"
+}
+
+remote_auto_lifecycle_app() {
+    require_root
+    local action=$1 app=$2 alias owner
+    [[ "$action" == start || "$action" == stop ]] ||
+        die "Unsupported automatic-remote lifecycle action '$action'."
+    validate_app_name "$app"
+    load_cfg "$app"
+    [[ "${REMOTE_MODE:-}" == auto ]] || return 0
+
+    alias=${REMOTE_ALIAS:-}
+    owner=${REMOTE_OWNER_ID:-}
+    [[ -n "$alias" && -n "$owner" ]] ||
+        die "Automatic remote app '$app' has incomplete lifecycle metadata."
+    [[ -f "$(remote_cfg_file "$alias")" ]] ||
+        die "Automatic remote app '$app' has no SSH registration for '$alias'."
+
+    case "$action" in
+        start) log "Starting automatic remote resources for '$app'..." ;;
+        stop)  log "Stopping automatic remote resources for '$app'..." ;;
+    esac
+    if ! remote_auto_command "$alias" "$action" "$owner"; then
+        return 1
+    fi
+}
+
+remote_auto_start_app() {
+    local app=$1
+    if ! remote_auto_lifecycle_app start "$app"; then
+        die "Could not start the automatic remote resources for '$app'. Rerun 'nns-app install $app via --remote user@remote-host' to upgrade or repair the remote helper."
+    fi
+}
+
+stop_app_cli() {
+    require_root
+    local app=$1 mode=${2:-remote} remote_mode alias owner deployed=0
+    validate_app_name "$app"
+    [[ "$mode" == remote || "$mode" == local-only ]] ||
+        die "Unsupported stop mode '$mode'."
+    load_cfg "$app"
+    remote_mode=${REMOTE_MODE:-}
+    alias=${REMOTE_ALIAS:-}
+    owner=${REMOTE_OWNER_ID:-}
+    if [[ "$remote_mode" == auto && -n "${DEFAULT_PROFILE:-}" &&
+          -n "${VPN_TYPE:-}" && -n "$alias" && -n "$owner" ]]; then
+        deployed=1
+    fi
+
+    # Stop the local client first so it cannot reconnect-loop while the remote
+    # gateway and provider exit are being shut down.
+    stop_app "$app"
+
+    if (( deployed )) && [[ "$mode" != local-only ]]; then
+        if ! remote_auto_lifecycle_app stop "$app"; then
+            warn "Local app '$app' was stopped, but its automatic remote gateway/exit could not be stopped. Retry when the remote host is reachable, or use --local-only to acknowledge a local-only stop."
+            return 1
+        fi
+        log "Stopped '$app' locally and on its automatic remote host."
+    elif (( deployed )); then
+        warn "Stopped '$app' locally only; its automatic remote gateway and provider exit remain running."
+    fi
 }
 
 remote_auto_cleanup_app() {
@@ -8382,8 +8524,15 @@ main() {
             start_app "$START_APP_NAME" "$START_IGNORE" "$START_VIA"
             ;;
         stop)
-            [[ $# -eq 2 ]] || die "Usage: nns-app stop <app_name>"
-            stop_app "$2"
+            case $# in
+                2) stop_app_cli "$2" remote ;;
+                3)
+                    [[ "$3" == --local-only ]] ||
+                        die "Usage: nns-app stop <app_name> [--local-only]"
+                    stop_app_cli "$2" local-only
+                    ;;
+                *) die "Usage: nns-app stop <app_name> [--local-only]" ;;
+            esac
             ;;
         gateway)
             (( $# >= 2 )) || die "Usage: nns-app gateway <create|start|stop|status|list|remove|client> ..."

@@ -291,8 +291,15 @@ main() {
             start_app "$START_APP_NAME" "$START_IGNORE" "$START_VIA"
             ;;
         stop)
-            [[ $# -eq 2 ]] || die "Usage: nns-app stop <app_name>"
-            stop_app "$2"
+            case $# in
+                2) stop_app_cli "$2" remote ;;
+                3)
+                    [[ "$3" == --local-only ]] ||
+                        die "Usage: nns-app stop <app_name> [--local-only]"
+                    stop_app_cli "$2" local-only
+                    ;;
+                *) die "Usage: nns-app stop <app_name> [--local-only]" ;;
+            esac
             ;;
         gateway)
             (( $# >= 2 )) || die "Usage: nns-app gateway <create|start|stop|status|list|remove|client> ..."

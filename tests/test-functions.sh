@@ -717,4 +717,84 @@ manual_payload=$(remote_command_payload gateway client export \
 )
 
 
+# Automatic remote start/stop are first-class restricted operations and must
+# preserve the owner argument exactly.
+(
+    require_root() { :; }
+    remote_auto_start_internal() {
+        [[ "$1" == 0123456789abcdef ]] || fail 'start owner was changed'
+        printf 'remote-start:%s\n' "$1"
+    }
+    remote_auto_stop_internal() {
+        [[ "$1" == 0123456789abcdef ]] || fail 'stop owner was changed'
+        printf 'remote-stop:%s\n' "$1"
+    }
+    output=$(remote_auto_dispatch start 0123456789abcdef)
+    grep -Fq 'remote-start:0123456789abcdef' <<<"$output" ||
+        fail 'automatic remote start dispatch'
+    output=$(remote_auto_dispatch stop 0123456789abcdef)
+    grep -Fq 'remote-stop:0123456789abcdef' <<<"$output" ||
+        fail 'automatic remote stop dispatch'
+)
+
+# Public stop defaults to symmetric automatic-remote shutdown, but exposes an
+# explicit local-only escape hatch. Local/manual apps never invoke SSH.
+(
+    require_root() { :; }
+    validate_app_name() { :; }
+    load_cfg() {
+        if [[ "$1" == remote-app ]]; then
+            REMOTE_MODE=auto
+            REMOTE_ALIAS=auto-test
+            REMOTE_OWNER_ID=0123456789abcdef
+            DEFAULT_PROFILE=client.ovpn
+            VPN_TYPE=openvpn
+        else
+            REMOTE_MODE=
+            REMOTE_ALIAS=
+            REMOTE_OWNER_ID=
+            DEFAULT_PROFILE=local.ovpn
+            VPN_TYPE=openvpn
+        fi
+    }
+    stop_app() { printf 'local-stop:%s\n' "$1"; }
+    remote_auto_lifecycle_app() {
+        printf 'remote-%s:%s\n' "$1" "$2"
+    }
+    warn() { printf 'warn:%s\n' "$*"; }
+    log() { printf 'log:%s\n' "$*"; }
+
+    output=$(stop_app_cli remote-app remote)
+    [[ "$(sed -n '1p' <<<"$output")" == 'local-stop:remote-app' ]] ||
+        fail 'automatic stop did not stop local side first'
+    grep -Fq 'remote-stop:remote-app' <<<"$output" ||
+        fail 'automatic stop omitted remote lifecycle'
+
+    output=$(stop_app_cli remote-app local-only)
+    grep -Fq 'local-stop:remote-app' <<<"$output" ||
+        fail 'local-only stop omitted local shutdown'
+    if grep -Fq 'remote-stop:remote-app' <<<"$output"; then
+        fail 'local-only stop touched remote lifecycle'
+    fi
+
+    output=$(stop_app_cli local-app remote)
+    grep -Fq 'local-stop:local-app' <<<"$output" ||
+        fail 'manual app stop omitted local shutdown'
+    if grep -Fq 'remote-stop:local-app' <<<"$output"; then
+        fail 'manual app stop attempted remote lifecycle'
+    fi
+)
+
+# CLI stop parsing must select symmetric or local-only semantics explicitly.
+(
+    stop_app_cli() { printf 'stop-cli:%s:%s\n' "$1" "$2"; }
+    output=$(main stop my-app)
+    grep -Fq 'stop-cli:my-app:remote' <<<"$output" ||
+        fail 'default stop parser did not select remote lifecycle'
+    output=$(main stop my-app --local-only)
+    grep -Fq 'stop-cli:my-app:local-only' <<<"$output" ||
+        fail 'local-only stop parser'
+)
+
+
 echo 'Function tests passed.'
