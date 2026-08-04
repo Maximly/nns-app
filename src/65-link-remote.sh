@@ -1350,6 +1350,61 @@ remote_auto_provider_ipv4() {
     printf '%s\n' "$ip"
 }
 
+# A single-session provider can evict the existing connection as soon as a
+# second profile reaches tunnel setup. Waiting for the candidate's complete
+# Internet data path before comparing tunnel addresses therefore creates a
+# reconnect race and prevents sharing from ever being selected. Wait only for
+# the provider-assigned tunnel address here; full readiness is checked later
+# when the candidate does not match an existing pool.
+remote_auto_wait_provider_ipv4() {
+    local exit_app=$1 timeout=${2:-60} deadline ip
+    validate_app_name "$exit_app"
+    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || timeout=60
+    deadline=$((SECONDS + timeout))
+
+    while (( SECONDS < deadline )); do
+        ip=$(remote_auto_provider_ipv4 "$exit_app" 2>/dev/null || true)
+        if [[ -n "$ip" ]]; then
+            printf '%s\n' "$ip"
+            return 0
+        fi
+
+        # Fail promptly when the backend itself has exited. A running backend
+        # is allowed to remain without Internet access during this probe.
+        if ! systemctl is-active --quiet "nns-openvpn@${exit_app}.service"; then
+            return 1
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# Persist currently observable tunnel addresses before starting a competing
+# probe. Some providers remove the older TUN interface immediately when the
+# duplicate session connects; recording the address first lets the later pool
+# scan still identify the displaced connection.
+remote_auto_snapshot_provider_ipv4s() {
+    local uploaded_type=$1 exclude_owner=${2:-} file candidate_owner live_ip
+    shopt -s nullglob
+    for file in "$STATE_DIR"/remote-auto/*.cfg; do
+        candidate_owner=${file##*/}
+        candidate_owner=${candidate_owner%.cfg}
+        [[ "$candidate_owner" =~ ^[a-f0-9]{16}$ &&
+           "$candidate_owner" != "$exclude_owner" ]] || continue
+        remote_auto_load_state "$candidate_owner" 2>/dev/null || continue
+        [[ -f "$(cfg_file "$RA_EXIT_APP")" ]] || continue
+        [[ "$(vpn_type_for_app "$RA_EXIT_APP" 2>/dev/null || true)" == "$uploaded_type" ]] || continue
+        live_ip=$(remote_auto_provider_ipv4 "$RA_EXIT_APP" 2>/dev/null || true)
+        [[ -n "$live_ip" ]] || continue
+        if [[ "$RA_PROVIDER_VPN_IPV4" != "$live_ip" ]]; then
+            remote_auto_write_state "$candidate_owner" "$RA_EXIT_APP" "$RA_GATEWAY" "$RA_CLIENT" \
+                "$RA_POOL_ID" "$live_ip" "$RA_PROFILE_SHA256" "$RA_ACTIVE"
+        fi
+    done
+    shopt -u nullglob
+    return 0
+}
+
 remote_auto_find_shared_pool() {
     local owner=$1 provider_ipv4=$2 uploaded_type=$3 file candidate_owner live_ip
     validate_remote_owner_id "$owner"
@@ -1552,10 +1607,26 @@ remote_auto_deploy_internal() {
     add_profile "$exit_app" "$temp"
     cfg_set "$exit_app" READY_TIMEOUT 60
     cfg_set "$exit_app" AUTOSTART on
-    start_app "$exit_app" off __default__
-    provider_ipv4=$(remote_auto_provider_ipv4 "$exit_app" 2>/dev/null || true)
-    [[ -n "$provider_ipv4" ]] ||
+
+    # Snapshot existing pool addresses while they are still observable. The
+    # candidate may make a single-session provider remove the older tunnel
+    # interface before the comparison runs.
+    remote_auto_snapshot_provider_ipv4s "$uploaded_type" "$owner"
+
+    # Probe mode deliberately leaves the backend running when its full data
+    # path is not online yet. A single-session provider may have displaced an
+    # existing pool already, so the tunnel address must be compared before the
+    # normal readiness timeout can stop this candidate.
+    start_app "$exit_app" probe __default__
+    provider_ipv4=$(remote_auto_wait_provider_ipv4 "$exit_app" 60 2>/dev/null || true)
+    if [[ -z "$provider_ipv4" ]]; then
+        warn "'$exit_app' did not receive a provider-side VPN address within 60s."
+        warn "Recent backend log:"
+        journalctl -u "nns-openvpn@${exit_app}.service" -n 20 \
+            -o cat --no-pager >&2 2>/dev/null || true
+        stop_app "$exit_app" >/dev/null 2>&1 || true
         die "Could not determine the provider-side VPN address for '$exit_app'."
+    fi
 
     # A second session with the same provider-side address usually means the
     # provider profile/account is single-session. Share the first managed exit
@@ -1600,6 +1671,20 @@ remote_auto_deploy_internal() {
         log "Shared provider-side VPN address '$provider_ipv4'; attached '$owner' to pool '$pool_id' ($member_count clients)."
         log "Automatic remote '$owner' is ready: $shared_exit -> $shared_gateway/$client."
         return 0
+    fi
+
+    # No existing pool matched the provider-assigned address. Only now require
+    # the candidate's complete routed data path before building a gateway on
+    # top of it. This preserves the normal deployment guarantee without
+    # blocking address-based sharing behind that guarantee.
+    if ! wait_online "$exit_app" 60; then
+        warn "'$exit_app' received tunnel address '$provider_ipv4', but its data path was not online within 60s."
+        warn "Stopping the failed instance instead of leaving it reconnecting."
+        warn "Recent backend log:"
+        journalctl -u "nns-openvpn@${exit_app}.service" -n 20 \
+            -o cat --no-pager >&2 2>/dev/null || true
+        stop_app "$exit_app" >/dev/null 2>&1 || true
+        die "The provider VPN data path for '$exit_app' did not become online."
     fi
 
     if [[ ! -f "$(gateway_cfg_file "$gateway")" ]]; then

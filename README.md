@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.19
+**Release:** 1.3.20
 
 **Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
@@ -132,9 +132,12 @@ When another automatic client on the same remote host uses an identical
 recorded profile, nns-app reuses that provider exit immediately. If the profile
 files differ but the newly started provider session receives the same
 provider-side tunnel IPv4 address as an existing automatic exit, nns-app treats
-them as the same single-session provider identity: it removes the duplicate
-exit, reconnects the existing pool, and adds a new unique gateway client. The
-result is one provider VPN session and one remote gateway shared by several
+them as the same single-session provider identity. The address comparison runs
+as soon as the candidate tunnel address is assigned, before full Internet
+readiness is required, so a provider that drops the older duplicate session
+cannot trap deployment in a reconnect/timeout loop. nns-app removes the
+duplicate exit, reconnects the existing pool, and adds a new unique gateway
+client. The result is one provider VPN session and one remote gateway shared by several
 local nns-app environments, while each local machine keeps its own certificate,
 private key, TLS Crypt v2 key, SSH key, and lifecycle state.
 

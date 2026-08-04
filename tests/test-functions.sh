@@ -1108,7 +1108,7 @@ manual_payload=$(remote_command_payload gateway client export \
     systemctl() { return 1; }
     app_is_started() { return 1; }
     add_profile() { printf 'profile:%s:%s\n' "$1" "${2##*/}"; }
-    start_app() { printf 'start:%s\n' "$1"; }
+    start_app() { printf 'start:%s:%s\n' "$1" "${2:-}"; }
     stop_app() { printf 'stop:%s\n' "$1"; }
     remove_app() { printf 'remove:%s:%s\n' "$1" "$2"; }
     profile_type_from_file() { printf '%s\n' openvpn; }
@@ -1140,6 +1140,8 @@ manual_payload=$(remote_command_payload gateway client export \
 
     output=$(printf '%s\n' client | remote_auto_deploy_internal \
         3333333333333333 remote-host 22 provider.ovpn)
+    grep -Fq 'start:ra-333333333333-exit:probe' <<<"$output" ||
+        fail 'candidate exit was not started in address-probe mode before sharing'
     grep -Fq 'remove:ra-333333333333-exit:local-only' <<<"$output" ||
         fail 'duplicate provider exit was not removed during sharing'
     grep -Fq 'client-add:ra-111111111111-gw:ra-333333333333-client' <<<"$output" ||

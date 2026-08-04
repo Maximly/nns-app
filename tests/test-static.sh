@@ -9,7 +9,7 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fq 'nns-app 1.3.19' <<<"$version"
+grep -Fq 'nns-app 1.3.20' <<<"$version"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -35,6 +35,9 @@ grep -Fq 'remote_auto_install' "$INSTALLER"
 grep -Fq 'remote_auto_deploy_internal' "$INSTALLER"
 grep -Fq 'remote_auto_find_shared_pool' "$INSTALLER"
 grep -Fq 'remote_auto_find_shared_profile' "$INSTALLER"
+grep -Fq 'remote_auto_wait_provider_ipv4' "$INSTALLER"
+grep -Fq 'remote_auto_snapshot_provider_ipv4s' "$INSTALLER"
+grep -Fq 'start_app "$exit_app" probe __default__' "$INSTALLER"
 grep -Fq 'PROVIDER_VPN_IPV4' "$INSTALLER"
 grep -Fq 'POOL_ID' "$INSTALLER"
 grep -Fq 'shared pool' "$ROOT/README.md"
@@ -200,7 +203,7 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 1.3.19' "$ROOT/README.md"
+grep -Fq '**Release:** 1.3.20' "$ROOT/README.md"
 grep -Fq '## Quick start' "$ROOT/README.md"
 grep -Fq '### Run the VPN profile locally' "$ROOT/README.md"
 grep -Fq 'nns-app install my-private-app' "$ROOT/README.md"

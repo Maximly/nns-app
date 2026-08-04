@@ -364,6 +364,10 @@ start_app() {
     local app=$1
     local ignore_start_error=${2:-off}
     local via_override=${3:-__default__}
+    case "$ignore_start_error" in
+        off|on|probe) ;;
+        *) die "Invalid start readiness mode '$ignore_start_error'." ;;
+    esac
     local vpn_type profile_marker
     validate_app_name "$app"
     load_cfg "$app"
@@ -466,7 +470,7 @@ start_app() {
     sync_watchdog_timer "$app"
 
     local timeout
-    if bool_on "$ignore_start_error"; then
+    if [[ "$ignore_start_error" == probe ]] || bool_on "$ignore_start_error"; then
         timeout=1
     else
         timeout=${READY_TIMEOUT:-5}
@@ -482,6 +486,11 @@ start_app() {
             watchdog_mark_online "$app"
         fi
         log "Started '$app' with '$profile_marker' ($(vpn_type_label "$vpn_type")) via $desired_via.${ext:+ External IP: $ext}"
+        return 0
+    fi
+
+    if [[ "$ignore_start_error" == probe ]]; then
+        log "Started provider-address probe for '$app' via $desired_via; full data-path readiness is deferred."
         return 0
     fi
 

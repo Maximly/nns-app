@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.3.20
+
+- Fixed automatic remote profile sharing for single-session VPN providers.
+  Deployment now waits only for the candidate tunnel address before comparing
+  it with existing pools; full Internet readiness is required afterward only
+  when no shared pool matches. This prevents two sessions with the same
+  provider-side address from repeatedly evicting each other until the new
+  candidate times out.
+- Added a bounded provider-address probe that fails promptly if the backend
+  exits and leaves no competing provider exit running after a failed probe.
+- Snapshot observable addresses of existing pools before starting the probe,
+  so matching still works when the provider immediately removes the displaced
+  exit's tunnel interface.
+
 ## 1.3.19
 
 - Fixed automatic-remote purge recovery when the owner state file is already absent and another unrelated gateway or application remains on the remote host.
