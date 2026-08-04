@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.20
+**Release:** 1.3.21
 
 **Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
@@ -24,7 +24,9 @@ sudo ./nns-app-install.sh install
 Then choose one of the following two alternatives. Use a different application
 name if you want to keep both configurations on the same client.
 
-### Run the VPN profile locally
+### Run a VPN locally
+
+Install the application environment, then add either your own profile:
 
 ```bash
 nns-app install my-private-app
@@ -32,10 +34,21 @@ nns-app add my-private-app ~/my-base-profile.ovpn
 nns-app run my-private-app ping -c 4 1.1.1.1
 ```
 
-The provider profile runs on the current host. The `ping` process runs inside
-`my-private-app` and its traffic exits through that profile.
+or let nns-app select and test a free VPN Gate profile, optionally by country:
 
-### Run the same VPN profile on a remote Linux host
+```bash
+nns-app install my-private-app
+nns-app add my-private-app any
+# Or, for example: nns-app add my-private-app any JP
+nns-app run my-private-app ping -c 4 1.1.1.1
+```
+
+The selected provider profile runs on the current host. The `ping` process runs
+inside `my-private-app` and its traffic exits through that profile.
+
+### Run a VPN on a remote Linux host
+
+Use your own profile:
 
 ```bash
 nns-app install my-private-app via --remote user@remote-host
@@ -43,13 +56,27 @@ nns-app add my-private-app ~/my-base-profile.ovpn
 nns-app run my-private-app ping -c 4 1.1.1.1
 ```
 
+or select a free VPN Gate profile and deploy it automatically to the remote
+host:
+
+```bash
+nns-app install my-private-app via --remote user@remote-host
+nns-app add my-private-app any
+# Or, for example: nns-app add my-private-app any JP
+nns-app run my-private-app ping -c 4 1.1.1.1
+```
+
 The first command bootstraps or upgrades nns-app on `remote-host` over SSH. The
-second command deploys the provider profile there and automatically creates the
-private remote exit, gateway, client credentials, and local link. The final
-command runs `ping` locally inside `my-private-app`, with its traffic routed
-through the remote host and then through the deployed provider VPN. Existing
-`ssh user@remote-host` access and remote `sudo` permission are required for the
-first bootstrap.
+second command either deploys the supplied profile or selects a free profile,
+then automatically creates the private remote exit, gateway, client
+credentials, and local link. The final command runs `ping` locally inside
+`my-private-app`, with its traffic routed through the remote host and then
+through the deployed provider VPN. Existing `ssh user@remote-host` access and
+remote `sudo` permission are required for the first bootstrap.
+
+VPN Gate is a volunteer-operated public network. Relays may disappear, log
+traffic, or provide inconsistent performance. Use end-to-end encryption and a
+provider-managed profile for reliable or sensitive use.
 
 ## Highlights
 
