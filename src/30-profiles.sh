@@ -788,7 +788,11 @@ def looks_usable(config):
         return False
     if re.search(r"(?im)^\s*(?:up|down|route-up|route-pre-down|plugin|script-security|management\S*)\b", text):
         return False
-    if re.search(r"(?im)^\s*auth-user-pass(?:\s+(?!\[inline\])\S+)?\s*$", text):
+    # VPN Gate occasionally emits a bare auth-user-pass directive. It is safe
+    # only because nns-app replaces it with the service's documented public
+    # credentials before probing or importing. External credential paths stay
+    # rejected.
+    if re.search(r"(?im)^\s*auth-user-pass\s+(?!\[inline\]\s*$)\S+", text):
         return False
     return True
 
@@ -847,9 +851,37 @@ def first_endpoint(config):
 
     return None
 
-def probe_compatible_config(config):
+def vpngate_compatible_config(config):
     text = config.decode("utf-8", errors="replace")
     additions = []
+
+    # VPN Gate documents the public username and password as "vpn" / "vpn".
+    # Some relays request them only after TLS has completed, so accepting a
+    # profile at "Peer Connection Initiated" is insufficient. Canonicalize a
+    # bare auth-user-pass directive into an inline, unattended credential block
+    # used by both the selector probe and the installed managed profile.
+    has_inline_auth = bool(
+        re.search(
+            r"(?ims)^\s*<auth-user-pass>\s*.*?^\s*</auth-user-pass>\s*$",
+            text,
+        )
+    )
+    text = re.sub(
+        r"(?im)^\s*auth-user-pass(?:\s+\[inline\])?\s*$\n?",
+        "",
+        text,
+    )
+    if not has_inline_auth:
+        additions.extend([
+            "<auth-user-pass>",
+            "vpn",
+            "vpn",
+            "</auth-user-pass>",
+        ])
+    if not re.search(r"(?im)^\s*auth-retry(?:\s|$)", text):
+        additions.append("auth-retry nointeract")
+    if not re.search(r"(?im)^\s*auth-nocache(?:\s|$)", text):
+        additions.append("auth-nocache")
 
     if not re.search(r"(?im)^\s*disable-dco(?:\s|$)", text):
         additions.append("disable-dco")
@@ -872,6 +904,10 @@ def probe_compatible_config(config):
 
     return text.encode("utf-8")
 
+
+def probe_compatible_config(config):
+    return vpngate_compatible_config(config)
+
 def classify_probe_log(log_text, endpoint):
     lower = log_text.casefold()
     _, _, proto = endpoint
@@ -889,7 +925,7 @@ def classify_probe_log(log_text, endpoint):
     if "options error" in lower:
         return "OpenVPN configuration rejected"
     if "tcp connection established" in lower:
-        return "TCP connected, but OpenVPN handshake timed out"
+        return "TCP connected, but OpenVPN tunnel initialization timed out"
     if proto == "tcp":
         return "TCP connection timed out"
     return "UDP/OpenVPN handshake timed out"
@@ -959,11 +995,20 @@ def quick_openvpn_probe(config, endpoint, candidate_number):
                     encoding="utf-8",
                     errors="replace",
                 )
-                if (
-                    "Peer Connection Initiated" in log_text
-                    or "Initialization Sequence Completed" in log_text
-                ):
+                if "Initialization Sequence Completed" in log_text:
                     success = True
+                    break
+                if any(
+                    marker in log_text
+                    for marker in (
+                        "AUTH_FAILED",
+                        "VERIFY ERROR",
+                        "TLS Error",
+                        "Options error",
+                        "Connection refused",
+                        "Network is unreachable",
+                    )
+                ):
                     break
 
             if proc.poll() is not None:
@@ -989,7 +1034,7 @@ def quick_openvpn_probe(config, endpoint, candidate_number):
             pass
 
     if success:
-        return True, "OpenVPN peer connection established", elapsed
+        return True, "OpenVPN tunnel initialization completed", elapsed
 
     return False, classify_probe_log(log_text, endpoint), elapsed
 
@@ -1188,7 +1233,7 @@ comment = (
     "# This is a volunteer-operated public VPN relay. Do not assume privacy "
     "or no logging.\n\n"
 ).encode("utf-8")
-path.write_bytes(comment + config)
+path.write_bytes(comment + vpngate_compatible_config(config))
 os.chmod(path, 0o600)
 
 speed_mbps = speed / 1_000_000 if speed > 0 else 0.0

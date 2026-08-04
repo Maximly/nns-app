@@ -47,7 +47,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.22"
+readonly VERSION="1.3.23"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -87,7 +87,7 @@ readonly VPNGATE_CACHE_FILE="$CACHE_DIR/vpngate.csv"
 # Candidate profiles are live-tested before import, so the large VPN Gate
 # CSV does not need to be downloaded every few minutes.
 readonly VPNGATE_CACHE_TTL=172800
-readonly VPNGATE_PROBE_TIMEOUT=6
+readonly VPNGATE_PROBE_TIMEOUT=12
 readonly VPNGATE_PROBE_ATTEMPTS=10
 
 log()  { printf '%s\n' "$*"; }

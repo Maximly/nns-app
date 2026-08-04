@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.23
+
+- Fixed remote and local `add <app> any` selection of VPN Gate relays that request username/password authentication after the TLS peer connection has already been established.
+- Add VPN Gate's documented public `vpn` / `vpn` credentials as an inline `auth-user-pass` block in the root-owned selected profile, with non-interactive authentication retry behavior.
+- Require `Initialization Sequence Completed` before accepting a candidate; `Peer Connection Initiated` alone no longer passes the quick probe.
+- Detect `AUTH_FAILED`, certificate, TLS, options, and basic network failures during the probe instead of waiting for the full timeout.
+- Increased the per-candidate initialization window from 6 to 12 seconds so relays that authenticate and push configuration more slowly are not rejected prematurely.
+
 ## 1.3.22
 
 - Run `nns-app add <app> any [country]` discovery, download, and relay probing on the automatic remote host rather than on the local client.

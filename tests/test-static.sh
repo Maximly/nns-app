@@ -9,7 +9,7 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fq 'nns-app 1.3.22' <<<"$version"
+grep -Fq 'nns-app 1.3.23' <<<"$version"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -203,7 +203,7 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 1.3.22' "$ROOT/README.md"
+grep -Fq '**Release:** 1.3.23' "$ROOT/README.md"
 grep -Fq '## Quick start' "$ROOT/README.md"
 grep -Fq '### Run a VPN locally' "$ROOT/README.md"
 grep -Fq 'nns-app install my-private-app' "$ROOT/README.md"
@@ -319,3 +319,13 @@ grep -Fq 'assert_destructive_command_from_host "purge nns-app"' "$INSTALLER" || 
 }
 
 echo 'Static tests passed.'
+
+grep -Fq 'readonly VPNGATE_PROBE_TIMEOUT=12' "$INSTALLER"
+grep -Fq '<auth-user-pass>' "$INSTALLER"
+grep -Fq 'OpenVPN tunnel initialization completed' "$INSTALLER"
+grep -Fq 'if "Initialization Sequence Completed" in log_text' "$INSTALLER"
+if grep -Fq '"Peer Connection Initiated" in log_text' "$INSTALLER"; then
+    echo 'VPN Gate probe still accepts TLS-only peer connection' >&2
+    exit 1
+fi
+grep -Fq 'documented public OpenVPN credentials (`vpn` / `vpn`)' "$ROOT/README.md"

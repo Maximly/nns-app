@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.22
+**Release:** 1.3.23
 
 **Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
@@ -586,6 +586,11 @@ sudo nns-app add my-private-app any US --via my-upstream-vpn
 For an automatic-remote app, discovery and probing always run on the remote
 host. `--via` is therefore unnecessary; only the default remote-host path (or
 an explicit `--via host`) is accepted.
+
+nns-app supplies VPN Gate's documented public OpenVPN credentials (`vpn` / `vpn`)
+inside the root-owned managed profile and accepts a relay only after OpenVPN
+reports `Initialization Sequence Completed`; a TLS-only peer connection is not
+considered a usable profile.
 
 VPN Gate is a volunteer network. Profiles can disappear or stop responding
 without notice; use `status` and provider-managed profiles for reliable
