@@ -210,6 +210,25 @@ empty_composed_path=$(compose_user_run_path '')
 [[ "$empty_composed_path" == /usr/local/sbin:* ]] ||
     fail 'empty caller PATH did not receive the standard system path'
 
+# A locally selected free profile uses the local importer. Automatic-remote
+# apps must divert before any local download or probe and ask the remote host
+# to perform selection instead.
+(
+    add_profile() { printf 'LOCAL:%s:%s\n' "$1" "$2"; }
+    output=$(add_selected_profile_for_app sample-app /tmp/free.ovpn)
+    [[ "$output" == 'LOCAL:sample-app:/tmp/free.ovpn' ]] ||
+        fail "free profile did not use the local importer: $output"
+)
+(
+    require_root() { :; }
+    validate_app_name() { :; }
+    load_cfg() { REMOTE_MODE=auto; }
+    remote_auto_add_any_profile() { printf 'REMOTE-ANY:%s:%s:%s\n' "$1" "$2" "$3"; }
+    output=$(add_any_profile sample-app JP on __default__)
+    [[ "$output" == 'REMOTE-ANY:sample-app:JP:on' ]] ||
+        fail "automatic free-profile selection did not run remotely: $output"
+)
+
 if command_needs_namespaced_snap_mounts ping; then
     fail 'ordinary command incorrectly requires Snap mounts'
 fi
@@ -710,6 +729,51 @@ fi
         fail 'automatic deployment did not persist autostart'
     grep -Fq 'start:my-app:off:__default__' <<<"$output" ||
         fail 'automatic deployment did not start the local environment'
+)
+
+# Automatic free-profile deployment must send only selection criteria to the
+# remote helper; no local VPN Gate profile path is involved.
+(
+    require_root() { :; }
+    validate_app_name() { :; }
+    load_cfg() {
+        REMOTE_MODE=auto
+        REMOTE_ALIAS=auto-test
+        REMOTE_OWNER_ID=0123456789abcdef
+    }
+    load_remote_cfg() {
+        SSH_TARGET=user@remote-host
+        SSH_PORT=2222
+    }
+    remote_auto_command() {
+        [[ "$1" == auto-test ]] || fail 'remote alias changed'
+        [[ "$2" == deploy-any ]] || fail "unexpected remote action: $2"
+        [[ "$3" == 0123456789abcdef ]] || fail 'owner changed'
+        [[ "$4" == remote-host && "$5" == 2222 ]] || fail 'remote endpoint changed'
+        [[ "$6" == JP && "$7" == on ]] || fail 'remote selection criteria changed'
+        printf 'deploy-any-ok\n'
+    }
+    remote_auto_finish_profile_deployment() {
+        printf 'finish:%s:%s:%s\n' "$1" "$2" "$3"
+    }
+    log() { :; }
+    output=$(remote_auto_add_any_profile my-app JP on)
+    grep -Fq 'deploy-any-ok' <<<"$output" ||
+        fail 'automatic free-profile deployment did not invoke deploy-any'
+    grep -Fq 'finish:my-app:auto-test:0123456789abcdef' <<<"$output" ||
+        fail 'automatic free-profile deployment did not finalize locally'
+)
+
+# The remote dispatcher must preserve all deploy-any arguments, including an
+# empty country filter.
+(
+    require_root() { :; }
+    remote_auto_deploy_any_internal() {
+        printf 'deploy-any:%s:%s:%s:%s:%s\n' "$1" "$2" "$3" "$4" "$5"
+    }
+    output=$(remote_auto_dispatch deploy-any 0123456789abcdef remote-host 22 '' off)
+    [[ "$output" == 'deploy-any:0123456789abcdef:remote-host:22::off' ]] ||
+        fail "automatic remote deploy-any dispatch changed arguments: $output"
 )
 
 # Automatic remote cleanup is a first-class remote operation and must preserve

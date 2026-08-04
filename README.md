@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.21
+**Release:** 1.3.22
 
 **Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
@@ -56,8 +56,8 @@ nns-app add my-private-app ~/my-base-profile.ovpn
 nns-app run my-private-app ping -c 4 1.1.1.1
 ```
 
-or select a free VPN Gate profile and deploy it automatically to the remote
-host:
+or ask the remote host to download, rank, and probe a free VPN Gate profile,
+then deploy the selected relay automatically:
 
 ```bash
 nns-app install my-private-app via --remote user@remote-host
@@ -66,10 +66,11 @@ nns-app add my-private-app any
 nns-app run my-private-app ping -c 4 1.1.1.1
 ```
 
-The first command bootstraps or upgrades nns-app on `remote-host` over SSH. The
-second command either deploys the supplied profile or selects a free profile,
-then automatically creates the private remote exit, gateway, client
-credentials, and local link. The final command runs `ping` locally inside
+The first command bootstraps or upgrades nns-app on `remote-host` over SSH. For
+`add ... any`, the VPN Gate relay list is downloaded and candidates are probed
+on `remote-host`; the local client does not need access to VPN Gate or to the
+candidate relay endpoints. The second command then automatically creates the
+private remote exit, gateway, client credentials, and local link. The final command runs `ping` locally inside
 `my-private-app`, with its traffic routed through the remote host and then
 through the deployed provider VPN. Existing `ssh user@remote-host` access and
 remote `sudo` permission are required for the first bootstrap.
@@ -576,11 +577,15 @@ Force a fresh server list:
 sudo nns-app add my-private-app any US --refresh
 ```
 
-Probe candidates through an upstream environment:
+Probe candidates through an upstream environment for a local app:
 
 ```bash
 sudo nns-app add my-private-app any US --via my-upstream-vpn
 ```
+
+For an automatic-remote app, discovery and probing always run on the remote
+host. `--via` is therefore unnecessary; only the default remote-host path (or
+an explicit `--via host`) is accepted.
 
 VPN Gate is a volunteer network. Profiles can disappear or stop responding
 without notice; use `status` and provider-managed profiles for reliable

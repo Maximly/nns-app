@@ -47,7 +47,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.20"
+readonly VERSION="1.3.22"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -1965,11 +1965,27 @@ add_profile() {
 }
 
 
+add_selected_profile_for_app() {
+    local app=$1 selected=$2
+    # Selection has already occurred on this host. Automatic-remote apps are
+    # diverted before selection so a relay that is inaccessible locally can
+    # still be discovered and probed from the remote host.
+    add_profile "$app" "$selected"
+}
+
+
 add_any_profile() {
     require_root
     local app=$1 country=${2:-} force_refresh=${3:-off} via_override=${4:-__default__}
     validate_app_name "$app"
     load_cfg "$app"
+
+    if [[ "${REMOTE_MODE:-}" == auto ]]; then
+        [[ "$via_override" == __default__ || "$via_override" == host ]] ||
+            die "Automatic-remote free-profile selection runs on the remote host; --via accepts only 'host'."
+        remote_auto_add_any_profile "$app" "$country" "$force_refresh"
+        return 0
+    fi
 
     command -v curl >/dev/null 2>&1 || die "curl is required. Refresh the installation with: nns-app install $app"
     command -v python3 >/dev/null 2>&1 || die "python3 is required. Refresh the installation with: nns-app install $app"
@@ -2574,8 +2590,8 @@ PY_SELECT
     warn "VPN Gate relays are operated by volunteers and may log traffic."
     warn "Use end-to-end encryption and do not treat this as a trusted privacy VPN."
 
-    add_profile "$app" "$selected"
-    if [[ "$probe_via" != host ]]; then
+    add_selected_profile_for_app "$app" "$selected"
+    if [[ "${REMOTE_MODE:-}" != auto && "$probe_via" != host ]]; then
         log "Start this profile through the same path with: nns-app start $app --via $probe_via"
     fi
     rm -rf "$tmpdir"
@@ -7530,6 +7546,54 @@ remote_auto_deploy_internal() {
     log "Automatic remote '$owner' is ready: $exit_app -> $gateway/$client."
 }
 
+remote_auto_deploy_any_internal() {
+    require_root
+    local owner=$1 ssh_host=$2 ssh_port=$3 country=$4 force_refresh=$5
+    local selector_app selected profile_name attempt
+
+    validate_remote_owner_id "$owner"
+    [[ "$ssh_host" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] ||
+        die "Invalid automatic-remote SSH host '$ssh_host'."
+    [[ "$ssh_port" =~ ^[1-9][0-9]{0,4}$ && "$ssh_port" -le 65535 ]] ||
+        die "Invalid automatic-remote SSH port '$ssh_port'."
+    [[ "$force_refresh" == on || "$force_refresh" == off ]] ||
+        die "Automatic-remote free-profile refresh must be 'on' or 'off'."
+
+    # Use a short-lived ordinary app only as the remote VPN Gate selection
+    # context. Selection, CSV download, endpoint probing, and profile decoding
+    # therefore happen on the remote host rather than on the client.
+    for attempt in {1..20}; do
+        selector_app="ra-${owner:0:8}-select-${RANDOM}"
+        [[ ! -e "$(cfg_file "$selector_app")" ]] && break
+        selector_app=""
+    done
+    [[ -n "$selector_app" ]] || die "Could not allocate a temporary remote selector app."
+
+    install_app "$selector_app" __default__ >/dev/null
+    if ! ( add_any_profile "$selector_app" "$country" "$force_refresh" host ); then
+        remove_app "$selector_app" local-only >/dev/null 2>&1 || true
+        die "Remote VPN Gate profile selection failed."
+    fi
+
+    load_cfg "$selector_app"
+    [[ -n "${DEFAULT_PROFILE:-}" ]] || {
+        remove_app "$selector_app" local-only >/dev/null 2>&1 || true
+        die "Remote VPN Gate selection completed without a default profile."
+    }
+    selected="$(profiles_dir "$selector_app")/$DEFAULT_PROFILE"
+    [[ -s "$selected" ]] || {
+        remove_app "$selector_app" local-only >/dev/null 2>&1 || true
+        die "Remote VPN Gate selector profile is missing: $selected"
+    }
+    profile_name=$DEFAULT_PROFILE
+
+    if ! ( remote_auto_deploy_internal "$owner" "$ssh_host" "$ssh_port" "$profile_name" <"$selected" ); then
+        remove_app "$selector_app" local-only >/dev/null 2>&1 || true
+        die "Could not deploy the remotely selected VPN Gate profile."
+    fi
+    remove_app "$selector_app" local-only >/dev/null 2>&1 || true
+}
+
 remote_auto_export_internal() {
     require_root
     local owner=$1
@@ -7774,6 +7838,11 @@ remote_auto_dispatch() {
             [[ $# -eq 4 ]] ||
                 die "_remote-auto deploy requires owner, SSH host, SSH port and profile name."
             remote_auto_deploy_internal "$@"
+            ;;
+        deploy-any)
+            [[ $# -eq 5 ]] ||
+                die "_remote-auto deploy-any requires owner, SSH host, SSH port, country and refresh mode."
+            remote_auto_deploy_any_internal "$@"
             ;;
         export)
             [[ $# -eq 1 ]] || die "_remote-auto export requires owner."
@@ -8156,39 +8225,22 @@ remote_auto_cleanup_app() {
     log "Automatic remote resources for '$app' were removed."
 }
 
-remote_auto_add_profile() {
-    require_root
-    local app=$1 src=$2 alias owner gateway client temp profile_name host
-    validate_app_name "$app"
-    load_cfg "$app"
-    [[ "${REMOTE_MODE:-}" == auto && -n "$REMOTE_ALIAS" && -n "$REMOTE_OWNER_ID" ]] ||
-        die "App '$app' is not configured for automatic remote mode."
-    src=$(readlink -f "$src")
-    local type
-    type=$(profile_type_from_file "$src" 2>/dev/null || true)
-    [[ -n "$type" ]] || die "Cannot identify '$src' as an OpenVPN or WireGuard profile."
-    case "$type" in
-        openvpn) validate_ovpn "$src" ;;
-        wireguard) validate_wireguard "$src" ;;
-    esac
-    alias=$REMOTE_ALIAS
-    owner=$REMOTE_OWNER_ID
-    gateway=$(remote_auto_gateway_name "$owner")
-    client=$(remote_auto_client_name "$owner")
-    load_remote_cfg "$alias"
-    host=${SSH_TARGET#*@}
-    host=${host#[}; host=${host%]}
-    profile_name=$(profile_name_from_path "$src" "$type")
+remote_auto_finish_profile_deployment() {
+    local app=$1 alias=$2 owner=$3 gateway client temp
 
-    log "Deploying '$profile_name' to '$SSH_TARGET' and creating or sharing its private gateway..."
-    remote_auto_command "$alias" deploy "$owner" "$host" "$SSH_PORT" "$profile_name" <"$src"
     remote_auto_locate "$alias" "$owner" ||
         die "Automatic remote deployment completed without readable state."
     gateway=$REMOTE_AUTO_GATEWAY
     client=$REMOTE_AUTO_CLIENT
     temp=$(mktemp --suffix=.nnslink)
-    remote_auto_command "$alias" export "$owner" >"$temp"
-    [[ -s "$temp" ]] || die "Automatic remote returned an empty .nnslink bundle."
+    if ! remote_auto_command "$alias" export "$owner" >"$temp"; then
+        rm -f "$temp"
+        die "Automatic remote could not export its client bundle."
+    fi
+    [[ -s "$temp" ]] || {
+        rm -f "$temp"
+        die "Automatic remote returned an empty .nnslink bundle."
+    }
     remote_import_bundle "$alias" "$gateway" "$client" "$app" "$temp"
     rm -f "$temp"
 
@@ -8205,14 +8257,62 @@ remote_auto_add_profile() {
     cfg_set "$app" TRANSPORT_SSH_KNOWN_HOSTS "$(remote_known_hosts "$alias")"
     cfg_set "$app" AUTOSTART on
 
-    # Complete the simple API by bringing the local side online immediately.
-    # start_app enables the namespace, backend, online check, and watchdog
-    # units because AUTOSTART is on; later boots recreate the full SSH/OpenVPN
-    # path without requiring a prior run command.
     start_app "$app" off __default__
     log "Automatic remote '$app' is ready, started, and enabled for boot."
     log "Run commands with: nns-app run $app <command>"
 }
+
+remote_auto_add_profile() {
+    require_root
+    local app=$1 src=$2 alias owner profile_name host
+    validate_app_name "$app"
+    load_cfg "$app"
+    [[ "${REMOTE_MODE:-}" == auto && -n "$REMOTE_ALIAS" && -n "$REMOTE_OWNER_ID" ]] ||
+        die "App '$app' is not configured for automatic remote mode."
+    src=$(readlink -f "$src")
+    local type
+    type=$(profile_type_from_file "$src" 2>/dev/null || true)
+    [[ -n "$type" ]] || die "Cannot identify '$src' as an OpenVPN or WireGuard profile."
+    case "$type" in
+        openvpn) validate_ovpn "$src" ;;
+        wireguard) validate_wireguard "$src" ;;
+    esac
+    alias=$REMOTE_ALIAS
+    owner=$REMOTE_OWNER_ID
+    load_remote_cfg "$alias"
+    host=${SSH_TARGET#*@}
+    host=${host#[}; host=${host%]}
+    profile_name=$(profile_name_from_path "$src" "$type")
+
+    log "Deploying '$profile_name' to '$SSH_TARGET' and creating or sharing its private gateway..."
+    remote_auto_command "$alias" deploy "$owner" "$host" "$SSH_PORT" "$profile_name" <"$src"
+    remote_auto_finish_profile_deployment "$app" "$alias" "$owner"
+}
+
+remote_auto_add_any_profile() {
+    require_root
+    local app=$1 country=${2:-} force_refresh=${3:-off}
+    local alias owner host country_label
+
+    validate_app_name "$app"
+    load_cfg "$app"
+    [[ "${REMOTE_MODE:-}" == auto && -n "$REMOTE_ALIAS" && -n "$REMOTE_OWNER_ID" ]] ||
+        die "App '$app' is not configured for automatic remote mode."
+    [[ "$force_refresh" == on || "$force_refresh" == off ]] ||
+        die "Free-profile refresh mode must be 'on' or 'off'."
+
+    alias=$REMOTE_ALIAS
+    owner=$REMOTE_OWNER_ID
+    load_remote_cfg "$alias"
+    host=${SSH_TARGET#*@}
+    host=${host#[}; host=${host%]}
+    country_label=${country:-any country}
+
+    log "Searching and probing VPN Gate relays on '$SSH_TARGET' for $country_label..."
+    remote_auto_command "$alias" deploy-any "$owner" "$host" "$SSH_PORT" "$country" "$force_refresh"
+    remote_auto_finish_profile_deployment "$app" "$alias" "$owner"
+}
+
 
 # nns-app source module: command execution and detailed status reporting.
 mount_type_at() {

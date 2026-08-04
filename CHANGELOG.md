@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.3.22
+
+- Run `nns-app add <app> any [country]` discovery, download, and relay probing on the automatic remote host rather than on the local client.
+- Added the restricted automatic-remote `deploy-any` operation and a temporary remote selection context that is removed after deployment.
+- Reused the common bundle-import/finalization path for supplied and remotely selected profiles.
+- Clarified Quick start and VPN Gate documentation; local `--via` probing is not applied to automatic-remote selection.
+
+## 1.3.21
+
+- Added the free VPN Gate profile option to the early Quick start section for
+  both local and automatic-remote workflows.
+- Made `nns-app add <app> any [country]` honor automatic-remote mode: the
+  locally selected and tested free profile is now deployed through the same
+  remote orchestration path as a supplied `.ovpn` profile.
+- Kept the public-network warning next to the Quick start examples so the free
+  option is not presented as a trusted or reliable privacy service.
+
 ## 1.3.20
 
 - Fixed automatic remote profile sharing for single-session VPN providers.

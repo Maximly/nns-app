@@ -602,11 +602,27 @@ add_profile() {
 }
 
 
+add_selected_profile_for_app() {
+    local app=$1 selected=$2
+    # Selection has already occurred on this host. Automatic-remote apps are
+    # diverted before selection so a relay that is inaccessible locally can
+    # still be discovered and probed from the remote host.
+    add_profile "$app" "$selected"
+}
+
+
 add_any_profile() {
     require_root
     local app=$1 country=${2:-} force_refresh=${3:-off} via_override=${4:-__default__}
     validate_app_name "$app"
     load_cfg "$app"
+
+    if [[ "${REMOTE_MODE:-}" == auto ]]; then
+        [[ "$via_override" == __default__ || "$via_override" == host ]] ||
+            die "Automatic-remote free-profile selection runs on the remote host; --via accepts only 'host'."
+        remote_auto_add_any_profile "$app" "$country" "$force_refresh"
+        return 0
+    fi
 
     command -v curl >/dev/null 2>&1 || die "curl is required. Refresh the installation with: nns-app install $app"
     command -v python3 >/dev/null 2>&1 || die "python3 is required. Refresh the installation with: nns-app install $app"
@@ -1211,8 +1227,8 @@ PY_SELECT
     warn "VPN Gate relays are operated by volunteers and may log traffic."
     warn "Use end-to-end encryption and do not treat this as a trusted privacy VPN."
 
-    add_profile "$app" "$selected"
-    if [[ "$probe_via" != host ]]; then
+    add_selected_profile_for_app "$app" "$selected"
+    if [[ "${REMOTE_MODE:-}" != auto && "$probe_via" != host ]]; then
         log "Start this profile through the same path with: nns-app start $app --via $probe_via"
     fi
     rm -rf "$tmpdir"
