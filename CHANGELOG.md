@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.17
+
+- Added automatic sharing of an existing automatic-remote provider exit when another client presents the same profile fingerprint or is observed with the same provider-side tunnel IPv4 address.
+- Keep one provider VPN session and one managed remote gateway while issuing a distinct gateway certificate and TLS Crypt v2 key to every local client.
+- Record pool membership, provider-side IPv4, profile fingerprint, and active state in root-owned remote state files; older per-client deployments remain valid and are migrated lazily.
+- Make remote `start`, `stop`, `status`, rotation, synchronization, removal, and purge pool-aware: stopping one member keeps the pool online for other active clients, removing a member revokes only its credential, and the last member removes the shared gateway and exit.
+- Avoid opening a duplicate provider session when an identical already-recorded profile can be matched immediately; otherwise use the observed provider-side address to consolidate the new client after the first live comparison.
+
 ## 1.3.16
 
 - Added supported Fedora installation with `dnf`/`dnf5` package mappings for `iproute`, `iptables-nft`, `iputils`, and `openssh-clients`.

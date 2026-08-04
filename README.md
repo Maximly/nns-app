@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.16
+**Release:** 1.3.17
 
 **Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
@@ -62,7 +62,7 @@ first bootstrap.
 - Adaptive data-path watchdog that preserves running application namespaces.
 - Snap desktop-application support inside private mount namespaces.
 - Managed remote OpenVPN gateways routed through a selected remote nns-app exit.
-- Three-command automatic remote deployment over SSH, plus manual enrollment, synchronization, credential rotation, and status.
+- Three-command automatic remote deployment over SSH, with automatic sharing of matching provider exits plus manual enrollment, synchronization, credential rotation, and status.
 - Direct, SSH-forward, stunnel, and Cloak gateway transports with portable `.nnslink` bundles.
 - Unique client certificates and TLS Crypt v2 keys for gateway clients.
 - Collision-safe network, routing-table, and policy-priority allocation.
@@ -128,6 +128,16 @@ ends for boot recovery. The default data transport is a supervised SSH local
 forward through the existing SSH port, so no additional cloud firewall rule or
 public gateway port is needed.
 
+When another automatic client on the same remote host uses an identical
+recorded profile, nns-app reuses that provider exit immediately. If the profile
+files differ but the newly started provider session receives the same
+provider-side tunnel IPv4 address as an existing automatic exit, nns-app treats
+them as the same single-session provider identity: it removes the duplicate
+exit, reconnects the existing pool, and adds a new unique gateway client. The
+result is one provider VPN session and one remote gateway shared by several
+local nns-app environments, while each local machine keeps its own certificate,
+private key, TLS Crypt v2 key, SSH key, and lifecycle state.
+
 The third command executes the requested process inside the already running
 local namespace. If the environment was stopped manually, `run` starts it
 again. Normal status, synchronization, and credential rotation remain
@@ -155,8 +165,15 @@ remote host reboots, systemd recreates the remote provider exit, private
 gateway, local SSH forward, OpenVPN client, online check, and watchdog. Running
 applications themselves do not survive a client reboot.
 
-Removing an automatic-remote app also removes the hidden remote client,
-gateway, provider exit, remote state, and that app's dedicated SSH key:
+For a shared pool, `nns-app stop <app>` disconnects that local member and marks
+it inactive. The remote provider exit remains online while another pool member
+is active; the last active member stops the shared gateway and exit. `start` or
+`run` reactivates the member and brings the pool online when necessary.
+
+Removing an automatic-remote app revokes that client's remote gateway
+credential, removes its state and dedicated SSH key, and preserves a shared
+provider pool while other clients still reference it. The managed gateway and
+provider exit are removed only with the last pool member:
 
 ```bash
 nns-app remove my-private-app

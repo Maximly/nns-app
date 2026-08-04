@@ -693,6 +693,7 @@ fi
         shift 2
         case "$action" in
             deploy) cat >/dev/null ;;
+            locate) printf '%s\n' 'ra-0123456789ab-exit|ra-0123456789ab-gw|ra-0123456789ab-client|0123456789abcdef|10.120.0.2|1' ;;
             export) printf '%s\n' test-bundle ;;
             *) fail "unexpected automatic remote action: $action" ;;
         esac
@@ -768,7 +769,16 @@ printf '%s\n' test >"$cleanup_remote_cfg"
 cleanup_state="$TEST_TMP/remote-auto-state.cfg"
 cleanup_gateway_cfg="$TEST_TMP/remote-gateway.cfg"
 cleanup_exit_cfg="$TEST_TMP/remote-exit.cfg"
-printf '%s\n' state >"$cleanup_state"
+cat >"$cleanup_state" <<'EOF_CLEANUP_STATE'
+OWNER_ID=0123456789abcdef
+POOL_ID=0123456789abcdef
+EXIT_APP=ra-0123456789ab-exit
+GATEWAY=ra-0123456789ab-gw
+CLIENT=ra-0123456789ab-client
+PROVIDER_VPN_IPV4=10.120.0.2
+PROFILE_SHA256=
+ACTIVE=on
+EOF_CLEANUP_STATE
 printf '%s\n' gateway >"$cleanup_gateway_cfg"
 printf '%s\n' exit >"$cleanup_exit_cfg"
 (
@@ -981,9 +991,12 @@ manual_payload=$(remote_command_payload gateway client export \
 # adopted only when their state record and deterministic relationship validate.
 (
     require_root() { :; }
-    remote_auto_assert_state() { [[ "$1" == 0123456789abcdef ]]; }
-    remote_auto_exit_name() { printf '%s\n' ra-0123456789ab-exit; }
-    remote_auto_gateway_name() { printf '%s\n' ra-0123456789ab-gw; }
+    remote_auto_load_state() {
+        [[ "$1" == 0123456789abcdef ]]
+        RA_POOL_ID=0123456789abcdef
+        RA_EXIT_APP=ra-0123456789ab-exit
+        RA_GATEWAY=ra-0123456789ab-gw
+    }
     temp=$(mktemp -d)
     cfg_file() { printf '%s/%s.cfg\n' "$temp" "$1"; }
     gateway_cfg_file() { printf '%s/%s.cfg\n' "$temp" "$1"; }
@@ -1009,9 +1022,11 @@ manual_payload=$(remote_command_payload gateway client export \
 # A nonempty conflicting marker must never be silently rewritten.
 (
     require_root() { :; }
-    remote_auto_assert_state() { :; }
-    remote_auto_exit_name() { printf '%s\n' ra-0123456789ab-exit; }
-    remote_auto_gateway_name() { printf '%s\n' ra-0123456789ab-gw; }
+    remote_auto_load_state() {
+        RA_POOL_ID=0123456789abcdef
+        RA_EXIT_APP=ra-0123456789ab-exit
+        RA_GATEWAY=ra-0123456789ab-gw
+    }
     temp=$(mktemp -d)
     cfg_file() { printf '%s/%s.cfg\n' "$temp" "$1"; }
     gateway_cfg_file() { printf '%s/%s.cfg\n' "$temp" "$1"; }
@@ -1022,9 +1037,122 @@ manual_payload=$(remote_command_payload gateway client export \
     die() { printf '%s\n' "$*" >&2; exit 1; }
     output=$(remote_auto_reconcile_owner_markers 0123456789abcdef 2>&1) &&
         fail 'conflicting owner marker was accepted'
-    grep -Fq 'owner marker mismatch' <<<"$output" ||
+    grep -Fq 'pool marker mismatch' <<<"$output" ||
         fail 'conflicting marker did not report mismatch'
     rm -rf "$temp"
+)
+
+
+# A second automatic client with the same provider-side tunnel address must
+# attach to the existing pool instead of leaving two competing provider exits.
+(
+    require_root() { :; }
+    acquire_lock() { :; }
+    remote_auto_state_file() { printf '%s/%s.cfg\n' "$TEST_TMP" "$1"; }
+    cfg_file() { printf '%s/%s.app.cfg\n' "$TEST_TMP" "$1"; }
+    gateway_cfg_file() { printf '%s/%s.gw.cfg\n' "$TEST_TMP" "$1"; }
+    install_app() { : >"$(cfg_file "$1")"; printf 'install:%s\n' "$1"; }
+    load_cfg() { REMOTE_MANAGED_OWNER_ID=; }
+    cfg_set() { printf 'cfg-set:%s:%s:%s\n' "$1" "$2" "$3"; }
+    systemctl() { return 1; }
+    app_is_started() { return 1; }
+    add_profile() { printf 'profile:%s:%s\n' "$1" "${2##*/}"; }
+    start_app() { printf 'start:%s\n' "$1"; }
+    stop_app() { printf 'stop:%s\n' "$1"; }
+    remove_app() { printf 'remove:%s:%s\n' "$1" "$2"; }
+    profile_type_from_file() { printf '%s\n' openvpn; }
+    validate_ovpn() { :; }
+    remote_auto_provider_ipv4() { printf '%s\n' 10.120.0.2; }
+    remote_auto_find_shared_pool() {
+        printf '%s\n' '1111111111111111|ra-111111111111-exit|ra-111111111111-gw|2222222222222222'
+    }
+    wait_online() { return 1; }
+    gateway_stop() { printf 'gateway-stop:%s\n' "$1"; }
+    gateway_start() { printf 'gateway-start:%s\n' "$1"; }
+    gateway_client_dir() { printf '%s/client-%s-%s\n' "$TEST_TMP" "$1" "$2"; }
+    gateway_client_add() { printf 'client-add:%s:%s\n' "$1" "$2"; }
+    gateway_client_load() { STATUS=active; }
+    gateway_client_rotate() { printf 'client-rotate:%s:%s\n' "$1" "$2"; }
+    remote_auto_load_state() {
+        RA_POOL_ID=1111111111111111
+        RA_EXIT_APP=ra-111111111111-exit
+        RA_GATEWAY=ra-111111111111-gw
+        RA_CLIENT=ra-222222222222-client
+        RA_PROVIDER_VPN_IPV4=
+        RA_PROFILE_SHA256=
+        RA_ACTIVE=on
+    }
+    remote_auto_write_state() { printf 'state:%s:%s:%s:%s:%s:%s:%s:%s\n' "$@"; }
+    remote_auto_pool_member_count() { printf '%s\n' 2; }
+    gateway_remove() { printf 'gateway-remove:%s\n' "$1"; }
+    log() { printf 'log:%s\n' "$*"; }
+
+    output=$(printf '%s\n' client | remote_auto_deploy_internal \
+        3333333333333333 remote-host 22 provider.ovpn)
+    grep -Fq 'remove:ra-333333333333-exit:local-only' <<<"$output" ||
+        fail 'duplicate provider exit was not removed during sharing'
+    grep -Fq 'client-add:ra-111111111111-gw:ra-333333333333-client' <<<"$output" ||
+        fail 'new owner did not receive a unique client on the shared gateway'
+    grep -Fq 'state:3333333333333333:ra-111111111111-exit:ra-111111111111-gw:ra-333333333333-client:1111111111111111:10.120.0.2:' <<<"$output" ||
+        fail 'new owner state did not reference the shared pool'
+)
+
+# Stopping one member must not stop a shared remote exit while another member
+# is marked active.
+(
+    require_root() { :; }
+    remote_auto_reconcile_owner_markers() { :; }
+    remote_auto_load_state() {
+        RA_EXIT_APP=ra-111111111111-exit
+        RA_GATEWAY=ra-111111111111-gw
+        RA_CLIENT=ra-333333333333-client
+        RA_POOL_ID=1111111111111111
+        RA_PROVIDER_VPN_IPV4=10.120.0.2
+        RA_PROFILE_SHA256=
+    }
+    remote_auto_write_state() { printf 'state-active:%s\n' "$8"; }
+    remote_auto_pool_has_active_member() { return 0; }
+    gateway_stop() { fail 'shared gateway was stopped while another client was active'; }
+    stop_app() { fail 'shared exit was stopped while another client was active'; }
+    log() { printf 'log:%s\n' "$*"; }
+    output=$(remote_auto_stop_internal 3333333333333333)
+    grep -Fq 'state-active:off' <<<"$output" || fail 'stopped member was not marked inactive'
+    grep -Fq 'remains online for other clients' <<<"$output" ||
+        fail 'shared stop did not report retained pool'
+)
+
+# Removing a follower revokes only its gateway credential and preserves the
+# shared gateway/exit while at least one pool member remains.
+(
+    require_root() { :; }
+    state="$TEST_TMP/shared-cleanup.cfg"
+    : >"$state"
+    cdir="$TEST_TMP/shared-client"
+    mkdir -p "$cdir"
+    : >"$cdir/client.cfg"
+    remote_auto_state_file() { printf '%s\n' "$state"; }
+    remote_auto_load_state() {
+        RA_EXIT_APP=ra-111111111111-exit
+        RA_GATEWAY=ra-111111111111-gw
+        RA_CLIENT=ra-333333333333-client
+        RA_POOL_ID=1111111111111111
+        RA_PROVIDER_VPN_IPV4=10.120.0.2
+        RA_PROFILE_SHA256=
+        RA_ACTIVE=on
+    }
+    gateway_client_dir() { printf '%s\n' "$cdir"; }
+    gateway_client_load() { STATUS=active; }
+    gateway_client_revoke() { printf 'revoke:%s:%s\n' "$1" "$2"; }
+    remote_auto_pool_member_count() { printf '%s\n' 1; }
+    remote_auto_deauthorize_owner() { printf 'deauthorize:%s\n' "$1"; }
+    gateway_remove() { fail 'shared gateway was removed with members remaining'; }
+    remove_app() { fail 'shared exit was removed with members remaining'; }
+    systemctl() { :; }
+    log() { printf 'log:%s\n' "$*"; }
+    output=$(remote_auto_cleanup_internal 3333333333333333)
+    grep -Fq 'revoke:ra-111111111111-gw:ra-333333333333-client' <<<"$output" ||
+        fail 'shared follower credential was not revoked'
+    grep -Fq 'shared pool' <<<"$output" || fail 'shared cleanup did not preserve the pool'
 )
 
 echo 'Function tests passed.'

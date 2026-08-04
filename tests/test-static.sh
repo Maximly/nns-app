@@ -9,7 +9,7 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fq 'nns-app 1.3.16' <<<"$version"
+grep -Fq 'nns-app 1.3.17' <<<"$version"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -33,6 +33,11 @@ grep -Fq 'REMOTE_MANAGED_OWNER_ID' "$INSTALLER"
 grep -Fq 'remote_auto_reconcile_owner_markers' "$INSTALLER"
 grep -Fq 'remote_auto_install' "$INSTALLER"
 grep -Fq 'remote_auto_deploy_internal' "$INSTALLER"
+grep -Fq 'remote_auto_find_shared_pool' "$INSTALLER"
+grep -Fq 'remote_auto_find_shared_profile' "$INSTALLER"
+grep -Fq 'PROVIDER_VPN_IPV4' "$INSTALLER"
+grep -Fq 'POOL_ID' "$INSTALLER"
+grep -Fq 'shared pool' "$ROOT/README.md"
 autostart_sets=$(grep -Fc 'cfg_set "$app" AUTOSTART on' "$INSTALLER")
 (( autostart_sets >= 2 )) || {
     echo 'automatic-remote install/deploy does not enable boot startup' >&2
@@ -195,7 +200,7 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 1.3.16' "$ROOT/README.md"
+grep -Fq '**Release:** 1.3.17' "$ROOT/README.md"
 grep -Fq '## Quick start' "$ROOT/README.md"
 grep -Fq '### Run the VPN profile locally' "$ROOT/README.md"
 grep -Fq 'nns-app install my-private-app' "$ROOT/README.md"

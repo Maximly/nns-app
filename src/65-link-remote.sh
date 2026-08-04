@@ -647,6 +647,10 @@ remote_sync() {
     owner=${REMOTE_OWNER_ID:-}
     temp=$(mktemp --suffix=.nnslink)
     if [[ "$mode" == auto ]]; then
+        remote_auto_locate "$alias" "$owner" ||
+            die "Cannot locate automatic remote state for '$app'."
+        gateway=$REMOTE_AUTO_GATEWAY
+        client=$REMOTE_AUTO_CLIENT
         remote_auto_command "$alias" export "$owner" >"$temp"
     else
         remote_command "$alias" gateway client export "$gateway" "$client" \
@@ -658,7 +662,9 @@ remote_sync() {
         load_remote_cfg "$alias"
         cfg_set "$app" REMOTE_MODE auto
         cfg_set "$app" REMOTE_OWNER_ID "$owner"
-        cfg_set "$app" REMOTE_EXIT_APP "$(remote_auto_exit_name "$owner")"
+        cfg_set "$app" REMOTE_EXIT_APP "$REMOTE_AUTO_EXIT"
+        cfg_set "$app" REMOTE_GATEWAY "$REMOTE_AUTO_GATEWAY"
+        cfg_set "$app" REMOTE_CLIENT "$REMOTE_AUTO_CLIENT"
         cfg_set "$app" TRANSPORT_SSH_TARGET "$SSH_TARGET"
         cfg_set "$app" TRANSPORT_SSH_IDENTITY "$SSH_IDENTITY"
         cfg_set "$app" TRANSPORT_SSH_KNOWN_HOSTS "$(remote_known_hosts "$alias")"
@@ -1226,33 +1232,175 @@ REMOTE_AUTO_SUDOERS
 }
 
 remote_auto_write_state() {
-    local owner=$1 exit_app=$2 gateway=$3 client=$4 file tmp
+    local owner=$1 exit_app=$2 gateway=$3 client=$4
+    local pool_id=${5:-$owner} provider_ipv4=${6:-} profile_sha256=${7:-} active=${8:-on}
+    local file tmp
+    validate_remote_owner_id "$owner"
+    validate_remote_owner_id "$pool_id"
+    validate_app_name "$exit_app"
+    validate_gateway_name "$gateway"
+    validate_gateway_client_name "$client"
+    [[ "$client" == "$(remote_auto_client_name "$owner")" ]] ||
+        die "Automatic-remote client '$client' does not match owner '$owner'."
+    [[ "$exit_app" == "$(remote_auto_exit_name "$pool_id")" &&
+       "$gateway" == "$(remote_auto_gateway_name "$pool_id")" ]] ||
+        die "Automatic-remote pool '$pool_id' has inconsistent object names."
+    [[ -z "$provider_ipv4" || "$provider_ipv4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] ||
+        die "Invalid provider-side VPN address '$provider_ipv4'."
+    [[ -z "$profile_sha256" || "$profile_sha256" =~ ^[a-f0-9]{64}$ ]] ||
+        die "Invalid provider profile fingerprint."
+    [[ "$active" == on || "$active" == off ]] ||
+        die "Invalid automatic-remote active state '$active'."
+
     file=$(remote_auto_state_file "$owner")
     install -d -o root -g root -m 0700 "$(dirname "$file")"
     tmp=$(mktemp)
     {
         printf 'OWNER_ID=%q\n' "$owner"
+        printf 'POOL_ID=%q\n' "$pool_id"
         printf 'EXIT_APP=%q\n' "$exit_app"
         printf 'GATEWAY=%q\n' "$gateway"
         printf 'CLIENT=%q\n' "$client"
+        printf 'PROVIDER_VPN_IPV4=%q\n' "$provider_ipv4"
+        printf 'PROFILE_SHA256=%q\n' "$profile_sha256"
+        printf 'ACTIVE=%q\n' "$active"
     } >"$tmp"
     install -o root -g root -m 0600 "$tmp" "$file"
     rm -f "$tmp"
 }
 
-remote_auto_assert_state() {
-    local owner=$1 expected_exit expected_gateway expected_client file
-    expected_exit=$(remote_auto_exit_name "$owner")
-    expected_gateway=$(remote_auto_gateway_name "$owner")
-    expected_client=$(remote_auto_client_name "$owner")
+remote_auto_load_state() {
+    local owner=$1 file
+    validate_remote_owner_id "$owner"
     file=$(remote_auto_state_file "$owner")
     [[ -f "$file" ]] || die "Automatic remote '$owner' is not deployed."
-    local OWNER_ID="" EXIT_APP="" GATEWAY="" CLIENT=""
+
+    local OWNER_ID="" POOL_ID="" EXIT_APP="" GATEWAY="" CLIENT=""
+    local PROVIDER_VPN_IPV4="" PROFILE_SHA256="" ACTIVE=""
     # shellcheck disable=SC1090
     source "$file"
-    [[ "$OWNER_ID" == "$owner" && "$EXIT_APP" == "$expected_exit" &&
-       "$GATEWAY" == "$expected_gateway" && "$CLIENT" == "$expected_client" ]] ||
+    [[ "$OWNER_ID" == "$owner" ]] ||
+        die "Automatic-remote state '$file' has the wrong owner."
+    POOL_ID=${POOL_ID:-$owner}
+    ACTIVE=${ACTIVE:-on}
+    validate_remote_owner_id "$POOL_ID"
+    [[ "$EXIT_APP" == "$(remote_auto_exit_name "$POOL_ID")" &&
+       "$GATEWAY" == "$(remote_auto_gateway_name "$POOL_ID")" &&
+       "$CLIENT" == "$(remote_auto_client_name "$owner")" ]] ||
         die "Automatic-remote state '$file' is inconsistent."
+    [[ -z "$PROVIDER_VPN_IPV4" || "$PROVIDER_VPN_IPV4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] ||
+        die "Automatic-remote state '$file' has an invalid provider-side VPN address."
+    [[ -z "$PROFILE_SHA256" || "$PROFILE_SHA256" =~ ^[a-f0-9]{64}$ ]] ||
+        die "Automatic-remote state '$file' has an invalid profile fingerprint."
+    [[ "$ACTIVE" == on || "$ACTIVE" == off ]] ||
+        die "Automatic-remote state '$file' has an invalid active flag."
+
+    RA_OWNER_ID=$OWNER_ID
+    RA_POOL_ID=$POOL_ID
+    RA_EXIT_APP=$EXIT_APP
+    RA_GATEWAY=$GATEWAY
+    RA_CLIENT=$CLIENT
+    RA_PROVIDER_VPN_IPV4=$PROVIDER_VPN_IPV4
+    RA_PROFILE_SHA256=$PROFILE_SHA256
+    RA_ACTIVE=$ACTIVE
+}
+
+remote_auto_assert_state() {
+    remote_auto_load_state "$1"
+}
+
+remote_auto_pool_member_count() {
+    local pool_id=$1 exclude_owner=${2:-} file owner count=0
+    validate_remote_owner_id "$pool_id"
+    shopt -s nullglob
+    for file in "$STATE_DIR"/remote-auto/*.cfg; do
+        owner=${file##*/}
+        owner=${owner%.cfg}
+        [[ "$owner" =~ ^[a-f0-9]{16}$ && "$owner" != "$exclude_owner" ]] || continue
+        if remote_auto_load_state "$owner" 2>/dev/null && [[ "$RA_POOL_ID" == "$pool_id" ]]; then
+            count=$((count + 1))
+        fi
+    done
+    shopt -u nullglob
+    printf '%s\n' "$count"
+}
+
+remote_auto_pool_has_active_member() {
+    local pool_id=$1 exclude_owner=${2:-} file owner
+    validate_remote_owner_id "$pool_id"
+    shopt -s nullglob
+    for file in "$STATE_DIR"/remote-auto/*.cfg; do
+        owner=${file##*/}
+        owner=${owner%.cfg}
+        [[ "$owner" =~ ^[a-f0-9]{16}$ && "$owner" != "$exclude_owner" ]] || continue
+        if remote_auto_load_state "$owner" 2>/dev/null &&
+           [[ "$RA_POOL_ID" == "$pool_id" && "$RA_ACTIVE" == on ]]; then
+            shopt -u nullglob
+            return 0
+        fi
+    done
+    shopt -u nullglob
+    return 1
+}
+
+remote_auto_provider_ipv4() {
+    local exit_app=$1 ip
+    ip=$(vpn_local_ipv4 "$exit_app" 2>/dev/null || true)
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    printf '%s\n' "$ip"
+}
+
+remote_auto_find_shared_pool() {
+    local owner=$1 provider_ipv4=$2 uploaded_type=$3 file candidate_owner live_ip
+    validate_remote_owner_id "$owner"
+    [[ "$provider_ipv4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    shopt -s nullglob
+    for file in "$STATE_DIR"/remote-auto/*.cfg; do
+        candidate_owner=${file##*/}
+        candidate_owner=${candidate_owner%.cfg}
+        [[ "$candidate_owner" =~ ^[a-f0-9]{16}$ && "$candidate_owner" != "$owner" ]] || continue
+        remote_auto_load_state "$candidate_owner" 2>/dev/null || continue
+        [[ -f "$(cfg_file "$RA_EXIT_APP")" && -f "$(gateway_cfg_file "$RA_GATEWAY")" ]] || continue
+        [[ "$(vpn_type_for_app "$RA_EXIT_APP" 2>/dev/null || true)" == "$uploaded_type" ]] || continue
+        load_gateway_cfg "$RA_GATEWAY"
+        [[ "$VIA_APP" == "$RA_EXIT_APP" && "${TRANSPORT:-}" == ssh ]] || continue
+        [[ -z "${REMOTE_MANAGED_OWNER_ID:-}" ||
+           "$REMOTE_MANAGED_OWNER_ID" == "$RA_POOL_ID" ]] || continue
+        live_ip=$(remote_auto_provider_ipv4 "$RA_EXIT_APP" 2>/dev/null || true)
+        [[ -n "$live_ip" ]] || live_ip=$RA_PROVIDER_VPN_IPV4
+        if [[ "$live_ip" == "$provider_ipv4" ]]; then
+            printf '%s|%s|%s|%s\n' "$RA_POOL_ID" "$RA_EXIT_APP" "$RA_GATEWAY" "$candidate_owner"
+            shopt -u nullglob
+            return 0
+        fi
+    done
+    shopt -u nullglob
+    return 1
+}
+
+remote_auto_find_shared_profile() {
+    local owner=$1 profile_sha256=$2 uploaded_type=$3 file candidate_owner
+    validate_remote_owner_id "$owner"
+    [[ "$profile_sha256" =~ ^[a-f0-9]{64}$ ]] || return 1
+    shopt -s nullglob
+    for file in "$STATE_DIR"/remote-auto/*.cfg; do
+        candidate_owner=${file##*/}
+        candidate_owner=${candidate_owner%.cfg}
+        [[ "$candidate_owner" =~ ^[a-f0-9]{16}$ && "$candidate_owner" != "$owner" ]] || continue
+        remote_auto_load_state "$candidate_owner" 2>/dev/null || continue
+        [[ "$RA_PROFILE_SHA256" == "$profile_sha256" && -n "$RA_PROVIDER_VPN_IPV4" ]] || continue
+        [[ -f "$(cfg_file "$RA_EXIT_APP")" && -f "$(gateway_cfg_file "$RA_GATEWAY")" ]] || continue
+        [[ "$(vpn_type_for_app "$RA_EXIT_APP" 2>/dev/null || true)" == "$uploaded_type" ]] || continue
+        load_gateway_cfg "$RA_GATEWAY"
+        [[ "$VIA_APP" == "$RA_EXIT_APP" && "${TRANSPORT:-}" == ssh ]] || continue
+        [[ -z "${REMOTE_MANAGED_OWNER_ID:-}" ||
+           "$REMOTE_MANAGED_OWNER_ID" == "$RA_POOL_ID" ]] || continue
+        printf '%s|%s|%s|%s|%s\n' "$RA_POOL_ID" "$RA_EXIT_APP" "$RA_GATEWAY"             "$candidate_owner" "$RA_PROVIDER_VPN_IPV4"
+        shopt -u nullglob
+        return 0
+    done
+    shopt -u nullglob
+    return 1
 }
 
 # Owner markers were introduced after the first automatic-remote releases.
@@ -1261,32 +1409,30 @@ remote_auto_assert_state() {
 # only that empty legacy state; a conflicting nonempty marker remains fatal.
 remote_auto_reconcile_owner_markers() {
     require_root
-    local owner=$1 exit_app gateway marker
-    remote_auto_assert_state "$owner"
-    exit_app=$(remote_auto_exit_name "$owner")
-    gateway=$(remote_auto_gateway_name "$owner")
+    local owner=$1 marker
+    remote_auto_load_state "$owner"
 
-    if [[ -f "$(cfg_file "$exit_app")" ]]; then
-        load_cfg "$exit_app"
+    if [[ -f "$(cfg_file "$RA_EXIT_APP")" ]]; then
+        load_cfg "$RA_EXIT_APP"
         marker=${REMOTE_MANAGED_OWNER_ID:-}
         if [[ -z "$marker" ]]; then
-            cfg_set "$exit_app" REMOTE_MANAGED_OWNER_ID "$owner"
-            log "Adopted legacy automatic-remote owner marker for exit '$exit_app'."
-        elif [[ "$marker" != "$owner" ]]; then
-            die "Refusing to adopt exit '$exit_app': owner marker mismatch."
+            cfg_set "$RA_EXIT_APP" REMOTE_MANAGED_OWNER_ID "$RA_POOL_ID"
+            log "Adopted automatic-remote pool marker for exit '$RA_EXIT_APP'."
+        elif [[ "$marker" != "$RA_POOL_ID" ]]; then
+            die "Refusing to adopt exit '$RA_EXIT_APP': pool marker mismatch."
         fi
     fi
 
-    if [[ -f "$(gateway_cfg_file "$gateway")" ]]; then
-        load_gateway_cfg "$gateway"
-        [[ "$VIA_APP" == "$exit_app" ]] ||
-            die "Refusing to adopt gateway '$gateway': it does not use '$exit_app'."
+    if [[ -f "$(gateway_cfg_file "$RA_GATEWAY")" ]]; then
+        load_gateway_cfg "$RA_GATEWAY"
+        [[ "$VIA_APP" == "$RA_EXIT_APP" ]] ||
+            die "Refusing to adopt gateway '$RA_GATEWAY': it does not use '$RA_EXIT_APP'."
         marker=${REMOTE_MANAGED_OWNER_ID:-}
         if [[ -z "$marker" ]]; then
-            gateway_cfg_set "$gateway" REMOTE_MANAGED_OWNER_ID "$owner"
-            log "Adopted legacy automatic-remote owner marker for gateway '$gateway'."
-        elif [[ "$marker" != "$owner" ]]; then
-            die "Refusing to adopt gateway '$gateway': owner marker mismatch."
+            gateway_cfg_set "$RA_GATEWAY" REMOTE_MANAGED_OWNER_ID "$RA_POOL_ID"
+            log "Adopted automatic-remote pool marker for gateway '$RA_GATEWAY'."
+        elif [[ "$marker" != "$RA_POOL_ID" ]]; then
+            die "Refusing to adopt gateway '$RA_GATEWAY': pool marker mismatch."
         fi
     fi
 }
@@ -1294,7 +1440,9 @@ remote_auto_reconcile_owner_markers() {
 remote_auto_deploy_internal() {
     require_root
     local owner=$1 ssh_host=$2 ssh_port=$3 profile_name=$4
-    local exit_app gateway client temp temp_dir port
+    local exit_app gateway client temp temp_dir port state_file profile_sha256
+    local uploaded_type provider_ipv4 shared pool_id shared_exit shared_gateway shared_owner
+    local member_count
     validate_remote_owner_id "$owner"
     [[ "$ssh_host" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] ||
         die "Invalid automatic-remote SSH host '$ssh_host'."
@@ -1303,6 +1451,8 @@ remote_auto_deploy_internal() {
     [[ "$profile_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] ||
         die "Invalid remote profile name '$profile_name'."
 
+    acquire_lock remote-auto-pools
+    state_file=$(remote_auto_state_file "$owner")
     exit_app=$(remote_auto_exit_name "$owner")
     gateway=$(remote_auto_gateway_name "$owner")
     client=$(remote_auto_client_name "$owner")
@@ -1311,24 +1461,87 @@ remote_auto_deploy_internal() {
     trap 'rm -rf "${temp_dir:-}"' EXIT
     cat >"$temp"
     [[ -s "$temp" ]] || die "The uploaded VPN profile is empty."
-    local uploaded_type
     uploaded_type=$(profile_type_from_file "$temp" 2>/dev/null || true)
     [[ -n "$uploaded_type" ]] || die "The uploaded file is not an OpenVPN or WireGuard profile."
     case "$uploaded_type" in
         openvpn) validate_ovpn "$temp" ;;
         wireguard) validate_wireguard "$temp" ;;
     esac
+    profile_sha256=$(sha256sum "$temp" | awk '{print $1}')
+
+    # Repeated deployment of the same profile is a reconciliation operation.
+    # In particular, a follower in a shared pool must never recreate a second
+    # provider session merely because `nns-app add` is repeated.
+    if [[ -f "$state_file" ]]; then
+        remote_auto_load_state "$owner"
+        member_count=$(remote_auto_pool_member_count "$RA_POOL_ID")
+        if [[ -n "$RA_PROFILE_SHA256" && "$RA_PROFILE_SHA256" == "$profile_sha256" ]]; then
+            remote_auto_reconcile_owner_markers "$owner"
+            start_app "$RA_EXIT_APP" off __default__
+            gateway_start "$RA_GATEWAY"
+            if [[ ! -f "$(gateway_client_dir "$RA_GATEWAY" "$RA_CLIENT")/client.cfg" ]]; then
+                gateway_client_add "$RA_GATEWAY" "$RA_CLIENT"
+            else
+                gateway_client_load "$RA_GATEWAY" "$RA_CLIENT"
+                [[ "${STATUS:-}" == active ]] || gateway_client_rotate "$RA_GATEWAY" "$RA_CLIENT"
+            fi
+            provider_ipv4=$(remote_auto_provider_ipv4 "$RA_EXIT_APP" 2>/dev/null || true)
+            [[ -n "$provider_ipv4" ]] || provider_ipv4=$RA_PROVIDER_VPN_IPV4
+            remote_auto_write_state "$owner" "$RA_EXIT_APP" "$RA_GATEWAY" "$RA_CLIENT" \
+                "$RA_POOL_ID" "$provider_ipv4" "$profile_sha256" on
+            trap - EXIT
+            rm -rf "$temp_dir"
+            log "Automatic remote '$owner' reused shared pool '$RA_POOL_ID': $RA_EXIT_APP -> $RA_GATEWAY/$RA_CLIENT."
+            return 0
+        fi
+        if (( member_count > 1 )); then
+            die "Automatic remote '$owner' shares provider exit '$RA_EXIT_APP' with other clients. Remove this app before replacing its provider profile."
+        fi
+        exit_app=$RA_EXIT_APP
+        gateway=$RA_GATEWAY
+        pool_id=$RA_POOL_ID
+    else
+        pool_id=$owner
+    fi
+
+    # Once a pool has recorded both the profile fingerprint and its observed
+    # provider-side address, an identical profile can attach without opening a
+    # second provider session. This avoids the provider briefly evicting the
+    # first client merely to rediscover the same address.
+    if [[ ! -f "$state_file" ]]; then
+        shared=$(remote_auto_find_shared_profile "$owner" "$profile_sha256" "$uploaded_type" 2>/dev/null || true)
+        if [[ -n "$shared" ]]; then
+            IFS='|' read -r pool_id shared_exit shared_gateway shared_owner provider_ipv4 <<<"$shared"
+            remote_auto_reconcile_owner_markers "$shared_owner"
+            start_app "$shared_exit" off __default__
+            gateway_start "$shared_gateway"
+            if [[ ! -f "$(gateway_client_dir "$shared_gateway" "$client")/client.cfg" ]]; then
+                gateway_client_add "$shared_gateway" "$client"
+            else
+                gateway_client_load "$shared_gateway" "$client"
+                [[ "${STATUS:-}" == active ]] || gateway_client_rotate "$shared_gateway" "$client"
+            fi
+            remote_auto_write_state "$owner" "$shared_exit" "$shared_gateway" "$client"                 "$pool_id" "$provider_ipv4" "$profile_sha256" on
+            trap - EXIT
+            rm -rf "$temp_dir"
+            member_count=$(remote_auto_pool_member_count "$pool_id")
+            log "Reused provider pool '$pool_id' for matching profile/address '$provider_ipv4' ($member_count clients)."
+            log "Automatic remote '$owner' is ready: $shared_exit -> $shared_gateway/$client."
+            return 0
+        fi
+    fi
 
     if [[ ! -f "$(cfg_file "$exit_app")" ]]; then
         install_app "$exit_app" __default__
     fi
     load_cfg "$exit_app"
     [[ -z "${REMOTE_MANAGED_OWNER_ID:-}" ||
-       "$REMOTE_MANAGED_OWNER_ID" == "$owner" ]] ||
-        die "Automatic remote exit '$exit_app' belongs to another owner."
-    cfg_set "$exit_app" REMOTE_MANAGED_OWNER_ID "$owner"
+       "$REMOTE_MANAGED_OWNER_ID" == "$pool_id" ]] ||
+        die "Automatic remote exit '$exit_app' belongs to another pool."
+    cfg_set "$exit_app" REMOTE_MANAGED_OWNER_ID "$pool_id"
 
-    if systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
+    if [[ -f "$(gateway_cfg_file "$gateway")" ]] &&
+       systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
         gateway_stop "$gateway"
     fi
     if app_is_started "$exit_app" ||
@@ -1340,6 +1553,54 @@ remote_auto_deploy_internal() {
     cfg_set "$exit_app" READY_TIMEOUT 60
     cfg_set "$exit_app" AUTOSTART on
     start_app "$exit_app" off __default__
+    provider_ipv4=$(remote_auto_provider_ipv4 "$exit_app" 2>/dev/null || true)
+    [[ -n "$provider_ipv4" ]] ||
+        die "Could not determine the provider-side VPN address for '$exit_app'."
+
+    # A second session with the same provider-side address usually means the
+    # provider profile/account is single-session. Share the first managed exit
+    # and gateway instead of letting the two sessions evict each other.
+    shared=$(remote_auto_find_shared_pool "$owner" "$provider_ipv4" "$uploaded_type" 2>/dev/null || true)
+    if [[ -n "$shared" ]]; then
+        IFS='|' read -r pool_id shared_exit shared_gateway shared_owner <<<"$shared"
+
+        if [[ "$gateway" != "$shared_gateway" && -f "$(gateway_cfg_file "$gateway")" ]]; then
+            gateway_remove "$gateway"
+        fi
+        stop_app "$exit_app"
+        remove_app "$exit_app" local-only
+
+        # The probe connection may have displaced the older provider session.
+        # Give it a short chance to recover without disruption; restart the
+        # selected pool only when its data path is still offline.
+        if ! wait_online "$shared_exit" 5; then
+            gateway_stop "$shared_gateway" >/dev/null 2>&1 || true
+            stop_app "$shared_exit" >/dev/null 2>&1 || true
+            start_app "$shared_exit" off __default__
+        fi
+        gateway_start "$shared_gateway"
+
+        if [[ ! -f "$(gateway_client_dir "$shared_gateway" "$client")/client.cfg" ]]; then
+            gateway_client_add "$shared_gateway" "$client"
+        else
+            gateway_client_load "$shared_gateway" "$client"
+            [[ "${STATUS:-}" == active ]] || gateway_client_rotate "$shared_gateway" "$client"
+        fi
+
+        # Backfill the first member's state so future matching does not depend
+        # on that exit still being online at scan time.
+        remote_auto_load_state "$shared_owner"
+        remote_auto_write_state "$shared_owner" "$RA_EXIT_APP" "$RA_GATEWAY" "$RA_CLIENT" \
+            "$RA_POOL_ID" "$provider_ipv4" "${RA_PROFILE_SHA256:-$profile_sha256}" "$RA_ACTIVE"
+        remote_auto_write_state "$owner" "$shared_exit" "$shared_gateway" "$client" \
+            "$pool_id" "$provider_ipv4" "$profile_sha256" on
+        trap - EXIT
+        rm -rf "$temp_dir"
+        member_count=$(remote_auto_pool_member_count "$pool_id")
+        log "Shared provider-side VPN address '$provider_ipv4'; attached '$owner' to pool '$pool_id' ($member_count clients)."
+        log "Automatic remote '$owner' is ready: $shared_exit -> $shared_gateway/$client."
+        return 0
+    fi
 
     if [[ ! -f "$(gateway_cfg_file "$gateway")" ]]; then
         port=$(gateway_allocate_backend_port "$gateway")
@@ -1351,10 +1612,10 @@ remote_auto_deploy_internal() {
            "$PUBLIC_HOST" == "$ssh_host" && "$PUBLIC_PORT" == "$ssh_port" ]] ||
             die "Existing automatic gateway '$gateway' does not match this deployment."
         [[ -z "${REMOTE_MANAGED_OWNER_ID:-}" ||
-           "$REMOTE_MANAGED_OWNER_ID" == "$owner" ]] ||
-            die "Automatic gateway '$gateway' belongs to another owner."
+           "$REMOTE_MANAGED_OWNER_ID" == "$pool_id" ]] ||
+            die "Automatic gateway '$gateway' belongs to another pool."
     fi
-    gateway_cfg_set "$gateway" REMOTE_MANAGED_OWNER_ID "$owner"
+    gateway_cfg_set "$gateway" REMOTE_MANAGED_OWNER_ID "$pool_id"
 
     if ! gateway_start "$gateway"; then
         die "Automatic gateway '$gateway' failed to start. The remote provider exit remains configured; rerun nns-app add after upgrading or correcting the gateway."
@@ -1365,11 +1626,10 @@ remote_auto_deploy_internal() {
         gateway_client_add "$gateway" "$client"
     else
         gateway_client_load "$gateway" "$client"
-        if [[ "${STATUS:-}" != active ]]; then
-            gateway_client_rotate "$gateway" "$client"
-        fi
+        [[ "${STATUS:-}" == active ]] || gateway_client_rotate "$gateway" "$client"
     fi
-    remote_auto_write_state "$owner" "$exit_app" "$gateway" "$client"
+    remote_auto_write_state "$owner" "$exit_app" "$gateway" "$client" \
+        "$pool_id" "$provider_ipv4" "$profile_sha256" on
     trap - EXIT
     rm -rf "$temp_dir"
     log "Automatic remote '$owner' is ready: $exit_app -> $gateway/$client."
@@ -1377,97 +1637,107 @@ remote_auto_deploy_internal() {
 
 remote_auto_export_internal() {
     require_root
-    local owner=$1 gateway client
-    remote_auto_assert_state "$owner"
-    gateway=$(remote_auto_gateway_name "$owner")
-    client=$(remote_auto_client_name "$owner")
-    gateway_write_nnslink_bundle "$gateway" "$client" -
+    local owner=$1
+    remote_auto_load_state "$owner"
+    gateway_write_nnslink_bundle "$RA_GATEWAY" "$RA_CLIENT" -
 }
 
 remote_auto_rotate_internal() {
     require_root
-    local owner=$1 gateway client
-    remote_auto_assert_state "$owner"
-    gateway=$(remote_auto_gateway_name "$owner")
-    client=$(remote_auto_client_name "$owner")
-    gateway_client_rotate "$gateway" "$client"
+    local owner=$1
+    remote_auto_load_state "$owner"
+    gateway_client_rotate "$RA_GATEWAY" "$RA_CLIENT"
+}
+
+remote_auto_locate_internal() {
+    require_root
+    local owner=$1 members
+    remote_auto_load_state "$owner"
+    members=$(remote_auto_pool_member_count "$RA_POOL_ID")
+    printf '%s|%s|%s|%s|%s|%s\n'         "$RA_EXIT_APP" "$RA_GATEWAY" "$RA_CLIENT" "$RA_POOL_ID"         "$RA_PROVIDER_VPN_IPV4" "$members"
 }
 
 remote_auto_status_internal() {
     require_root
-    local owner=$1 exit_app gateway client
-    remote_auto_assert_state "$owner"
-    exit_app=$(remote_auto_exit_name "$owner")
-    gateway=$(remote_auto_gateway_name "$owner")
-    client=$(remote_auto_client_name "$owner")
+    local owner=$1 members
+    remote_auto_load_state "$owner"
+    members=$(remote_auto_pool_member_count "$RA_POOL_ID")
     printf 'Automatic owner:    %s\n' "$owner"
-    printf 'Remote exit app:    %s\n' "$exit_app"
-    printf 'Remote gateway:     %s\n' "$gateway"
-    printf 'Remote client:      %s\n\n' "$client"
-    gateway_status "$gateway"
+    printf 'Remote pool:        %s\n' "$RA_POOL_ID"
+    printf 'Pool clients:       %s\n' "$members"
+    printf 'Provider VPN IPv4:  %s\n' "${RA_PROVIDER_VPN_IPV4:-unknown}"
+    printf 'Remote exit app:    %s\n' "$RA_EXIT_APP"
+    printf 'Remote gateway:     %s\n' "$RA_GATEWAY"
+    printf 'Remote client:      %s\n\n' "$RA_CLIENT"
+    gateway_status "$RA_GATEWAY"
 }
 
 remote_auto_start_internal() {
     require_root
-    local owner=$1 exit_app gateway
+    local owner=$1 provider_ipv4
     remote_auto_reconcile_owner_markers "$owner"
-    exit_app=$(remote_auto_exit_name "$owner")
-    gateway=$(remote_auto_gateway_name "$owner")
+    remote_auto_load_state "$owner"
 
-    [[ -f "$(cfg_file "$exit_app")" ]] ||
-        die "Automatic remote exit '$exit_app' is missing."
-    [[ -f "$(gateway_cfg_file "$gateway")" ]] ||
-        die "Automatic remote gateway '$gateway' is missing."
+    [[ -f "$(cfg_file "$RA_EXIT_APP")" ]] ||
+        die "Automatic remote exit '$RA_EXIT_APP' is missing."
+    [[ -f "$(gateway_cfg_file "$RA_GATEWAY")" ]] ||
+        die "Automatic remote gateway '$RA_GATEWAY' is missing."
 
-    load_cfg "$exit_app"
-    [[ "${REMOTE_MANAGED_OWNER_ID:-}" == "$owner" ]] ||
-        die "Refusing to start exit '$exit_app': owner marker mismatch."
-    start_app "$exit_app" off __default__
+    load_cfg "$RA_EXIT_APP"
+    [[ "${REMOTE_MANAGED_OWNER_ID:-}" == "$RA_POOL_ID" ]] ||
+        die "Refusing to start exit '$RA_EXIT_APP': pool marker mismatch."
+    start_app "$RA_EXIT_APP" off __default__
 
-    load_gateway_cfg "$gateway"
-    [[ "$VIA_APP" == "$exit_app" ]] ||
-        die "Refusing to start gateway '$gateway': it does not use '$exit_app'."
-    [[ "${REMOTE_MANAGED_OWNER_ID:-}" == "$owner" ]] ||
-        die "Refusing to start gateway '$gateway': owner marker mismatch."
-    gateway_start "$gateway"
+    load_gateway_cfg "$RA_GATEWAY"
+    [[ "$VIA_APP" == "$RA_EXIT_APP" ]] ||
+        die "Refusing to start gateway '$RA_GATEWAY': it does not use '$RA_EXIT_APP'."
+    [[ "${REMOTE_MANAGED_OWNER_ID:-}" == "$RA_POOL_ID" ]] ||
+        die "Refusing to start gateway '$RA_GATEWAY': pool marker mismatch."
+    gateway_start "$RA_GATEWAY"
 
-    # Keep boot recovery enabled even after an explicit stop/start cycle.
-    systemctl enable \
-        "nns-netns@${exit_app}.service" \
-        "nns-openvpn@${exit_app}.service" \
-        "nns-online@${exit_app}.service" \
-        "nns-gateway@${gateway}.service" \
-        >/dev/null
-    log "Started automatic remote '$owner': $exit_app -> $gateway."
+    systemctl enable         "nns-netns@${RA_EXIT_APP}.service"         "nns-openvpn@${RA_EXIT_APP}.service"         "nns-online@${RA_EXIT_APP}.service"         "nns-gateway@${RA_GATEWAY}.service"         >/dev/null
+    provider_ipv4=$(remote_auto_provider_ipv4 "$RA_EXIT_APP" 2>/dev/null || true)
+    [[ -n "$provider_ipv4" ]] || provider_ipv4=$RA_PROVIDER_VPN_IPV4
+    remote_auto_write_state "$owner" "$RA_EXIT_APP" "$RA_GATEWAY" "$RA_CLIENT"         "$RA_POOL_ID" "$provider_ipv4" "$RA_PROFILE_SHA256" on
+    log "Started automatic remote '$owner': $RA_EXIT_APP -> $RA_GATEWAY."
 }
 
 remote_auto_stop_internal() {
     require_root
-    local owner=$1 exit_app gateway
+    local owner=$1 exit_app gateway client pool_id provider_ipv4 profile_sha256
     remote_auto_reconcile_owner_markers "$owner"
-    exit_app=$(remote_auto_exit_name "$owner")
-    gateway=$(remote_auto_gateway_name "$owner")
+    remote_auto_load_state "$owner"
+    exit_app=$RA_EXIT_APP
+    gateway=$RA_GATEWAY
+    client=$RA_CLIENT
+    pool_id=$RA_POOL_ID
+    provider_ipv4=$RA_PROVIDER_VPN_IPV4
+    profile_sha256=$RA_PROFILE_SHA256
+
+    remote_auto_write_state "$owner" "$exit_app" "$gateway" "$client"         "$pool_id" "$provider_ipv4" "$profile_sha256" off
+
+    if remote_auto_pool_has_active_member "$pool_id" "$owner"; then
+        log "Stopped automatic client '$owner'; shared pool '$pool_id' remains online for other clients."
+        return 0
+    fi
 
     if [[ -f "$(gateway_cfg_file "$gateway")" ]]; then
         load_gateway_cfg "$gateway"
         [[ "$VIA_APP" == "$exit_app" ]] ||
             die "Refusing to stop gateway '$gateway': it does not use '$exit_app'."
-        [[ "${REMOTE_MANAGED_OWNER_ID:-}" == "$owner" ]] ||
-            die "Refusing to stop gateway '$gateway': owner marker mismatch."
+        [[ "${REMOTE_MANAGED_OWNER_ID:-}" == "$pool_id" ]] ||
+            die "Refusing to stop gateway '$gateway': pool marker mismatch."
         gateway_stop "$gateway"
     fi
 
     if [[ -f "$(cfg_file "$exit_app")" ]]; then
         load_cfg "$exit_app"
-        [[ "${REMOTE_MANAGED_OWNER_ID:-}" == "$owner" ]] ||
-            die "Refusing to stop exit '$exit_app': owner marker mismatch."
+        [[ "${REMOTE_MANAGED_OWNER_ID:-}" == "$pool_id" ]] ||
+            die "Refusing to stop exit '$exit_app': pool marker mismatch."
         stop_app "$exit_app"
     fi
 
-    # Deliberately do not disable the units: AUTOSTART remains the recovery
-    # policy after either host reboots, while this command stops the current
-    # runtime on both machines.
-    log "Stopped automatic remote '$owner': $gateway and $exit_app."
+    log "Stopped automatic remote pool '$pool_id': $gateway and $exit_app."
 }
 
 remote_auto_deauthorize_owner() {
@@ -1511,54 +1781,66 @@ remote_auto_deauthorize_owner() {
 
 remote_auto_cleanup_internal() {
     require_root
-    local owner=$1 exit_app gateway client state_file marker
+    local owner=$1 state_file remaining marker
+    local exit_app gateway client pool_id provider_ipv4 profile_sha256 active
     validate_remote_owner_id "$owner"
-    exit_app=$(remote_auto_exit_name "$owner")
-    gateway=$(remote_auto_gateway_name "$owner")
-    client=$(remote_auto_client_name "$owner")
     state_file=$(remote_auto_state_file "$owner")
 
-    # A completed deployment has a state file. Older failed deployments can
-    # lack it, so deterministic names are still reconciled, but every existing
-    # object must match the expected owner relationship before removal.
     if [[ -f "$state_file" ]]; then
-        remote_auto_assert_state "$owner"
+        remote_auto_load_state "$owner"
+        exit_app=$RA_EXIT_APP
+        gateway=$RA_GATEWAY
+        client=$RA_CLIENT
+        pool_id=$RA_POOL_ID
+        provider_ipv4=$RA_PROVIDER_VPN_IPV4
+        profile_sha256=$RA_PROFILE_SHA256
+        active=$RA_ACTIVE
+
+        if [[ -f "$(gateway_client_dir "$gateway" "$client")/client.cfg" ]]; then
+            gateway_client_load "$gateway" "$client"
+            if [[ "${STATUS:-}" == active ]]; then
+                gateway_client_revoke "$gateway" "$client"
+            fi
+            rm -rf -- "$(gateway_client_dir "$gateway" "$client")"
+        fi
+
+        rm -f -- "$state_file"
+        remaining=$(remote_auto_pool_member_count "$pool_id")
+        if (( remaining > 0 )); then
+            remote_auto_deauthorize_owner "$owner"
+            systemctl daemon-reload
+            log "Removed automatic client '$owner'; shared pool '$pool_id' remains for $remaining client(s)."
+            return 0
+        fi
     else
         warn "Automatic-remote state '$state_file' is absent; cleaning deterministic partial objects."
+        pool_id=$owner
+        exit_app=$(remote_auto_exit_name "$owner")
+        gateway=$(remote_auto_gateway_name "$owner")
+        client=$(remote_auto_client_name "$owner")
     fi
 
     if [[ -f "$(gateway_cfg_file "$gateway")" ]]; then
         load_gateway_cfg "$gateway"
         [[ "$VIA_APP" == "$exit_app" ]] ||
             die "Refusing to remove gateway '$gateway': it does not use '$exit_app'."
-        [[ -z "${REMOTE_MANAGED_OWNER_ID:-}" ||
-           "$REMOTE_MANAGED_OWNER_ID" == "$owner" ]] ||
-            die "Refusing to remove gateway '$gateway': owner marker mismatch."
+        marker=${REMOTE_MANAGED_OWNER_ID:-}
+        [[ -z "$marker" || "$marker" == "$pool_id" ]] ||
+            die "Refusing to remove gateway '$gateway': pool marker mismatch."
         gateway_remove "$gateway"
     else
-        systemctl disable --now \
-            "nns-gateway@${gateway}.service" \
-            "nns-gateway-crl-refresh@${gateway}.timer" \
-            >/dev/null 2>&1 || true
-        rm -rf -- \
-            "$(gateway_dropin_dir "$gateway")" \
-            "$(gateway_dir "$gateway")" \
-            "$(gateway_runtime_dir "$gateway")"
+        systemctl disable --now             "nns-gateway@${gateway}.service"             "nns-gateway-crl-refresh@${gateway}.timer"             >/dev/null 2>&1 || true
+        rm -rf --             "$(gateway_dropin_dir "$gateway")"             "$(gateway_dir "$gateway")"             "$(gateway_runtime_dir "$gateway")"
     fi
 
     if [[ -f "$(cfg_file "$exit_app")" ]]; then
         load_cfg "$exit_app"
         marker=${REMOTE_MANAGED_OWNER_ID:-}
-        [[ -z "$marker" || "$marker" == "$owner" ]] ||
-            die "Refusing to remove exit '$exit_app': owner marker mismatch."
+        [[ -z "$marker" || "$marker" == "$pool_id" ]] ||
+            die "Refusing to remove exit '$exit_app': pool marker mismatch."
         remove_app "$exit_app" local-only
     else
-        systemctl disable --now \
-            "nns-watchdog@${exit_app}.timer" \
-            "nns-online@${exit_app}.service" \
-            "nns-openvpn@${exit_app}.service" \
-            "nns-netns@${exit_app}.service" \
-            >/dev/null 2>&1 || true
+        systemctl disable --now             "nns-watchdog@${exit_app}.timer"             "nns-online@${exit_app}.service"             "nns-openvpn@${exit_app}.service"             "nns-netns@${exit_app}.service"             >/dev/null 2>&1 || true
     fi
 
     rm -f -- "$state_file"
@@ -1592,6 +1874,10 @@ remote_auto_dispatch() {
         status)
             [[ $# -eq 1 ]] || die "_remote-auto status requires owner."
             remote_auto_status_internal "$1"
+            ;;
+        locate)
+            [[ $# -eq 1 ]] || die "_remote-auto locate requires owner."
+            remote_auto_locate_internal "$1"
             ;;
         start)
             [[ $# -eq 1 ]] || die "_remote-auto start requires owner."
@@ -1803,6 +2089,15 @@ remote_auto_install() {
         remote_auto_register "$alias" "$target" "$port" "$(remote_dir "$alias")/id_ed25519"
     fi
 
+    # A previously deployed app may now be a member of a shared provider pool.
+    # Reconcile the actual remote object names after upgrading the helper.
+    if [[ -n "${VPN_TYPE:-}" && -n "${DEFAULT_PROFILE:-}" ]] &&
+       remote_auto_locate "$alias" "$owner" 2>/dev/null; then
+        exit_app=$REMOTE_AUTO_EXIT
+        gateway=$REMOTE_AUTO_GATEWAY
+        client=$REMOTE_AUTO_CLIENT
+    fi
+
     cfg_set "$app" REMOTE_MODE auto
     cfg_set "$app" REMOTE_ALIAS "$alias"
     cfg_set "$app" REMOTE_OWNER_ID "$owner"
@@ -1839,6 +2134,20 @@ remote_auto_command() {
     remote_ssh_args "$alias"
     payload=$(remote_auto_command_payload "$@")
     "${REMOTE_SSH_ARGS[@]}" "$payload"
+}
+
+remote_auto_locate() {
+    local alias=$1 owner=$2 output
+    output=$(remote_auto_command "$alias" locate "$owner") || return 1
+    IFS='|' read -r REMOTE_AUTO_EXIT REMOTE_AUTO_GATEWAY REMOTE_AUTO_CLIENT         REMOTE_AUTO_POOL REMOTE_AUTO_PROVIDER_IPV4 REMOTE_AUTO_POOL_CLIENTS <<<"$output"
+    validate_app_name "$REMOTE_AUTO_EXIT"
+    validate_gateway_name "$REMOTE_AUTO_GATEWAY"
+    validate_gateway_client_name "$REMOTE_AUTO_CLIENT"
+    validate_remote_owner_id "$REMOTE_AUTO_POOL"
+    [[ "$REMOTE_AUTO_CLIENT" == "$(remote_auto_client_name "$owner")" ]] ||
+        die "Remote automatic state returned an unexpected client identity."
+    [[ "$REMOTE_AUTO_POOL_CLIENTS" =~ ^[1-9][0-9]*$ ]] ||
+        die "Remote automatic state returned an invalid pool size."
 }
 
 remote_auto_lifecycle_app() {
@@ -1959,8 +2268,12 @@ remote_auto_add_profile() {
     host=${host#[}; host=${host%]}
     profile_name=$(profile_name_from_path "$src" "$type")
 
-    log "Deploying '$profile_name' to '$SSH_TARGET' and creating its private gateway..."
+    log "Deploying '$profile_name' to '$SSH_TARGET' and creating or sharing its private gateway..."
     remote_auto_command "$alias" deploy "$owner" "$host" "$SSH_PORT" "$profile_name" <"$src"
+    remote_auto_locate "$alias" "$owner" ||
+        die "Automatic remote deployment completed without readable state."
+    gateway=$REMOTE_AUTO_GATEWAY
+    client=$REMOTE_AUTO_CLIENT
     temp=$(mktemp --suffix=.nnslink)
     remote_auto_command "$alias" export "$owner" >"$temp"
     [[ -s "$temp" ]] || die "Automatic remote returned an empty .nnslink bundle."
@@ -1971,7 +2284,9 @@ remote_auto_add_profile() {
     cfg_set "$app" REMOTE_MODE auto
     cfg_set "$app" REMOTE_OWNER_ID "$owner"
     cfg_set "$app" REMOTE_CLEANED off
-    cfg_set "$app" REMOTE_EXIT_APP "$(remote_auto_exit_name "$owner")"
+    cfg_set "$app" REMOTE_EXIT_APP "$REMOTE_AUTO_EXIT"
+    cfg_set "$app" REMOTE_GATEWAY "$gateway"
+    cfg_set "$app" REMOTE_CLIENT "$client"
     cfg_set "$app" READY_TIMEOUT 30
     cfg_set "$app" TRANSPORT_SSH_TARGET "$SSH_TARGET"
     cfg_set "$app" TRANSPORT_SSH_IDENTITY "$SSH_IDENTITY"
