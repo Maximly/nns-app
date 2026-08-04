@@ -1163,6 +1163,11 @@ gateways_using_app() {
         via=$(gateway_cfg_value "$gateway" VIA_APP 2>/dev/null || true)
         [[ "$via" == "$app" ]] && printf '%s\n' "$gateway"
     done
+
+    # This is an enumerator, not a predicate. A different gateway—or no
+    # gateway at all—must produce empty output with success. remove_app() uses
+    # it in a pipe while errexit/pipefail are enabled.
+    return 0
 }
 
 stop_gateways_via_app() {

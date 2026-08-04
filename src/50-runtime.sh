@@ -566,6 +566,11 @@ apps_using_upstream() {
         parent=$(cfg_read_value "$app" UPSTREAM_APP 2>/dev/null || true)
         [[ "$parent" == "$upstream" ]] && printf '%s\n' "$app"
     done
+
+    # This is an enumerator, not a predicate. An empty result is successful.
+    # Without the explicit return, the last non-matching [[ ... ]] becomes the
+    # function status and `set -e -o pipefail` can abort remove/purge silently.
+    return 0
 }
 
 remote_alias_used_by_other_app() {

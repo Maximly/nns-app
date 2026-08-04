@@ -47,7 +47,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.17"
+readonly VERSION="1.3.19"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -3708,6 +3708,11 @@ apps_using_upstream() {
         parent=$(cfg_read_value "$app" UPSTREAM_APP 2>/dev/null || true)
         [[ "$parent" == "$upstream" ]] && printf '%s\n' "$app"
     done
+
+    # This is an enumerator, not a predicate. An empty result is successful.
+    # Without the explicit return, the last non-matching [[ ... ]] becomes the
+    # function status and `set -e -o pipefail` can abort remove/purge silently.
+    return 0
 }
 
 remote_alias_used_by_other_app() {
@@ -5091,6 +5096,11 @@ gateways_using_app() {
         via=$(gateway_cfg_value "$gateway" VIA_APP 2>/dev/null || true)
         [[ "$via" == "$app" ]] && printf '%s\n' "$gateway"
     done
+
+    # This is an enumerator, not a predicate. A different gateway—or no
+    # gateway at all—must produce empty output with success. remove_app() uses
+    # it in a pipe while errexit/pipefail are enabled.
+    return 0
 }
 
 stop_gateways_via_app() {
@@ -7572,7 +7582,7 @@ remote_auto_deauthorize_owner() {
 
 remote_auto_cleanup_internal() {
     require_root
-    local owner=$1 state_file remaining marker
+    local owner=$1 state_file remaining marker client_cfg
     local exit_app gateway client pool_id provider_ipv4 profile_sha256 active
     validate_remote_owner_id "$owner"
     state_file=$(remote_auto_state_file "$owner")
@@ -7587,22 +7597,36 @@ remote_auto_cleanup_internal() {
         profile_sha256=$RA_PROFILE_SHA256
         active=$RA_ACTIVE
 
-        if [[ -f "$(gateway_client_dir "$gateway" "$client")/client.cfg" ]]; then
-            gateway_client_load "$gateway" "$client"
-            if [[ "${STATUS:-}" == active ]]; then
-                gateway_client_revoke "$gateway" "$client"
-            fi
-            rm -rf -- "$(gateway_client_dir "$gateway" "$client")"
-        fi
-
-        rm -f -- "$state_file"
-        remaining=$(remote_auto_pool_member_count "$pool_id")
+        # Count the other members while this owner's state is still present.
+        # This keeps cleanup transactional: a later failure leaves the state
+        # available for a safe retry instead of forcing deterministic fallback.
+        remaining=$(remote_auto_pool_member_count "$pool_id" "$owner")
         if (( remaining > 0 )); then
+            # A shared pool survives, so revoke only this member's credential.
+            # Revocation is valid whether the gateway is running or stopped;
+            # gateway_client_revoke() restarts it only when it was active.
+            client_cfg="$(gateway_client_dir "$gateway" "$client")/client.cfg"
+            if [[ -f "$client_cfg" ]]; then
+                gateway_client_load "$gateway" "$client"
+                if [[ "${STATUS:-}" == active ]]; then
+                    gateway_client_revoke "$gateway" "$client"
+                fi
+                rm -rf -- "$(gateway_client_dir "$gateway" "$client")"
+            fi
+
+            # Commit state removal only after credential cleanup succeeded.
+            rm -f -- "$state_file"
             remote_auto_deauthorize_owner "$owner"
             systemctl daemon-reload
             log "Removed automatic client '$owner'; shared pool '$pool_id' remains for $remaining client(s)."
             return 0
         fi
+
+        # This is the final pool member. Do not revoke its certificate first:
+        # the entire gateway CA and all client keys are removed below. Besides
+        # being unnecessary, revocation can fail on an old or stopped gateway
+        # and must not prevent deletion of the owned pool.
+        log "Removing final automatic remote pool '$pool_id' for '$owner'."
     else
         warn "Automatic-remote state '$state_file' is absent; cleaning deterministic partial objects."
         pool_id=$owner
@@ -7618,6 +7642,7 @@ remote_auto_cleanup_internal() {
         marker=${REMOTE_MANAGED_OWNER_ID:-}
         [[ -z "$marker" || "$marker" == "$pool_id" ]] ||
             die "Refusing to remove gateway '$gateway': pool marker mismatch."
+        log "Removing automatic gateway '$gateway'."
         gateway_remove "$gateway"
     else
         systemctl disable --now             "nns-gateway@${gateway}.service"             "nns-gateway-crl-refresh@${gateway}.timer"             >/dev/null 2>&1 || true
@@ -7629,11 +7654,13 @@ remote_auto_cleanup_internal() {
         marker=${REMOTE_MANAGED_OWNER_ID:-}
         [[ -z "$marker" || "$marker" == "$pool_id" ]] ||
             die "Refusing to remove exit '$exit_app': pool marker mismatch."
+        log "Removing automatic provider exit '$exit_app'."
         remove_app "$exit_app" local-only
     else
         systemctl disable --now             "nns-watchdog@${exit_app}.timer"             "nns-online@${exit_app}.service"             "nns-openvpn@${exit_app}.service"             "nns-netns@${exit_app}.service"             >/dev/null 2>&1 || true
     fi
 
+    # Commit owner-state deletion only after the gateway and exit are gone.
     rm -f -- "$state_file"
     remote_auto_deauthorize_owner "$owner"
     systemctl daemon-reload

@@ -764,8 +764,9 @@ printf '%s\n' test >"$cleanup_remote_cfg"
         fail 'cleanup completion was not recorded'
 )
 
-# Remote cleanup removes the gateway before its exit and passes local-only to
-# the nested remove operation so it cannot recurse into remote management.
+# Final-pool cleanup works while the provider exit is stopped. It removes the
+# whole gateway before its exit, skips unnecessary client revocation, and
+# passes local-only to the nested remove operation so cleanup cannot recurse.
 cleanup_state="$TEST_TMP/remote-auto-state.cfg"
 cleanup_gateway_cfg="$TEST_TMP/remote-gateway.cfg"
 cleanup_exit_cfg="$TEST_TMP/remote-exit.cfg"
@@ -777,7 +778,7 @@ GATEWAY=ra-0123456789ab-gw
 CLIENT=ra-0123456789ab-client
 PROVIDER_VPN_IPV4=10.120.0.2
 PROFILE_SHA256=
-ACTIVE=on
+ACTIVE=off
 EOF_CLEANUP_STATE
 printf '%s\n' gateway >"$cleanup_gateway_cfg"
 printf '%s\n' exit >"$cleanup_exit_cfg"
@@ -791,6 +792,7 @@ printf '%s\n' exit >"$cleanup_exit_cfg"
         VIA_APP=ra-0123456789ab-exit
         REMOTE_MANAGED_OWNER_ID=0123456789abcdef
     }
+    gateway_client_revoke() { fail 'final pool attempted unnecessary client revocation'; }
     gateway_remove() { printf 'gateway-remove:%s\n' "$1"; }
     load_cfg() { REMOTE_MANAGED_OWNER_ID=0123456789abcdef; }
     remove_app() { printf 'app-remove:%s:%s\n' "$1" "$2"; }
@@ -804,7 +806,56 @@ printf '%s\n' exit >"$cleanup_exit_cfg"
         fail 'remote exit was not removed without recursion'
     grep -Fq 'deauthorize:0123456789abcdef' <<<"$output" ||
         fail 'per-owner SSH authorization was not removed'
+    [[ ! -e "$cleanup_state" ]] || fail 'completed final-pool cleanup retained owner state'
 )
+
+# A failed final-pool deletion retains the owner state so purge can be retried.
+cat >"$cleanup_state" <<'EOF_CLEANUP_RETRY_STATE'
+OWNER_ID=0123456789abcdef
+POOL_ID=0123456789abcdef
+EXIT_APP=ra-0123456789ab-exit
+GATEWAY=ra-0123456789ab-gw
+CLIENT=ra-0123456789ab-client
+PROVIDER_VPN_IPV4=10.120.0.2
+PROFILE_SHA256=
+ACTIVE=off
+EOF_CLEANUP_RETRY_STATE
+if (
+    require_root() { :; }
+    remote_auto_state_file() { printf '%s\n' "$cleanup_state"; }
+    remote_auto_load_state() {
+        RA_EXIT_APP=ra-0123456789ab-exit
+        RA_GATEWAY=ra-0123456789ab-gw
+        RA_CLIENT=ra-0123456789ab-client
+        RA_POOL_ID=0123456789abcdef
+        RA_PROVIDER_VPN_IPV4=10.120.0.2
+        RA_PROFILE_SHA256=
+        RA_ACTIVE=off
+    }
+    remote_auto_pool_member_count() { printf '%s\n' 0; }
+    gateway_cfg_file() { printf '%s\n' "$cleanup_gateway_cfg"; }
+    cfg_file() { printf '%s\n' "$cleanup_exit_cfg"; }
+    load_gateway_cfg() {
+        VIA_APP=ra-0123456789ab-exit
+        REMOTE_MANAGED_OWNER_ID=0123456789abcdef
+    }
+    gateway_remove() { exit 1; }
+    log() { :; }
+    remote_auto_cleanup_internal 0123456789abcdef >/dev/null 2>&1
+); then
+    fail 'failed final gateway deletion was reported as success'
+fi
+[[ -f "$cleanup_state" ]] || fail 'failed final-pool cleanup deleted retry state'
+
+# Dependency enumerators are list-producing helpers, not predicates. Their
+# definitions must end in explicit success so a zero-match result remains safe
+# in remove_app() pipelines under set -e -o pipefail.
+gateway_enum_definition=$(declare -f gateways_using_app)
+app_enum_definition=$(declare -f apps_using_upstream)
+grep -Fq 'return 0' <<<"$gateway_enum_definition" ||
+    fail 'gateway dependency enumerator has no explicit successful empty result'
+grep -Fq 'return 0' <<<"$app_enum_definition" ||
+    fail 'app dependency enumerator has no explicit successful empty result'
 
 # Public CLI exposes explicit local-only escape hatches; normal remove/purge
 # use ownership-scoped remote cleanup by default.
@@ -1143,7 +1194,11 @@ manual_payload=$(remote_command_payload gateway client export \
     gateway_client_dir() { printf '%s\n' "$cdir"; }
     gateway_client_load() { STATUS=active; }
     gateway_client_revoke() { printf 'revoke:%s:%s\n' "$1" "$2"; }
-    remote_auto_pool_member_count() { printf '%s\n' 1; }
+    remote_auto_pool_member_count() {
+        [[ "$1" == 1111111111111111 && "$2" == 3333333333333333 ]] ||
+            fail 'shared cleanup did not exclude the owner being removed'
+        printf '%s\n' 1
+    }
     remote_auto_deauthorize_owner() { printf 'deauthorize:%s\n' "$1"; }
     gateway_remove() { fail 'shared gateway was removed with members remaining'; }
     remove_app() { fail 'shared exit was removed with members remaining'; }
@@ -1153,6 +1208,7 @@ manual_payload=$(remote_command_payload gateway client export \
     grep -Fq 'revoke:ra-111111111111-gw:ra-333333333333-client' <<<"$output" ||
         fail 'shared follower credential was not revoked'
     grep -Fq 'shared pool' <<<"$output" || fail 'shared cleanup did not preserve the pool'
+    [[ ! -e "$state" ]] || fail 'shared cleanup retained removed member state'
 )
 
 echo 'Function tests passed.'

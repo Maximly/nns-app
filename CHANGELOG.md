@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.3.19
+
+- Fixed automatic-remote purge recovery when the owner state file is already absent and another unrelated gateway or application remains on the remote host.
+- Made `gateways_using_app` and `apps_using_upstream` true enumerators: an empty match set now returns success instead of inheriting the last failed comparison.
+- Prevented `set -e -o pipefail` from aborting `remove_app` silently while removing a stopped deterministic provider exit after a partially completed older purge.
+- Added regression coverage for zero-match dependency enumeration in the presence of unrelated remote objects.
+
+## 1.3.18
+
+- Fixed `remove`/`purge` of a stopped final automatic-remote profile: final pool cleanup now deletes the owned gateway CA and exit directly instead of performing an unnecessary client-certificate revocation first.
+- Made automatic-remote cleanup transactional: owner state is retained until shared-member credential cleanup or final gateway/exit deletion completes, so a failed purge can be retried safely.
+- Count shared-pool members while excluding the owner being removed, preserving the gateway and provider exit only when another member actually remains.
+- Kept shared-member cleanup strict: only that member's gateway credential is revoked and removed; the shared pool remains untouched.
+
 ## 1.3.17
 
 - Added automatic sharing of an existing automatic-remote provider exit when another client presents the same profile fingerprint or is observed with the same provider-side tunnel IPv4 address.
