@@ -4,9 +4,9 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.15
+**Release:** 1.3.16
 
-**Supported platform:** Ubuntu with systemd and iptables  
+**Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
 
 The release includes both the modular source tree and a pre-built,
@@ -67,6 +67,7 @@ first bootstrap.
 - Unique client certificates and TLS Crypt v2 keys for gateway clients.
 - Collision-safe network, routing-table, and policy-priority allocation.
 - Dedicated, tagged gateway firewall chains.
+- Fedora firewalld integration with a private nns-app zone and forwarding policy.
 - Cycle detection and systemd dependencies for chained environments.
 - Weekly atomic CRL renewal for managed gateways.
 - Transactional gateway, client, and PKI changes.
@@ -249,7 +250,7 @@ changing routing, firewall, PKI, locking, configuration, or lifecycle code.
 The README keeps only the user-facing architecture and operating workflow.
 
 The generated installer remains a single executable file so it can be copied
-to a new Ubuntu host without installing the source tree.
+to a new Ubuntu or Fedora host without installing the source tree.
 
 ## Architecture
 
@@ -357,20 +358,24 @@ The gateway data path uses:
 
 ## Requirements
 
-The installer checks or installs these Ubuntu packages:
+The installer detects Ubuntu/Debian or Fedora and installs the matching packages
+with `apt-get` or `dnf`/`dnf5`:
 
-- Bash
+- Bash and systemd
 - OpenVPN 2.6 or newer
 - `wireguard-tools`
-- `iproute2`
-- `iptables`
-- systemd
-- sudo
-- curl
-- `iputils-ping`
-- OpenSSL
-- Python 3
-- `util-linux` (`setpriv` and `flock`)
+- `iproute2` on Ubuntu/Debian or `iproute` on Fedora
+- `iptables` on Ubuntu/Debian or `iptables-nft` on Fedora
+- `iputils-ping` on Ubuntu/Debian or `iputils` on Fedora
+- `openssh-client` on Ubuntu/Debian or `openssh-clients` on Fedora
+- sudo, curl, OpenSSL, Python 3, and `util-linux`
+
+On Fedora, nns-app keeps SELinux enabled and restores the standard contexts of
+installed engine, systemd, and sudoers files. When firewalld is active, nns-app
+creates a dedicated `nns-app` zone and `nns-app-forward` policy, assigns only its
+managed host-side interfaces, and removes those global objects during purge.
+The existing per-environment iptables-nft rules remain responsible for the kill
+switch, endpoint restrictions, NAT, and detailed forwarding policy.
 
 Optional transports require a locally installed binary on both ends:
 
@@ -892,7 +897,7 @@ Namespace DNS remains authoritative instead of being delegated to `wg-quick`.
 `ip netns exec` creates a private mount namespace for namespace-specific
 resolver files. Snap launchers also require cgroup v2 and securityfs there.
 `nns-app run` detects direct Snap aliases, the Snap launcher itself, and distro
-transition wrappers such as Ubuntu's `/usr/bin/firefox` wrapper. It mounts those
+transition wrappers such as a distribution-provided `/usr/bin/firefox` wrapper. It mounts those
 filesystems inside the private command mount namespace before dropping to the
 configured desktop user. Ordinary commands and non-Snap desktop applications
 skip this extra mount preparation.
@@ -913,8 +918,9 @@ sudo ./nns-app-install.sh install
 ```
 
 The installer refreshes systemd templates and generated dependency drop-ins.
-An upgrade from 1.1.24 to 1.1.25 changes documentation, comments, help examples,
-and contributor guidance; it does not change the networking data path.
+On Fedora it also installs the distribution-specific dependency names and
+reconciles the dedicated firewalld zone and forwarding policy when firewalld is
+running.
 
 A gateway still running from 1.0.23 must be restarted once so the current
 policy-rule and dedicated firewall-chain model replaces the legacy rules:
@@ -968,7 +974,7 @@ sudo ip netns exec nns-my-remote-exit iptables-save
 ## Known limitations
 
 - IPv4 client data paths only.
-- Ubuntu/systemd/iptables are the supported platform combination.
+- Ubuntu and Fedora with systemd are supported; other distributions require manual dependency and firewall validation.
 - Managed gateways use an OpenVPN server backend only.
 - Router port forwarding and host INPUT firewall changes are not automated.
 - Client and server certificate renewal requires issuing a new client identity

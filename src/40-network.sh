@@ -138,6 +138,95 @@ iptables_delete_all() {
     fi
 }
 
+firewalld_is_active() {
+    command -v firewall-cmd >/dev/null 2>&1 &&
+        firewall-cmd --state >/dev/null 2>&1
+}
+
+firewalld_list_contains() {
+    local kind=$1 name=$2 scope=${3:-runtime} values
+    local -a cmd=(firewall-cmd)
+    [[ "$scope" == permanent ]] && cmd+=(--permanent)
+    case "$kind" in
+        zone) cmd+=(--get-zones) ;;
+        policy) cmd+=(--get-policies) ;;
+        *) return 1 ;;
+    esac
+    values=$("${cmd[@]}" 2>/dev/null || true)
+    tr ' ' '\n' <<<"$values" | grep -Fxq "$name"
+}
+
+firewalld_ensure_scope() {
+    local scope=$1
+    local -a cmd=(firewall-cmd)
+    [[ "$scope" == permanent ]] && cmd+=(--permanent)
+
+    if ! firewalld_list_contains zone "$FIREWALLD_ZONE" "$scope"; then
+        "${cmd[@]}" --new-zone="$FIREWALLD_ZONE" >/dev/null
+    fi
+    "${cmd[@]}" --zone="$FIREWALLD_ZONE" --set-target=DROP >/dev/null
+
+    if ! firewalld_list_contains policy "$FIREWALLD_POLICY" "$scope"; then
+        "${cmd[@]}" --new-policy="$FIREWALLD_POLICY" >/dev/null
+    fi
+    "${cmd[@]}" --policy="$FIREWALLD_POLICY" \
+        --add-ingress-zone="$FIREWALLD_ZONE" >/dev/null 2>&1 || true
+    "${cmd[@]}" --policy="$FIREWALLD_POLICY" \
+        --add-egress-zone=ANY >/dev/null 2>&1 || true
+    "${cmd[@]}" --policy="$FIREWALLD_POLICY" --set-target=ACCEPT >/dev/null
+}
+
+firewalld_ensure_integration() {
+    firewalld_is_active || return 0
+    firewalld_ensure_scope permanent
+    firewalld_ensure_scope runtime
+}
+
+firewalld_interface_add() {
+    local interface=$1
+    firewalld_is_active || return 0
+    firewalld_ensure_integration
+    firewall-cmd --permanent --zone="$FIREWALLD_ZONE" \
+        --add-interface="$interface" >/dev/null 2>&1 || true
+    firewall-cmd --zone="$FIREWALLD_ZONE" \
+        --add-interface="$interface" >/dev/null 2>&1 || true
+}
+
+firewalld_interface_remove() {
+    local interface=$1
+    if firewalld_is_active; then
+        firewall-cmd --permanent --zone="$FIREWALLD_ZONE" \
+            --remove-interface="$interface" >/dev/null 2>&1 || true
+        firewall-cmd --zone="$FIREWALLD_ZONE" \
+            --remove-interface="$interface" >/dev/null 2>&1 || true
+    elif command -v firewall-offline-cmd >/dev/null 2>&1; then
+        firewall-offline-cmd --zone="$FIREWALLD_ZONE" \
+            --remove-interface="$interface" >/dev/null 2>&1 || true
+    fi
+}
+
+firewalld_remove_integration() {
+    if firewalld_is_active; then
+        if firewalld_list_contains policy "$FIREWALLD_POLICY" runtime; then
+            firewall-cmd --delete-policy="$FIREWALLD_POLICY" \
+                >/dev/null 2>&1 || true
+        fi
+        if firewalld_list_contains zone "$FIREWALLD_ZONE" runtime; then
+            firewall-cmd --delete-zone="$FIREWALLD_ZONE" \
+                >/dev/null 2>&1 || true
+        fi
+        firewall-cmd --permanent --delete-policy="$FIREWALLD_POLICY" \
+            >/dev/null 2>&1 || true
+        firewall-cmd --permanent --delete-zone="$FIREWALLD_ZONE" \
+            >/dev/null 2>&1 || true
+    elif command -v firewall-offline-cmd >/dev/null 2>&1; then
+        firewall-offline-cmd --delete-policy="$FIREWALLD_POLICY" \
+            >/dev/null 2>&1 || true
+        firewall-offline-cmd --delete-zone="$FIREWALLD_ZONE" \
+            >/dev/null 2>&1 || true
+    fi
+}
+
 host_rules_up() {
     local wan=$1
     iptables_add_once filter FORWARD -i "$VETH_HOST" -o "$wan" -j ACCEPT
@@ -239,6 +328,9 @@ netns_up() {
         load_cfg "$app"
     fi
     delete_veth_everywhere "$VETH_HOST"
+    # Clear a stale permanent firewalld assignment before deciding whether
+    # this app uplinks through the host or another namespace.
+    firewalld_interface_remove "$VETH_HOST"
 
     if [[ "$via_app" == host ]]; then
         wan=$(detect_wan_iface "$WAN_IFACE")
@@ -303,6 +395,7 @@ netns_up() {
     if [[ "$via_app" == host ]]; then
         ip addr add "$HOST_ADDR" dev "$VETH_HOST"
         ip link set "$VETH_HOST" up
+        firewalld_interface_add "$VETH_HOST"
     else
         ip link set "$VETH_HOST" netns "$upstream_ns"
         ip -n "$upstream_ns" addr add "$HOST_ADDR" dev "$VETH_HOST"

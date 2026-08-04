@@ -1,18 +1,26 @@
 # nns-app source module: OpenVPN/WireGuard runtime and app lifecycle.
 openvpn_exec() {
-    local app=$1 profile=$2
+    local app=$1 profile=$2 openvpn_bin ip_bin
     load_cfg "$app"
+    openvpn_bin=$(openvpn_binary)
+    ip_bin=$(ip_binary)
 
     local args=(
-        /usr/sbin/openvpn
+        "$openvpn_bin"
         --config "$profile"
-        --dns-updown disable
     )
+    # OpenVPN 2.7 gained --dns-updown. Fedora 43 still ships the supported
+    # OpenVPN 2.6 branch, where the option does not exist. Namespace-local
+    # resolv.conf handling does not require the hook, so disable it only when
+    # the installed OpenVPN advertises the option.
+    if openvpn_supports_dns_updown; then
+        args+=(--dns-updown disable)
+    fi
     if bool_on "$DISABLE_DCO"; then
         args+=(--disable-dco)
     fi
 
-    exec /usr/sbin/ip netns exec "$NS_NAME" "${args[@]}"
+    exec "$ip_bin" netns exec "$NS_NAME" "${args[@]}"
 }
 
 wireguard_exec() {
@@ -600,6 +608,7 @@ remove_app() {
 
     stop_app "$app"
     load_cfg "$app"
+    firewalld_interface_remove "$VETH_HOST"
     systemctl disable --now "nns-watchdog@${app}.timer" \
         >/dev/null 2>&1 || true
     systemctl disable \
@@ -711,6 +720,10 @@ purge_engine() {
         fi
         ip netns del "$ns" 2>/dev/null || true
     done < <(ip netns list 2>/dev/null | awk '{print $1}')
+
+    # Remove the global firewalld objects after all managed interfaces have
+    # disappeared. They are owned exclusively by nns-app.
+    firewalld_remove_integration
 
     # Remove all files installed by this engine. Do not remove dependency
     # packages (openvpn, wireguard-tools, iproute2, iptables, curl, sudo, etc.).

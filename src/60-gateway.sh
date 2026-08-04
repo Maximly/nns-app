@@ -423,6 +423,7 @@ gateway_generate_pki() {
 gateway_write_server_config() {
     local gateway=$1 root=${2:-$(gateway_dir "$gateway")}
     local config output pki proto_option network netmask dns
+    local unpriv_user unpriv_group
 
     if [[ "$root" == "$(gateway_dir "$gateway")" ]]; then
         load_gateway_cfg "$gateway"
@@ -438,6 +439,8 @@ gateway_write_server_config() {
         output=$(mktemp "$root/server.conf.XXXXXX")
     fi
     pki="$root/pki"
+    unpriv_user=$(nns_unprivileged_user)
+    unpriv_group=$(nns_unprivileged_group)
     [[ "$OPENVPN_LISTEN_PROTO" == tcp ]] &&
         proto_option=tcp-server || proto_option=udp
 
@@ -481,8 +484,8 @@ PY_GATEWAY_POOL
         printf 'persist-tun\n'
         printf 'script-security 2\n'
         printf 'up "%s _gateway-tun-up %s"\n' "$ENGINE_PATH" "$gateway"
-        printf 'user nobody\n'
-        printf 'group nogroup\n'
+        printf 'user %s\n' "$unpriv_user"
+        printf 'group %s\n' "$unpriv_group"
         printf 'status %s 5\n' "$(gateway_status_file "$gateway")"
         printf 'status-version 3\n'
         printf 'push "redirect-gateway def1 bypass-dhcp"\n'
@@ -499,13 +502,13 @@ PY_GATEWAY_POOL
     }
 
     if [[ "$output" != "$config" ]]; then
-        install -o root -g nogroup -m 0640 "$output" "$config" || {
+        install -o root -g "$unpriv_group" -m 0640 "$output" "$config" || {
             rm -f "$output"
             return 1
         }
         rm -f "$output"
     else
-        chown root:nogroup "$config" || return 1
+        chown "root:$unpriv_group" "$config" || return 1
         chmod 0640 "$config" || return 1
     fi
 }
@@ -980,13 +983,17 @@ gateway_up() {
     host_ip=${TRANSIT_HOST_ADDR%/*}
     ns_ip=${TRANSIT_NS_ADDR%/*}
     runtime=$(gateway_runtime_file "$gateway")
-    install -d -o nobody -g nogroup -m 0750 \
+    local unpriv_user unpriv_group
+    unpriv_user=$(nns_unprivileged_user)
+    unpriv_group=$(nns_unprivileged_group)
+    install -d -o "$unpriv_user" -g "$unpriv_group" -m 0750 \
         "$(gateway_runtime_dir "$gateway")"
 
     ip link add "$GATEWAY_VETH_HOST" \
         type veth peer name "$GATEWAY_VETH_NS"
     ip addr add "$TRANSIT_HOST_ADDR" dev "$GATEWAY_VETH_HOST"
     ip link set "$GATEWAY_VETH_HOST" up
+    firewalld_interface_add "$GATEWAY_VETH_HOST"
     sysctl -q -w \
         "net.ipv4.conf.${GATEWAY_VETH_HOST}.rp_filter=2"
 
@@ -1047,6 +1054,7 @@ gateway_tun_up() {
 
     sysctl -q -w \
         "net.ipv4.conf.${tunnel_dev}.rp_filter=2" || true
+    firewalld_interface_add "$tunnel_dev"
 
     # Match both the server TUN and client pool. Source-only matching could
     # capture unrelated host-generated packets that use an address from the pool.
@@ -1067,7 +1075,7 @@ gateway_server_exec() {
     config=$(gateway_server_config "$gateway")
     [[ -f "$config" ]] || die "Gateway server config is missing: $config"
     case "${TRANSPORT:-direct}" in
-        direct|ssh) exec /usr/sbin/openvpn --config "$config" ;;
+        direct|ssh) exec "$(openvpn_binary)" --config "$config" ;;
         stunnel|cloak) gateway_transport_server_exec "$gateway" ;;
         *) die "Unsupported gateway transport '$TRANSPORT'." ;;
     esac
@@ -1839,6 +1847,8 @@ gateway_remove() {
 
     systemctl disable "nns-gateway@${gateway}.service" \
         >/dev/null 2>&1 || true
+    firewalld_interface_remove "$GATEWAY_TUN"
+    firewalld_interface_remove "$GATEWAY_VETH_HOST"
     rm -rf \
         "$(gateway_dropin_dir "$gateway")" \
         "$(gateway_dir "$gateway")" \

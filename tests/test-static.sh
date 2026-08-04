@@ -9,7 +9,7 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fq 'nns-app 1.3.15' <<<"$version"
+grep -Fq 'nns-app 1.3.16' <<<"$version"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -195,7 +195,7 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 1.3.15' "$ROOT/README.md"
+grep -Fq '**Release:** 1.3.16' "$ROOT/README.md"
 grep -Fq '## Quick start' "$ROOT/README.md"
 grep -Fq '### Run the VPN profile locally' "$ROOT/README.md"
 grep -Fq 'nns-app install my-private-app' "$ROOT/README.md"
@@ -203,6 +203,25 @@ grep -Fq '### Run the same VPN profile on a remote Linux host' "$ROOT/README.md"
 grep -Fq 'nns-app install my-private-app via --remote user@remote-host' "$ROOT/README.md"
 grep -Fq 'nns-app run my-private-app ping -c 4 1.1.1.1' "$ROOT/README.md"
 grep -Fq 'OpenVPN 2.6+' "$ROOT/README.md"
+grep -Fq '**Supported platforms:** Ubuntu and Fedora with systemd' "$ROOT/README.md"
+grep -Fq 'iptables-nft' "$ROOT/README.md"
+grep -Fq 'nns-app-forward' "$ROOT/README.md"
+grep -Fq "fedora:iptables) printf 'iptables-nft\\n'" "$INSTALLER"
+grep -Fq "fedora:ip) printf 'iproute\\n'" "$INSTALLER"
+grep -Fq "fedora:ping) printf 'iputils\\n'" "$INSTALLER"
+grep -Fq "fedora:ssh|fedora:scp) printf 'openssh-clients\\n'" "$INSTALLER"
+grep -Fq 'command -v dnf5' "$INSTALLER"
+grep -Fq 'openvpn_supports_dns_updown' "$INSTALLER"
+grep -Fq 'nns_unprivileged_group' "$INSTALLER"
+grep -Fq 'firewalld_ensure_integration' "$INSTALLER"
+grep -Fq 'firewalld_interface_add "$VETH_HOST"' "$INSTALLER"
+grep -Fq 'firewalld_interface_add "$tunnel_dev"' "$INSTALLER"
+grep -Fq 'firewalld_remove_integration' "$INSTALLER"
+grep -Fq 'restore_selinux_contexts' "$INSTALLER"
+if grep -Fq '/usr/sbin/openvpn' "$INSTALLER"; then
+    echo 'hard-coded Ubuntu OpenVPN path remains in installer' >&2
+    exit 1
+fi
 
 # Public documentation and help use one descriptive example-name set.
 for expected_name in \

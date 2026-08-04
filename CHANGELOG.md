@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.16
+
+- Added supported Fedora installation with `dnf`/`dnf5` package mappings for `iproute`, `iptables-nft`, `iputils`, and `openssh-clients`.
+- Resolve OpenVPN and iproute binaries from `PATH`, support Fedora's `/usr/bin` layout, and select the distribution's available unprivileged group.
+- Keep compatibility with OpenVPN 2.6 by using `--dns-updown` only when the installed binary advertises it.
+- Integrate active firewalld installations through a dedicated `nns-app` zone and `nns-app-forward` policy while retaining nns-app's detailed iptables-nft kill-switch and NAT rules.
+- Restore SELinux contexts on installed engine, systemd, and sudoers files without disabling enforcement.
+- Updated README platform, dependency, firewall, upgrade, and limitation guidance for Ubuntu and Fedora.
+
 ## 1.3.15
 
 - Added an early `Quick start` section to the README with two complete three-command workflows: run a provider profile locally, or deploy the same profile automatically to a remote Linux host.

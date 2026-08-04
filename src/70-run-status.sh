@@ -123,7 +123,7 @@ dns_proxy_exec() {
     # drops to nobody before forwarding any packet, so the pre-tunnel
     # root-only DNS exception cannot leak application DNS around the kill
     # switch while the VPN is down.
-    exec /usr/sbin/ip netns exec "$NS_NAME" \
+    exec "$(ip_binary)" netns exec "$NS_NAME" \
         /usr/bin/python3 - "$DNS_SERVERS" <<'PY_NNS_DNS_PROXY'
 from __future__ import annotations
 
@@ -395,13 +395,13 @@ run_in_app() {
     # `ip netns exec` supplies the namespace-specific resolver bind. The
     # internal helper prepares Snap-required mounts, then drops permanently to
     # APP_USER without shell re-parsing or eval.
-    exec /usr/sbin/ip netns exec "$NS_NAME" \
+    exec "$(ip_binary)" netns exec "$NS_NAME" \
         "$ENGINE_PATH" _run-user "$app" "$@"
 }
 
 
 myip_route_snapshot_current() {
-    /usr/sbin/ip -4 route get 1.1.1.1 2>/dev/null |
+    "$(ip_binary)" -4 route get 1.1.1.1 2>/dev/null |
         awk 'NR == 1 {
             dev = via = src = ""
             for (i = 1; i <= NF; i++) {
@@ -418,7 +418,7 @@ myip_route_snapshot_current() {
 
 myip_route_snapshot_namespace() {
     local ns=$1
-    /usr/sbin/ip -n "$ns" -4 route get 1.1.1.1 2>/dev/null |
+    "$(ip_binary)" -n "$ns" -4 route get 1.1.1.1 2>/dev/null |
         awk 'NR == 1 {
             dev = via = src = ""
             for (i = 1; i <= NF; i++) {
@@ -444,7 +444,7 @@ myip_external_current() {
 
 myip_external_namespace() {
     local ns=$1 url=${2:-https://api.ipify.org} value
-    value=$(/usr/sbin/ip netns exec "$ns" /usr/bin/curl -4fsS \
+    value=$("$(ip_binary)" netns exec "$ns" /usr/bin/curl -4fsS \
         --connect-timeout 2 --max-time 5 "$url" 2>/dev/null || true)
     value=${value//$'\r'/}
     value=${value//$'\n'/}

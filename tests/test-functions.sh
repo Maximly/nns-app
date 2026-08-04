@@ -19,6 +19,92 @@ fail() {
     exit 1
 }
 
+# Distribution-specific dependency resolution must remain deterministic.
+fedora_os_release="$TEST_TMP/fedora-os-release"
+cat >"$fedora_os_release" <<'EOF_TEST_FEDORA_OS_RELEASE'
+NAME="Fedora Linux"
+ID=fedora
+VERSION_ID=44
+EOF_TEST_FEDORA_OS_RELEASE
+NNS_APP_OS_RELEASE_FILE="$fedora_os_release"
+export NNS_APP_OS_RELEASE_FILE
+[[ "$(detect_platform_family)" == fedora ]] || fail 'Fedora platform detection'
+[[ "$(dependency_package_for fedora ip)" == iproute ]] || fail 'Fedora iproute package mapping'
+[[ "$(dependency_package_for fedora iptables)" == iptables-nft ]] || fail 'Fedora iptables package mapping'
+[[ "$(dependency_package_for fedora ping)" == iputils ]] || fail 'Fedora ping package mapping'
+[[ "$(dependency_package_for fedora ssh)" == openssh-clients ]] || fail 'Fedora SSH package mapping'
+
+ubuntu_os_release="$TEST_TMP/ubuntu-os-release"
+cat >"$ubuntu_os_release" <<'EOF_TEST_UBUNTU_OS_RELEASE'
+NAME="Ubuntu"
+ID=ubuntu
+ID_LIKE=debian
+EOF_TEST_UBUNTU_OS_RELEASE
+NNS_APP_OS_RELEASE_FILE="$ubuntu_os_release"
+[[ "$(detect_platform_family)" == debian ]] || fail 'Ubuntu platform detection'
+unset NNS_APP_OS_RELEASE_FILE
+
+fake_openvpn_26="$TEST_TMP/openvpn-2.6"
+cat >"$fake_openvpn_26" <<'EOF_TEST_OPENVPN_26'
+#!/bin/sh
+[ "$1" = --help ] && { echo 'OpenVPN options'; exit 0; }
+EOF_TEST_OPENVPN_26
+chmod 0755 "$fake_openvpn_26"
+(
+    openvpn_binary() { printf '%s\n' "$fake_openvpn_26"; }
+    if openvpn_supports_dns_updown; then
+        fail 'OpenVPN 2.6-style help incorrectly advertises dns-updown'
+    fi
+)
+fake_openvpn_27="$TEST_TMP/openvpn-2.7"
+cat >"$fake_openvpn_27" <<'EOF_TEST_OPENVPN_27'
+#!/bin/sh
+[ "$1" = --help ] && { echo '  --dns-updown mode'; exit 0; }
+EOF_TEST_OPENVPN_27
+chmod 0755 "$fake_openvpn_27"
+(
+    openvpn_binary() { printf '%s\n' "$fake_openvpn_27"; }
+    openvpn_supports_dns_updown || fail 'OpenVPN 2.7 dns-updown capability detection'
+)
+
+unprivileged_group=$(nns_unprivileged_group)
+getent group "$unprivileged_group" >/dev/null 2>&1 ||
+    fail 'unprivileged group helper returned an unknown group'
+
+# Active firewalld receives both persistent and runtime objects. The zone has a
+# DROP target for host input; the policy only permits forwarding onward.
+(
+    firewalld_log="$TEST_TMP/firewalld.log"
+    firewall-cmd() {
+        local arg
+        for arg in "$@"; do printf '%s ' "$arg" >>"$firewalld_log"; done
+        printf '\n' >>"$firewalld_log"
+        for arg in "$@"; do
+            case "$arg" in
+                --state) return 0 ;;
+                --get-zones) printf 'public\n'; return 0 ;;
+                --get-policies) printf '\n'; return 0 ;;
+            esac
+        done
+        return 0
+    }
+    firewalld_interface_add nns-unit-host
+    grep -Fq -- '--permanent --new-zone=nns-app' "$firewalld_log" ||
+        fail 'firewalld permanent zone was not created'
+    grep -Fq -- '--zone=nns-app --set-target=DROP' "$firewalld_log" ||
+        fail 'firewalld zone target was not restricted'
+    grep -Fq -- '--permanent --new-policy=nns-app-forward' "$firewalld_log" ||
+        fail 'firewalld permanent policy was not created'
+    grep -Fq -- '--policy=nns-app-forward --add-ingress-zone=nns-app' "$firewalld_log" ||
+        fail 'firewalld ingress zone was not configured'
+    grep -Fq -- '--policy=nns-app-forward --add-egress-zone=ANY' "$firewalld_log" ||
+        fail 'firewalld egress zone was not configured'
+    grep -Fq -- '--policy=nns-app-forward --set-target=ACCEPT' "$firewalld_log" ||
+        fail 'firewalld forwarding target was not configured'
+    grep -Fq -- '--permanent --zone=nns-app --add-interface=nns-unit-host' "$firewalld_log" ||
+        fail 'firewalld persistent interface assignment was omitted'
+)
+
 [[ "$(format_duration 0)" == 0s ]] || fail 'format_duration 0'
 [[ "$(format_duration 59)" == 59s ]] || fail 'format_duration seconds'
 [[ "$(format_duration 60)" == 1m ]] || fail 'format_duration minute'

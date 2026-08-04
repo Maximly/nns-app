@@ -1,7 +1,82 @@
 # nns-app source module: dependency checks, installation, upgrades and removal.
+os_release_value() {
+    local key=$1 file=${NNS_APP_OS_RELEASE_FILE:-/etc/os-release}
+    local line value
+    [[ -r "$file" ]] || return 1
+    line=$(grep -m1 -E "^${key}=" "$file" 2>/dev/null || true)
+    [[ -n "$line" ]] || return 1
+    value=${line#*=}
+    if [[ "$value" == \"*\" && ${#value} -ge 2 ]]; then
+        value=${value:1:${#value}-2}
+    elif [[ "$value" == \'*\' && ${#value} -ge 2 ]]; then
+        value=${value:1:${#value}-2}
+    fi
+    printf '%s\n' "$value"
+}
+
+detect_platform_family() {
+    local id id_like
+    id=$(os_release_value ID 2>/dev/null || true)
+    id_like=$(os_release_value ID_LIKE 2>/dev/null || true)
+    case "$id" in
+        ubuntu|debian) printf 'debian\n' ;;
+        fedora) printf 'fedora\n' ;;
+        *)
+            case " $id_like " in
+                *' debian '*) printf 'debian\n' ;;
+                *) return 1 ;;
+            esac
+            ;;
+    esac
+}
+
+dependency_package_for() {
+    local family=$1 command_name=$2
+    case "$family:$command_name" in
+        debian:ip) printf 'iproute2\n' ;;
+        fedora:ip) printf 'iproute\n' ;;
+        debian:iptables) printf 'iptables\n' ;;
+        fedora:iptables) printf 'iptables-nft\n' ;;
+        debian:ping) printf 'iputils-ping\n' ;;
+        fedora:ping) printf 'iputils\n' ;;
+        debian:ssh|debian:scp) printf 'openssh-client\n' ;;
+        fedora:ssh|fedora:scp) printf 'openssh-clients\n' ;;
+        *:openvpn) printf 'openvpn\n' ;;
+        *:wg|*:wg-quick) printf 'wireguard-tools\n' ;;
+        *:curl) printf 'curl\n' ;;
+        *:setpriv) printf 'util-linux\n' ;;
+        *:sudo) printf 'sudo\n' ;;
+        *:openssl) printf 'openssl\n' ;;
+        *:python3) printf 'python3\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+install_dependency_packages() {
+    local family=$1
+    shift
+    (( $# > 0 )) || return 0
+    case "$family" in
+        debian)
+            command -v apt-get >/dev/null 2>&1 ||
+                die "apt-get is unavailable on this Debian-family host."
+            DEBIAN_FRONTEND=noninteractive apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+            ;;
+        fedora)
+            local dnf_binary
+            dnf_binary=$(command -v dnf5 2>/dev/null || command -v dnf 2>/dev/null || true)
+            [[ -n "$dnf_binary" ]] || die "dnf is unavailable on this Fedora host."
+            "$dnf_binary" -y install "$@"
+            ;;
+        *) die "Unsupported package-manager family '$family'." ;;
+    esac
+}
+
 check_openvpn_version() {
-    local raw version
-    raw=$(openvpn --version 2>/dev/null | head -n1 || true)
+    local raw version binary
+    binary=$(openvpn_binary)
+    raw=$("$binary" --version 2>/dev/null | head -n1 || true)
     version=$(sed -nE \
         's/^OpenVPN[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' <<<"$raw")
     [[ -n "$version" ]] ||
@@ -13,27 +88,50 @@ check_openvpn_version() {
 }
 
 ensure_dependencies() {
-    local missing=()
-    command -v ip >/dev/null 2>&1       || missing+=(iproute2)
-    command -v openvpn >/dev/null 2>&1  || missing+=(openvpn)
-    command -v wg >/dev/null 2>&1       || missing+=(wireguard-tools)
-    command -v wg-quick >/dev/null 2>&1 || missing+=(wireguard-tools)
-    command -v iptables >/dev/null 2>&1 || missing+=(iptables)
-    command -v curl >/dev/null 2>&1     || missing+=(curl)
-    command -v ping >/dev/null 2>&1     || missing+=(iputils-ping)
-    command -v setpriv >/dev/null 2>&1  || missing+=(util-linux)
-    command -v sudo >/dev/null 2>&1     || missing+=(sudo)
-    command -v openssl >/dev/null 2>&1  || missing+=(openssl)
-    command -v python3 >/dev/null 2>&1  || missing+=(python3)
-    command -v ssh >/dev/null 2>&1      || missing+=(openssh-client)
-    command -v scp >/dev/null 2>&1      || missing+=(openssh-client)
+    local family command_name package
+    local -a commands=(
+        ip openvpn wg wg-quick iptables curl ping setpriv sudo openssl
+        python3 ssh scp
+    )
+    local -a missing=()
+    local -A selected=()
+
+    for command_name in "${commands[@]}"; do
+        command -v "$command_name" >/dev/null 2>&1 && continue
+        if [[ -z "${family:-}" ]]; then
+            family=$(detect_platform_family 2>/dev/null || true)
+            [[ -n "$family" ]] ||
+                die "Unsupported Linux distribution. Install the required commands manually; supported automatic installers are Ubuntu/Debian and Fedora."
+        fi
+        package=$(dependency_package_for "$family" "$command_name" 2>/dev/null || true)
+        [[ -n "$package" ]] ||
+            die "No package mapping for missing command '$command_name' on '$family'."
+        if [[ -z "${selected[$package]:-}" ]]; then
+            selected[$package]=1
+            missing+=("$package")
+        fi
+    done
 
     if (( ${#missing[@]} )); then
         log "Installing required packages: ${missing[*]}"
-        DEBIAN_FRONTEND=noninteractive apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
+        install_dependency_packages "$family" "${missing[@]}"
     fi
+
+    for command_name in "${commands[@]}"; do
+        command -v "$command_name" >/dev/null 2>&1 ||
+            die "Required command '$command_name' is still unavailable after dependency installation."
+    done
     check_openvpn_version
+}
+
+restore_selinux_contexts() {
+    [[ -e /sys/fs/selinux/enforce ]] || return 0
+    command -v restorecon >/dev/null 2>&1 || {
+        warn "SELinux is enabled but restorecon is unavailable; install policycoreutils and reinstall nns-app."
+        return 0
+    }
+    restorecon -F "$@" >/dev/null 2>&1 ||
+        warn "Could not restore one or more SELinux file contexts."
 }
 
 install_engine_files() {
@@ -195,6 +293,11 @@ WantedBy=timers.target
 CRL_TIMER_EOF
 
     chmod 0644 "$NETNS_UNIT" "$VPN_UNIT" "$ONLINE_UNIT" "$DNS_PROXY_UNIT" \
+        "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$GATEWAY_UNIT" \
+        "$GATEWAY_CRL_SERVICE" "$GATEWAY_CRL_TIMER"
+    restore_selinux_contexts \
+        "$ENGINE_PATH" "$USER_PATH" \
+        "$NETNS_UNIT" "$VPN_UNIT" "$ONLINE_UNIT" "$DNS_PROXY_UNIT" \
         "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$GATEWAY_UNIT" \
         "$GATEWAY_CRL_SERVICE" "$GATEWAY_CRL_TIMER"
     systemctl daemon-reload
@@ -382,6 +485,7 @@ SUDOERS_EOF
         die "Generated sudoers rule failed validation."
     }
     install -o root -g root -m 0440 "$tmp" "$file"
+    restore_selinux_contexts "$file"
     rm -f "$tmp"
 }
 

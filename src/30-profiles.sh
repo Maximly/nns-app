@@ -636,7 +636,7 @@ add_any_profile() {
         local upstream_data
         upstream_data=$(ensure_upstream_ready "$app" "$probe_via")
         probe_ns=${upstream_data%%|*}
-        path_prefix=(/usr/sbin/ip netns exec "$probe_ns")
+        path_prefix=("$(ip_binary)" netns exec "$probe_ns")
     fi
 
     state_key=$(printf '%s' "${country:-ANY}" |
@@ -889,7 +889,7 @@ def terminate_process(proc):
         proc.wait(timeout=1)
 
 def quick_openvpn_probe(config, endpoint, candidate_number):
-    openvpn = shutil.which("openvpn") or "/usr/sbin/openvpn"
+    openvpn = shutil.which("openvpn") or "/usr/bin/openvpn"
     if not Path(openvpn).is_file():
         return False, "OpenVPN executable is unavailable", 0.0
 
@@ -920,7 +920,7 @@ def quick_openvpn_probe(config, endpoint, candidate_number):
 
     if probe_namespace != "host":
         command = [
-            "/usr/sbin/ip", "netns", "exec", probe_namespace,
+            shutil.which("ip") or "/usr/bin/ip", "netns", "exec", probe_namespace,
         ] + command
 
     started = time.monotonic()

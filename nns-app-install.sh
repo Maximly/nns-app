@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# nns-app - manage per-application VPN network namespaces on Ubuntu.
+# nns-app - manage per-application VPN network namespaces on Linux.
 #
 # Copyright (C) 2026 Maxim Lyadvinsky
 #
@@ -47,7 +47,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.15"
+readonly VERSION="1.3.16"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -64,6 +64,8 @@ readonly WATCHDOG_SERVICE="/etc/systemd/system/nns-watchdog@.service"
 readonly WATCHDOG_TIMER="/etc/systemd/system/nns-watchdog@.timer"
 readonly GATEWAY_CRL_SERVICE="/etc/systemd/system/nns-gateway-crl-refresh@.service"
 readonly GATEWAY_CRL_TIMER="/etc/systemd/system/nns-gateway-crl-refresh@.timer"
+readonly FIREWALLD_ZONE="nns-app"
+readonly FIREWALLD_POLICY="nns-app-forward"
 readonly SYSTEMD_UNIT_DIR="/etc/systemd/system"
 readonly DEFAULT_LOCK_DIR="/run/lock/nns-app"
 # Unit tests source the built script without root privileges. They may point
@@ -192,6 +194,43 @@ reset_gateway_cfg_vars() {
 reset_gateway_client_vars() {
     CLIENT_NAME="" STATUS="" CERT_SERIAL="" CREATED_AT="" REVOKED_AT=""
     GENERATION="" CLOAK_UID=""
+}
+
+required_binary() {
+    local name=$1 path
+    path=$(command -v "$name" 2>/dev/null || true)
+    [[ -n "$path" && -x "$path" ]] || die "Required executable '$name' is unavailable."
+    readlink -f -- "$path"
+}
+
+openvpn_binary() {
+    required_binary openvpn
+}
+
+ip_binary() {
+    required_binary ip
+}
+
+openvpn_supports_dns_updown() {
+    local binary
+    binary=$(openvpn_binary)
+    "$binary" --help 2>&1 | grep -Fq -- '--dns-updown'
+}
+
+nns_unprivileged_user() {
+    id nobody >/dev/null 2>&1 || die "The system account 'nobody' is missing."
+    printf 'nobody\n'
+}
+
+nns_unprivileged_group() {
+    if getent group nogroup >/dev/null 2>&1; then
+        printf 'nogroup\n'
+    elif getent group nobody >/dev/null 2>&1; then
+        printf 'nobody\n'
+    else
+        id -gn nobody 2>/dev/null ||
+            die "Cannot determine the unprivileged group for 'nobody'."
+    fi
 }
 
 format_duration() {
@@ -676,9 +715,84 @@ parse_start_cli() {
 
 
 # nns-app source module: dependency checks, installation, upgrades and removal.
+os_release_value() {
+    local key=$1 file=${NNS_APP_OS_RELEASE_FILE:-/etc/os-release}
+    local line value
+    [[ -r "$file" ]] || return 1
+    line=$(grep -m1 -E "^${key}=" "$file" 2>/dev/null || true)
+    [[ -n "$line" ]] || return 1
+    value=${line#*=}
+    if [[ "$value" == \"*\" && ${#value} -ge 2 ]]; then
+        value=${value:1:${#value}-2}
+    elif [[ "$value" == \'*\' && ${#value} -ge 2 ]]; then
+        value=${value:1:${#value}-2}
+    fi
+    printf '%s\n' "$value"
+}
+
+detect_platform_family() {
+    local id id_like
+    id=$(os_release_value ID 2>/dev/null || true)
+    id_like=$(os_release_value ID_LIKE 2>/dev/null || true)
+    case "$id" in
+        ubuntu|debian) printf 'debian\n' ;;
+        fedora) printf 'fedora\n' ;;
+        *)
+            case " $id_like " in
+                *' debian '*) printf 'debian\n' ;;
+                *) return 1 ;;
+            esac
+            ;;
+    esac
+}
+
+dependency_package_for() {
+    local family=$1 command_name=$2
+    case "$family:$command_name" in
+        debian:ip) printf 'iproute2\n' ;;
+        fedora:ip) printf 'iproute\n' ;;
+        debian:iptables) printf 'iptables\n' ;;
+        fedora:iptables) printf 'iptables-nft\n' ;;
+        debian:ping) printf 'iputils-ping\n' ;;
+        fedora:ping) printf 'iputils\n' ;;
+        debian:ssh|debian:scp) printf 'openssh-client\n' ;;
+        fedora:ssh|fedora:scp) printf 'openssh-clients\n' ;;
+        *:openvpn) printf 'openvpn\n' ;;
+        *:wg|*:wg-quick) printf 'wireguard-tools\n' ;;
+        *:curl) printf 'curl\n' ;;
+        *:setpriv) printf 'util-linux\n' ;;
+        *:sudo) printf 'sudo\n' ;;
+        *:openssl) printf 'openssl\n' ;;
+        *:python3) printf 'python3\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+install_dependency_packages() {
+    local family=$1
+    shift
+    (( $# > 0 )) || return 0
+    case "$family" in
+        debian)
+            command -v apt-get >/dev/null 2>&1 ||
+                die "apt-get is unavailable on this Debian-family host."
+            DEBIAN_FRONTEND=noninteractive apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+            ;;
+        fedora)
+            local dnf_binary
+            dnf_binary=$(command -v dnf5 2>/dev/null || command -v dnf 2>/dev/null || true)
+            [[ -n "$dnf_binary" ]] || die "dnf is unavailable on this Fedora host."
+            "$dnf_binary" -y install "$@"
+            ;;
+        *) die "Unsupported package-manager family '$family'." ;;
+    esac
+}
+
 check_openvpn_version() {
-    local raw version
-    raw=$(openvpn --version 2>/dev/null | head -n1 || true)
+    local raw version binary
+    binary=$(openvpn_binary)
+    raw=$("$binary" --version 2>/dev/null | head -n1 || true)
     version=$(sed -nE \
         's/^OpenVPN[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' <<<"$raw")
     [[ -n "$version" ]] ||
@@ -690,27 +804,50 @@ check_openvpn_version() {
 }
 
 ensure_dependencies() {
-    local missing=()
-    command -v ip >/dev/null 2>&1       || missing+=(iproute2)
-    command -v openvpn >/dev/null 2>&1  || missing+=(openvpn)
-    command -v wg >/dev/null 2>&1       || missing+=(wireguard-tools)
-    command -v wg-quick >/dev/null 2>&1 || missing+=(wireguard-tools)
-    command -v iptables >/dev/null 2>&1 || missing+=(iptables)
-    command -v curl >/dev/null 2>&1     || missing+=(curl)
-    command -v ping >/dev/null 2>&1     || missing+=(iputils-ping)
-    command -v setpriv >/dev/null 2>&1  || missing+=(util-linux)
-    command -v sudo >/dev/null 2>&1     || missing+=(sudo)
-    command -v openssl >/dev/null 2>&1  || missing+=(openssl)
-    command -v python3 >/dev/null 2>&1  || missing+=(python3)
-    command -v ssh >/dev/null 2>&1      || missing+=(openssh-client)
-    command -v scp >/dev/null 2>&1      || missing+=(openssh-client)
+    local family command_name package
+    local -a commands=(
+        ip openvpn wg wg-quick iptables curl ping setpriv sudo openssl
+        python3 ssh scp
+    )
+    local -a missing=()
+    local -A selected=()
+
+    for command_name in "${commands[@]}"; do
+        command -v "$command_name" >/dev/null 2>&1 && continue
+        if [[ -z "${family:-}" ]]; then
+            family=$(detect_platform_family 2>/dev/null || true)
+            [[ -n "$family" ]] ||
+                die "Unsupported Linux distribution. Install the required commands manually; supported automatic installers are Ubuntu/Debian and Fedora."
+        fi
+        package=$(dependency_package_for "$family" "$command_name" 2>/dev/null || true)
+        [[ -n "$package" ]] ||
+            die "No package mapping for missing command '$command_name' on '$family'."
+        if [[ -z "${selected[$package]:-}" ]]; then
+            selected[$package]=1
+            missing+=("$package")
+        fi
+    done
 
     if (( ${#missing[@]} )); then
         log "Installing required packages: ${missing[*]}"
-        DEBIAN_FRONTEND=noninteractive apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
+        install_dependency_packages "$family" "${missing[@]}"
     fi
+
+    for command_name in "${commands[@]}"; do
+        command -v "$command_name" >/dev/null 2>&1 ||
+            die "Required command '$command_name' is still unavailable after dependency installation."
+    done
     check_openvpn_version
+}
+
+restore_selinux_contexts() {
+    [[ -e /sys/fs/selinux/enforce ]] || return 0
+    command -v restorecon >/dev/null 2>&1 || {
+        warn "SELinux is enabled but restorecon is unavailable; install policycoreutils and reinstall nns-app."
+        return 0
+    }
+    restorecon -F "$@" >/dev/null 2>&1 ||
+        warn "Could not restore one or more SELinux file contexts."
 }
 
 install_engine_files() {
@@ -872,6 +1009,11 @@ WantedBy=timers.target
 CRL_TIMER_EOF
 
     chmod 0644 "$NETNS_UNIT" "$VPN_UNIT" "$ONLINE_UNIT" "$DNS_PROXY_UNIT" \
+        "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$GATEWAY_UNIT" \
+        "$GATEWAY_CRL_SERVICE" "$GATEWAY_CRL_TIMER"
+    restore_selinux_contexts \
+        "$ENGINE_PATH" "$USER_PATH" \
+        "$NETNS_UNIT" "$VPN_UNIT" "$ONLINE_UNIT" "$DNS_PROXY_UNIT" \
         "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$GATEWAY_UNIT" \
         "$GATEWAY_CRL_SERVICE" "$GATEWAY_CRL_TIMER"
     systemctl daemon-reload
@@ -1059,6 +1201,7 @@ SUDOERS_EOF
         die "Generated sudoers rule failed validation."
     }
     install -o root -g root -m 0440 "$tmp" "$file"
+    restore_selinux_contexts "$file"
     rm -f "$tmp"
 }
 
@@ -1856,7 +1999,7 @@ add_any_profile() {
         local upstream_data
         upstream_data=$(ensure_upstream_ready "$app" "$probe_via")
         probe_ns=${upstream_data%%|*}
-        path_prefix=(/usr/sbin/ip netns exec "$probe_ns")
+        path_prefix=("$(ip_binary)" netns exec "$probe_ns")
     fi
 
     state_key=$(printf '%s' "${country:-ANY}" |
@@ -2109,7 +2252,7 @@ def terminate_process(proc):
         proc.wait(timeout=1)
 
 def quick_openvpn_probe(config, endpoint, candidate_number):
-    openvpn = shutil.which("openvpn") or "/usr/sbin/openvpn"
+    openvpn = shutil.which("openvpn") or "/usr/bin/openvpn"
     if not Path(openvpn).is_file():
         return False, "OpenVPN executable is unavailable", 0.0
 
@@ -2140,7 +2283,7 @@ def quick_openvpn_probe(config, endpoint, candidate_number):
 
     if probe_namespace != "host":
         command = [
-            "/usr/sbin/ip", "netns", "exec", probe_namespace,
+            shutil.which("ip") or "/usr/bin/ip", "netns", "exec", probe_namespace,
         ] + command
 
     started = time.monotonic()
@@ -2581,6 +2724,95 @@ iptables_delete_all() {
     fi
 }
 
+firewalld_is_active() {
+    command -v firewall-cmd >/dev/null 2>&1 &&
+        firewall-cmd --state >/dev/null 2>&1
+}
+
+firewalld_list_contains() {
+    local kind=$1 name=$2 scope=${3:-runtime} values
+    local -a cmd=(firewall-cmd)
+    [[ "$scope" == permanent ]] && cmd+=(--permanent)
+    case "$kind" in
+        zone) cmd+=(--get-zones) ;;
+        policy) cmd+=(--get-policies) ;;
+        *) return 1 ;;
+    esac
+    values=$("${cmd[@]}" 2>/dev/null || true)
+    tr ' ' '\n' <<<"$values" | grep -Fxq "$name"
+}
+
+firewalld_ensure_scope() {
+    local scope=$1
+    local -a cmd=(firewall-cmd)
+    [[ "$scope" == permanent ]] && cmd+=(--permanent)
+
+    if ! firewalld_list_contains zone "$FIREWALLD_ZONE" "$scope"; then
+        "${cmd[@]}" --new-zone="$FIREWALLD_ZONE" >/dev/null
+    fi
+    "${cmd[@]}" --zone="$FIREWALLD_ZONE" --set-target=DROP >/dev/null
+
+    if ! firewalld_list_contains policy "$FIREWALLD_POLICY" "$scope"; then
+        "${cmd[@]}" --new-policy="$FIREWALLD_POLICY" >/dev/null
+    fi
+    "${cmd[@]}" --policy="$FIREWALLD_POLICY" \
+        --add-ingress-zone="$FIREWALLD_ZONE" >/dev/null 2>&1 || true
+    "${cmd[@]}" --policy="$FIREWALLD_POLICY" \
+        --add-egress-zone=ANY >/dev/null 2>&1 || true
+    "${cmd[@]}" --policy="$FIREWALLD_POLICY" --set-target=ACCEPT >/dev/null
+}
+
+firewalld_ensure_integration() {
+    firewalld_is_active || return 0
+    firewalld_ensure_scope permanent
+    firewalld_ensure_scope runtime
+}
+
+firewalld_interface_add() {
+    local interface=$1
+    firewalld_is_active || return 0
+    firewalld_ensure_integration
+    firewall-cmd --permanent --zone="$FIREWALLD_ZONE" \
+        --add-interface="$interface" >/dev/null 2>&1 || true
+    firewall-cmd --zone="$FIREWALLD_ZONE" \
+        --add-interface="$interface" >/dev/null 2>&1 || true
+}
+
+firewalld_interface_remove() {
+    local interface=$1
+    if firewalld_is_active; then
+        firewall-cmd --permanent --zone="$FIREWALLD_ZONE" \
+            --remove-interface="$interface" >/dev/null 2>&1 || true
+        firewall-cmd --zone="$FIREWALLD_ZONE" \
+            --remove-interface="$interface" >/dev/null 2>&1 || true
+    elif command -v firewall-offline-cmd >/dev/null 2>&1; then
+        firewall-offline-cmd --zone="$FIREWALLD_ZONE" \
+            --remove-interface="$interface" >/dev/null 2>&1 || true
+    fi
+}
+
+firewalld_remove_integration() {
+    if firewalld_is_active; then
+        if firewalld_list_contains policy "$FIREWALLD_POLICY" runtime; then
+            firewall-cmd --delete-policy="$FIREWALLD_POLICY" \
+                >/dev/null 2>&1 || true
+        fi
+        if firewalld_list_contains zone "$FIREWALLD_ZONE" runtime; then
+            firewall-cmd --delete-zone="$FIREWALLD_ZONE" \
+                >/dev/null 2>&1 || true
+        fi
+        firewall-cmd --permanent --delete-policy="$FIREWALLD_POLICY" \
+            >/dev/null 2>&1 || true
+        firewall-cmd --permanent --delete-zone="$FIREWALLD_ZONE" \
+            >/dev/null 2>&1 || true
+    elif command -v firewall-offline-cmd >/dev/null 2>&1; then
+        firewall-offline-cmd --delete-policy="$FIREWALLD_POLICY" \
+            >/dev/null 2>&1 || true
+        firewall-offline-cmd --delete-zone="$FIREWALLD_ZONE" \
+            >/dev/null 2>&1 || true
+    fi
+}
+
 host_rules_up() {
     local wan=$1
     iptables_add_once filter FORWARD -i "$VETH_HOST" -o "$wan" -j ACCEPT
@@ -2682,6 +2914,9 @@ netns_up() {
         load_cfg "$app"
     fi
     delete_veth_everywhere "$VETH_HOST"
+    # Clear a stale permanent firewalld assignment before deciding whether
+    # this app uplinks through the host or another namespace.
+    firewalld_interface_remove "$VETH_HOST"
 
     if [[ "$via_app" == host ]]; then
         wan=$(detect_wan_iface "$WAN_IFACE")
@@ -2746,6 +2981,7 @@ netns_up() {
     if [[ "$via_app" == host ]]; then
         ip addr add "$HOST_ADDR" dev "$VETH_HOST"
         ip link set "$VETH_HOST" up
+        firewalld_interface_add "$VETH_HOST"
     else
         ip link set "$VETH_HOST" netns "$upstream_ns"
         ip -n "$upstream_ns" addr add "$HOST_ADDR" dev "$VETH_HOST"
@@ -2906,19 +3142,27 @@ netns_down() {
 
 # nns-app source module: OpenVPN/WireGuard runtime and app lifecycle.
 openvpn_exec() {
-    local app=$1 profile=$2
+    local app=$1 profile=$2 openvpn_bin ip_bin
     load_cfg "$app"
+    openvpn_bin=$(openvpn_binary)
+    ip_bin=$(ip_binary)
 
     local args=(
-        /usr/sbin/openvpn
+        "$openvpn_bin"
         --config "$profile"
-        --dns-updown disable
     )
+    # OpenVPN 2.7 gained --dns-updown. Fedora 43 still ships the supported
+    # OpenVPN 2.6 branch, where the option does not exist. Namespace-local
+    # resolv.conf handling does not require the hook, so disable it only when
+    # the installed OpenVPN advertises the option.
+    if openvpn_supports_dns_updown; then
+        args+=(--dns-updown disable)
+    fi
     if bool_on "$DISABLE_DCO"; then
         args+=(--disable-dco)
     fi
 
-    exec /usr/sbin/ip netns exec "$NS_NAME" "${args[@]}"
+    exec "$ip_bin" netns exec "$NS_NAME" "${args[@]}"
 }
 
 wireguard_exec() {
@@ -3506,6 +3750,7 @@ remove_app() {
 
     stop_app "$app"
     load_cfg "$app"
+    firewalld_interface_remove "$VETH_HOST"
     systemctl disable --now "nns-watchdog@${app}.timer" \
         >/dev/null 2>&1 || true
     systemctl disable \
@@ -3617,6 +3862,10 @@ purge_engine() {
         fi
         ip netns del "$ns" 2>/dev/null || true
     done < <(ip netns list 2>/dev/null | awk '{print $1}')
+
+    # Remove the global firewalld objects after all managed interfaces have
+    # disappeared. They are owned exclusively by nns-app.
+    firewalld_remove_integration
 
     # Remove all files installed by this engine. Do not remove dependency
     # packages (openvpn, wireguard-tools, iproute2, iptables, curl, sudo, etc.).
@@ -4102,6 +4351,7 @@ gateway_generate_pki() {
 gateway_write_server_config() {
     local gateway=$1 root=${2:-$(gateway_dir "$gateway")}
     local config output pki proto_option network netmask dns
+    local unpriv_user unpriv_group
 
     if [[ "$root" == "$(gateway_dir "$gateway")" ]]; then
         load_gateway_cfg "$gateway"
@@ -4117,6 +4367,8 @@ gateway_write_server_config() {
         output=$(mktemp "$root/server.conf.XXXXXX")
     fi
     pki="$root/pki"
+    unpriv_user=$(nns_unprivileged_user)
+    unpriv_group=$(nns_unprivileged_group)
     [[ "$OPENVPN_LISTEN_PROTO" == tcp ]] &&
         proto_option=tcp-server || proto_option=udp
 
@@ -4160,8 +4412,8 @@ PY_GATEWAY_POOL
         printf 'persist-tun\n'
         printf 'script-security 2\n'
         printf 'up "%s _gateway-tun-up %s"\n' "$ENGINE_PATH" "$gateway"
-        printf 'user nobody\n'
-        printf 'group nogroup\n'
+        printf 'user %s\n' "$unpriv_user"
+        printf 'group %s\n' "$unpriv_group"
         printf 'status %s 5\n' "$(gateway_status_file "$gateway")"
         printf 'status-version 3\n'
         printf 'push "redirect-gateway def1 bypass-dhcp"\n'
@@ -4178,13 +4430,13 @@ PY_GATEWAY_POOL
     }
 
     if [[ "$output" != "$config" ]]; then
-        install -o root -g nogroup -m 0640 "$output" "$config" || {
+        install -o root -g "$unpriv_group" -m 0640 "$output" "$config" || {
             rm -f "$output"
             return 1
         }
         rm -f "$output"
     else
-        chown root:nogroup "$config" || return 1
+        chown "root:$unpriv_group" "$config" || return 1
         chmod 0640 "$config" || return 1
     fi
 }
@@ -4659,13 +4911,17 @@ gateway_up() {
     host_ip=${TRANSIT_HOST_ADDR%/*}
     ns_ip=${TRANSIT_NS_ADDR%/*}
     runtime=$(gateway_runtime_file "$gateway")
-    install -d -o nobody -g nogroup -m 0750 \
+    local unpriv_user unpriv_group
+    unpriv_user=$(nns_unprivileged_user)
+    unpriv_group=$(nns_unprivileged_group)
+    install -d -o "$unpriv_user" -g "$unpriv_group" -m 0750 \
         "$(gateway_runtime_dir "$gateway")"
 
     ip link add "$GATEWAY_VETH_HOST" \
         type veth peer name "$GATEWAY_VETH_NS"
     ip addr add "$TRANSIT_HOST_ADDR" dev "$GATEWAY_VETH_HOST"
     ip link set "$GATEWAY_VETH_HOST" up
+    firewalld_interface_add "$GATEWAY_VETH_HOST"
     sysctl -q -w \
         "net.ipv4.conf.${GATEWAY_VETH_HOST}.rp_filter=2"
 
@@ -4726,6 +4982,7 @@ gateway_tun_up() {
 
     sysctl -q -w \
         "net.ipv4.conf.${tunnel_dev}.rp_filter=2" || true
+    firewalld_interface_add "$tunnel_dev"
 
     # Match both the server TUN and client pool. Source-only matching could
     # capture unrelated host-generated packets that use an address from the pool.
@@ -4746,7 +5003,7 @@ gateway_server_exec() {
     config=$(gateway_server_config "$gateway")
     [[ -f "$config" ]] || die "Gateway server config is missing: $config"
     case "${TRANSPORT:-direct}" in
-        direct|ssh) exec /usr/sbin/openvpn --config "$config" ;;
+        direct|ssh) exec "$(openvpn_binary)" --config "$config" ;;
         stunnel|cloak) gateway_transport_server_exec "$gateway" ;;
         *) die "Unsupported gateway transport '$TRANSPORT'." ;;
     esac
@@ -5518,6 +5775,8 @@ gateway_remove() {
 
     systemctl disable "nns-gateway@${gateway}.service" \
         >/dev/null 2>&1 || true
+    firewalld_interface_remove "$GATEWAY_TUN"
+    firewalld_interface_remove "$GATEWAY_VETH_HOST"
     rm -rf \
         "$(gateway_dropin_dir "$gateway")" \
         "$(gateway_dir "$gateway")" \
@@ -5681,8 +5940,15 @@ transport_client_exec() {
         grep -Eq "127\\.0\\.0\\.1:${TRANSPORT_LOCAL_PORT}([[:space:]]|$)" ||
         die "The $type client did not open 127.0.0.1:${TRANSPORT_LOCAL_PORT}."
 
-    ip netns exec "$NS_NAME" /usr/sbin/openvpn \
-        --config "$profile" --dns-updown disable --disable-dco &
+    local openvpn_bin
+    local -a openvpn_args
+    openvpn_bin=$(openvpn_binary)
+    openvpn_args=("$openvpn_bin" --config "$profile")
+    if openvpn_supports_dns_updown; then
+        openvpn_args+=(--dns-updown disable)
+    fi
+    openvpn_args+=(--disable-dco)
+    ip netns exec "$NS_NAME" "${openvpn_args[@]}" &
     vpn_pid=$!
 
     wait -n "$wrapper_pid" "$vpn_pid" || rc=$?
@@ -6445,7 +6711,7 @@ gateway_transport_server_exec() {
     trap 'exit 0' TERM INT HUP
     trap gateway_transport_cleanup EXIT
 
-    /usr/sbin/openvpn --config "$config" &
+    "$(openvpn_binary)" --config "$config" &
     openvpn_pid=$!
     case "$type" in
         stunnel) "$binary" "$(gateway_transport_dir "$gateway")/server.conf" & ;;
@@ -7637,7 +7903,7 @@ dns_proxy_exec() {
     # drops to nobody before forwarding any packet, so the pre-tunnel
     # root-only DNS exception cannot leak application DNS around the kill
     # switch while the VPN is down.
-    exec /usr/sbin/ip netns exec "$NS_NAME" \
+    exec "$(ip_binary)" netns exec "$NS_NAME" \
         /usr/bin/python3 - "$DNS_SERVERS" <<'PY_NNS_DNS_PROXY'
 from __future__ import annotations
 
@@ -7909,13 +8175,13 @@ run_in_app() {
     # `ip netns exec` supplies the namespace-specific resolver bind. The
     # internal helper prepares Snap-required mounts, then drops permanently to
     # APP_USER without shell re-parsing or eval.
-    exec /usr/sbin/ip netns exec "$NS_NAME" \
+    exec "$(ip_binary)" netns exec "$NS_NAME" \
         "$ENGINE_PATH" _run-user "$app" "$@"
 }
 
 
 myip_route_snapshot_current() {
-    /usr/sbin/ip -4 route get 1.1.1.1 2>/dev/null |
+    "$(ip_binary)" -4 route get 1.1.1.1 2>/dev/null |
         awk 'NR == 1 {
             dev = via = src = ""
             for (i = 1; i <= NF; i++) {
@@ -7932,7 +8198,7 @@ myip_route_snapshot_current() {
 
 myip_route_snapshot_namespace() {
     local ns=$1
-    /usr/sbin/ip -n "$ns" -4 route get 1.1.1.1 2>/dev/null |
+    "$(ip_binary)" -n "$ns" -4 route get 1.1.1.1 2>/dev/null |
         awk 'NR == 1 {
             dev = via = src = ""
             for (i = 1; i <= NF; i++) {
@@ -7958,7 +8224,7 @@ myip_external_current() {
 
 myip_external_namespace() {
     local ns=$1 url=${2:-https://api.ipify.org} value
-    value=$(/usr/sbin/ip netns exec "$ns" /usr/bin/curl -4fsS \
+    value=$("$(ip_binary)" netns exec "$ns" /usr/bin/curl -4fsS \
         --connect-timeout 2 --max-time 5 "$url" 2>/dev/null || true)
     value=${value//$'\r'/}
     value=${value//$'\n'/}

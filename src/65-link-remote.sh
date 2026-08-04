@@ -149,8 +149,15 @@ transport_client_exec() {
         grep -Eq "127\\.0\\.0\\.1:${TRANSPORT_LOCAL_PORT}([[:space:]]|$)" ||
         die "The $type client did not open 127.0.0.1:${TRANSPORT_LOCAL_PORT}."
 
-    ip netns exec "$NS_NAME" /usr/sbin/openvpn \
-        --config "$profile" --dns-updown disable --disable-dco &
+    local openvpn_bin
+    local -a openvpn_args
+    openvpn_bin=$(openvpn_binary)
+    openvpn_args=("$openvpn_bin" --config "$profile")
+    if openvpn_supports_dns_updown; then
+        openvpn_args+=(--dns-updown disable)
+    fi
+    openvpn_args+=(--disable-dco)
+    ip netns exec "$NS_NAME" "${openvpn_args[@]}" &
     vpn_pid=$!
 
     wait -n "$wrapper_pid" "$vpn_pid" || rc=$?
@@ -913,7 +920,7 @@ gateway_transport_server_exec() {
     trap 'exit 0' TERM INT HUP
     trap gateway_transport_cleanup EXIT
 
-    /usr/sbin/openvpn --config "$config" &
+    "$(openvpn_binary)" --config "$config" &
     openvpn_pid=$!
     case "$type" in
         stunnel) "$binary" "$(gateway_transport_dir "$gateway")/server.conf" & ;;

@@ -207,4 +207,4 @@ uses `/run/lock/nns-app` with root ownership checks.
 - public example-name checks.
 
 Live namespace, firewall, OpenVPN, WireGuard, and gateway integration should be
-tested on an Ubuntu host before release deployment.
+tested on both Ubuntu and Fedora hosts before release deployment. On Fedora, include an enforcing-SELinux run and an active-firewalld run.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# nns-app - manage per-application VPN network namespaces on Ubuntu.
+# nns-app - manage per-application VPN network namespaces on Linux.
 #
 # Copyright (C) 2026 Maxim Lyadvinsky
 #
@@ -47,7 +47,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.15"
+readonly VERSION="1.3.16"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -64,6 +64,8 @@ readonly WATCHDOG_SERVICE="/etc/systemd/system/nns-watchdog@.service"
 readonly WATCHDOG_TIMER="/etc/systemd/system/nns-watchdog@.timer"
 readonly GATEWAY_CRL_SERVICE="/etc/systemd/system/nns-gateway-crl-refresh@.service"
 readonly GATEWAY_CRL_TIMER="/etc/systemd/system/nns-gateway-crl-refresh@.timer"
+readonly FIREWALLD_ZONE="nns-app"
+readonly FIREWALLD_POLICY="nns-app-forward"
 readonly SYSTEMD_UNIT_DIR="/etc/systemd/system"
 readonly DEFAULT_LOCK_DIR="/run/lock/nns-app"
 # Unit tests source the built script without root privileges. They may point
@@ -192,6 +194,43 @@ reset_gateway_cfg_vars() {
 reset_gateway_client_vars() {
     CLIENT_NAME="" STATUS="" CERT_SERIAL="" CREATED_AT="" REVOKED_AT=""
     GENERATION="" CLOAK_UID=""
+}
+
+required_binary() {
+    local name=$1 path
+    path=$(command -v "$name" 2>/dev/null || true)
+    [[ -n "$path" && -x "$path" ]] || die "Required executable '$name' is unavailable."
+    readlink -f -- "$path"
+}
+
+openvpn_binary() {
+    required_binary openvpn
+}
+
+ip_binary() {
+    required_binary ip
+}
+
+openvpn_supports_dns_updown() {
+    local binary
+    binary=$(openvpn_binary)
+    "$binary" --help 2>&1 | grep -Fq -- '--dns-updown'
+}
+
+nns_unprivileged_user() {
+    id nobody >/dev/null 2>&1 || die "The system account 'nobody' is missing."
+    printf 'nobody\n'
+}
+
+nns_unprivileged_group() {
+    if getent group nogroup >/dev/null 2>&1; then
+        printf 'nogroup\n'
+    elif getent group nobody >/dev/null 2>&1; then
+        printf 'nobody\n'
+    else
+        id -gn nobody 2>/dev/null ||
+            die "Cannot determine the unprivileged group for 'nobody'."
+    fi
 }
 
 format_duration() {
