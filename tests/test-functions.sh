@@ -1310,6 +1310,86 @@ manual_payload=$(remote_command_payload gateway client export \
         fail "automatic public revoke dispatch: $output"
 )
 
+# First public export may omit --public: infer the current automatic-remote
+# host and allocate a distinct direct OpenVPN port instead of colliding with
+# the SSH-only loopback listener.
+(
+    export_test="$TEST_TMP/public-export-default"
+    mkdir -p "$export_test"
+    : >"$export_test/exit.cfg"
+    : >"$export_test/private-gateway.cfg"
+
+    require_root() { :; }
+    validate_remote_owner_id() { :; }
+    validate_gateway_client_name() { :; }
+    acquire_lock() { :; }
+    release_lock() { :; }
+    remote_auto_reconcile_owner_markers() { :; }
+    remote_auto_load_state() {
+        RA_POOL_ID=0123456789abcdef
+        RA_EXIT_APP=ra-0123456789ab-exit
+        RA_GATEWAY=ra-0123456789ab-gw
+        RA_CLIENT=ra-fedcba987654-client
+    }
+    remote_auto_public_gateway_name() { printf '%s\n' ra-0123456789ab-public; }
+    cfg_file() { printf '%s\n' "$export_test/exit.cfg"; }
+    gateway_cfg_file() {
+        case "$1" in
+            ra-0123456789ab-gw) printf '%s\n' "$export_test/private-gateway.cfg" ;;
+            ra-0123456789ab-public) printf '%s\n' "$export_test/public-gateway.cfg" ;;
+            *) printf '%s/%s.cfg\n' "$export_test" "$1" ;;
+        esac
+    }
+    load_cfg() { REMOTE_MANAGED_OWNER_ID=0123456789abcdef; }
+    load_gateway_cfg() {
+        case "$1" in
+            ra-0123456789ab-gw)
+                VIA_APP=ra-0123456789ab-exit
+                TRANSPORT=ssh
+                REMOTE_MANAGED_OWNER_ID=0123456789abcdef
+                PUBLIC_HOST=remote.example.net
+                PUBLIC_PORT=22
+                OPENVPN_LISTEN_PROTO=tcp
+                OPENVPN_LISTEN_PORT=23111
+                ;;
+            ra-0123456789ab-public)
+                VIA_APP=ra-0123456789ab-exit
+                TRANSPORT=direct
+                REMOTE_MANAGED_OWNER_ID=0123456789abcdef
+                PUBLIC_HOST=remote.example.net
+                PUBLIC_PORT=24777
+                LISTEN_PROTO=tcp
+                LISTEN_PORT=24777
+                ;;
+        esac
+    }
+    gateway_allocate_backend_port() { printf '%s\n' 24777; }
+    start_app() { :; }
+    gateway_create() {
+        printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" "$7" >"$export_test/create.log"
+        : >"$export_test/public-gateway.cfg"
+    }
+    gateway_cfg_set() { :; }
+    gateway_start() { :; }
+    systemctl() { :; }
+    gateway_client_dir() { printf '%s/%s-%s\n' "$export_test" "$1" "$2"; }
+    gateway_client_add() { :; }
+    remote_auto_public_active_client_count() { printf '%s\n' 1; }
+    warn() { :; }
+    gateway_client_export() { printf 'PROFILE\n'; }
+    log() { printf '%s\n' "$*" >&2; }
+
+    remote_auto_public_export_internal 0123456789abcdef laptop - auto \
+        >"$export_test/profile" 2>"$export_test/stderr"
+    [[ "$(cat "$export_test/create.log")" == \
+       'ra-0123456789ab-public|ra-0123456789ab-exit|tcp:24777|remote.example.net:24777|direct' ]] ||
+        fail "automatic public endpoint inference: $(cat "$export_test/create.log")"
+    grep -Fq "using current remote host 'remote.example.net' with automatically selected OpenVPN port '24777'" \
+        "$export_test/stderr" || fail 'automatic public endpoint inference message'
+    [[ "$(cat "$export_test/profile")" == PROFILE ]] ||
+        fail 'automatic public export profile output'
+)
+
 (
     remote_auto_export_public_ovpn() {
         printf 'EXPORT:%s:%s:%s:%s:%s\n' "$1" "$2" "$3" "$4" "$5"

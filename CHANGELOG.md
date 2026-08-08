@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.25
+
+- Made `--public <host>:<port>` optional on the first `nns-app export ovpn` call.
+- When no public endpoint exists yet, reuse the automatic-remote host already known by the private gateway and allocate a free direct OpenVPN listener port.
+- Continue reusing the existing public gateway host/port/protocol on subsequent exports; explicit `--public` and `--proto` remain overrides.
+- Keep the SSH-only gateway loopback listener separate instead of attempting to bind a second public OpenVPN server to the same occupied port.
+
 ## 1.3.24
 
 - Added `nns-app export ovpn <app> --client <name> --public <host>:<port>` for

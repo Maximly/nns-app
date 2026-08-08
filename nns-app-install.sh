@@ -50,7 +50,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.24"
+readonly VERSION="1.3.25"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -342,9 +342,10 @@ Examples:
   nns-app myip my-private-app
 
   # Export a standard OpenVPN profile for a client that does not run nns-app.
-  # --public is required when the public gateway is created for the first time.
+  # The current automatic-remote host and a free OpenVPN port are used by default.
   nns-app export ovpn my-private-app --client my-laptop \
-      --public vpn.example.net:443 --output ~/my-laptop.ovpn
+      --output ~/my-laptop.ovpn
+  # Optional override: --public vpn.example.net:443
   nns-app revoke my-private-app my-laptop
 
   # On a remote Linux box where `my-remote-exit` is already online:
@@ -7736,12 +7737,35 @@ remote_auto_public_export_internal() {
             die "Public gateway '$gateway' already uses protocol '$LISTEN_PROTO'."
         }
     else
-        [[ "$public" != - ]] || {
-            release_lock remote-auto-pools
-            die "First public export requires --public <host>:<port>."
-        }
-        [[ "$proto" != auto ]] || proto=tcp
-        IFS='|' read -r public_host public_port <<<"$(parse_public_endpoint "$public")"
+        if [[ "$public" == - ]]; then
+            # The automatic private gateway already knows the remote host, but
+            # its OpenVPN listener is loopback-only for SSH transport. Reuse
+            # that current host and allocate a separate free direct-listener
+            # port rather than asking the user to repeat the endpoint.
+            [[ -f "$(gateway_cfg_file "$RA_GATEWAY")" ]] || {
+                release_lock remote-auto-pools
+                die "Automatic private gateway '$RA_GATEWAY' is missing; cannot infer the public endpoint."
+            }
+            load_gateway_cfg "$RA_GATEWAY"
+            [[ "$VIA_APP" == "$exit_app" && "${TRANSPORT:-}" == ssh &&
+               "${REMOTE_MANAGED_OWNER_ID:-}" == "$pool_id" ]] || {
+                release_lock remote-auto-pools
+                die "Automatic private gateway '$RA_GATEWAY' is inconsistent; cannot infer the public endpoint."
+            }
+            public_host=$PUBLIC_HOST
+            [[ -n "$public_host" ]] || {
+                release_lock remote-auto-pools
+                die "Automatic private gateway '$RA_GATEWAY' has no current remote host."
+            }
+            public_port=$(gateway_allocate_backend_port "$gateway")
+            [[ "$proto" != auto ]] || proto=${OPENVPN_LISTEN_PROTO:-tcp}
+            case "$proto" in tcp|udp) ;; *) proto=tcp ;; esac
+            public="$public_host:$public_port"
+            log "No --public endpoint supplied; using current remote host '$public_host' with automatically selected OpenVPN port '$public_port'." >&2
+        else
+            [[ "$proto" != auto ]] || proto=tcp
+            IFS='|' read -r public_host public_port <<<"$(parse_public_endpoint "$public")"
+        fi
 
         # A generic OpenVPN client cannot establish nns-app's SSH wrapper, so
         # give it a distinct direct gateway that shares the same provider exit.

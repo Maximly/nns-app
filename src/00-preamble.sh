@@ -50,7 +50,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.24"
+readonly VERSION="1.3.25"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -342,9 +342,10 @@ Examples:
   nns-app myip my-private-app
 
   # Export a standard OpenVPN profile for a client that does not run nns-app.
-  # --public is required when the public gateway is created for the first time.
+  # The current automatic-remote host and a free OpenVPN port are used by default.
   nns-app export ovpn my-private-app --client my-laptop \
-      --public vpn.example.net:443 --output ~/my-laptop.ovpn
+      --output ~/my-laptop.ovpn
+  # Optional override: --public vpn.example.net:443
   nns-app revoke my-private-app my-laptop
 
   # On a remote Linux box where `my-remote-exit` is already online:

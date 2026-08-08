@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.24
+**Release:** 1.3.25
 
 **Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
@@ -89,18 +89,26 @@ On the machine that manages the automatic-remote app:
 
 ```bash
 nns-app export ovpn my-private-app --client my-laptop \
-    --public vpn.example.net:443 --output ~/my-laptop.ovpn
+    --output ~/my-laptop.ovpn
 ```
 
-Import `my-laptop.ovpn` into OpenVPN Connect, NetworkManager, Tunnelblick, or
-another compatible OpenVPN client. `--proto tcp` is the default on the first
-export; use `--proto udp` if desired. After the public gateway exists,
-`--public` and `--proto` may be omitted when exporting additional clients:
+`--public` is optional even on the first export. By default nns-app reuses the
+current automatic-remote host and automatically chooses a free direct OpenVPN
+listener port. The existing SSH-only OpenVPN listener remains private on
+loopback, so the exported client gets the separate direct listener rather than
+colliding with that port. Override the endpoint when a DNS name, NAT mapping,
+or fixed firewall port is required:
 
 ```bash
 nns-app export ovpn my-private-app --client my-phone \
-    --output ~/my-phone.ovpn
+    --public vpn.example.net:443 --output ~/my-phone.ovpn
 ```
+
+Import the generated `.ovpn` into OpenVPN Connect, NetworkManager, Tunnelblick,
+or another compatible OpenVPN client. `--proto` also defaults automatically;
+use `--proto tcp` or `--proto udp` to force a protocol. Once a public gateway
+exists, later exports reuse its current host, port, and protocol unless an
+override is supplied.
 
 The public endpoint must be reachable by the external client. Ensure the
 remote host firewall, cloud security group, and any upstream NAT/router allow
