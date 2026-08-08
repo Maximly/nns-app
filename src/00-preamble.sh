@@ -21,10 +21,12 @@
 # Author: Maxim Lyadvinsky
 #
 # Public commands:
+#   install [--local-only]
 #   install [<app_name> [--backend inherit] [--via <upstream-app>|host]
 #                         [--via-remote <user@host> [--remote-port <port>]]]
 #   remove  <app_name>
 #   purge
+#   repair [--local-only]
 #   list
 #   status  <app_name>
 #   myip    [<app_name>]
@@ -50,7 +52,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.25"
+readonly VERSION="1.3.30"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -272,11 +274,13 @@ show_version() {
 usage() {
     cat <<'USAGE'
 Usage:
-  nns-app install [app_name [--backend inherit] [--via <upstream-app>|host]]
+  nns-app install [--local-only]
+  nns-app install <app_name> [--backend inherit] [--via <upstream-app>|host]
   nns-app install <app_name> via --remote <user@host> [--remote-port <port>]
   nns-app remove  <app_name> [--local-only]
   nns-app purge [--local-only]
-  nns-app list
+  nns-app repair [--local-only]
+  nns-app list [all|gateway|clients]
   nns-app status  <app_name>
   nns-app myip [<app_name>]
   nns-app export ovpn <app_name> --client <client_name>
@@ -321,6 +325,7 @@ Simple managed-remote mode:
 
 Examples:
   sudo ./nns-app.sh install
+  sudo ./nns-app.sh install --local-only
   sudo nns-app install my-upstream-vpn
   nns-app install my-private-app via --remote user@remote-host
   nns-app add my-private-app ~/my-base-profile.ovpn
@@ -336,7 +341,11 @@ Examples:
   nns-app run my-private-app curl -4 https://api.ipify.org
   nns-app run my-private-app firefox --no-remote
   sudo nns-app purge
+  sudo nns-app repair
   nns-app list
+  nns-app list all
+  nns-app list gateway
+  nns-app list clients
   nns-app status my-private-app
   nns-app myip
   nns-app myip my-private-app

@@ -105,6 +105,118 @@ getent group "$unprivileged_group" >/dev/null 2>&1 ||
         fail 'firewalld persistent interface assignment was omitted'
 )
 
+
+# Public gateways own their host-firewall exceptions. UFW rules are tagged,
+# removed on shutdown/removal, and pre-existing administrator rules are not
+# claimed or deleted.
+(
+    fwtest="$TEST_TMP/public-fw-ufw"
+    mkdir -p "$fwtest"
+    rules="$fwtest/rules"
+    logf="$fwtest/ufw.log"
+    : >"$rules"
+    : >"$logf"
+
+    gateway_ufw_state_file() { printf '%s/state\n' "$fwtest"; }
+    gateway_firewalld_state_file() { printf '%s/fwld-state\n' "$fwtest"; }
+    firewalld_is_active() { return 1; }
+    gateway_iptables_public_down() { :; }
+    ufw() {
+        printf '%s\n' "$*" >>"$logf"
+        case "${1:-} ${2:-}" in
+            'status '*) printf 'Status: active\n'; return 0 ;;
+            'show added') cat "$rules"; return 0 ;;
+            'allow 25108/tcp')
+                printf "ufw allow 25108/tcp comment 'nns-app:gateway:test-public:public-input'\n" >"$rules"
+                return 0
+                ;;
+            'delete allow')
+                : >"$rules"
+                return 0
+                ;;
+        esac
+        return 0
+    }
+
+    TRANSPORT=direct
+    LISTEN_PORT=25108
+    LISTEN_PROTO=tcp
+    gateway_public_firewall_up test-public || fail 'UFW public firewall open failed'
+    [[ -e "$fwtest/state" ]] || fail 'UFW ownership marker was not created'
+    grep -Fq "comment 'nns-app:gateway:test-public:public-input'" "$rules" ||
+        fail 'UFW managed public rule was not created'
+    gateway_public_firewall_down test-public || fail 'UFW public firewall close failed'
+    [[ ! -e "$fwtest/state" ]] || fail 'UFW ownership marker survived successful close'
+    [[ ! -s "$rules" ]] || fail 'UFW managed public rule survived gateway close'
+)
+
+(
+    fwtest="$TEST_TMP/public-fw-ufw-preexisting"
+    mkdir -p "$fwtest"
+    rules="$fwtest/rules"
+    logf="$fwtest/ufw.log"
+    printf "ufw allow 25108/tcp comment 'administrator-owned'\n" >"$rules"
+    : >"$logf"
+
+    gateway_ufw_state_file() { printf '%s/state\n' "$fwtest"; }
+    ufw() {
+        printf '%s\n' "$*" >>"$logf"
+        case "${1:-} ${2:-}" in
+            'status '*) printf 'Status: active\n'; return 0 ;;
+            'show added') cat "$rules"; return 0 ;;
+            allow*|delete*) fail 'UFW pre-existing administrator rule was modified' ;;
+        esac
+        return 0
+    }
+
+    gateway_ufw_public_up test-public 25108 tcp ||
+        fail 'pre-existing UFW allow was not accepted'
+    [[ ! -e "$fwtest/state" ]] || fail 'pre-existing UFW rule was incorrectly claimed'
+    gateway_ufw_public_down test-public 25108 tcp ||
+        fail 'pre-existing UFW cleanup should be a no-op'
+    grep -Fq "administrator-owned" "$rules" ||
+        fail 'pre-existing UFW rule was removed'
+)
+
+# firewalld ownership is persisted only for ports nns-app itself created, and
+# both runtime and permanent scopes are removed again on gateway shutdown.
+(
+    fwtest="$TEST_TMP/public-fw-firewalld"
+    mkdir -p "$fwtest"
+    runtime="$fwtest/runtime"
+    permanent="$fwtest/permanent"
+    : >"$runtime"
+    : >"$permanent"
+
+    gateway_firewalld_state_file() { printf '%s/state\n' "$fwtest"; }
+    firewalld_is_active() { return 0; }
+    firewalld_public_zone() { printf 'public\n'; }
+    firewalld_port_query() {
+        local scope=$1
+        grep -Fxq '25108/tcp' "${scope/permanent/$permanent}" 2>/dev/null && return 0
+        if [[ "$scope" == runtime ]]; then grep -Fxq '25108/tcp' "$runtime" 2>/dev/null; else grep -Fxq '25108/tcp' "$permanent" 2>/dev/null; fi
+    }
+    firewalld_port_add() {
+        local scope=$1
+        if [[ "$scope" == runtime ]]; then printf '25108/tcp\n' >"$runtime"; else printf '25108/tcp\n' >"$permanent"; fi
+    }
+    firewalld_port_remove() {
+        local scope=$1
+        if [[ "$scope" == runtime ]]; then : >"$runtime"; else : >"$permanent"; fi
+    }
+
+    gateway_firewalld_public_up test-public 25108 tcp ||
+        fail 'firewalld public firewall open failed'
+    [[ "$(cat "$fwtest/state")" == public ]] || fail 'firewalld ownership zone was not recorded'
+    grep -Fxq '25108/tcp' "$runtime" || fail 'firewalld runtime port was not opened'
+    grep -Fxq '25108/tcp' "$permanent" || fail 'firewalld permanent port was not opened'
+    gateway_firewalld_public_down test-public 25108 tcp ||
+        fail 'firewalld public firewall close failed'
+    [[ ! -e "$fwtest/state" ]] || fail 'firewalld ownership marker survived close'
+    [[ ! -s "$runtime" && ! -s "$permanent" ]] ||
+        fail 'firewalld managed port survived gateway close'
+)
+
 [[ "$(format_duration 0)" == 0s ]] || fail 'format_duration 0'
 [[ "$(format_duration 59)" == 59s ]] || fail 'format_duration seconds'
 [[ "$(format_duration 60)" == 1m ]] || fail 'format_duration minute'
@@ -1406,6 +1518,180 @@ manual_payload=$(remote_command_payload gateway client export \
     output=$(main revoke my-app my-phone)
     [[ "$output" == 'REVOKE:my-app:my-phone' ]] ||
         fail "public revoke CLI parsing: $output"
+)
+
+
+# High-level list record formatting keeps gateway/client inventories readable
+# and retains the source association for automatic-remote objects.
+(
+    output=$(list_gateway_record_print 'GATEWAY|my-public-gw|public|active|my-exit|vpn.example.net:443/tcp|2|1|1|remote:my-private-app')
+    grep -Fq 'my-public-gw' <<<"$output" || fail 'gateway overview omits gateway name'
+    grep -Fq '2/1' <<<"$output" || fail 'gateway overview omits active/revoked counts'
+    grep -Fq 'remote:my-private-app' <<<"$output" || fail 'gateway overview omits remote source association'
+)
+(
+    output=$(list_client_record_print 'CLIENT|my-phone|active|my-public-gw|vpn.example.net:443/tcp|2026-08-08T00:00:00Z|yes|remote:my-private-app')
+    grep -Fq 'my-phone' <<<"$output" || fail 'external client overview omits client name'
+    grep -Fq 'yes' <<<"$output" || fail 'external client overview omits connection state'
+    grep -Fq 'remote:my-private-app' <<<"$output" || fail 'external client overview omits remote source association'
+)
+(
+    REMOTE_ALIAS=auto-test
+    REMOTE_OWNER_ID=0123456789abcdef
+    remote_auto_command() {
+        [[ "$1" == auto-test && "$2" == topology && "$3" == 0123456789abcdef ]] ||
+            fail 'status topology sent wrong remote request'
+        printf 'Remote pool:        0123456789abcdef\nPublic gateway:     my-public-gw (active; vpn.example.net:443/tcp)\nExternal clients:   1 active/0 revoked; connected=1\n'
+    }
+    output=$(status_remote_topology my-private-app)
+    grep -Fq 'Remote topology:' <<<"$output" || fail 'status remote topology heading missing'
+    grep -Fq 'Public gateway:' <<<"$output" || fail 'status remote topology omits public gateway'
+    grep -Fq 'External clients:' <<<"$output" || fail 'status remote topology omits external client summary'
+)
+
+
+
+# Engine-only install refreshes configured automatic-remote nodes by default,
+# while --local-only suppresses propagation.  This also guarantees that the
+# bootstrap path can install on a remote node without recursively walking that
+# node's own remote graph.
+(
+    require_root() { :; }
+    acquire_lock() { :; }
+    release_lock() { :; }
+    ensure_dependencies() { :; }
+    install_engine_files() { :; }
+    install() { :; }
+    refresh_managed_unit_metadata() { :; }
+    remote_auto_refresh_configured_nodes() { printf '%s\n' remote-refresh; }
+    log() { printf 'log:%s\n' "$*"; }
+    output=$(install_engine on)
+    grep -Fq 'remote-refresh' <<<"$output" ||
+        fail 'plain engine install did not refresh automatic remotes'
+    output=$(install_engine off)
+    if grep -Fq 'remote-refresh' <<<"$output"; then
+        fail 'local-only engine install unexpectedly refreshed automatic remotes'
+    fi
+)
+
+# The public command parser exposes the same local-only switch.
+(
+    reexec_as_root_if_needed() { :; }
+    install_engine() { printf 'engine:%s\n' "${1:-unset}"; }
+    output=$(main install)
+    grep -Fq 'engine:on' <<<"$output" || fail 'plain install parser lost remote refresh'
+    output=$(main install --local-only)
+    grep -Fq 'engine:off' <<<"$output" || fail 'install --local-only parser'
+)
+
+# Refreshing one configured automatic-remote app must preserve its registered
+# SSH endpoint/port and repair a stale remote with the normal bootstrap +
+# registration sequence.  A current remote must not be bootstrapped again.
+(
+    validate_app_name() { :; }
+    load_cfg() {
+        REMOTE_MODE=auto
+        REMOTE_ALIAS=auto-test
+        REMOTE_OWNER_ID=0123456789abcdef
+    }
+    load_remote_cfg() {
+        SSH_TARGET=user@remote-host
+        SSH_PORT=2222
+    }
+    remote_dir() { printf '%s\n' /tmp/auto-test; }
+    remote_auto_is_current() { return 1; }
+    remote_auto_bootstrap() { printf 'bootstrap:%s:%s:%s:%s:%s\n' "$@"; }
+    remote_auto_register() { printf 'register:%s:%s:%s:%s\n' "$@"; }
+    log() { printf 'log:%s\n' "$*"; }
+    output=$(remote_auto_refresh_configured_app my-app)
+    grep -Fq 'bootstrap:my-app:user@remote-host:2222:auto-test:0123456789abcdef' <<<"$output" ||
+        fail 'remote engine refresh lost configured SSH endpoint or owner'
+    grep -Fq 'register:auto-test:user@remote-host:2222:/tmp/auto-test/id_ed25519' <<<"$output" ||
+        fail 'remote engine refresh did not re-register the upgraded helper'
+)
+(
+    validate_app_name() { :; }
+    load_cfg() {
+        REMOTE_MODE=auto
+        REMOTE_ALIAS=auto-test
+        REMOTE_OWNER_ID=0123456789abcdef
+    }
+    load_remote_cfg() { SSH_TARGET=user@remote-host; SSH_PORT=22; }
+    remote_auto_is_current() { return 0; }
+    remote_auto_bootstrap() { fail 'current remote was unnecessarily bootstrapped'; }
+    remote_auto_register() { fail 'current remote was unnecessarily registered'; }
+    log() { printf 'log:%s\n' "$*"; }
+    output=$(remote_auto_refresh_configured_app my-app)
+    grep -Fq 'already runs nns-app 1.3.30' <<<"$output" ||
+        fail 'current remote refresh status missing'
+)
+
+
+
+# Repair parses remote-auto state without executing it and can reconstruct a
+# missing state from exactly one deterministic private gateway/client.
+(
+    state_test="$TEST_TMP/repair-state"
+    mkdir -p "$state_test"
+    cat >"$state_test/state.cfg" <<'EOF_REPAIR_STATE'
+OWNER_ID=0123456789abcdef
+POOL_ID=0123456789abcdef
+EXIT_APP=ra-0123456789ab-exit
+GATEWAY=ra-0123456789ab-gw
+CLIENT=ra-0123456789ab-client
+PROVIDER_VPN_IPV4=10.10.10.10
+PROFILE_SHA256=''
+ACTIVE=on
+EOF_REPAIR_STATE
+    output=$(repair_remote_state_record "$state_test/state.cfg" 0123456789abcdef)
+    [[ "$output" == '0123456789abcdef|0123456789abcdef|ra-0123456789ab-exit|ra-0123456789ab-gw|ra-0123456789ab-client|10.10.10.10||on' ]] ||
+        fail "strict repair state parser: $output"
+    printf 'OWNER_ID=0123456789abcdef\nPOOL_ID=$(touch /tmp/nns-repair-should-not-run)\n' >"$state_test/bad.cfg"
+    if repair_remote_state_record "$state_test/bad.cfg" 0123456789abcdef >/dev/null 2>&1; then
+        fail 'repair state parser accepted executable shell syntax'
+    fi
+    [[ ! -e /tmp/nns-repair-should-not-run ]] || fail 'repair state parser executed damaged state'
+)
+
+# Repair CLI exposes remote and local-only reconciliation modes.
+(
+    reexec_as_root_if_needed() { :; }
+    repair_engine() { printf 'repair:%s\n' "$1"; }
+    output=$(main repair)
+    [[ "$output" == 'repair:remote' ]] || fail "repair CLI default mode: $output"
+    output=$(main repair --local-only)
+    [[ "$output" == 'repair:local-only' ]] || fail "repair CLI local-only mode: $output"
+)
+
+# A stopped public gateway with an nns-app-owned UFW rule closes that rule;
+# an active gateway missing the rule opens it.
+(
+    REPAIR_FIXED=0 REPAIR_WARNINGS=0 REPAIR_UNRESOLVED=0
+    validate_gateway_name() { :; }
+    acquire_lock() { :; }
+    release_lock() { :; }
+    load_gateway_cfg() {
+        TRANSPORT=direct LISTEN_PORT=25108 LISTEN_PROTO=tcp
+        GATEWAY_TUN=ngwtest REMOTE_MANAGED_OWNER_ID=""
+    }
+    write_gateway_unit_dropin() { :; }
+    gateway_write_openssl_config() { :; }
+    gateway_write_server_config() { :; }
+    gateway_write_transport_config() { :; }
+    repair_gateway_abandoned_certs() { :; }
+    systemctl() {
+        if [[ "$1" == is-active ]]; then printf 'inactive\n'; return 3; fi
+        return 1
+    }
+    ufw_is_active() { return 0; }
+    ufw_managed_public_rule_exists() { return 0; }
+    gateway_ufw_state_file() { printf '%s\n' "$TEST_TMP/repair-ufw-state"; }
+    gateway_ufw_public_down() { printf 'closed\n' >"$TEST_TMP/repair-ufw"; rm -f "$TEST_TMP/repair-ufw-state"; }
+    gateway_firewalld_public_down() { :; }
+    gateway_iptables_public_down() { :; }
+    repair_gateway_expected_running() { return 1; }
+    repair_gateway_one gw >/dev/null
+    [[ -f "$TEST_TMP/repair-ufw" ]] || fail 'repair did not close stale UFW gateway rule'
 )
 
 echo 'Function tests passed.'

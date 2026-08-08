@@ -340,6 +340,10 @@ refresh_managed_unit_metadata() {
 
 install_engine() {
     require_root
+    local refresh_remotes=${1:-on}
+    [[ "$refresh_remotes" == on || "$refresh_remotes" == off ]] ||
+        die "Internal install mode must be 'on' or 'off'."
+
     acquire_lock global
     ensure_dependencies
     install_engine_files
@@ -352,6 +356,15 @@ install_engine() {
     log "Installed nns-app $VERSION."
     log "Command: $USER_PATH"
     log "Engine:  $ENGINE_PATH"
+
+    # Keep direct automatic-remote nodes at the same engine version as the
+    # client that owns them.  Inventory/status RPCs evolve with the engine,
+    # so silently leaving an older helper behind makes a healthy remote look
+    # offline to a newly upgraded client.  Remote bootstrap itself installs
+    # with refresh_remotes=off to avoid recursive propagation.
+    if [[ "$refresh_remotes" == on ]]; then
+        remote_auto_refresh_configured_nodes
+    fi
 }
 
 collect_live_ipv4_networks() {
@@ -467,6 +480,12 @@ Defaults!$ENGINE_PATH !use_pty
 Defaults!$ENGINE_PATH env_keep += "NNS_APP_RUN_PATH DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE DESKTOP_SESSION GDMSESSION GNOME_DESKTOP_SESSION_ID GNOME_KEYRING_CONTROL KDE_FULL_SESSION KDE_SESSION_VERSION XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME XDG_CONFIG_DIRS XDG_DATA_DIRS LANG LANGUAGE LC_ALL TERM COLORTERM SSH_AUTH_SOCK"
 Cmnd_Alias $alias = \\
     $ENGINE_PATH list, \\
+    $ENGINE_PATH list apps, \\
+    $ENGINE_PATH list all, \\
+    $ENGINE_PATH list gateway, \\
+    $ENGINE_PATH list gateways, \\
+    $ENGINE_PATH list client, \\
+    $ENGINE_PATH list clients, \\
     $ENGINE_PATH status $app, \\
     $ENGINE_PATH myip $app, \\
     $ENGINE_PATH start $app, \\

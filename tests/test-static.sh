@@ -9,7 +9,7 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fq 'nns-app 1.3.25' <<<"$version"
+grep -Fq 'nns-app 1.3.30' <<<"$version"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -23,6 +23,7 @@ grep -Fq -- '--transport direct|stunnel|cloak' <<<"$help"
 grep -Fq -- '--server-name <cloak-decoy-host>' <<<"$help"
 grep -Fq -- 'via --remote <user@host>' <<<"$help"
 grep -Fq 'nns-app purge [--local-only]' <<<"$help"
+grep -Fq 'nns-app repair [--local-only]' <<<"$help"
 grep -Fq 'nns-app remove  <app_name> [--local-only]' <<<"$help"
 grep -Fq 'remote_auto_cleanup_internal' "$INSTALLER"
 grep -Fq 'remote_auto_cleanup_app' "$INSTALLER"
@@ -203,10 +204,13 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 1.3.25' "$ROOT/README.md"
+grep -Fq '**Release:** 1.3.30' "$ROOT/README.md"
 grep -Fq '## Quick start' "$ROOT/README.md"
 grep -Fq '### Run a VPN locally' "$ROOT/README.md"
 grep -Fq 'nns-app install my-private-app' "$ROOT/README.md"
+grep -Fq 'install --local-only' "$ROOT/README.md"
+grep -Fq 'remote_auto_refresh_configured_nodes' "$INSTALLER"
+grep -Fq "install --local-only; sudo /bin/bash '\$remote_tmp' _remote-auto-authorize" "$INSTALLER"
 grep -Fq '### Run a VPN on a remote Linux host' "$ROOT/README.md"
 grep -Fq 'nns-app install my-private-app via --remote user@remote-host' "$ROOT/README.md"
 grep -Fq 'nns-app run my-private-app ping -c 4 1.1.1.1' "$ROOT/README.md"
@@ -241,6 +245,14 @@ grep -Fq 'firewalld_ensure_integration' "$INSTALLER"
 grep -Fq 'firewalld_interface_add "$VETH_HOST"' "$INSTALLER"
 grep -Fq 'firewalld_interface_add "$tunnel_dev"' "$INSTALLER"
 grep -Fq 'firewalld_remove_integration' "$INSTALLER"
+grep -Fq 'gateway_public_firewall_up' "$INSTALLER"
+grep -Fq 'gateway_public_firewall_down' "$INSTALLER"
+grep -Fq 'ufw allow "$port/$proto" comment "$marker"' "$INSTALLER"
+grep -Fq 'ufw delete allow "$port/$proto" comment "$marker"' "$INSTALLER"
+grep -Fq -- '--add-port="$port/$proto"' "$INSTALLER"
+grep -Fq -- '--remove-port="$port/$proto"' "$INSTALLER"
+grep -Fq 'tagged iptables INPUT rule' "$ROOT/README.md"
+grep -Fq 'Pre-existing administrator firewall rules are' "$ROOT/README.md"
 grep -Fq 'restore_selinux_contexts' "$INSTALLER"
 if grep -Fq '/usr/sbin/openvpn' "$INSTALLER"; then
     echo 'hard-coded Ubuntu OpenVPN path remains in installer' >&2
@@ -326,7 +338,6 @@ grep -Fq 'assert_destructive_command_from_host "purge nns-app"' "$INSTALLER" || 
     exit 1
 }
 
-echo 'Static tests passed.'
 
 grep -Fq 'readonly VPNGATE_PROBE_TIMEOUT=12' "$INSTALLER"
 grep -Fq '<auth-user-pass>' "$INSTALLER"
@@ -337,3 +348,67 @@ if grep -Fq '"Peer Connection Initiated" in log_text' "$INSTALLER"; then
     exit 1
 fi
 grep -Fq 'documented public OpenVPN credentials (`vpn` / `vpn`)' "$ROOT/README.md"
+
+grep -Fq 'nns-app list [all|gateway|clients]' "$INSTALLER" || {
+    echo 'extended list usage is missing' >&2
+    exit 1
+}
+grep -Fq 'list_all_objects' "$INSTALLER" || {
+    echo 'list all implementation is missing' >&2
+    exit 1
+}
+grep -Fq 'list_gateways_overview' "$INSTALLER" || {
+    echo 'list gateway implementation is missing' >&2
+    exit 1
+}
+grep -Fq 'list_external_clients_overview' "$INSTALLER" || {
+    echo 'list clients implementation is missing' >&2
+    exit 1
+}
+grep -Fq 'remote_auto_topology_internal' "$INSTALLER" || {
+    echo 'automatic-remote status topology implementation is missing' >&2
+    exit 1
+}
+grep -Fq 'inventory-gateways)' "$INSTALLER" || {
+    echo 'automatic-remote gateway inventory operation is missing' >&2
+    exit 1
+}
+grep -Fq 'inventory-clients)' "$INSTALLER" || {
+    echo 'automatic-remote client inventory operation is missing' >&2
+    exit 1
+}
+for list_form in 'list all' 'list gateway' 'list clients'; do
+    grep -Fq '$ENGINE_PATH '"$list_form" "$INSTALLER" || {
+        echo "per-app sudoers does not allow $list_form" >&2
+        exit 1
+    }
+done
+grep -Fq 'nns-app list all       # apps, gateways, external clients' "$ROOT/README.md" || {
+    echo 'README does not document list all' >&2
+    exit 1
+}
+
+
+
+grep -Fq 'nns-app repair [--local-only]' "$INSTALLER" || {
+    echo 'repair usage is missing' >&2
+    exit 1
+}
+grep -Fq 'remote_auto_repair_internal' "$INSTALLER" || {
+    echo 'automatic-remote repair implementation is missing' >&2
+    exit 1
+}
+grep -Fq 'repair_remote_state_record' "$INSTALLER" || {
+    echo 'strict remote-state repair parser is missing' >&2
+    exit 1
+}
+grep -Fq 'repair_ufw_orphan_rules' "$INSTALLER" || {
+    echo 'UFW repair implementation is missing' >&2
+    exit 1
+}
+grep -Fq 'repair_gateway_abandoned_certs' "$INSTALLER" || {
+    echo 'gateway certificate repair implementation is missing' >&2
+    exit 1
+}
+
+echo 'Static tests passed.'

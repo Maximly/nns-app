@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.3.30
+
+- Fixed `nns-app help` / `--help`: the public `nns-app repair [--local-only]` command is now present in the primary Usage command list.
+- Added a static regression check so the repair command cannot disappear from generated help again.
+
+## 1.3.29
+
+- Added `nns-app repair [--local-only]` for conservative local and automatic-remote reconciliation.
+- Repairs missing remote-auto state when deterministic gateway/client ownership proves a unique reconstruction.
+- Detects/restarts dead SSH forwards and stale gateways expected to be running.
+- Reconciles nns-app-owned UFW/firewall listener access and removes orphan tagged UFW rules.
+- Revokes abandoned valid gateway certificates with no tracked client metadata, with CA rollback on failure.
+- Removes unreferenced remote-managed provider exits and dangling nns-app systemd instances; referenced duplicate exits are reported rather than merged unsafely.
+
+## 1.3.28
+
+- Plain engine `install` now upgrades every configured direct automatic-remote nns-app node after installing the local engine, keeping remote status/inventory RPCs version-compatible with the client.
+- Added `install --local-only` for intentionally offline remotes and for the internal remote bootstrap path; remote bootstrap uses it to prevent recursive upgrade propagation.
+- Remote refresh checks the existing dedicated management channel first, upgrades only stale nodes, preserves configured non-default SSH ports, and continues through other remotes if one node is unreachable.
+- A failed remote refresh no longer makes the successful local package installation fail, but it emits an explicit warning that remote status/inventory can remain incomplete until the next retry.
+
+## 1.3.27
+
+- Extended `nns-app status <app>` for automatic-remote apps with a concise remote topology: shared pool, provider exit, private gateway, public gateway, and exported-client state/connection details.
+- Extended `nns-app list` while preserving the original app-only default: `list all`, `list gateway`, and `list clients`.
+- `list gateway` and `list clients` include automatic-remote objects associated with local apps and mark an unreachable remote instead of failing the entire inventory.
+- External-client inventory excludes the private SSH gateway identity used internally by nns-app, while retaining active and revoked exported client records.
+- Updated per-app sudoers rules so the new read-only list forms remain passwordless like the original `list` command.
+
+## 1.3.26
+
+- Managed public gateway firewall lifecycle: automatically open the selected TCP/UDP listener in active UFW or firewalld, with a tagged iptables fallback when neither manager is active.
+- Remove only nns-app-owned host INPUT rules when a gateway stops or is removed; pre-existing administrator rules are preserved.
+- Gateway removal now requires successful cleanup of nns-app-owned persistent firewall access before deleting gateway state, leaving configuration intact for a safe retry on cleanup failure.
+- Automatic-remote OpenVPN export now reports that the remote host firewall is managed while still warning about external cloud security groups and upstream NAT/router forwarding.
+
 ## 1.3.25
 
 - Made `--public <host>:<port>` optional on the first `nns-app export ovpn` call.

@@ -110,6 +110,266 @@ gateway_cfg_set() {
     rm -f "$tmp"
 }
 
+
+gateway_ufw_state_file() {
+    printf '%s/.host-firewall-ufw\n' "$(gateway_dir "$1")"
+}
+
+gateway_firewalld_state_file() {
+    printf '%s/.host-firewall-firewalld\n' "$(gateway_dir "$1")"
+}
+
+gateway_public_firewall_comment() {
+    printf 'nns-app:gateway:%s:public-input\n' "$1"
+}
+
+ufw_is_active() {
+    command -v ufw >/dev/null 2>&1 || return 1
+    LC_ALL=C ufw status 2>/dev/null | grep -Fxq 'Status: active'
+}
+
+# Avoid claiming/removing a broad UFW rule that the administrator already
+# owned before nns-app started the gateway.  This catches the canonical short
+# form and the equivalent unrestricted long form.  More specific source or
+# interface rules do not count because they may not make the public endpoint
+# reachable from an arbitrary exported client.
+ufw_public_allow_exists() {
+    local port=$1 proto=$2 spec="${1}/${2}"
+    command -v ufw >/dev/null 2>&1 || return 1
+    LC_ALL=C ufw show added 2>/dev/null | awk \
+        -v spec="$spec" -v port="$port" -v proto="$proto" '
+        $1 != "ufw" || $2 != "allow" { next }
+        {
+            end=NF
+            for (i=3; i<=NF; i++) {
+                if ($i == "comment") { end=i-1; break }
+            }
+            start=3
+            if ($start == "in") start++
+            if (start <= end && $start == spec) { found=1; next }
+
+            saw_on=0; p=""; src=""; dst=""; dport=""
+            for (i=start; i<=end; i++) {
+                if ($i == "on") saw_on=1
+                else if ($i == "proto" && i < end) p=$(i+1)
+                else if ($i == "from" && i < end) src=$(i+1)
+                else if ($i == "to" && i < end) dst=$(i+1)
+                else if ($i == "port" && i < end) dport=$(i+1)
+            }
+            if (!saw_on && p == proto && src == "any" && dst == "any" && dport == port)
+                found=1
+        }
+        END { exit(found ? 0 : 1) }
+    '
+}
+
+ufw_managed_public_rule_exists() {
+    local gateway=$1 port=$2 proto=$3 marker line
+    marker=$(gateway_public_firewall_comment "$gateway")
+    command -v ufw >/dev/null 2>&1 || return 1
+    while IFS= read -r line; do
+        [[ "$line" == *"comment '$marker'"* ]] || continue
+        [[ "$line" == "ufw allow $port/$proto "* ||
+           "$line" == "ufw allow in $port/$proto "* ||
+           "$line" == "ufw allow $port/$proto" ||
+           "$line" == "ufw allow in $port/$proto" ]] && return 0
+    done < <(LC_ALL=C ufw show added 2>/dev/null || true)
+    return 1
+}
+
+gateway_ufw_public_up() {
+    local gateway=$1 port=$2 proto=$3 state marker
+    ufw_is_active || return 0
+    state=$(gateway_ufw_state_file "$gateway")
+    marker=$(gateway_public_firewall_comment "$gateway")
+
+    if [[ ! -e "$state" ]] && ufw_public_allow_exists "$port" "$proto"; then
+        # Administrator-owned broad access already exists.  Do not alter its
+        # comment and, crucially, do not delete it when the gateway goes away.
+        return 0
+    fi
+
+    if ! ufw_managed_public_rule_exists "$gateway" "$port" "$proto"; then
+        ufw allow "$port/$proto" comment "$marker" >/dev/null 2>&1 || return 1
+    fi
+    if [[ ! -e "$state" ]]; then
+        : >"$state" || {
+            ufw delete allow "$port/$proto" comment "$marker" >/dev/null 2>&1 || true
+            return 1
+        }
+        chmod 0600 "$state" 2>/dev/null || true
+    fi
+    return 0
+}
+
+gateway_ufw_public_down() {
+    local gateway=$1 port=$2 proto=$3 state marker
+    state=$(gateway_ufw_state_file "$gateway")
+    [[ -e "$state" ]] || return 0
+    marker=$(gateway_public_firewall_comment "$gateway")
+    command -v ufw >/dev/null 2>&1 || return 1
+
+    if ufw_managed_public_rule_exists "$gateway" "$port" "$proto"; then
+        # UFW explicitly supports deleting the original rule including its
+        # comment, so this cannot consume an unrelated administrator rule.
+        ufw delete allow "$port/$proto" comment "$marker" >/dev/null 2>&1 || return 1
+    fi
+    ! ufw_managed_public_rule_exists "$gateway" "$port" "$proto" || return 1
+    rm -f "$state"
+    return 0
+}
+
+firewalld_public_zone() {
+    local wan zone
+    wan=$(detect_wan_iface auto) || return 1
+    zone=$(firewall-cmd --get-zone-of-interface="$wan" 2>/dev/null || true)
+    if [[ -z "$zone" || "$zone" == 'no zone' ]]; then
+        zone=$(firewall-cmd --get-default-zone 2>/dev/null || true)
+    fi
+    [[ -n "$zone" && "$zone" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    printf '%s\n' "$zone"
+}
+
+firewalld_port_query() {
+    local scope=$1 zone=$2 port=$3 proto=$4
+    local -a cmd=(firewall-cmd)
+    [[ "$scope" == permanent ]] && cmd+=(--permanent)
+    "${cmd[@]}" --zone="$zone" --query-port="$port/$proto" >/dev/null 2>&1
+}
+
+firewalld_port_add() {
+    local scope=$1 zone=$2 port=$3 proto=$4
+    local -a cmd=(firewall-cmd)
+    [[ "$scope" == permanent ]] && cmd+=(--permanent)
+    "${cmd[@]}" --zone="$zone" --add-port="$port/$proto" >/dev/null 2>&1
+}
+
+firewalld_port_remove() {
+    local scope=$1 zone=$2 port=$3 proto=$4
+    local -a cmd=(firewall-cmd)
+    [[ "$scope" == permanent ]] && cmd+=(--permanent)
+    if firewalld_port_query "$scope" "$zone" "$port" "$proto"; then
+        "${cmd[@]}" --zone="$zone" --remove-port="$port/$proto" >/dev/null 2>&1
+    fi
+}
+
+gateway_firewalld_public_up() {
+    local gateway=$1 port=$2 proto=$3 state zone old_zone runtime_has=no permanent_has=no
+    firewalld_is_active || return 0
+    state=$(gateway_firewalld_state_file "$gateway")
+    zone=$(firewalld_public_zone) || return 1
+
+    if [[ -s "$state" ]]; then
+        old_zone=$(head -n 1 "$state" 2>/dev/null || true)
+        [[ "$old_zone" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+        if [[ "$old_zone" != "$zone" ]]; then
+            firewalld_port_remove runtime "$old_zone" "$port" "$proto" || return 1
+            firewalld_port_remove permanent "$old_zone" "$port" "$proto" || return 1
+            printf '%s\n' "$zone" >"$state" || return 1
+            chmod 0600 "$state" 2>/dev/null || true
+        fi
+        firewalld_port_query runtime "$zone" "$port" "$proto" ||
+            firewalld_port_add runtime "$zone" "$port" "$proto" || return 1
+        firewalld_port_query permanent "$zone" "$port" "$proto" ||
+            firewalld_port_add permanent "$zone" "$port" "$proto" || return 1
+        return 0
+    fi
+
+    firewalld_port_query runtime "$zone" "$port" "$proto" && runtime_has=yes
+    firewalld_port_query permanent "$zone" "$port" "$proto" && permanent_has=yes
+
+    # If the administrator already owns either scope, do not claim it.  A
+    # permanent rule is mirrored into runtime so the current gateway works;
+    # it remains administrator-owned and is intentionally retained later.
+    if [[ "$runtime_has" == yes || "$permanent_has" == yes ]]; then
+        if [[ "$runtime_has" != yes && "$permanent_has" == yes ]]; then
+            firewalld_port_add runtime "$zone" "$port" "$proto" || return 1
+        fi
+        return 0
+    fi
+
+    firewalld_port_add permanent "$zone" "$port" "$proto" || return 1
+    if ! firewalld_port_add runtime "$zone" "$port" "$proto"; then
+        firewalld_port_remove permanent "$zone" "$port" "$proto" || true
+        return 1
+    fi
+    printf '%s\n' "$zone" >"$state" || {
+        firewalld_port_remove runtime "$zone" "$port" "$proto" || true
+        firewalld_port_remove permanent "$zone" "$port" "$proto" || true
+        return 1
+    }
+    chmod 0600 "$state" 2>/dev/null || true
+    return 0
+}
+
+gateway_firewalld_public_down() {
+    local gateway=$1 port=$2 proto=$3 state zone
+    state=$(gateway_firewalld_state_file "$gateway")
+    [[ -s "$state" ]] || return 0
+    zone=$(head -n 1 "$state" 2>/dev/null || true)
+    [[ "$zone" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+
+    if firewalld_is_active; then
+        firewalld_port_remove runtime "$zone" "$port" "$proto" || return 1
+        firewalld_port_remove permanent "$zone" "$port" "$proto" || return 1
+        ! firewalld_port_query runtime "$zone" "$port" "$proto" || return 1
+        ! firewalld_port_query permanent "$zone" "$port" "$proto" || return 1
+    elif command -v firewall-offline-cmd >/dev/null 2>&1; then
+        firewall-offline-cmd --zone="$zone" --remove-port="$port/$proto" \
+            >/dev/null 2>&1 || return 1
+    else
+        return 1
+    fi
+    rm -f "$state"
+    return 0
+}
+
+gateway_iptables_public_up() {
+    local gateway=$1 port=$2 proto=$3 comment
+    comment=$(gateway_public_firewall_comment "$gateway")
+    iptables_add_once filter INPUT -p "$proto" --dport "$port" \
+        -m comment --comment "$comment" -j ACCEPT
+}
+
+gateway_iptables_public_down() {
+    local gateway=$1 port=$2 proto=$3 comment
+    comment=$(gateway_public_firewall_comment "$gateway")
+    command -v iptables >/dev/null 2>&1 || return 0
+    iptables_delete_all filter INPUT -p "$proto" --dport "$port" \
+        -m comment --comment "$comment" -j ACCEPT
+}
+
+gateway_public_firewall_up() {
+    local gateway=$1 managed=no
+    [[ "${TRANSPORT:-direct}" != ssh ]] || return 0
+
+    if ufw_is_active; then
+        gateway_ufw_public_up "$gateway" "$LISTEN_PORT" "$LISTEN_PROTO" || return 1
+        managed=yes
+    fi
+    if firewalld_is_active; then
+        gateway_firewalld_public_up "$gateway" "$LISTEN_PORT" "$LISTEN_PROTO" || {
+            gateway_ufw_public_down "$gateway" "$LISTEN_PORT" "$LISTEN_PROTO" || true
+            return 1
+        }
+        managed=yes
+    fi
+    if [[ "$managed" == no ]]; then
+        gateway_iptables_public_up "$gateway" "$LISTEN_PORT" "$LISTEN_PROTO" || return 1
+    fi
+    return 0
+}
+
+gateway_public_firewall_down() {
+    local gateway=$1 rc=0
+    [[ "${TRANSPORT:-direct}" != ssh ]] || return 0
+
+    gateway_ufw_public_down "$gateway" "$LISTEN_PORT" "$LISTEN_PROTO" || rc=1
+    gateway_firewalld_public_down "$gateway" "$LISTEN_PORT" "$LISTEN_PROTO" || rc=1
+    gateway_iptables_public_down "$gateway" "$LISTEN_PORT" "$LISTEN_PROTO" || rc=1
+    return "$rc"
+}
+
 make_gateway_names() {
     local gateway=$1 crc hex
     crc=$(printf 'gateway:%s' "$gateway" | cksum | awk '{print $1}')
@@ -704,7 +964,8 @@ GATEWAY_CONFIG_EOF
     log "Client pool:     $client_pool"
     log "Remote exit:     $via_app"
     if [[ "$transport" != ssh ]]; then
-        warn "Ensure the host firewall and upstream NAT/router allow $listen_proto port $listen_port."
+        log "Host firewall:    nns-app opens $listen_port/$listen_proto while the gateway is running and removes its owned rule when stopped/removed."
+        warn "External cloud security groups and upstream NAT/router forwarding are not managed by nns-app."
     fi
 }
 
@@ -938,6 +1199,10 @@ gateway_down_locked() {
         upstream_tun=$(vpn_route_iface "$VIA_APP" 2>/dev/null || true)
     [[ -n "$ns_ip" ]] || ns_ip=${TRANSIT_NS_ADDR%/*}
 
+    # Public INPUT access is lifecycle-owned by the gateway.  Remove the
+    # nns-app-owned host-firewall rule before tearing down the data plane so a
+    # stopped/removed public gateway does not leave an exposed listening port.
+    gateway_public_firewall_down "$gateway" || true
     gateway_host_rules_down || true
     gateway_rule_delete_exact || true
     gateway_remove_legacy_rule || true
@@ -1028,6 +1293,12 @@ gateway_up() {
     chown root:root "$runtime"
     chmod 0600 "$runtime"
 
+    if ! gateway_public_firewall_up "$gateway"; then
+        gateway_down_locked "$gateway" >/dev/null 2>&1 || true
+        release_lock "gateway-$gateway"
+        die "Could not open host firewall for gateway '$gateway' on $LISTEN_PORT/$LISTEN_PROTO."
+    fi
+
     release_lock "gateway-$gateway"
     log "Gateway '$gateway' data plane is ready through '$VIA_APP/$upstream_tun'."
 }
@@ -1099,6 +1370,11 @@ gateway_start() {
     pki=$(gateway_pki_dir "$gateway")
     if ! gateway_crl_valid_for "$pki/crl.pem" 604800; then
         gateway_crl_refresh "$gateway"
+    fi
+    if ! gateway_public_firewall_up "$gateway"; then
+        gateway_public_firewall_down "$gateway" >/dev/null 2>&1 || true
+        release_lock "gateway-$gateway"
+        die "Could not open host firewall for gateway '$gateway' on $LISTEN_PORT/$LISTEN_PROTO."
     fi
     release_lock "gateway-$gateway"
 
@@ -1560,6 +1836,93 @@ gateway_client_list() {
     release_lock "gateway-$gateway"
 }
 
+gateway_client_counts() {
+    local gateway=$1 dir client active=0 revoked=0 total=0
+    validate_gateway_name "$gateway"
+    shopt -s nullglob
+    for dir in "$(gateway_clients_dir "$gateway")"/*; do
+        [[ -f "$dir/client.cfg" ]] || continue
+        client=$(basename "$dir")
+        if ! gateway_client_load "$gateway" "$client" 2>/dev/null; then
+            continue
+        fi
+        total=$((total + 1))
+        case "${STATUS:-unknown}" in
+            active) active=$((active + 1)) ;;
+            revoked) revoked=$((revoked + 1)) ;;
+        esac
+    done
+    shopt -u nullglob
+    printf '%s|%s|%s\n' "$total" "$active" "$revoked"
+}
+
+gateway_connected_client_count() {
+    local gateway=$1 count=0 line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && count=$((count + 1))
+    done < <(gateway_connected_clients "$gateway")
+    printf '%s\n' "$count"
+}
+
+gateway_client_is_connected() {
+    local gateway=$1 client=$2 line cn
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        IFS='|' read -r cn _ <<<"$line"
+        [[ "$cn" == "$client" ]] && return 0
+    done < <(gateway_connected_clients "$gateway")
+    return 1
+}
+
+gateway_inventory_record() {
+    # Machine-readable record used by the high-level `nns-app list` views and
+    # automatic-remote inventory. Fields never contain literal '|'.
+    local gateway=$1 source=${2:-local}
+    local state endpoint kind counts total active revoked connected
+    validate_gateway_name "$gateway"
+    load_gateway_cfg "$gateway"
+    state=$(systemctl is-active "nns-gateway@${gateway}.service" 2>/dev/null || true)
+    [[ "$state" == active ]] || state=stopped
+    if [[ "${TRANSPORT:-direct}" == ssh ]]; then
+        kind=private
+        endpoint="${PUBLIC_HOST}:${PUBLIC_PORT}/ssh"
+    else
+        kind=public
+        endpoint="${PUBLIC_HOST}:${PUBLIC_PORT}/${LISTEN_PROTO}"
+    fi
+    counts=$(gateway_client_counts "$gateway")
+    IFS='|' read -r total active revoked <<<"$counts"
+    connected=$(gateway_connected_client_count "$gateway")
+    printf 'GATEWAY|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+        "$gateway" "$kind" "$state" "$VIA_APP" "$endpoint" \
+        "$active" "$revoked" "$connected" "$source"
+}
+
+gateway_external_client_records() {
+    # External clients are identities exposed through a non-SSH gateway.
+    # The SSH transport is the private nns-app-to-nns-app gateway and is not
+    # shown as an external client surface.
+    local gateway=$1 source=${2:-local} dir client endpoint connected
+    validate_gateway_name "$gateway"
+    load_gateway_cfg "$gateway"
+    [[ "${TRANSPORT:-direct}" != ssh ]] || return 0
+    endpoint="${PUBLIC_HOST}:${PUBLIC_PORT}/${LISTEN_PROTO}"
+    shopt -s nullglob
+    for dir in "$(gateway_clients_dir "$gateway")"/*; do
+        [[ -f "$dir/client.cfg" ]] || continue
+        client=$(basename "$dir")
+        gateway_client_load "$gateway" "$client" 2>/dev/null || continue
+        connected=no
+        if [[ "${STATUS:-unknown}" == active ]] && gateway_client_is_connected "$gateway" "$client"; then
+            connected=yes
+        fi
+        printf 'CLIENT|%s|%s|%s|%s|%s|%s|%s\n' \
+            "$client" "${STATUS:-unknown}" "$gateway" "$endpoint" \
+            "${CREATED_AT:-unknown}" "$connected" "$source"
+    done
+    shopt -u nullglob
+}
+
 gateway_connected_clients() {
     local gateway=$1 status_file
     status_file=$(gateway_status_file "$gateway")
@@ -1849,6 +2212,17 @@ gateway_remove() {
     # ExecStopPost runs _gateway-down in another process and must acquire it.
     gateway_stop "$gateway"
     acquire_lock "gateway-$gateway"
+    load_gateway_cfg "$gateway"
+
+    # gateway_stop/ExecStopPost normally performs this cleanup already.  Do it
+    # again under the removal lock and require success before deleting the
+    # gateway configuration; otherwise a stale persistent firewall exception
+    # could become impossible for nns-app to identify and retry later.
+    if ! gateway_public_firewall_down "$gateway"; then
+        release_lock "gateway-$gateway"
+        release_lock global
+        die "Could not remove the host-firewall rule for gateway '$gateway'; configuration was preserved for a safe retry."
+    fi
 
     systemctl disable "nns-gateway@${gateway}.service" \
         >/dev/null 2>&1 || true

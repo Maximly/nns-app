@@ -21,10 +21,12 @@
 # Author: Maxim Lyadvinsky
 #
 # Public commands:
+#   install [--local-only]
 #   install [<app_name> [--backend inherit] [--via <upstream-app>|host]
 #                         [--via-remote <user@host> [--remote-port <port>]]]
 #   remove  <app_name>
 #   purge
+#   repair [--local-only]
 #   list
 #   status  <app_name>
 #   myip    [<app_name>]
@@ -50,7 +52,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.25"
+readonly VERSION="1.3.30"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -272,11 +274,13 @@ show_version() {
 usage() {
     cat <<'USAGE'
 Usage:
-  nns-app install [app_name [--backend inherit] [--via <upstream-app>|host]]
+  nns-app install [--local-only]
+  nns-app install <app_name> [--backend inherit] [--via <upstream-app>|host]
   nns-app install <app_name> via --remote <user@host> [--remote-port <port>]
   nns-app remove  <app_name> [--local-only]
   nns-app purge [--local-only]
-  nns-app list
+  nns-app repair [--local-only]
+  nns-app list [all|gateway|clients]
   nns-app status  <app_name>
   nns-app myip [<app_name>]
   nns-app export ovpn <app_name> --client <client_name>
@@ -321,6 +325,7 @@ Simple managed-remote mode:
 
 Examples:
   sudo ./nns-app.sh install
+  sudo ./nns-app.sh install --local-only
   sudo nns-app install my-upstream-vpn
   nns-app install my-private-app via --remote user@remote-host
   nns-app add my-private-app ~/my-base-profile.ovpn
@@ -336,7 +341,11 @@ Examples:
   nns-app run my-private-app curl -4 https://api.ipify.org
   nns-app run my-private-app firefox --no-remote
   sudo nns-app purge
+  sudo nns-app repair
   nns-app list
+  nns-app list all
+  nns-app list gateway
+  nns-app list clients
   nns-app status my-private-app
   nns-app myip
   nns-app myip my-private-app
@@ -400,7 +409,7 @@ reexec_as_root_if_needed() {
         list|status|myip|start|stop|run)
             sudo_args+=( -n )
             ;;
-        install|remove|add|purge|gateway|remote|link|export|revoke)
+        install|remove|add|purge|repair|gateway|remote|link|export|revoke)
             ;;
         *)
             die "Unknown command '$cmd'."
@@ -1070,6 +1079,10 @@ refresh_managed_unit_metadata() {
 
 install_engine() {
     require_root
+    local refresh_remotes=${1:-on}
+    [[ "$refresh_remotes" == on || "$refresh_remotes" == off ]] ||
+        die "Internal install mode must be 'on' or 'off'."
+
     acquire_lock global
     ensure_dependencies
     install_engine_files
@@ -1082,6 +1095,15 @@ install_engine() {
     log "Installed nns-app $VERSION."
     log "Command: $USER_PATH"
     log "Engine:  $ENGINE_PATH"
+
+    # Keep direct automatic-remote nodes at the same engine version as the
+    # client that owns them.  Inventory/status RPCs evolve with the engine,
+    # so silently leaving an older helper behind makes a healthy remote look
+    # offline to a newly upgraded client.  Remote bootstrap itself installs
+    # with refresh_remotes=off to avoid recursive propagation.
+    if [[ "$refresh_remotes" == on ]]; then
+        remote_auto_refresh_configured_nodes
+    fi
 }
 
 collect_live_ipv4_networks() {
@@ -1197,6 +1219,12 @@ Defaults!$ENGINE_PATH !use_pty
 Defaults!$ENGINE_PATH env_keep += "NNS_APP_RUN_PATH DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE DESKTOP_SESSION GDMSESSION GNOME_DESKTOP_SESSION_ID GNOME_KEYRING_CONTROL KDE_FULL_SESSION KDE_SESSION_VERSION XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME XDG_CONFIG_DIRS XDG_DATA_DIRS LANG LANGUAGE LC_ALL TERM COLORTERM SSH_AUTH_SOCK"
 Cmnd_Alias $alias = \\
     $ENGINE_PATH list, \\
+    $ENGINE_PATH list apps, \\
+    $ENGINE_PATH list all, \\
+    $ENGINE_PATH list gateway, \\
+    $ENGINE_PATH list gateways, \\
+    $ENGINE_PATH list client, \\
+    $ENGINE_PATH list clients, \\
     $ENGINE_PATH status $app, \\
     $ENGINE_PATH myip $app, \\
     $ENGINE_PATH start $app, \\
@@ -4127,6 +4155,266 @@ gateway_cfg_set() {
     rm -f "$tmp"
 }
 
+
+gateway_ufw_state_file() {
+    printf '%s/.host-firewall-ufw\n' "$(gateway_dir "$1")"
+}
+
+gateway_firewalld_state_file() {
+    printf '%s/.host-firewall-firewalld\n' "$(gateway_dir "$1")"
+}
+
+gateway_public_firewall_comment() {
+    printf 'nns-app:gateway:%s:public-input\n' "$1"
+}
+
+ufw_is_active() {
+    command -v ufw >/dev/null 2>&1 || return 1
+    LC_ALL=C ufw status 2>/dev/null | grep -Fxq 'Status: active'
+}
+
+# Avoid claiming/removing a broad UFW rule that the administrator already
+# owned before nns-app started the gateway.  This catches the canonical short
+# form and the equivalent unrestricted long form.  More specific source or
+# interface rules do not count because they may not make the public endpoint
+# reachable from an arbitrary exported client.
+ufw_public_allow_exists() {
+    local port=$1 proto=$2 spec="${1}/${2}"
+    command -v ufw >/dev/null 2>&1 || return 1
+    LC_ALL=C ufw show added 2>/dev/null | awk \
+        -v spec="$spec" -v port="$port" -v proto="$proto" '
+        $1 != "ufw" || $2 != "allow" { next }
+        {
+            end=NF
+            for (i=3; i<=NF; i++) {
+                if ($i == "comment") { end=i-1; break }
+            }
+            start=3
+            if ($start == "in") start++
+            if (start <= end && $start == spec) { found=1; next }
+
+            saw_on=0; p=""; src=""; dst=""; dport=""
+            for (i=start; i<=end; i++) {
+                if ($i == "on") saw_on=1
+                else if ($i == "proto" && i < end) p=$(i+1)
+                else if ($i == "from" && i < end) src=$(i+1)
+                else if ($i == "to" && i < end) dst=$(i+1)
+                else if ($i == "port" && i < end) dport=$(i+1)
+            }
+            if (!saw_on && p == proto && src == "any" && dst == "any" && dport == port)
+                found=1
+        }
+        END { exit(found ? 0 : 1) }
+    '
+}
+
+ufw_managed_public_rule_exists() {
+    local gateway=$1 port=$2 proto=$3 marker line
+    marker=$(gateway_public_firewall_comment "$gateway")
+    command -v ufw >/dev/null 2>&1 || return 1
+    while IFS= read -r line; do
+        [[ "$line" == *"comment '$marker'"* ]] || continue
+        [[ "$line" == "ufw allow $port/$proto "* ||
+           "$line" == "ufw allow in $port/$proto "* ||
+           "$line" == "ufw allow $port/$proto" ||
+           "$line" == "ufw allow in $port/$proto" ]] && return 0
+    done < <(LC_ALL=C ufw show added 2>/dev/null || true)
+    return 1
+}
+
+gateway_ufw_public_up() {
+    local gateway=$1 port=$2 proto=$3 state marker
+    ufw_is_active || return 0
+    state=$(gateway_ufw_state_file "$gateway")
+    marker=$(gateway_public_firewall_comment "$gateway")
+
+    if [[ ! -e "$state" ]] && ufw_public_allow_exists "$port" "$proto"; then
+        # Administrator-owned broad access already exists.  Do not alter its
+        # comment and, crucially, do not delete it when the gateway goes away.
+        return 0
+    fi
+
+    if ! ufw_managed_public_rule_exists "$gateway" "$port" "$proto"; then
+        ufw allow "$port/$proto" comment "$marker" >/dev/null 2>&1 || return 1
+    fi
+    if [[ ! -e "$state" ]]; then
+        : >"$state" || {
+            ufw delete allow "$port/$proto" comment "$marker" >/dev/null 2>&1 || true
+            return 1
+        }
+        chmod 0600 "$state" 2>/dev/null || true
+    fi
+    return 0
+}
+
+gateway_ufw_public_down() {
+    local gateway=$1 port=$2 proto=$3 state marker
+    state=$(gateway_ufw_state_file "$gateway")
+    [[ -e "$state" ]] || return 0
+    marker=$(gateway_public_firewall_comment "$gateway")
+    command -v ufw >/dev/null 2>&1 || return 1
+
+    if ufw_managed_public_rule_exists "$gateway" "$port" "$proto"; then
+        # UFW explicitly supports deleting the original rule including its
+        # comment, so this cannot consume an unrelated administrator rule.
+        ufw delete allow "$port/$proto" comment "$marker" >/dev/null 2>&1 || return 1
+    fi
+    ! ufw_managed_public_rule_exists "$gateway" "$port" "$proto" || return 1
+    rm -f "$state"
+    return 0
+}
+
+firewalld_public_zone() {
+    local wan zone
+    wan=$(detect_wan_iface auto) || return 1
+    zone=$(firewall-cmd --get-zone-of-interface="$wan" 2>/dev/null || true)
+    if [[ -z "$zone" || "$zone" == 'no zone' ]]; then
+        zone=$(firewall-cmd --get-default-zone 2>/dev/null || true)
+    fi
+    [[ -n "$zone" && "$zone" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    printf '%s\n' "$zone"
+}
+
+firewalld_port_query() {
+    local scope=$1 zone=$2 port=$3 proto=$4
+    local -a cmd=(firewall-cmd)
+    [[ "$scope" == permanent ]] && cmd+=(--permanent)
+    "${cmd[@]}" --zone="$zone" --query-port="$port/$proto" >/dev/null 2>&1
+}
+
+firewalld_port_add() {
+    local scope=$1 zone=$2 port=$3 proto=$4
+    local -a cmd=(firewall-cmd)
+    [[ "$scope" == permanent ]] && cmd+=(--permanent)
+    "${cmd[@]}" --zone="$zone" --add-port="$port/$proto" >/dev/null 2>&1
+}
+
+firewalld_port_remove() {
+    local scope=$1 zone=$2 port=$3 proto=$4
+    local -a cmd=(firewall-cmd)
+    [[ "$scope" == permanent ]] && cmd+=(--permanent)
+    if firewalld_port_query "$scope" "$zone" "$port" "$proto"; then
+        "${cmd[@]}" --zone="$zone" --remove-port="$port/$proto" >/dev/null 2>&1
+    fi
+}
+
+gateway_firewalld_public_up() {
+    local gateway=$1 port=$2 proto=$3 state zone old_zone runtime_has=no permanent_has=no
+    firewalld_is_active || return 0
+    state=$(gateway_firewalld_state_file "$gateway")
+    zone=$(firewalld_public_zone) || return 1
+
+    if [[ -s "$state" ]]; then
+        old_zone=$(head -n 1 "$state" 2>/dev/null || true)
+        [[ "$old_zone" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+        if [[ "$old_zone" != "$zone" ]]; then
+            firewalld_port_remove runtime "$old_zone" "$port" "$proto" || return 1
+            firewalld_port_remove permanent "$old_zone" "$port" "$proto" || return 1
+            printf '%s\n' "$zone" >"$state" || return 1
+            chmod 0600 "$state" 2>/dev/null || true
+        fi
+        firewalld_port_query runtime "$zone" "$port" "$proto" ||
+            firewalld_port_add runtime "$zone" "$port" "$proto" || return 1
+        firewalld_port_query permanent "$zone" "$port" "$proto" ||
+            firewalld_port_add permanent "$zone" "$port" "$proto" || return 1
+        return 0
+    fi
+
+    firewalld_port_query runtime "$zone" "$port" "$proto" && runtime_has=yes
+    firewalld_port_query permanent "$zone" "$port" "$proto" && permanent_has=yes
+
+    # If the administrator already owns either scope, do not claim it.  A
+    # permanent rule is mirrored into runtime so the current gateway works;
+    # it remains administrator-owned and is intentionally retained later.
+    if [[ "$runtime_has" == yes || "$permanent_has" == yes ]]; then
+        if [[ "$runtime_has" != yes && "$permanent_has" == yes ]]; then
+            firewalld_port_add runtime "$zone" "$port" "$proto" || return 1
+        fi
+        return 0
+    fi
+
+    firewalld_port_add permanent "$zone" "$port" "$proto" || return 1
+    if ! firewalld_port_add runtime "$zone" "$port" "$proto"; then
+        firewalld_port_remove permanent "$zone" "$port" "$proto" || true
+        return 1
+    fi
+    printf '%s\n' "$zone" >"$state" || {
+        firewalld_port_remove runtime "$zone" "$port" "$proto" || true
+        firewalld_port_remove permanent "$zone" "$port" "$proto" || true
+        return 1
+    }
+    chmod 0600 "$state" 2>/dev/null || true
+    return 0
+}
+
+gateway_firewalld_public_down() {
+    local gateway=$1 port=$2 proto=$3 state zone
+    state=$(gateway_firewalld_state_file "$gateway")
+    [[ -s "$state" ]] || return 0
+    zone=$(head -n 1 "$state" 2>/dev/null || true)
+    [[ "$zone" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+
+    if firewalld_is_active; then
+        firewalld_port_remove runtime "$zone" "$port" "$proto" || return 1
+        firewalld_port_remove permanent "$zone" "$port" "$proto" || return 1
+        ! firewalld_port_query runtime "$zone" "$port" "$proto" || return 1
+        ! firewalld_port_query permanent "$zone" "$port" "$proto" || return 1
+    elif command -v firewall-offline-cmd >/dev/null 2>&1; then
+        firewall-offline-cmd --zone="$zone" --remove-port="$port/$proto" \
+            >/dev/null 2>&1 || return 1
+    else
+        return 1
+    fi
+    rm -f "$state"
+    return 0
+}
+
+gateway_iptables_public_up() {
+    local gateway=$1 port=$2 proto=$3 comment
+    comment=$(gateway_public_firewall_comment "$gateway")
+    iptables_add_once filter INPUT -p "$proto" --dport "$port" \
+        -m comment --comment "$comment" -j ACCEPT
+}
+
+gateway_iptables_public_down() {
+    local gateway=$1 port=$2 proto=$3 comment
+    comment=$(gateway_public_firewall_comment "$gateway")
+    command -v iptables >/dev/null 2>&1 || return 0
+    iptables_delete_all filter INPUT -p "$proto" --dport "$port" \
+        -m comment --comment "$comment" -j ACCEPT
+}
+
+gateway_public_firewall_up() {
+    local gateway=$1 managed=no
+    [[ "${TRANSPORT:-direct}" != ssh ]] || return 0
+
+    if ufw_is_active; then
+        gateway_ufw_public_up "$gateway" "$LISTEN_PORT" "$LISTEN_PROTO" || return 1
+        managed=yes
+    fi
+    if firewalld_is_active; then
+        gateway_firewalld_public_up "$gateway" "$LISTEN_PORT" "$LISTEN_PROTO" || {
+            gateway_ufw_public_down "$gateway" "$LISTEN_PORT" "$LISTEN_PROTO" || true
+            return 1
+        }
+        managed=yes
+    fi
+    if [[ "$managed" == no ]]; then
+        gateway_iptables_public_up "$gateway" "$LISTEN_PORT" "$LISTEN_PROTO" || return 1
+    fi
+    return 0
+}
+
+gateway_public_firewall_down() {
+    local gateway=$1 rc=0
+    [[ "${TRANSPORT:-direct}" != ssh ]] || return 0
+
+    gateway_ufw_public_down "$gateway" "$LISTEN_PORT" "$LISTEN_PROTO" || rc=1
+    gateway_firewalld_public_down "$gateway" "$LISTEN_PORT" "$LISTEN_PROTO" || rc=1
+    gateway_iptables_public_down "$gateway" "$LISTEN_PORT" "$LISTEN_PROTO" || rc=1
+    return "$rc"
+}
+
 make_gateway_names() {
     local gateway=$1 crc hex
     crc=$(printf 'gateway:%s' "$gateway" | cksum | awk '{print $1}')
@@ -4721,7 +5009,8 @@ GATEWAY_CONFIG_EOF
     log "Client pool:     $client_pool"
     log "Remote exit:     $via_app"
     if [[ "$transport" != ssh ]]; then
-        warn "Ensure the host firewall and upstream NAT/router allow $listen_proto port $listen_port."
+        log "Host firewall:    nns-app opens $listen_port/$listen_proto while the gateway is running and removes its owned rule when stopped/removed."
+        warn "External cloud security groups and upstream NAT/router forwarding are not managed by nns-app."
     fi
 }
 
@@ -4955,6 +5244,10 @@ gateway_down_locked() {
         upstream_tun=$(vpn_route_iface "$VIA_APP" 2>/dev/null || true)
     [[ -n "$ns_ip" ]] || ns_ip=${TRANSIT_NS_ADDR%/*}
 
+    # Public INPUT access is lifecycle-owned by the gateway.  Remove the
+    # nns-app-owned host-firewall rule before tearing down the data plane so a
+    # stopped/removed public gateway does not leave an exposed listening port.
+    gateway_public_firewall_down "$gateway" || true
     gateway_host_rules_down || true
     gateway_rule_delete_exact || true
     gateway_remove_legacy_rule || true
@@ -5045,6 +5338,12 @@ gateway_up() {
     chown root:root "$runtime"
     chmod 0600 "$runtime"
 
+    if ! gateway_public_firewall_up "$gateway"; then
+        gateway_down_locked "$gateway" >/dev/null 2>&1 || true
+        release_lock "gateway-$gateway"
+        die "Could not open host firewall for gateway '$gateway' on $LISTEN_PORT/$LISTEN_PROTO."
+    fi
+
     release_lock "gateway-$gateway"
     log "Gateway '$gateway' data plane is ready through '$VIA_APP/$upstream_tun'."
 }
@@ -5116,6 +5415,11 @@ gateway_start() {
     pki=$(gateway_pki_dir "$gateway")
     if ! gateway_crl_valid_for "$pki/crl.pem" 604800; then
         gateway_crl_refresh "$gateway"
+    fi
+    if ! gateway_public_firewall_up "$gateway"; then
+        gateway_public_firewall_down "$gateway" >/dev/null 2>&1 || true
+        release_lock "gateway-$gateway"
+        die "Could not open host firewall for gateway '$gateway' on $LISTEN_PORT/$LISTEN_PROTO."
     fi
     release_lock "gateway-$gateway"
 
@@ -5577,6 +5881,93 @@ gateway_client_list() {
     release_lock "gateway-$gateway"
 }
 
+gateway_client_counts() {
+    local gateway=$1 dir client active=0 revoked=0 total=0
+    validate_gateway_name "$gateway"
+    shopt -s nullglob
+    for dir in "$(gateway_clients_dir "$gateway")"/*; do
+        [[ -f "$dir/client.cfg" ]] || continue
+        client=$(basename "$dir")
+        if ! gateway_client_load "$gateway" "$client" 2>/dev/null; then
+            continue
+        fi
+        total=$((total + 1))
+        case "${STATUS:-unknown}" in
+            active) active=$((active + 1)) ;;
+            revoked) revoked=$((revoked + 1)) ;;
+        esac
+    done
+    shopt -u nullglob
+    printf '%s|%s|%s\n' "$total" "$active" "$revoked"
+}
+
+gateway_connected_client_count() {
+    local gateway=$1 count=0 line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && count=$((count + 1))
+    done < <(gateway_connected_clients "$gateway")
+    printf '%s\n' "$count"
+}
+
+gateway_client_is_connected() {
+    local gateway=$1 client=$2 line cn
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        IFS='|' read -r cn _ <<<"$line"
+        [[ "$cn" == "$client" ]] && return 0
+    done < <(gateway_connected_clients "$gateway")
+    return 1
+}
+
+gateway_inventory_record() {
+    # Machine-readable record used by the high-level `nns-app list` views and
+    # automatic-remote inventory. Fields never contain literal '|'.
+    local gateway=$1 source=${2:-local}
+    local state endpoint kind counts total active revoked connected
+    validate_gateway_name "$gateway"
+    load_gateway_cfg "$gateway"
+    state=$(systemctl is-active "nns-gateway@${gateway}.service" 2>/dev/null || true)
+    [[ "$state" == active ]] || state=stopped
+    if [[ "${TRANSPORT:-direct}" == ssh ]]; then
+        kind=private
+        endpoint="${PUBLIC_HOST}:${PUBLIC_PORT}/ssh"
+    else
+        kind=public
+        endpoint="${PUBLIC_HOST}:${PUBLIC_PORT}/${LISTEN_PROTO}"
+    fi
+    counts=$(gateway_client_counts "$gateway")
+    IFS='|' read -r total active revoked <<<"$counts"
+    connected=$(gateway_connected_client_count "$gateway")
+    printf 'GATEWAY|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+        "$gateway" "$kind" "$state" "$VIA_APP" "$endpoint" \
+        "$active" "$revoked" "$connected" "$source"
+}
+
+gateway_external_client_records() {
+    # External clients are identities exposed through a non-SSH gateway.
+    # The SSH transport is the private nns-app-to-nns-app gateway and is not
+    # shown as an external client surface.
+    local gateway=$1 source=${2:-local} dir client endpoint connected
+    validate_gateway_name "$gateway"
+    load_gateway_cfg "$gateway"
+    [[ "${TRANSPORT:-direct}" != ssh ]] || return 0
+    endpoint="${PUBLIC_HOST}:${PUBLIC_PORT}/${LISTEN_PROTO}"
+    shopt -s nullglob
+    for dir in "$(gateway_clients_dir "$gateway")"/*; do
+        [[ -f "$dir/client.cfg" ]] || continue
+        client=$(basename "$dir")
+        gateway_client_load "$gateway" "$client" 2>/dev/null || continue
+        connected=no
+        if [[ "${STATUS:-unknown}" == active ]] && gateway_client_is_connected "$gateway" "$client"; then
+            connected=yes
+        fi
+        printf 'CLIENT|%s|%s|%s|%s|%s|%s|%s\n' \
+            "$client" "${STATUS:-unknown}" "$gateway" "$endpoint" \
+            "${CREATED_AT:-unknown}" "$connected" "$source"
+    done
+    shopt -u nullglob
+}
+
 gateway_connected_clients() {
     local gateway=$1 status_file
     status_file=$(gateway_status_file "$gateway")
@@ -5866,6 +6257,17 @@ gateway_remove() {
     # ExecStopPost runs _gateway-down in another process and must acquire it.
     gateway_stop "$gateway"
     acquire_lock "gateway-$gateway"
+    load_gateway_cfg "$gateway"
+
+    # gateway_stop/ExecStopPost normally performs this cleanup already.  Do it
+    # again under the removal lock and require success before deleting the
+    # gateway configuration; otherwise a stale persistent firewall exception
+    # could become impossible for nns-app to identify and retry later.
+    if ! gateway_public_firewall_down "$gateway"; then
+        release_lock "gateway-$gateway"
+        release_lock global
+        die "Could not remove the host-firewall rule for gateway '$gateway'; configuration was preserved for a safe retry."
+    fi
 
     systemctl disable "nns-gateway@${gateway}.service" \
         >/dev/null 2>&1 || true
@@ -7802,7 +8204,8 @@ remote_auto_public_export_internal() {
         "$client" "$pool_id" "$active_count" >&2
     printf '# Public endpoint: %s:%s/%s\n' \
         "$PUBLIC_HOST" "$PUBLIC_PORT" "$LISTEN_PROTO" >&2
-    warn "Ensure the remote host firewall, cloud security group, and upstream NAT allow $LISTEN_PROTO port $LISTEN_PORT."
+    log "Remote host firewall access for $LISTEN_PORT/$LISTEN_PROTO is managed by nns-app while the public gateway is running." >&2
+    warn "External cloud security groups and upstream NAT/router forwarding must still allow $LISTEN_PROTO port $LISTEN_PORT."
 
     gateway_client_export "$gateway" "$client" - ovpn
     release_lock remote-auto-pools
@@ -7857,19 +8260,118 @@ remote_auto_locate_internal() {
     printf '%s|%s|%s|%s|%s|%s\n'         "$RA_EXIT_APP" "$RA_GATEWAY" "$RA_CLIENT" "$RA_POOL_ID"         "$RA_PROVIDER_VPN_IPV4" "$members"
 }
 
-remote_auto_status_internal() {
+remote_auto_topology_internal() {
     require_root
-    local owner=$1 members
+    local owner=$1 members exit_state private_state public_gateway public_state
+    local private_counts private_total private_active private_revoked private_connected
+    local public_counts="0|0|0" public_total=0 public_active=0 public_revoked=0 public_connected=0
+    local public_endpoint="-" dir client connected
+
     remote_auto_load_state "$owner"
     members=$(remote_auto_pool_member_count "$RA_POOL_ID")
-    printf 'Automatic owner:    %s\n' "$owner"
+    exit_state=stopped
+    app_is_started "$RA_EXIT_APP" && exit_state=started
+
+    private_state=$(systemctl is-active "nns-gateway@${RA_GATEWAY}.service" 2>/dev/null || true)
+    [[ "$private_state" == active ]] || private_state=stopped
+    if [[ -f "$(gateway_cfg_file "$RA_GATEWAY")" ]]; then
+        private_counts=$(gateway_client_counts "$RA_GATEWAY")
+        IFS='|' read -r private_total private_active private_revoked <<<"$private_counts"
+        private_connected=$(gateway_connected_client_count "$RA_GATEWAY")
+    else
+        private_total=0 private_active=0 private_revoked=0 private_connected=0
+    fi
+
+    public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID")
+    if [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
+        load_gateway_cfg "$public_gateway"
+        public_state=$(systemctl is-active "nns-gateway@${public_gateway}.service" 2>/dev/null || true)
+        [[ "$public_state" == active ]] || public_state=stopped
+        public_endpoint="${PUBLIC_HOST}:${PUBLIC_PORT}/${LISTEN_PROTO}"
+        public_counts=$(gateway_client_counts "$public_gateway")
+        IFS='|' read -r public_total public_active public_revoked <<<"$public_counts"
+        public_connected=$(gateway_connected_client_count "$public_gateway")
+    else
+        public_state=none
+    fi
+
     printf 'Remote pool:        %s\n' "$RA_POOL_ID"
-    printf 'Pool clients:       %s\n' "$members"
-    printf 'Provider VPN IPv4:  %s\n' "${RA_PROVIDER_VPN_IPV4:-unknown}"
-    printf 'Remote exit app:    %s\n' "$RA_EXIT_APP"
-    printf 'Remote gateway:     %s\n' "$RA_GATEWAY"
+    printf 'Pool members:       %s\n' "$members"
+    printf 'Provider exit:      %s (%s; VPN IPv4=%s)\n' \
+        "$RA_EXIT_APP" "$exit_state" "${RA_PROVIDER_VPN_IPV4:-unknown}"
+    printf 'Private gateway:    %s (%s; clients=%s active/%s revoked; connected=%s)\n' \
+        "$RA_GATEWAY" "$private_state" "$private_active" "$private_revoked" "$private_connected"
+    if [[ "$public_state" == none ]]; then
+        printf 'Public gateway:     none\n'
+        printf 'External clients:   0\n'
+        return 0
+    fi
+
+    printf 'Public gateway:     %s (%s; %s)\n' \
+        "$public_gateway" "$public_state" "$public_endpoint"
+    printf 'External clients:   %s active/%s revoked; connected=%s\n' \
+        "$public_active" "$public_revoked" "$public_connected"
+
+    if (( public_total > 0 )); then
+        printf '\nExternal client details:\n'
+        printf '%-24s %-10s %-10s %s\n' \
+            'Client' 'Status' 'Connected' 'Created'
+        printf '%-24s %-10s %-10s %s\n' \
+            '------------------------' '----------' '----------' '--------------------'
+        shopt -s nullglob
+        for dir in "$(gateway_clients_dir "$public_gateway")"/*; do
+            [[ -f "$dir/client.cfg" ]] || continue
+            client=$(basename "$dir")
+            gateway_client_load "$public_gateway" "$client" 2>/dev/null || continue
+            connected=no
+            if [[ "${STATUS:-unknown}" == active ]] &&
+               gateway_client_is_connected "$public_gateway" "$client"; then
+                connected=yes
+            fi
+            printf '%-24s %-10s %-10s %s\n' \
+                "$client" "${STATUS:-unknown}" "$connected" "${CREATED_AT:-unknown}"
+        done
+        shopt -u nullglob
+    fi
+}
+
+remote_auto_inventory_gateways_internal() {
+    require_root
+    local owner=$1 public_gateway
+    remote_auto_load_state "$owner"
+    if [[ -f "$(gateway_cfg_file "$RA_GATEWAY")" ]]; then
+        gateway_inventory_record "$RA_GATEWAY" "remote"
+    fi
+    public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID")
+    if [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
+        gateway_inventory_record "$public_gateway" "remote"
+    fi
+}
+
+remote_auto_inventory_clients_internal() {
+    require_root
+    local owner=$1 public_gateway
+    remote_auto_load_state "$owner"
+    public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID")
+    [[ -f "$(gateway_cfg_file "$public_gateway")" ]] || return 0
+    gateway_external_client_records "$public_gateway" "remote"
+}
+
+remote_auto_status_internal() {
+    require_root
+    local owner=$1
+    remote_auto_load_state "$owner"
+    printf 'Automatic owner:    %s\n' "$owner"
     printf 'Remote client:      %s\n\n' "$RA_CLIENT"
+    remote_auto_topology_internal "$owner"
+    printf '\nPrivate gateway status:\n'
     gateway_status "$RA_GATEWAY"
+    local public_gateway
+    public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID")
+    if [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
+        printf '\nPublic gateway status:\n'
+        gateway_status "$public_gateway"
+    fi
 }
 
 remote_auto_start_internal() {
@@ -8147,6 +8649,18 @@ remote_auto_dispatch() {
             [[ $# -eq 1 ]] || die "_remote-auto status requires owner."
             remote_auto_status_internal "$1"
             ;;
+        topology)
+            [[ $# -eq 1 ]] || die "_remote-auto topology requires owner."
+            remote_auto_topology_internal "$1"
+            ;;
+        inventory-gateways)
+            [[ $# -eq 1 ]] || die "_remote-auto inventory-gateways requires owner."
+            remote_auto_inventory_gateways_internal "$1"
+            ;;
+        inventory-clients)
+            [[ $# -eq 1 ]] || die "_remote-auto inventory-clients requires owner."
+            remote_auto_inventory_clients_internal "$1"
+            ;;
         locate)
             [[ $# -eq 1 ]] || die "_remote-auto locate requires owner."
             remote_auto_locate_internal "$1"
@@ -8162,6 +8676,10 @@ remote_auto_dispatch() {
         cleanup)
             [[ $# -eq 1 ]] || die "_remote-auto cleanup requires owner."
             remote_auto_cleanup_internal "$1"
+            ;;
+        repair)
+            [[ $# -eq 2 ]] || die "_remote-auto repair requires owner and expected active state."
+            remote_auto_repair_internal "$1" "$2"
             ;;
         *) die "Unsupported automatic-remote operation '$action'." ;;
     esac
@@ -8272,7 +8790,7 @@ remote_auto_bootstrap() {
         die "Cannot upload the automatic-remote public key to '$target'."
     fi
 
-    printf -v command '%s' "set -e; umask 077; mkdir -p \"\$HOME/.ssh\"; touch \"\$HOME/.ssh/authorized_keys\"; chmod 700 \"\$HOME/.ssh\"; chmod 600 \"\$HOME/.ssh/authorized_keys\"; key=\$(awk '{print \$1\" \"\$2}' '$remote_pub'); grep -Fq \"\$key\" \"\$HOME/.ssh/authorized_keys\" || printf '\\nrestrict,port-forwarding %s nns-app-auto-$owner\\n' \"\$key\" >>\"\$HOME/.ssh/authorized_keys\"; sudo /bin/bash '$remote_tmp' install; sudo /bin/bash '$remote_tmp' _remote-auto-authorize \"\$(id -un)\"; rm -f '$remote_tmp' '$remote_pub'"
+    printf -v command '%s' "set -e; umask 077; mkdir -p \"\$HOME/.ssh\"; touch \"\$HOME/.ssh/authorized_keys\"; chmod 700 \"\$HOME/.ssh\"; chmod 600 \"\$HOME/.ssh/authorized_keys\"; key=\$(awk '{print \$1\" \"\$2}' '$remote_pub'); grep -Fq \"\$key\" \"\$HOME/.ssh/authorized_keys\" || printf '\\nrestrict,port-forwarding %s nns-app-auto-$owner\\n' \"\$key\" >>\"\$HOME/.ssh/authorized_keys\"; sudo /bin/bash '$remote_tmp' install --local-only; sudo /bin/bash '$remote_tmp' _remote-auto-authorize \"\$(id -un)\"; rm -f '$remote_tmp' '$remote_pub'"
     if ! remote_auto_user_exec "$user" ssh -tt \
         -o "ControlPath=$control" -p "$port" "$target" "$command"; then
         remote_auto_user_exec "$user" ssh \
@@ -8325,6 +8843,70 @@ remote_auto_is_current() {
     [[ "$SSH_TARGET" == "$target" && "$SSH_PORT" == "$port" ]] || return 1
     output=$(remote_auto_command "$alias" version 2>/dev/null) || return 1
     grep -Fq "nns-app-remote-auto $VERSION" <<<"$output"
+}
+
+remote_auto_refresh_configured_app() {
+    local app=$1 alias owner target port
+    validate_app_name "$app"
+    load_cfg "$app"
+    [[ "${REMOTE_MODE:-}" == auto ]] || return 0
+
+    alias=${REMOTE_ALIAS:-}
+    owner=${REMOTE_OWNER_ID:-}
+    [[ -n "$alias" && -n "$owner" ]] ||
+        die "Automatic-remote metadata is incomplete for '$app'."
+
+    # The registered remote record is the authoritative endpoint for an
+    # existing automatic-remote app.  It also preserves a non-default SSH
+    # port, which must not be guessed during an engine-wide refresh.
+    load_remote_cfg "$alias"
+    target=$SSH_TARGET
+    port=$SSH_PORT
+
+    if remote_auto_is_current "$alias" "$target" "$port"; then
+        log "Automatic remote '$target' for '$app' already runs nns-app $VERSION."
+        return 0
+    fi
+
+    log "Updating automatic remote '$target' for '$app' to nns-app $VERSION..."
+    remote_auto_bootstrap "$app" "$target" "$port" "$alias" "$owner"
+    remote_auto_register "$alias" "$target" "$port" "$(remote_dir "$alias")/id_ed25519"
+    log "Updated automatic remote '$target' for '$app' to nns-app $VERSION."
+}
+
+remote_auto_refresh_configured_nodes() {
+    require_root
+    local dir app file found=0 failures=0
+    shopt -s nullglob
+
+    # Do not source every application configuration merely to discover remote
+    # apps.  The exact REMOTE_MODE assignment is generated by nns-app itself;
+    # only matching files are handed to the fully validating loader below.
+    for dir in "$BASE_DIR"/*; do
+        [[ -d "$dir" ]] || continue
+        app=$(basename "$dir")
+        file=$(cfg_file "$app")
+        [[ -f "$file" ]] || continue
+        grep -Eq '^REMOTE_MODE=(auto|"auto")$' "$file" 2>/dev/null || continue
+        found=1
+
+        # A stale/unreachable remote must not roll back a successful local
+        # package upgrade.  Keep processing other nodes and report every
+        # failure prominently; the next plain `install` retries them.
+        if ! ( remote_auto_refresh_configured_app "$app" ); then
+            warn "Could not update the automatic remote configured for '$app'. Local nns-app $VERSION remains installed; retry 'nns-app install' when that remote is reachable."
+            failures=$((failures + 1))
+        fi
+    done
+    shopt -u nullglob
+
+    if (( found == 0 )); then
+        return 0
+    fi
+    if (( failures > 0 )); then
+        warn "$failures automatic-remote node(s) could not be refreshed. Remote status/inventory may be incomplete until they are upgraded."
+    fi
+    return 0
 }
 
 remote_auto_install() {
@@ -9391,6 +9973,23 @@ openvpn_status_diagnosis() {
     fi
 }
 
+status_remote_topology() {
+    local app=$1 alias owner output
+    # Caller already loaded the app configuration.
+    alias=${REMOTE_ALIAS:-}
+    owner=${REMOTE_OWNER_ID:-}
+    printf '\nRemote topology:\n'
+    if [[ -z "$alias" || -z "$owner" ]]; then
+        printf '  unavailable: automatic-remote management metadata is incomplete\n'
+        return 0
+    fi
+    if output=$(remote_auto_command "$alias" topology "$owner" 2>/dev/null); then
+        printf '%s\n' "$output"
+    else
+        printf '  unavailable: remote host is unreachable or its nns-app helper is older than %s\n' "$VERSION"
+    fi
+}
+
 status_app() {
     require_root
     local app=$1
@@ -9656,6 +10255,10 @@ status_app() {
             "$(human_bytes "${rx_bytes:-0}")" "$(human_bytes "${tx_bytes:-0}")"
     fi
 
+    if [[ "${REMOTE_MODE:-}" == auto ]]; then
+        status_remote_topology "$app"
+    fi
+
     if [[ "$health" == ONLINE ]]; then
         print_status_log_cut \
             "Recent successful backend markers:" "$vpn_log" \
@@ -9727,7 +10330,890 @@ list_apps() {
     (( found )) || log "No NNS apps installed."
 }
 
+list_gateway_record_print() {
+    local record=$1 gateway kind state via endpoint active revoked connected source
+    IFS='|' read -r _ gateway kind state via endpoint active revoked connected source <<<"$record"
+    printf '%-22s %-9s %-8s %-20s %-28s %-11s %-9s %s\n' \
+        "$gateway" "$state" "$kind" "$via" "$endpoint" \
+        "${active}/${revoked}" "$connected" "$source"
+}
 
+list_client_record_print() {
+    local record=$1 client status gateway endpoint created connected source
+    IFS='|' read -r _ client status gateway endpoint created connected source <<<"$record"
+    printf '%-24s %-10s %-22s %-28s %-10s %-20s %s\n' \
+        "$client" "$status" "$gateway" "$endpoint" "$connected" "$created" "$source"
+}
+
+list_remote_auto_records() {
+    # $1 is inventory-gateways or inventory-clients. Emit machine-readable
+    # records for automatic-remote apps configured on this local host. A read
+    # failure is represented as a WARN record so list remains useful offline.
+    local operation=$1 dir app alias owner key output
+    declare -A seen=()
+    shopt -s nullglob
+    for dir in "$BASE_DIR"/*; do
+        [[ -d "$dir" ]] || continue
+        app=$(basename "$dir")
+        [[ -f "$(cfg_file "$app")" ]] || continue
+        load_cfg "$app"
+        [[ "${REMOTE_MODE:-}" == auto ]] || continue
+        alias=${REMOTE_ALIAS:-}
+        owner=${REMOTE_OWNER_ID:-}
+        [[ -n "$alias" && -n "$owner" ]] || continue
+        key="$alias|$owner"
+        [[ -z "${seen[$key]+x}" ]] || continue
+        seen[$key]=1
+        if output=$(remote_auto_command "$alias" "$operation" "$owner" 2>/dev/null); then
+            while IFS= read -r record; do
+                [[ -n "$record" ]] || continue
+                # Replace the generic remote source with the local app name;
+                # this is the association users know on the client machine.
+                if [[ "$record" == GATEWAY\|* ]]; then
+                    record=${record%|remote}"|remote:$app"
+                elif [[ "$record" == CLIENT\|* ]]; then
+                    record=${record%|remote}"|remote:$app"
+                fi
+                printf '%s\n' "$record"
+            done <<<"$output"
+        else
+            printf 'WARN|%s|%s\n' "$app" "$operation"
+        fi
+    done
+    shopt -u nullglob
+}
+
+list_gateways_overview() {
+    require_root
+    local dir gateway record found=0 app operation
+    printf '%-22s %-9s %-8s %-20s %-28s %-11s %-9s %s\n' \
+        'Gateway' 'Status' 'Type' 'Via' 'Endpoint' 'Clients A/R' 'Connected' 'Source'
+    printf '%-22s %-9s %-8s %-20s %-28s %-11s %-9s %s\n' \
+        '----------------------' '---------' '--------' '--------------------' \
+        '----------------------------' '-----------' '---------' '----------------'
+
+    shopt -s nullglob
+    for dir in "$GATEWAY_BASE_DIR"/*; do
+        [[ -f "$dir/gateway.cfg" ]] || continue
+        gateway=$(basename "$dir")
+        record=$(gateway_inventory_record "$gateway" local)
+        list_gateway_record_print "$record"
+        found=1
+    done
+    shopt -u nullglob
+
+    while IFS= read -r record; do
+        [[ -n "$record" ]] || continue
+        if [[ "$record" == WARN\|* ]]; then
+            IFS='|' read -r _ app operation <<<"$record"
+            printf '%-22s %-9s %-8s %-20s %-28s %-11s %-9s %s\n' \
+                '-' 'offline' '-' '-' '-' '-' '-' "remote:$app"
+            found=1
+            continue
+        fi
+        list_gateway_record_print "$record"
+        found=1
+    done < <(list_remote_auto_records inventory-gateways)
+
+    (( found )) || log 'No managed gateways configured.'
+}
+
+list_external_clients_overview() {
+    require_root
+    local dir gateway record found=0 app operation
+    printf '%-24s %-10s %-22s %-28s %-10s %-20s %s\n' \
+        'Client' 'Status' 'Gateway' 'Endpoint' 'Connected' 'Created' 'Source'
+    printf '%-24s %-10s %-22s %-28s %-10s %-20s %s\n' \
+        '------------------------' '----------' '----------------------' \
+        '----------------------------' '----------' '--------------------' '----------------'
+
+    shopt -s nullglob
+    for dir in "$GATEWAY_BASE_DIR"/*; do
+        [[ -f "$dir/gateway.cfg" ]] || continue
+        gateway=$(basename "$dir")
+        while IFS= read -r record; do
+            [[ -n "$record" ]] || continue
+            list_client_record_print "$record"
+            found=1
+        done < <(gateway_external_client_records "$gateway" local)
+    done
+    shopt -u nullglob
+
+    while IFS= read -r record; do
+        [[ -n "$record" ]] || continue
+        if [[ "$record" == WARN\|* ]]; then
+            IFS='|' read -r _ app operation <<<"$record"
+            printf '%-24s %-10s %-22s %-28s %-10s %-20s %s\n' \
+                '-' 'offline' '-' '-' '-' '-' "remote:$app"
+            found=1
+            continue
+        fi
+        list_client_record_print "$record"
+        found=1
+    done < <(list_remote_auto_records inventory-clients)
+
+    (( found )) || log 'No external gateway clients configured.'
+}
+
+list_all_objects() {
+    require_root
+    printf 'Applications:\n'
+    list_apps
+    printf '\nGateways:\n'
+    list_gateways_overview
+    printf '\nExternal clients:\n'
+    list_external_clients_overview
+}
+
+
+
+# nns-app source module: conservative state and lifecycle reconciliation.
+#
+# `nns-app repair` fixes only resources whose nns-app ownership can be proven.
+# Ambiguous shared-pool or PKI state is reported and left untouched.
+
+REPAIR_FIXED=0
+REPAIR_WARNINGS=0
+REPAIR_UNRESOLVED=0
+
+repair_fixed() {
+    REPAIR_FIXED=$((REPAIR_FIXED + 1))
+    printf 'REPAIRED: %s\n' "$*"
+}
+
+repair_warning() {
+    REPAIR_WARNINGS=$((REPAIR_WARNINGS + 1))
+    printf 'WARNING: %s\n' "$*" >&2
+}
+
+repair_unresolved() {
+    REPAIR_UNRESOLVED=$((REPAIR_UNRESOLVED + 1))
+    printf 'UNRESOLVED: %s\n' "$*" >&2
+}
+
+# Strict, non-executing reader for automatic-remote state.  All values written
+# by remote_auto_write_state() are deliberately restricted to shell-safe
+# tokens, so repair never needs to `source` a possibly damaged state file.
+repair_remote_state_record() {
+    local file=$1 expected_owner=${2:-}
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    python3 - "$file" "$expected_owner" <<'PY_REPAIR_REMOTE_STATE'
+from __future__ import annotations
+import ipaddress
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+expected = sys.argv[2]
+allowed = {
+    "OWNER_ID", "POOL_ID", "EXIT_APP", "GATEWAY", "CLIENT",
+    "PROVIDER_VPN_IPV4", "PROFILE_SHA256", "ACTIVE",
+}
+values: dict[str, str] = {}
+try:
+    lines = path.read_text(encoding="utf-8").splitlines()
+except OSError:
+    raise SystemExit(1)
+for line in lines:
+    if not line:
+        continue
+    m = re.fullmatch(r"([A-Z0-9_]+)=(.*)", line)
+    if not m or m.group(1) not in allowed or m.group(1) in values:
+        raise SystemExit(1)
+    raw = m.group(2)
+    if raw == "''":
+        value = ""
+    elif re.fullmatch(r"[A-Za-z0-9._:/-]*", raw):
+        value = raw
+    elif len(raw) >= 2 and raw[0] == raw[-1] == "'" and "'" not in raw[1:-1]:
+        value = raw[1:-1]
+    elif len(raw) >= 2 and raw[0] == raw[-1] == '"' and '"' not in raw[1:-1]:
+        value = raw[1:-1]
+    else:
+        raise SystemExit(1)
+    values[m.group(1)] = value
+
+required = {"OWNER_ID", "EXIT_APP", "GATEWAY", "CLIENT"}
+if not required.issubset(values):
+    raise SystemExit(1)
+owner = values["OWNER_ID"]
+pool = values.get("POOL_ID") or owner
+active = values.get("ACTIVE") or "on"
+provider = values.get("PROVIDER_VPN_IPV4", "")
+fingerprint = values.get("PROFILE_SHA256", "")
+if expected and owner != expected:
+    raise SystemExit(1)
+if not re.fullmatch(r"[a-f0-9]{16}", owner) or not re.fullmatch(r"[a-f0-9]{16}", pool):
+    raise SystemExit(1)
+if values["EXIT_APP"] != f"ra-{pool[:12]}-exit":
+    raise SystemExit(1)
+if values["GATEWAY"] != f"ra-{pool[:12]}-gw":
+    raise SystemExit(1)
+if values["CLIENT"] != f"ra-{owner[:12]}-client":
+    raise SystemExit(1)
+if active not in {"on", "off"}:
+    raise SystemExit(1)
+if provider:
+    try:
+        if ipaddress.ip_address(provider).version != 4:
+            raise ValueError
+    except ValueError:
+        raise SystemExit(1)
+if fingerprint and not re.fullmatch(r"[a-f0-9]{64}", fingerprint):
+    raise SystemExit(1)
+print("|".join((owner, pool, values["EXIT_APP"], values["GATEWAY"],
+                values["CLIENT"], provider, fingerprint, active)))
+PY_REPAIR_REMOTE_STATE
+}
+
+repair_state_pool_has_member() {
+    local pool=$1 require_active=${2:-any} file record owner state_pool _exit _gw _client _ip _sha active
+    shopt -s nullglob
+    for file in "$STATE_DIR"/remote-auto/*.cfg; do
+        record=$(repair_remote_state_record "$file" 2>/dev/null || true)
+        [[ -n "$record" ]] || continue
+        IFS='|' read -r owner state_pool _exit _gw _client _ip _sha active <<<"$record"
+        [[ "$state_pool" == "$pool" ]] || continue
+        [[ "$require_active" != active || "$active" == on ]] || continue
+        shopt -u nullglob
+        return 0
+    done
+    shopt -u nullglob
+    return 1
+}
+
+repair_profile_fingerprint_for_exit() {
+    local app=$1 record profile
+    record=$(
+        load_cfg "$app"
+        [[ -n "${DEFAULT_PROFILE:-}" ]] || exit 1
+        profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
+        [[ -f "$profile" && ! -L "$profile" ]] || exit 1
+        sha256sum "$profile" | awk '{print $1}'
+    ) 2>/dev/null || return 1
+    [[ "$record" =~ ^[a-f0-9]{64}$ ]] || return 1
+    printf '%s\n' "$record"
+}
+
+# Reconstruct one missing automatic-remote state file only when its unique
+# deterministic client is found in exactly one consistently owned private
+# gateway.  No PKI or client credential is regenerated here.
+repair_remote_reconstruct_state() {
+    local owner=$1 expected_active=${2:-off} state_file record
+    local expected_client dir gateway candidate="" candidates=0 data pool exit_app marker transport
+    local provider="" fingerprint=""
+    validate_remote_owner_id "$owner"
+    [[ "$expected_active" == on || "$expected_active" == off ]] || return 1
+    state_file=$(remote_auto_state_file "$owner")
+
+    record=$(repair_remote_state_record "$state_file" "$owner" 2>/dev/null || true)
+    if [[ -n "$record" ]]; then
+        IFS='|' read -r RA_OWNER_ID RA_POOL_ID RA_EXIT_APP RA_GATEWAY RA_CLIENT \
+            RA_PROVIDER_VPN_IPV4 RA_PROFILE_SHA256 RA_ACTIVE <<<"$record"
+        # Rewrite through the canonical writer if an old file omitted fields.
+        remote_auto_write_state "$RA_OWNER_ID" "$RA_EXIT_APP" "$RA_GATEWAY" "$RA_CLIENT" \
+            "$RA_POOL_ID" "$RA_PROVIDER_VPN_IPV4" "$RA_PROFILE_SHA256" "$RA_ACTIVE"
+        return 0
+    fi
+
+    expected_client=$(remote_auto_client_name "$owner")
+    shopt -s nullglob
+    for dir in "$GATEWAY_BASE_DIR"/*; do
+        [[ -f "$dir/gateway.cfg" && -f "$dir/clients/$expected_client/client.cfg" ]] || continue
+        gateway=$(basename "$dir")
+        data=$(
+            load_gateway_cfg "$gateway"
+            gateway_client_load "$gateway" "$expected_client"
+            [[ "${STATUS:-}" == active ]] || exit 1
+            printf '%s|%s|%s\n' "${REMOTE_MANAGED_OWNER_ID:-}" "$VIA_APP" "${TRANSPORT:-direct}"
+        ) 2>/dev/null || continue
+        IFS='|' read -r marker exit_app transport <<<"$data"
+        [[ "$transport" == ssh && -f "$(cfg_file "$exit_app")" ]] || continue
+        data=$(
+            load_cfg "$exit_app"
+            printf '%s\n' "${REMOTE_MANAGED_OWNER_ID:-}"
+        ) 2>/dev/null || continue
+        if [[ "$marker" =~ ^[a-f0-9]{16}$ ]]; then
+            pool=$marker
+            [[ -z "$data" || "$data" == "$pool" ]] || continue
+        elif [[ "$data" =~ ^[a-f0-9]{16}$ ]]; then
+            pool=$data
+        else
+            continue
+        fi
+        [[ "$gateway" == "$(remote_auto_gateway_name "$pool")" &&
+           "$exit_app" == "$(remote_auto_exit_name "$pool")" ]] || continue
+        candidate="$pool|$exit_app|$gateway|$expected_client"
+        candidates=$((candidates + 1))
+    done
+    shopt -u nullglob
+
+    if (( candidates != 1 )); then
+        if [[ -e "$state_file" ]]; then
+            repair_unresolved "automatic-remote state for owner '$owner' is invalid and has $candidates unambiguous reconstruction candidate(s); left untouched"
+        else
+            repair_unresolved "automatic-remote state for owner '$owner' is missing and has $candidates unambiguous reconstruction candidate(s)"
+        fi
+        return 1
+    fi
+
+    IFS='|' read -r pool exit_app gateway expected_client <<<"$candidate"
+    data=$( ( load_cfg "$exit_app"; printf '%s\n' "${REMOTE_MANAGED_OWNER_ID:-}" ) 2>/dev/null || true)
+    if [[ -z "$data" ]]; then
+        cfg_set "$exit_app" REMOTE_MANAGED_OWNER_ID "$pool"
+        repair_fixed "adopted missing pool marker on provider exit '$exit_app'"
+    fi
+    data=$( ( load_gateway_cfg "$gateway"; printf '%s\n' "${REMOTE_MANAGED_OWNER_ID:-}" ) 2>/dev/null || true)
+    if [[ -z "$data" ]]; then
+        gateway_cfg_set "$gateway" REMOTE_MANAGED_OWNER_ID "$pool"
+        repair_fixed "adopted missing pool marker on gateway '$gateway'"
+    fi
+
+    provider=$(remote_auto_provider_ipv4 "$exit_app" 2>/dev/null || true)
+    # add_profile() may have applied managed compatibility edits to the stored
+    # provider profile, so hashing it here would not reproduce the original
+    # upload fingerprint. Leave the fingerprint unknown rather than recording
+    # a misleading identity; a later normal deployment can backfill it.
+    fingerprint=""
+    remote_auto_write_state "$owner" "$exit_app" "$gateway" "$expected_client" \
+        "$pool" "$provider" "$fingerprint" "$expected_active"
+    RA_OWNER_ID=$owner RA_POOL_ID=$pool RA_EXIT_APP=$exit_app RA_GATEWAY=$gateway
+    RA_CLIENT=$expected_client RA_PROVIDER_VPN_IPV4=$provider
+    RA_PROFILE_SHA256=$fingerprint RA_ACTIVE=$expected_active
+    repair_fixed "reconstructed automatic-remote state for owner '$owner' from '$gateway/$expected_client'"
+    return 0
+}
+
+repair_gateway_abandoned_certs() {
+    local gateway=$1 pki index server_cn row status serial cn cert backup rc=0 fixed_any=0
+    local cdir
+    load_gateway_cfg "$gateway"
+    pki=$(gateway_pki_dir "$gateway")
+    index="$pki/index.txt"
+    [[ -f "$index" ]] || {
+        repair_unresolved "gateway '$gateway' CA database is missing '$index'"
+        return 1
+    }
+    server_cn=${SERVER_CN:-}
+
+    # Staging directories are protected by the gateway lock. If repair owns the
+    # lock, no issuance transaction can legitimately still be using them.
+    shopt -s nullglob
+    for cdir in "$(gateway_clients_dir "$gateway")"/.*.new.* "$(gateway_dir "$gateway")"/.ca-db.*; do
+        [[ -e "$cdir" ]] || continue
+        rm -rf -- "$cdir"
+        repair_fixed "removed abandoned gateway transaction staging '$(basename "$cdir")' from '$gateway'"
+    done
+    shopt -u nullglob
+
+    while IFS='|' read -r status serial cn; do
+        [[ "$status" == V && -n "$serial" && -n "$cn" ]] || continue
+        [[ "$cn" != "$server_cn" ]] || continue
+        [[ "$cn" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$ ]] || continue
+        [[ ! -f "$(gateway_client_dir "$gateway" "$cn")/client.cfg" ]] || continue
+        cert="$pki/newcerts/${serial}.pem"
+        if [[ ! -f "$cert" ]]; then
+            # OpenSSL can also use lower-case serial filenames depending on CA
+            # tooling; try that without guessing any unrelated certificate.
+            cert="$pki/newcerts/${serial,,}.pem"
+        fi
+        if [[ ! -f "$cert" ]]; then
+            repair_unresolved "gateway '$gateway' has valid CA entry '$cn' serial '$serial' without tracked client metadata or certificate file"
+            continue
+        fi
+        backup=$(mktemp -d "$(gateway_dir "$gateway")/.repair-ca.XXXXXX")
+        if ! gateway_ca_snapshot "$pki" "$backup"; then
+            rm -rf "$backup"
+            repair_unresolved "could not snapshot CA database before revoking abandoned client '$cn' on '$gateway'"
+            continue
+        fi
+        if openssl ca -batch -config "$pki/openssl.cnf" -revoke "$cert" >/dev/null 2>&1 &&
+           gateway_generate_crl_at "$pki"; then
+            rm -rf "$backup"
+            repair_fixed "revoked abandoned certificate '$cn' on gateway '$gateway'"
+            fixed_any=1
+        else
+            gateway_ca_restore "$pki" "$backup" >/dev/null 2>&1 || true
+            rm -rf "$backup"
+            repair_unresolved "failed to revoke abandoned certificate '$cn' on gateway '$gateway'; CA database restored"
+            rc=1
+        fi
+    done < <(awk -F '\t' '
+        $1 == "V" {
+            cn=$6
+            sub(/^.*\/CN=/, "", cn)
+            sub(/\/.*/, "", cn)
+            print $1 "|" $4 "|" cn
+        }
+    ' "$index")
+
+    # OpenVPN reads the CRL file during client verification; replacing the CRL
+    # atomically is enough. Do not restart the service while the gateway lock is
+    # held because ExecStopPost would need the same lock in another process.
+    return "$rc"
+}
+
+repair_gateway_expected_running() {
+    local gateway=$1 marker active_public
+    systemctl is-enabled --quiet "nns-gateway@${gateway}.service" 2>/dev/null && return 0
+    marker=${REMOTE_MANAGED_OWNER_ID:-}
+    [[ "$marker" =~ ^[a-f0-9]{16}$ ]] || return 1
+    if [[ "$gateway" == "$(remote_auto_gateway_name "$marker")" ]]; then
+        repair_state_pool_has_member "$marker" active && return 0
+    elif [[ "$gateway" == "$(remote_auto_public_gateway_name "$marker")" ]]; then
+        active_public=$(remote_auto_public_active_client_count "$marker" 2>/dev/null || printf 0)
+        [[ "$active_public" =~ ^[0-9]+$ ]] && (( active_public > 0 )) && return 0
+    fi
+    return 1
+}
+
+repair_gateway_one() {
+    local gateway=$1 state pid restart_needed=no upstream_ns="" upstream_tun=""
+    local before_ufw=no
+    validate_gateway_name "$gateway"
+    if ! ( load_gateway_cfg "$gateway" ) 2>/dev/null; then
+        repair_unresolved "gateway '$gateway' has an invalid configuration"
+        return 1
+    fi
+    acquire_lock "gateway-$gateway"
+    load_gateway_cfg "$gateway"
+    write_gateway_unit_dropin "$gateway"
+    gateway_write_openssl_config "$gateway" "$(gateway_dir "$gateway")"
+    gateway_write_server_config "$gateway"
+    gateway_write_transport_config "$gateway"
+
+    repair_gateway_abandoned_certs "$gateway" || true
+
+    state=$(systemctl is-active "nns-gateway@${gateway}.service" 2>/dev/null || true)
+    if [[ "$state" == active ]]; then
+        if ufw_is_active && [[ "${TRANSPORT:-direct}" != ssh ]]; then
+            if ufw_public_allow_exists "$LISTEN_PORT" "$LISTEN_PROTO" ||
+               ufw_managed_public_rule_exists "$gateway" "$LISTEN_PORT" "$LISTEN_PROTO"; then
+                before_ufw=yes
+            fi
+        fi
+        if ! gateway_public_firewall_up "$gateway"; then
+            repair_unresolved "could not reconcile host firewall for active gateway '$gateway' ($LISTEN_PORT/$LISTEN_PROTO)"
+        elif [[ "$before_ufw" == no ]] && ufw_is_active && [[ "${TRANSPORT:-direct}" != ssh ]]; then
+            repair_fixed "opened missing UFW port $LISTEN_PORT/$LISTEN_PROTO for active gateway '$gateway'"
+        fi
+
+        pid=$(systemctl show "nns-gateway@${gateway}.service" -p MainPID --value 2>/dev/null || true)
+        ip link show dev "$GATEWAY_TUN" up >/dev/null 2>&1 || restart_needed=yes
+        gateway_listener_ready "${pid:-0}" || restart_needed=yes
+        gateway_policy_ready || restart_needed=yes
+        if [[ "$restart_needed" == yes ]]; then
+            release_lock "gateway-$gateway"
+            if ( gateway_stop "$gateway" >/dev/null 2>&1 ) &&
+               ( gateway_start "$gateway" >/dev/null 2>&1 ); then
+                repair_fixed "restarted stale gateway '$gateway' and rebuilt its data plane"
+                return 0
+            fi
+            repair_unresolved "gateway '$gateway' is configured active but its listener/data plane could not be rebuilt"
+            return 1
+        fi
+    else
+        # A stopped gateway must never retain an nns-app-owned public INPUT
+        # exception. Administrator-owned broad rules are intentionally retained.
+        if ufw_is_active && [[ "${TRANSPORT:-direct}" != ssh ]] &&
+           ufw_managed_public_rule_exists "$gateway" "$LISTEN_PORT" "$LISTEN_PROTO"; then
+            # Older/interrupted releases may have created the tagged UFW rule
+            # before recording the ownership state file. Recreate only that
+            # private marker so the normal exact-delete path can remove it.
+            if [[ ! -e "$(gateway_ufw_state_file "$gateway")" ]]; then
+                : >"$(gateway_ufw_state_file "$gateway")"
+                chmod 0600 "$(gateway_ufw_state_file "$gateway")" 2>/dev/null || true
+            fi
+            if gateway_ufw_public_down "$gateway" "$LISTEN_PORT" "$LISTEN_PROTO"; then
+                repair_fixed "closed stale UFW port $LISTEN_PORT/$LISTEN_PROTO for stopped gateway '$gateway'"
+            else
+                repair_unresolved "could not close stale UFW port for stopped gateway '$gateway'"
+            fi
+        fi
+        gateway_firewalld_public_down "$gateway" "$LISTEN_PORT" "$LISTEN_PROTO" >/dev/null 2>&1 || true
+        gateway_iptables_public_down "$gateway" "$LISTEN_PORT" "$LISTEN_PROTO" >/dev/null 2>&1 || true
+
+        if repair_gateway_expected_running "$gateway"; then
+            release_lock "gateway-$gateway"
+            if ( gateway_start "$gateway" >/dev/null 2>&1 ); then
+                repair_fixed "started gateway '$gateway' because its enabled/active ownership state requires it"
+                return 0
+            fi
+            repair_unresolved "gateway '$gateway' should be running but could not be started"
+            return 1
+        fi
+    fi
+    release_lock "gateway-$gateway"
+    return 0
+}
+
+repair_ufw_orphan_rules() {
+    ufw_is_active || return 0
+    local line spec gateway marker
+    while IFS= read -r line; do
+        [[ "$line" == *"nns-app:gateway:"*":public-input"* ]] || continue
+        gateway=$(sed -n "s/.*nns-app:gateway:\([A-Za-z0-9._-]*\):public-input.*/\1/p" <<<"$line")
+        [[ "$gateway" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]] || continue
+        [[ ! -f "$(gateway_cfg_file "$gateway")" ]] || continue
+        spec=$(awk '{ if ($3=="in") print $4; else print $3 }' <<<"$line")
+        [[ "$spec" =~ ^[1-9][0-9]{0,4}/(tcp|udp)$ ]] || continue
+        marker=$(gateway_public_firewall_comment "$gateway")
+        if ufw delete allow "$spec" comment "$marker" >/dev/null 2>&1; then
+            repair_fixed "removed orphan UFW rule '$spec' for deleted gateway '$gateway'"
+        else
+            repair_unresolved "could not remove orphan UFW rule '$spec' for deleted gateway '$gateway'"
+        fi
+    done < <(LC_ALL=C ufw show added 2>/dev/null || true)
+}
+
+
+repair_orphan_gateway_dirs() {
+    local dir gateway state zone server port proto
+    shopt -s nullglob
+    for dir in "$GATEWAY_BASE_DIR"/*; do
+        [[ -d "$dir" && ! -f "$dir/gateway.cfg" ]] || continue
+        gateway=$(basename "$dir")
+        [[ "$gateway" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]] || continue
+        server="$dir/server.conf"
+        port=""; proto=""
+        if [[ -f "$server" ]]; then
+            port=$(awk '$1=="port" && $2 ~ /^[0-9]+$/ {print $2; exit}' "$server" 2>/dev/null || true)
+            proto=$(awk '$1=="proto" {print $2; exit}' "$server" 2>/dev/null || true)
+            [[ "$proto" == tcp-server || "$proto" == tcp-client ]] && proto=tcp
+            [[ "$proto" == udp || "$proto" == tcp ]] || proto=""
+            [[ "$port" =~ ^[1-9][0-9]{0,4}$ && "$port" -le 65535 ]] || port=""
+        fi
+
+        state="$dir/.host-firewall-firewalld"
+        if [[ -s "$state" ]]; then
+            zone=$(head -n 1 "$state" 2>/dev/null || true)
+            zone=${zone%%|*}
+            if [[ "$zone" =~ ^[A-Za-z0-9_-]+$ && -n "$port" && -n "$proto" ]]; then
+                if firewalld_is_active; then
+                    firewalld_port_remove runtime "$zone" "$port" "$proto" >/dev/null 2>&1 || true
+                    firewalld_port_remove permanent "$zone" "$port" "$proto" >/dev/null 2>&1 || true
+                    if ! firewalld_port_query runtime "$zone" "$port" "$proto" &&
+                       ! firewalld_port_query permanent "$zone" "$port" "$proto"; then
+                        rm -f "$state"
+                        repair_fixed "removed orphan firewalld port $port/$proto for deleted gateway '$gateway'"
+                    else
+                        repair_unresolved "could not remove orphan firewalld port $port/$proto for deleted gateway '$gateway'"
+                    fi
+                elif command -v firewall-offline-cmd >/dev/null 2>&1; then
+                    if firewall-offline-cmd --zone="$zone" --remove-port="$port/$proto" >/dev/null 2>&1; then
+                        rm -f "$state"
+                        repair_fixed "removed persistent orphan firewalld port $port/$proto for deleted gateway '$gateway'"
+                    else
+                        repair_unresolved "could not remove persistent orphan firewalld port $port/$proto for deleted gateway '$gateway'"
+                    fi
+                else
+                    repair_unresolved "gateway '$gateway' is missing its config and owns a firewalld rule, but no firewalld tool is available to remove it"
+                fi
+            else
+                repair_unresolved "gateway directory '$gateway' is missing gateway.cfg and its firewalld ownership state cannot be safely reconstructed"
+            fi
+        fi
+
+        # Tagged fallback iptables access can be removed exactly when the old
+        # server config still proves the listener port/protocol.
+        if [[ -n "$port" && -n "$proto" ]] && command -v iptables >/dev/null 2>&1; then
+            if iptables -w -t filter -C INPUT -p "$proto" --dport "$port" \
+                -m comment --comment "$(gateway_public_firewall_comment "$gateway")" -j ACCEPT \
+                >/dev/null 2>&1; then
+                gateway_iptables_public_down "$gateway" "$port" "$proto" >/dev/null 2>&1 || true
+                if ! iptables -w -t filter -C INPUT -p "$proto" --dport "$port" \
+                    -m comment --comment "$(gateway_public_firewall_comment "$gateway")" -j ACCEPT \
+                    >/dev/null 2>&1; then
+                    repair_fixed "removed orphan iptables INPUT rule $port/$proto for deleted gateway '$gateway'"
+                else
+                    repair_unresolved "could not remove orphan iptables INPUT rule for deleted gateway '$gateway'"
+                fi
+            fi
+        fi
+
+        # Missing gateway.cfg means routing/PKI ownership cannot be proven
+        # sufficiently to reconstruct or delete the remaining directory.
+        if find "$dir" -mindepth 1 -maxdepth 1 ! -name '.host-firewall-ufw' ! -name '.host-firewall-firewalld' -print -quit 2>/dev/null | grep -q .; then
+            repair_unresolved "gateway directory '$gateway' is missing gateway.cfg; firewall was reconciled where possible but PKI/runtime files were preserved"
+        elif [[ -d "$dir" ]]; then
+            rmdir "$dir" 2>/dev/null || true
+        fi
+    done
+    shopt -u nullglob
+}
+
+repair_dangling_systemd_units() {
+    local unit kind name key
+    local -A seen=()
+    while read -r unit _; do
+        [[ -n "$unit" ]] || continue
+        seen["$unit"]=1
+    done < <(systemctl list-units --all --plain --no-legend \
+        'nns-netns@*.service' 'nns-openvpn@*.service' 'nns-online@*.service' \
+        'nns-dns@*.service' 'nns-watchdog@*.service' 'nns-watchdog@*.timer' \
+        'nns-gateway@*.service' 'nns-gateway-crl-refresh@*.service' \
+        'nns-gateway-crl-refresh@*.timer' 2>/dev/null || true)
+    while read -r unit _; do
+        [[ -n "$unit" ]] || continue
+        seen["$unit"]=1
+    done < <(systemctl list-unit-files --no-legend \
+        'nns-netns@*.service' 'nns-openvpn@*.service' 'nns-online@*.service' \
+        'nns-dns@*.service' 'nns-watchdog@*.service' 'nns-watchdog@*.timer' \
+        'nns-gateway@*.service' 'nns-gateway-crl-refresh@*.service' \
+        'nns-gateway-crl-refresh@*.timer' 2>/dev/null || true)
+
+    for unit in "${!seen[@]}"; do
+        case "$unit" in
+            nns-netns@*.service|nns-openvpn@*.service|nns-online@*.service|nns-dns@*.service|nns-watchdog@*.service|nns-watchdog@*.timer)
+                name=${unit#*@}; name=${name%.service}; name=${name%.timer}
+                [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]] || continue
+                [[ -f "$(cfg_file "$name")" ]] && continue
+                systemctl disable --now "$unit" >/dev/null 2>&1 || true
+                rm -rf -- "$(app_dropin_dir "$name")"
+                rm -f -- "/etc/sudoers.d/nns-app-$name"
+                repair_fixed "removed dangling systemd instance '$unit' with no application configuration"
+                ;;
+            nns-gateway@*.service|nns-gateway-crl-refresh@*.service|nns-gateway-crl-refresh@*.timer)
+                name=${unit#*@}; name=${name%.service}; name=${name%.timer}
+                [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]] || continue
+                [[ -f "$(gateway_cfg_file "$name")" ]] && continue
+                systemctl disable --now "$unit" >/dev/null 2>&1 || true
+                rm -rf -- "$(gateway_dropin_dir "$name")"
+                repair_fixed "removed dangling systemd instance '$unit' with no gateway configuration"
+                ;;
+        esac
+    done
+    systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+repair_local_ssh_forward() {
+    local app=$1 local_port ns active_ns=no listener=no
+    load_cfg "$app"
+    [[ "${TRANSPORT_TYPE:-direct}" == ssh ]] || return 0
+    [[ "${TRANSPORT_LOCAL_PORT:-}" =~ ^[1-9][0-9]{0,4}$ ]] || {
+        repair_unresolved "automatic-remote app '$app' has invalid local SSH-forward port metadata"
+        return 1
+    }
+    local_port=$TRANSPORT_LOCAL_PORT
+    ns=$NS_NAME
+    systemctl is-active --quiet "nns-netns@${app}.service" && active_ns=yes
+    [[ "$active_ns" == yes ]] || return 0
+    if ip netns exec "$ns" ss -H -lnt 2>/dev/null |
+       grep -Eq "127\\.0\\.0\\.1:${local_port}([[:space:]]|$)"; then
+        listener=yes
+    fi
+    if [[ "$listener" == yes && $(systemctl is-active "nns-openvpn@${app}.service" 2>/dev/null || true) == active ]]; then
+        return 0
+    fi
+
+    systemctl stop "nns-online@${app}.service" >/dev/null 2>&1 || true
+    if systemctl restart "nns-openvpn@${app}.service" >/dev/null 2>&1; then
+        local deadline=$((SECONDS + 10))
+        while (( SECONDS < deadline )); do
+            if ip netns exec "$ns" ss -H -lnt 2>/dev/null |
+               grep -Eq "127\\.0\\.0\\.1:${local_port}([[:space:]]|$)"; then
+                systemctl start "nns-online@${app}.service" >/dev/null 2>&1 || true
+                repair_fixed "restarted dead SSH forward for app '$app' on 127.0.0.1:$local_port"
+                return 0
+            fi
+            sleep 0.2
+        done
+    fi
+    repair_unresolved "SSH forward for running app '$app' is still unavailable on 127.0.0.1:$local_port"
+    return 1
+}
+
+repair_remote_owned_orphans() {
+    # Remove only remote-managed provider exits that are referenced by neither
+    # valid automatic-remote state nor any configured gateway. This safely
+    # catches failed/duplicate candidate exits without guessing shared pools.
+    local dir app marker referenced=no file record _owner _pool exit_ref _gw _client _ip _sha _active deps
+    shopt -s nullglob
+    for dir in "$BASE_DIR"/*; do
+        [[ -d "$dir" ]] || continue
+        app=$(basename "$dir")
+        [[ "$app" =~ ^ra-[a-f0-9]{12}-exit$ && -f "$(cfg_file "$app")" ]] || continue
+        marker=$( ( load_cfg "$app"; printf '%s\n' "${REMOTE_MANAGED_OWNER_ID:-}" ) 2>/dev/null || true)
+        [[ "$marker" =~ ^[a-f0-9]{16}$ && "$app" == "$(remote_auto_exit_name "$marker")" ]] || continue
+        referenced=no
+        for file in "$STATE_DIR"/remote-auto/*.cfg; do
+            record=$(repair_remote_state_record "$file" 2>/dev/null || true)
+            [[ -n "$record" ]] || continue
+            IFS='|' read -r _owner _pool exit_ref _gw _client _ip _sha _active <<<"$record"
+            if [[ "$exit_ref" == "$app" ]]; then referenced=yes; break; fi
+        done
+        [[ "$referenced" == no ]] || continue
+        deps=$(gateways_using_app "$app" | paste -sd ',' -)
+        [[ -z "$deps" ]] || continue
+        if ( remove_app "$app" local-only >/dev/null 2>&1 ); then
+            repair_fixed "removed unreferenced remote-managed provider exit '$app' (failed/duplicate orphan)"
+        else
+            repair_unresolved "could not remove unreferenced remote-managed provider exit '$app'"
+        fi
+    done
+    shopt -u nullglob
+}
+
+repair_detect_duplicate_exits() {
+    local file record owner pool exit_app gw client ip sha active key previous
+    local -A seen=()
+    shopt -s nullglob
+    for file in "$STATE_DIR"/remote-auto/*.cfg; do
+        record=$(repair_remote_state_record "$file" 2>/dev/null || true)
+        [[ -n "$record" ]] || continue
+        IFS='|' read -r owner pool exit_app gw client ip sha active <<<"$record"
+        [[ -n "$ip" ]] || continue
+        key="$ip"
+        previous=${seen[$key]-}
+        if [[ -n "$previous" && "$previous" != "$exit_app" ]]; then
+            repair_unresolved "duplicate managed provider exits '$previous' and '$exit_app' report provider-side VPN address '$ip'; both are referenced, so repair will not merge them automatically"
+        else
+            seen[$key]=$exit_app
+        fi
+    done
+    shopt -u nullglob
+}
+
+remote_auto_repair_internal() {
+    require_root
+    local owner=$1 expected_active=${2:-off} public_gateway
+    validate_remote_owner_id "$owner"
+    [[ "$expected_active" == on || "$expected_active" == off ]] ||
+        die "_remote-auto repair active state must be on or off."
+
+    REPAIR_FIXED=0 REPAIR_WARNINGS=0 REPAIR_UNRESOLVED=0
+    acquire_lock remote-auto-pools
+    if repair_remote_reconstruct_state "$owner" "$expected_active"; then
+        # The canonical file is now safe for the regular state loader.
+        remote_auto_load_state "$owner"
+        if [[ "$RA_ACTIVE" != "$expected_active" ]]; then
+            remote_auto_write_state "$owner" "$RA_EXIT_APP" "$RA_GATEWAY" "$RA_CLIENT" \
+                "$RA_POOL_ID" "$RA_PROVIDER_VPN_IPV4" "$RA_PROFILE_SHA256" "$expected_active"
+            RA_ACTIVE=$expected_active
+            repair_fixed "synchronized automatic-remote active state for owner '$owner' to '$expected_active'"
+        fi
+        if [[ -f "$(gateway_cfg_file "$RA_GATEWAY")" ]]; then
+            repair_gateway_one "$RA_GATEWAY" || true
+        else
+            repair_unresolved "private gateway '$RA_GATEWAY' referenced by owner '$owner' is missing"
+        fi
+        public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID")
+        if [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
+            repair_gateway_one "$public_gateway" || true
+        fi
+    fi
+    repair_remote_owned_orphans
+    repair_detect_duplicate_exits
+    repair_ufw_orphan_rules
+    repair_orphan_gateway_dirs
+    repair_dangling_systemd_units
+    release_lock remote-auto-pools
+
+    printf 'Repair summary: repaired=%s warnings=%s unresolved=%s\n' \
+        "$REPAIR_FIXED" "$REPAIR_WARNINGS" "$REPAIR_UNRESOLVED"
+    (( REPAIR_UNRESOLVED == 0 ))
+}
+
+repair_local_gateways() {
+    local dir gateway
+    shopt -s nullglob
+    for dir in "$GATEWAY_BASE_DIR"/*; do
+        [[ -f "$dir/gateway.cfg" ]] || continue
+        gateway=$(basename "$dir")
+        repair_gateway_one "$gateway" || true
+    done
+    shopt -u nullglob
+}
+
+repair_local_apps() {
+    local dir app
+    shopt -s nullglob
+    for dir in "$BASE_DIR"/*; do
+        [[ -d "$dir" ]] || continue
+        app=$(basename "$dir")
+        [[ -f "$(cfg_file "$app")" ]] || continue
+        if ! ( load_cfg "$app" ) 2>/dev/null; then
+            repair_unresolved "application '$app' has an invalid configuration"
+            continue
+        fi
+        load_cfg "$app"
+        write_app_unit_dropin "$app"
+        write_sudoers_for_app "$app" "$APP_USER"
+        sync_watchdog_timer "$app"
+        repair_local_ssh_forward "$app" || true
+    done
+    shopt -u nullglob
+}
+
+repair_configured_remotes() {
+    local dir app alias owner expected_active target port
+    shopt -s nullglob
+    for dir in "$BASE_DIR"/*; do
+        [[ -d "$dir" ]] || continue
+        app=$(basename "$dir")
+        [[ -f "$(cfg_file "$app")" ]] || continue
+        if ! ( load_cfg "$app" ) 2>/dev/null; then
+            continue
+        fi
+        load_cfg "$app"
+        [[ "${REMOTE_MODE:-}" == auto ]] || continue
+        alias=${REMOTE_ALIAS:-}; owner=${REMOTE_OWNER_ID:-}
+        if [[ -z "$alias" || -z "$owner" || ! -f "$(remote_cfg_file "$alias")" ]]; then
+            repair_unresolved "automatic-remote metadata/SSH registration is incomplete for '$app'"
+            continue
+        fi
+        expected_active=off
+        if app_is_started "$app" ||
+           systemctl is-active --quiet "nns-netns@${app}.service" 2>/dev/null ||
+           systemctl is-active --quiet "nns-openvpn@${app}.service" 2>/dev/null ||
+           [[ -f "$RUN_DIR/${app}.profile" ]]; then
+            expected_active=on
+        fi
+
+        if ! ( remote_auto_refresh_configured_app "$app" >/dev/null 2>&1 ); then
+            repair_unresolved "remote node for '$app' could not be upgraded/contacted; remote repair skipped"
+            continue
+        fi
+        load_cfg "$app"
+        alias=$REMOTE_ALIAS owner=$REMOTE_OWNER_ID
+        printf 'Remote repair for %s:\n' "$app"
+        if remote_auto_command "$alias" repair "$owner" "$expected_active"; then
+            :
+        else
+            repair_unresolved "remote reconciliation for '$app' reported unresolved problems"
+        fi
+    done
+    shopt -u nullglob
+}
+
+repair_engine() {
+    require_root
+    assert_destructive_command_from_host "repair nns-app"
+    local mode=${1:-remote}
+    [[ "$mode" == remote || "$mode" == local-only ]] || die "Unsupported repair mode '$mode'."
+    REPAIR_FIXED=0 REPAIR_WARNINGS=0 REPAIR_UNRESOLVED=0
+
+    log "Checking nns-app state and owned resources..."
+    if [[ "$mode" == remote ]]; then
+        repair_configured_remotes
+    else
+        log "Remote automatic nodes skipped (--local-only)."
+    fi
+    repair_local_apps
+    repair_local_gateways
+    repair_ufw_orphan_rules
+    repair_orphan_gateway_dirs
+    repair_dangling_systemd_units
+
+    printf 'Repair summary: repaired=%s warnings=%s unresolved=%s\n' \
+        "$REPAIR_FIXED" "$REPAIR_WARNINGS" "$REPAIR_UNRESOLVED"
+    if (( REPAIR_UNRESOLVED > 0 )); then
+        warn "Repair completed with unresolved items; ambiguous/destructive recovery was intentionally not attempted."
+        return 1
+    fi
+    return 0
+}
 
 # nns-app source module: CLI parser and source-only guard.
 main() {
@@ -9860,7 +11346,9 @@ main() {
     case "$cmd" in
         install)
             if (( $# == 1 )); then
-                install_engine
+                install_engine on
+            elif (( $# == 2 )) && [[ "$2" == --local-only ]]; then
+                install_engine off
             else
                 local install_app_name=$2 install_via="__default__" install_backend="__default__"
                 local install_remote="" install_remote_port=22
@@ -9960,9 +11448,37 @@ main() {
                 die "Usage: nns-app purge [--local-only]"
             fi
             ;;
+        repair)
+            if [[ $# -eq 1 ]]; then
+                repair_engine remote
+            elif [[ $# -eq 2 && "$2" == --local-only ]]; then
+                repair_engine local-only
+            else
+                die "Usage: nns-app repair [--local-only]"
+            fi
+            ;;
         list)
-            [[ $# -eq 1 ]] || die "Usage: nns-app list"
-            list_apps
+            case "${2:-apps}" in
+                apps)
+                    [[ $# -le 2 ]] || die "Usage: nns-app list [all|gateway|clients]"
+                    list_apps
+                    ;;
+                all)
+                    [[ $# -eq 2 ]] || die "Usage: nns-app list all"
+                    list_all_objects
+                    ;;
+                gateway|gateways)
+                    [[ $# -eq 2 ]] || die "Usage: nns-app list gateway"
+                    list_gateways_overview
+                    ;;
+                client|clients)
+                    [[ $# -eq 2 ]] || die "Usage: nns-app list clients"
+                    list_external_clients_overview
+                    ;;
+                *)
+                    die "Usage: nns-app list [all|gateway|clients]"
+                    ;;
+            esac
             ;;
         status)
             [[ $# -eq 2 ]] || die "Usage: nns-app status <app_name>"

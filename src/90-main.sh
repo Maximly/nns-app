@@ -129,7 +129,9 @@ main() {
     case "$cmd" in
         install)
             if (( $# == 1 )); then
-                install_engine
+                install_engine on
+            elif (( $# == 2 )) && [[ "$2" == --local-only ]]; then
+                install_engine off
             else
                 local install_app_name=$2 install_via="__default__" install_backend="__default__"
                 local install_remote="" install_remote_port=22
@@ -229,9 +231,37 @@ main() {
                 die "Usage: nns-app purge [--local-only]"
             fi
             ;;
+        repair)
+            if [[ $# -eq 1 ]]; then
+                repair_engine remote
+            elif [[ $# -eq 2 && "$2" == --local-only ]]; then
+                repair_engine local-only
+            else
+                die "Usage: nns-app repair [--local-only]"
+            fi
+            ;;
         list)
-            [[ $# -eq 1 ]] || die "Usage: nns-app list"
-            list_apps
+            case "${2:-apps}" in
+                apps)
+                    [[ $# -le 2 ]] || die "Usage: nns-app list [all|gateway|clients]"
+                    list_apps
+                    ;;
+                all)
+                    [[ $# -eq 2 ]] || die "Usage: nns-app list all"
+                    list_all_objects
+                    ;;
+                gateway|gateways)
+                    [[ $# -eq 2 ]] || die "Usage: nns-app list gateway"
+                    list_gateways_overview
+                    ;;
+                client|clients)
+                    [[ $# -eq 2 ]] || die "Usage: nns-app list clients"
+                    list_external_clients_overview
+                    ;;
+                *)
+                    die "Usage: nns-app list [all|gateway|clients]"
+                    ;;
+            esac
             ;;
         status)
             [[ $# -eq 2 ]] || die "Usage: nns-app status <app_name>"

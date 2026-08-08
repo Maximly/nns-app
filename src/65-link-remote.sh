@@ -1917,7 +1917,8 @@ remote_auto_public_export_internal() {
         "$client" "$pool_id" "$active_count" >&2
     printf '# Public endpoint: %s:%s/%s\n' \
         "$PUBLIC_HOST" "$PUBLIC_PORT" "$LISTEN_PROTO" >&2
-    warn "Ensure the remote host firewall, cloud security group, and upstream NAT allow $LISTEN_PROTO port $LISTEN_PORT."
+    log "Remote host firewall access for $LISTEN_PORT/$LISTEN_PROTO is managed by nns-app while the public gateway is running." >&2
+    warn "External cloud security groups and upstream NAT/router forwarding must still allow $LISTEN_PROTO port $LISTEN_PORT."
 
     gateway_client_export "$gateway" "$client" - ovpn
     release_lock remote-auto-pools
@@ -1972,19 +1973,118 @@ remote_auto_locate_internal() {
     printf '%s|%s|%s|%s|%s|%s\n'         "$RA_EXIT_APP" "$RA_GATEWAY" "$RA_CLIENT" "$RA_POOL_ID"         "$RA_PROVIDER_VPN_IPV4" "$members"
 }
 
-remote_auto_status_internal() {
+remote_auto_topology_internal() {
     require_root
-    local owner=$1 members
+    local owner=$1 members exit_state private_state public_gateway public_state
+    local private_counts private_total private_active private_revoked private_connected
+    local public_counts="0|0|0" public_total=0 public_active=0 public_revoked=0 public_connected=0
+    local public_endpoint="-" dir client connected
+
     remote_auto_load_state "$owner"
     members=$(remote_auto_pool_member_count "$RA_POOL_ID")
-    printf 'Automatic owner:    %s\n' "$owner"
+    exit_state=stopped
+    app_is_started "$RA_EXIT_APP" && exit_state=started
+
+    private_state=$(systemctl is-active "nns-gateway@${RA_GATEWAY}.service" 2>/dev/null || true)
+    [[ "$private_state" == active ]] || private_state=stopped
+    if [[ -f "$(gateway_cfg_file "$RA_GATEWAY")" ]]; then
+        private_counts=$(gateway_client_counts "$RA_GATEWAY")
+        IFS='|' read -r private_total private_active private_revoked <<<"$private_counts"
+        private_connected=$(gateway_connected_client_count "$RA_GATEWAY")
+    else
+        private_total=0 private_active=0 private_revoked=0 private_connected=0
+    fi
+
+    public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID")
+    if [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
+        load_gateway_cfg "$public_gateway"
+        public_state=$(systemctl is-active "nns-gateway@${public_gateway}.service" 2>/dev/null || true)
+        [[ "$public_state" == active ]] || public_state=stopped
+        public_endpoint="${PUBLIC_HOST}:${PUBLIC_PORT}/${LISTEN_PROTO}"
+        public_counts=$(gateway_client_counts "$public_gateway")
+        IFS='|' read -r public_total public_active public_revoked <<<"$public_counts"
+        public_connected=$(gateway_connected_client_count "$public_gateway")
+    else
+        public_state=none
+    fi
+
     printf 'Remote pool:        %s\n' "$RA_POOL_ID"
-    printf 'Pool clients:       %s\n' "$members"
-    printf 'Provider VPN IPv4:  %s\n' "${RA_PROVIDER_VPN_IPV4:-unknown}"
-    printf 'Remote exit app:    %s\n' "$RA_EXIT_APP"
-    printf 'Remote gateway:     %s\n' "$RA_GATEWAY"
+    printf 'Pool members:       %s\n' "$members"
+    printf 'Provider exit:      %s (%s; VPN IPv4=%s)\n' \
+        "$RA_EXIT_APP" "$exit_state" "${RA_PROVIDER_VPN_IPV4:-unknown}"
+    printf 'Private gateway:    %s (%s; clients=%s active/%s revoked; connected=%s)\n' \
+        "$RA_GATEWAY" "$private_state" "$private_active" "$private_revoked" "$private_connected"
+    if [[ "$public_state" == none ]]; then
+        printf 'Public gateway:     none\n'
+        printf 'External clients:   0\n'
+        return 0
+    fi
+
+    printf 'Public gateway:     %s (%s; %s)\n' \
+        "$public_gateway" "$public_state" "$public_endpoint"
+    printf 'External clients:   %s active/%s revoked; connected=%s\n' \
+        "$public_active" "$public_revoked" "$public_connected"
+
+    if (( public_total > 0 )); then
+        printf '\nExternal client details:\n'
+        printf '%-24s %-10s %-10s %s\n' \
+            'Client' 'Status' 'Connected' 'Created'
+        printf '%-24s %-10s %-10s %s\n' \
+            '------------------------' '----------' '----------' '--------------------'
+        shopt -s nullglob
+        for dir in "$(gateway_clients_dir "$public_gateway")"/*; do
+            [[ -f "$dir/client.cfg" ]] || continue
+            client=$(basename "$dir")
+            gateway_client_load "$public_gateway" "$client" 2>/dev/null || continue
+            connected=no
+            if [[ "${STATUS:-unknown}" == active ]] &&
+               gateway_client_is_connected "$public_gateway" "$client"; then
+                connected=yes
+            fi
+            printf '%-24s %-10s %-10s %s\n' \
+                "$client" "${STATUS:-unknown}" "$connected" "${CREATED_AT:-unknown}"
+        done
+        shopt -u nullglob
+    fi
+}
+
+remote_auto_inventory_gateways_internal() {
+    require_root
+    local owner=$1 public_gateway
+    remote_auto_load_state "$owner"
+    if [[ -f "$(gateway_cfg_file "$RA_GATEWAY")" ]]; then
+        gateway_inventory_record "$RA_GATEWAY" "remote"
+    fi
+    public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID")
+    if [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
+        gateway_inventory_record "$public_gateway" "remote"
+    fi
+}
+
+remote_auto_inventory_clients_internal() {
+    require_root
+    local owner=$1 public_gateway
+    remote_auto_load_state "$owner"
+    public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID")
+    [[ -f "$(gateway_cfg_file "$public_gateway")" ]] || return 0
+    gateway_external_client_records "$public_gateway" "remote"
+}
+
+remote_auto_status_internal() {
+    require_root
+    local owner=$1
+    remote_auto_load_state "$owner"
+    printf 'Automatic owner:    %s\n' "$owner"
     printf 'Remote client:      %s\n\n' "$RA_CLIENT"
+    remote_auto_topology_internal "$owner"
+    printf '\nPrivate gateway status:\n'
     gateway_status "$RA_GATEWAY"
+    local public_gateway
+    public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID")
+    if [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
+        printf '\nPublic gateway status:\n'
+        gateway_status "$public_gateway"
+    fi
 }
 
 remote_auto_start_internal() {
@@ -2262,6 +2362,18 @@ remote_auto_dispatch() {
             [[ $# -eq 1 ]] || die "_remote-auto status requires owner."
             remote_auto_status_internal "$1"
             ;;
+        topology)
+            [[ $# -eq 1 ]] || die "_remote-auto topology requires owner."
+            remote_auto_topology_internal "$1"
+            ;;
+        inventory-gateways)
+            [[ $# -eq 1 ]] || die "_remote-auto inventory-gateways requires owner."
+            remote_auto_inventory_gateways_internal "$1"
+            ;;
+        inventory-clients)
+            [[ $# -eq 1 ]] || die "_remote-auto inventory-clients requires owner."
+            remote_auto_inventory_clients_internal "$1"
+            ;;
         locate)
             [[ $# -eq 1 ]] || die "_remote-auto locate requires owner."
             remote_auto_locate_internal "$1"
@@ -2277,6 +2389,10 @@ remote_auto_dispatch() {
         cleanup)
             [[ $# -eq 1 ]] || die "_remote-auto cleanup requires owner."
             remote_auto_cleanup_internal "$1"
+            ;;
+        repair)
+            [[ $# -eq 2 ]] || die "_remote-auto repair requires owner and expected active state."
+            remote_auto_repair_internal "$1" "$2"
             ;;
         *) die "Unsupported automatic-remote operation '$action'." ;;
     esac
@@ -2387,7 +2503,7 @@ remote_auto_bootstrap() {
         die "Cannot upload the automatic-remote public key to '$target'."
     fi
 
-    printf -v command '%s' "set -e; umask 077; mkdir -p \"\$HOME/.ssh\"; touch \"\$HOME/.ssh/authorized_keys\"; chmod 700 \"\$HOME/.ssh\"; chmod 600 \"\$HOME/.ssh/authorized_keys\"; key=\$(awk '{print \$1\" \"\$2}' '$remote_pub'); grep -Fq \"\$key\" \"\$HOME/.ssh/authorized_keys\" || printf '\\nrestrict,port-forwarding %s nns-app-auto-$owner\\n' \"\$key\" >>\"\$HOME/.ssh/authorized_keys\"; sudo /bin/bash '$remote_tmp' install; sudo /bin/bash '$remote_tmp' _remote-auto-authorize \"\$(id -un)\"; rm -f '$remote_tmp' '$remote_pub'"
+    printf -v command '%s' "set -e; umask 077; mkdir -p \"\$HOME/.ssh\"; touch \"\$HOME/.ssh/authorized_keys\"; chmod 700 \"\$HOME/.ssh\"; chmod 600 \"\$HOME/.ssh/authorized_keys\"; key=\$(awk '{print \$1\" \"\$2}' '$remote_pub'); grep -Fq \"\$key\" \"\$HOME/.ssh/authorized_keys\" || printf '\\nrestrict,port-forwarding %s nns-app-auto-$owner\\n' \"\$key\" >>\"\$HOME/.ssh/authorized_keys\"; sudo /bin/bash '$remote_tmp' install --local-only; sudo /bin/bash '$remote_tmp' _remote-auto-authorize \"\$(id -un)\"; rm -f '$remote_tmp' '$remote_pub'"
     if ! remote_auto_user_exec "$user" ssh -tt \
         -o "ControlPath=$control" -p "$port" "$target" "$command"; then
         remote_auto_user_exec "$user" ssh \
@@ -2440,6 +2556,70 @@ remote_auto_is_current() {
     [[ "$SSH_TARGET" == "$target" && "$SSH_PORT" == "$port" ]] || return 1
     output=$(remote_auto_command "$alias" version 2>/dev/null) || return 1
     grep -Fq "nns-app-remote-auto $VERSION" <<<"$output"
+}
+
+remote_auto_refresh_configured_app() {
+    local app=$1 alias owner target port
+    validate_app_name "$app"
+    load_cfg "$app"
+    [[ "${REMOTE_MODE:-}" == auto ]] || return 0
+
+    alias=${REMOTE_ALIAS:-}
+    owner=${REMOTE_OWNER_ID:-}
+    [[ -n "$alias" && -n "$owner" ]] ||
+        die "Automatic-remote metadata is incomplete for '$app'."
+
+    # The registered remote record is the authoritative endpoint for an
+    # existing automatic-remote app.  It also preserves a non-default SSH
+    # port, which must not be guessed during an engine-wide refresh.
+    load_remote_cfg "$alias"
+    target=$SSH_TARGET
+    port=$SSH_PORT
+
+    if remote_auto_is_current "$alias" "$target" "$port"; then
+        log "Automatic remote '$target' for '$app' already runs nns-app $VERSION."
+        return 0
+    fi
+
+    log "Updating automatic remote '$target' for '$app' to nns-app $VERSION..."
+    remote_auto_bootstrap "$app" "$target" "$port" "$alias" "$owner"
+    remote_auto_register "$alias" "$target" "$port" "$(remote_dir "$alias")/id_ed25519"
+    log "Updated automatic remote '$target' for '$app' to nns-app $VERSION."
+}
+
+remote_auto_refresh_configured_nodes() {
+    require_root
+    local dir app file found=0 failures=0
+    shopt -s nullglob
+
+    # Do not source every application configuration merely to discover remote
+    # apps.  The exact REMOTE_MODE assignment is generated by nns-app itself;
+    # only matching files are handed to the fully validating loader below.
+    for dir in "$BASE_DIR"/*; do
+        [[ -d "$dir" ]] || continue
+        app=$(basename "$dir")
+        file=$(cfg_file "$app")
+        [[ -f "$file" ]] || continue
+        grep -Eq '^REMOTE_MODE=(auto|"auto")$' "$file" 2>/dev/null || continue
+        found=1
+
+        # A stale/unreachable remote must not roll back a successful local
+        # package upgrade.  Keep processing other nodes and report every
+        # failure prominently; the next plain `install` retries them.
+        if ! ( remote_auto_refresh_configured_app "$app" ); then
+            warn "Could not update the automatic remote configured for '$app'. Local nns-app $VERSION remains installed; retry 'nns-app install' when that remote is reachable."
+            failures=$((failures + 1))
+        fi
+    done
+    shopt -u nullglob
+
+    if (( found == 0 )); then
+        return 0
+    fi
+    if (( failures > 0 )); then
+        warn "$failures automatic-remote node(s) could not be refreshed. Remote status/inventory may be incomplete until they are upgraded."
+    fi
+    return 0
 }
 
 remote_auto_install() {

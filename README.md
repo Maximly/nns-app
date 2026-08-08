@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.25
+**Release:** 1.3.30
 
 **Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
@@ -20,6 +20,13 @@ Install nns-app once on the local Linux host:
 chmod +x nns-app-install.sh
 sudo ./nns-app-install.sh install
 ```
+
+On upgrades, this plain `install` also checks every automatic-remote app already
+configured on the machine and upgrades its directly managed remote nns-app node
+to the same version. A stale node may require the normal SSH and remote `sudo`
+credentials used during its original bootstrap. If a remote is deliberately
+offline, use `sudo ./nns-app-install.sh install --local-only`; a later plain
+`install` retries remote synchronization.
 
 Then choose one of the following two alternatives. Use a different application
 name if you want to keep both configurations on the same client.
@@ -110,10 +117,13 @@ use `--proto tcp` or `--proto udp` to force a protocol. Once a public gateway
 exists, later exports reuse its current host, port, and protocol unless an
 override is supplied.
 
-The public endpoint must be reachable by the external client. Ensure the
-remote host firewall, cloud security group, and any upstream NAT/router allow
-the selected port. nns-app can configure the OpenVPN listener but cannot modify
-an external cloud security group or router.
+The public endpoint must be reachable by the external client. While a public
+gateway is running, nns-app automatically opens its TCP/UDP listener in an
+active UFW or firewalld configuration; on hosts without either manager it uses
+a tagged iptables INPUT rule. The nns-app-owned rule is removed again when the
+gateway stops or is removed. Pre-existing administrator firewall rules are
+left untouched. External cloud security groups and upstream NAT/router port
+forwarding are outside the host and still need to allow the selected port.
 
 Each exported client receives a separate certificate, private key, and TLS
 Crypt v2 key. Revoke one without affecting the other clients:
@@ -648,17 +658,35 @@ deployments.
 
 ## Status commands
 
-List all application environments:
+List application environments (the default remains app-only):
 
 ```bash
 nns-app list
 ```
+
+Use the extended inventory views when gateways or exported clients matter:
+
+```bash
+nns-app list all       # apps, gateways, external clients
+nns-app list gateway   # gateways only
+nns-app list clients   # externally exported gateway clients only
+```
+
+For automatic-remote apps these inventory views also query the associated
+remote pool. Remote rows are marked with the local app that owns the
+management relationship; an unreachable remote is shown as offline instead of
+making the local inventory fail. `list clients` excludes the private SSH
+gateway identity used internally between nns-app hosts.
 
 Show a detailed report:
 
 ```bash
 nns-app status my-private-app
 ```
+
+For automatic-remote apps, `status` also includes a concise remote topology:
+the provider exit, shared-pool member count, private gateway, public gateway,
+and exported client state/connection information.
 
 Show the IP and route for the current shell context:
 
@@ -786,8 +814,12 @@ Remove the gateway and all of its private material:
 sudo nns-app gateway remove my-relay
 ```
 
-The gateway does not automatically open the host firewall or configure an
-external router. Permit or forward the selected TCP/UDP port separately.
+nns-app automatically opens the gateway listener in the active host firewall
+(UFW or firewalld, with a tagged iptables fallback) while the gateway is
+running, and removes only the rule it owns when the gateway stops or is
+removed. It does not modify external cloud security groups or configure an
+upstream router/NAT; forward or permit the selected TCP/UDP port there when
+needed.
 
 ### DPI-resistant gateway transports
 
@@ -1040,6 +1072,19 @@ sudo nns-app gateway start my-relay
 The installer prints a warning when it detects a running gateway that requires
 that migration restart.
 
+
+### Repair and reconciliation
+
+`nns-app repair` performs a conservative consistency pass over nns-app-owned state. It can reconstruct an automatic-remote state file when the deterministic gateway/client ownership is unambiguous, restart a dead SSH forward or stale gateway that is expected to be running, revoke valid CA certificates that have no tracked client, remove failed/unreferenced automatic provider exits, remove dangling nns-app systemd instances, and reconcile nns-app-owned public firewall rules (including UFW ports). Ambiguous shared-pool or PKI cases are reported as `UNRESOLVED` and left untouched.
+
+```bash
+sudo nns-app repair
+# Do not contact/reconcile configured automatic-remote nodes:
+sudo nns-app repair --local-only
+```
+
+The command never removes an administrator-owned broad firewall rule. Remote nodes are upgraded to the current nns-app version before their repair pass.
+
 ## Troubleshooting
 
 Application environment:
@@ -1083,7 +1128,7 @@ sudo ip netns exec nns-my-remote-exit iptables-save
 - IPv4 client data paths only.
 - Ubuntu and Fedora with systemd are supported; other distributions require manual dependency and firewall validation.
 - Managed gateways use an OpenVPN server backend only.
-- Router port forwarding and host INPUT firewall changes are not automated.
+- External cloud security groups and router/NAT port forwarding are not automated; host INPUT access for managed public gateways is automated for UFW, firewalld, or the iptables fallback.
 - Client and server certificate renewal requires issuing a new client identity
   or recreating the gateway before certificate expiry.
 - Direct OpenVPN gateway transport is not a full DPI-camouflage protocol.

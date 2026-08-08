@@ -699,6 +699,23 @@ openvpn_status_diagnosis() {
     fi
 }
 
+status_remote_topology() {
+    local app=$1 alias owner output
+    # Caller already loaded the app configuration.
+    alias=${REMOTE_ALIAS:-}
+    owner=${REMOTE_OWNER_ID:-}
+    printf '\nRemote topology:\n'
+    if [[ -z "$alias" || -z "$owner" ]]; then
+        printf '  unavailable: automatic-remote management metadata is incomplete\n'
+        return 0
+    fi
+    if output=$(remote_auto_command "$alias" topology "$owner" 2>/dev/null); then
+        printf '%s\n' "$output"
+    else
+        printf '  unavailable: remote host is unreachable or its nns-app helper is older than %s\n' "$VERSION"
+    fi
+}
+
 status_app() {
     require_root
     local app=$1
@@ -964,6 +981,10 @@ status_app() {
             "$(human_bytes "${rx_bytes:-0}")" "$(human_bytes "${tx_bytes:-0}")"
     fi
 
+    if [[ "${REMOTE_MODE:-}" == auto ]]; then
+        status_remote_topology "$app"
+    fi
+
     if [[ "$health" == ONLINE ]]; then
         print_status_log_cut \
             "Recent successful backend markers:" "$vpn_log" \
@@ -1033,6 +1054,141 @@ list_apps() {
     done
 
     (( found )) || log "No NNS apps installed."
+}
+
+list_gateway_record_print() {
+    local record=$1 gateway kind state via endpoint active revoked connected source
+    IFS='|' read -r _ gateway kind state via endpoint active revoked connected source <<<"$record"
+    printf '%-22s %-9s %-8s %-20s %-28s %-11s %-9s %s\n' \
+        "$gateway" "$state" "$kind" "$via" "$endpoint" \
+        "${active}/${revoked}" "$connected" "$source"
+}
+
+list_client_record_print() {
+    local record=$1 client status gateway endpoint created connected source
+    IFS='|' read -r _ client status gateway endpoint created connected source <<<"$record"
+    printf '%-24s %-10s %-22s %-28s %-10s %-20s %s\n' \
+        "$client" "$status" "$gateway" "$endpoint" "$connected" "$created" "$source"
+}
+
+list_remote_auto_records() {
+    # $1 is inventory-gateways or inventory-clients. Emit machine-readable
+    # records for automatic-remote apps configured on this local host. A read
+    # failure is represented as a WARN record so list remains useful offline.
+    local operation=$1 dir app alias owner key output
+    declare -A seen=()
+    shopt -s nullglob
+    for dir in "$BASE_DIR"/*; do
+        [[ -d "$dir" ]] || continue
+        app=$(basename "$dir")
+        [[ -f "$(cfg_file "$app")" ]] || continue
+        load_cfg "$app"
+        [[ "${REMOTE_MODE:-}" == auto ]] || continue
+        alias=${REMOTE_ALIAS:-}
+        owner=${REMOTE_OWNER_ID:-}
+        [[ -n "$alias" && -n "$owner" ]] || continue
+        key="$alias|$owner"
+        [[ -z "${seen[$key]+x}" ]] || continue
+        seen[$key]=1
+        if output=$(remote_auto_command "$alias" "$operation" "$owner" 2>/dev/null); then
+            while IFS= read -r record; do
+                [[ -n "$record" ]] || continue
+                # Replace the generic remote source with the local app name;
+                # this is the association users know on the client machine.
+                if [[ "$record" == GATEWAY\|* ]]; then
+                    record=${record%|remote}"|remote:$app"
+                elif [[ "$record" == CLIENT\|* ]]; then
+                    record=${record%|remote}"|remote:$app"
+                fi
+                printf '%s\n' "$record"
+            done <<<"$output"
+        else
+            printf 'WARN|%s|%s\n' "$app" "$operation"
+        fi
+    done
+    shopt -u nullglob
+}
+
+list_gateways_overview() {
+    require_root
+    local dir gateway record found=0 app operation
+    printf '%-22s %-9s %-8s %-20s %-28s %-11s %-9s %s\n' \
+        'Gateway' 'Status' 'Type' 'Via' 'Endpoint' 'Clients A/R' 'Connected' 'Source'
+    printf '%-22s %-9s %-8s %-20s %-28s %-11s %-9s %s\n' \
+        '----------------------' '---------' '--------' '--------------------' \
+        '----------------------------' '-----------' '---------' '----------------'
+
+    shopt -s nullglob
+    for dir in "$GATEWAY_BASE_DIR"/*; do
+        [[ -f "$dir/gateway.cfg" ]] || continue
+        gateway=$(basename "$dir")
+        record=$(gateway_inventory_record "$gateway" local)
+        list_gateway_record_print "$record"
+        found=1
+    done
+    shopt -u nullglob
+
+    while IFS= read -r record; do
+        [[ -n "$record" ]] || continue
+        if [[ "$record" == WARN\|* ]]; then
+            IFS='|' read -r _ app operation <<<"$record"
+            printf '%-22s %-9s %-8s %-20s %-28s %-11s %-9s %s\n' \
+                '-' 'offline' '-' '-' '-' '-' '-' "remote:$app"
+            found=1
+            continue
+        fi
+        list_gateway_record_print "$record"
+        found=1
+    done < <(list_remote_auto_records inventory-gateways)
+
+    (( found )) || log 'No managed gateways configured.'
+}
+
+list_external_clients_overview() {
+    require_root
+    local dir gateway record found=0 app operation
+    printf '%-24s %-10s %-22s %-28s %-10s %-20s %s\n' \
+        'Client' 'Status' 'Gateway' 'Endpoint' 'Connected' 'Created' 'Source'
+    printf '%-24s %-10s %-22s %-28s %-10s %-20s %s\n' \
+        '------------------------' '----------' '----------------------' \
+        '----------------------------' '----------' '--------------------' '----------------'
+
+    shopt -s nullglob
+    for dir in "$GATEWAY_BASE_DIR"/*; do
+        [[ -f "$dir/gateway.cfg" ]] || continue
+        gateway=$(basename "$dir")
+        while IFS= read -r record; do
+            [[ -n "$record" ]] || continue
+            list_client_record_print "$record"
+            found=1
+        done < <(gateway_external_client_records "$gateway" local)
+    done
+    shopt -u nullglob
+
+    while IFS= read -r record; do
+        [[ -n "$record" ]] || continue
+        if [[ "$record" == WARN\|* ]]; then
+            IFS='|' read -r _ app operation <<<"$record"
+            printf '%-24s %-10s %-22s %-28s %-10s %-20s %s\n' \
+                '-' 'offline' '-' '-' '-' '-' "remote:$app"
+            found=1
+            continue
+        fi
+        list_client_record_print "$record"
+        found=1
+    done < <(list_remote_auto_records inventory-clients)
+
+    (( found )) || log 'No external gateway clients configured.'
+}
+
+list_all_objects() {
+    require_root
+    printf 'Applications:\n'
+    list_apps
+    printf '\nGateways:\n'
+    list_gateways_overview
+    printf '\nExternal clients:\n'
+    list_external_clients_overview
 }
 
 
