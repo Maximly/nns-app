@@ -28,6 +28,9 @@
 #   list
 #   status  <app_name>
 #   myip    [<app_name>]
+#   export  ovpn <app_name> --client <name> [--public <host>:<port>]
+#                  [--proto tcp|udp] [--output <file|->]
+#   revoke  <app_name> <client_name>
 #   add     <app_name> <profile.ovpn|wireguard.conf>
 #   add     <app_name> any [country] [--refresh] [--via <upstream-app>|host]
 #   start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
@@ -47,7 +50,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.23"
+readonly VERSION="1.3.24"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -276,6 +279,10 @@ Usage:
   nns-app list
   nns-app status  <app_name>
   nns-app myip [<app_name>]
+  nns-app export ovpn <app_name> --client <client_name>
+                  [--public <host>:<port>] [--proto tcp|udp]
+                  [--output <file|->]
+  nns-app revoke <app_name> <client_name>
   nns-app add     <app_name> <profile.ovpn|wireguard.conf>
   nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
   nns-app start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
@@ -334,6 +341,12 @@ Examples:
   nns-app myip
   nns-app myip my-private-app
 
+  # Export a standard OpenVPN profile for a client that does not run nns-app.
+  # --public is required when the public gateway is created for the first time.
+  nns-app export ovpn my-private-app --client my-laptop \
+      --public vpn.example.net:443 --output ~/my-laptop.ovpn
+  nns-app revoke my-private-app my-laptop
+
   # On a remote Linux box where `my-remote-exit` is already online:
   sudo nns-app gateway create my-relay \
       --via my-remote-exit \
@@ -386,7 +399,7 @@ reexec_as_root_if_needed() {
         list|status|myip|start|stop|run)
             sudo_args+=( -n )
             ;;
-        install|remove|add|purge|gateway|remote|link)
+        install|remove|add|purge|gateway|remote|link|export|revoke)
             ;;
         *)
             die "Unknown command '$cmd'."
@@ -7051,7 +7064,9 @@ gateway_client_rotate() {
 # Automatic remote mode ------------------------------------------------------
 # The public three-command workflow uses SSH for both bootstrap and a
 # supervised local port forward. The remote OpenVPN gateway is loopback-only,
-# so no cloud firewall or additional public listener is required.
+# so no cloud firewall or additional public listener is required. `export
+# ovpn` can additionally create a separate direct public gateway for ordinary
+# OpenVPN clients without changing the private nns-app transport.
 
 validate_remote_owner_id() {
     local owner=${1:-}
@@ -7072,6 +7087,33 @@ remote_auto_gateway_name() {
 remote_auto_client_name() {
     validate_remote_owner_id "$1"
     printf 'ra-%s-client\n' "${1:0:12}"
+}
+
+remote_auto_public_gateway_name() {
+    validate_remote_owner_id "$1"
+    printf 'ra-%s-public\n' "${1:0:12}"
+}
+
+remote_auto_public_active_client_count() {
+    local pool_id=$1 gateway dir client count=0
+    validate_remote_owner_id "$pool_id"
+    gateway=$(remote_auto_public_gateway_name "$pool_id")
+    [[ -f "$(gateway_cfg_file "$gateway")" ]] || {
+        printf '0\n'
+        return 0
+    }
+
+    shopt -s nullglob
+    for dir in "$(gateway_clients_dir "$gateway")"/*; do
+        [[ -f "$dir/client.cfg" ]] || continue
+        client=$(basename "$dir")
+        if gateway_client_load "$gateway" "$client" 2>/dev/null &&
+           [[ "${STATUS:-}" == active ]]; then
+            count=$((count + 1))
+        fi
+    done
+    shopt -u nullglob
+    printf '%s\n' "$count"
 }
 
 remote_auto_state_file() {
@@ -7646,6 +7688,136 @@ remote_auto_export_internal() {
     gateway_write_nnslink_bundle "$RA_GATEWAY" "$RA_CLIENT" -
 }
 
+remote_auto_public_export_internal() {
+    require_root
+    local owner=$1 client=$2 public=${3:--} proto=${4:-auto}
+    local pool_id exit_app gateway public_host public_port active_count
+
+    validate_remote_owner_id "$owner"
+    validate_gateway_client_name "$client"
+    case "$proto" in auto|tcp|udp) ;; *) die "Public OpenVPN protocol must be tcp or udp." ;; esac
+
+    acquire_lock remote-auto-pools
+    remote_auto_reconcile_owner_markers "$owner" >&2
+    remote_auto_load_state "$owner"
+    pool_id=$RA_POOL_ID
+    exit_app=$RA_EXIT_APP
+    gateway=$(remote_auto_public_gateway_name "$pool_id")
+
+    [[ -f "$(cfg_file "$exit_app")" ]] || {
+        release_lock remote-auto-pools
+        die "Automatic remote exit '$exit_app' is missing."
+    }
+    load_cfg "$exit_app"
+    [[ "${REMOTE_MANAGED_OWNER_ID:-}" == "$pool_id" ]] || {
+        release_lock remote-auto-pools
+        die "Refusing public export: exit '$exit_app' pool marker mismatch."
+    }
+
+    if [[ -f "$(gateway_cfg_file "$gateway")" ]]; then
+        load_gateway_cfg "$gateway"
+        [[ "$VIA_APP" == "$exit_app" && "${TRANSPORT:-direct}" == direct ]] || {
+            release_lock remote-auto-pools
+            die "Public gateway '$gateway' is inconsistent with automatic pool '$pool_id'."
+        }
+        [[ "${REMOTE_MANAGED_OWNER_ID:-}" == "$pool_id" ]] || {
+            release_lock remote-auto-pools
+            die "Refusing public export: gateway '$gateway' pool marker mismatch."
+        }
+        if [[ "$public" != - ]]; then
+            IFS='|' read -r public_host public_port <<<"$(parse_public_endpoint "$public")"
+            [[ "$PUBLIC_HOST" == "$public_host" && "$PUBLIC_PORT" == "$public_port" ]] || {
+                release_lock remote-auto-pools
+                die "Public gateway '$gateway' already uses $PUBLIC_HOST:$PUBLIC_PORT; remove/recreate it before changing the public endpoint."
+            }
+        fi
+        [[ "$proto" == auto || "$LISTEN_PROTO" == "$proto" ]] || {
+            release_lock remote-auto-pools
+            die "Public gateway '$gateway' already uses protocol '$LISTEN_PROTO'."
+        }
+    else
+        [[ "$public" != - ]] || {
+            release_lock remote-auto-pools
+            die "First public export requires --public <host>:<port>."
+        }
+        [[ "$proto" != auto ]] || proto=tcp
+        IFS='|' read -r public_host public_port <<<"$(parse_public_endpoint "$public")"
+
+        # A generic OpenVPN client cannot establish nns-app's SSH wrapper, so
+        # give it a distinct direct gateway that shares the same provider exit.
+        start_app "$exit_app" off __default__ >&2
+        gateway_create "$gateway" "$exit_app" "$proto:$public_port" \
+            "$public_host:$public_port" "" "1.1.1.1 9.9.9.9" direct "" >&2
+        gateway_cfg_set "$gateway" REMOTE_MANAGED_OWNER_ID "$pool_id"
+    fi
+
+    # Keep the provider exit and public gateway recoverable after a reboot,
+    # independently of whether any local nns-app client is currently running.
+    start_app "$exit_app" off __default__ >&2
+    gateway_start "$gateway" >&2
+    systemctl enable \
+        "nns-netns@${exit_app}.service" \
+        "nns-openvpn@${exit_app}.service" \
+        "nns-online@${exit_app}.service" \
+        "nns-gateway@${gateway}.service" \
+        >/dev/null 2>&1 || true
+
+    if [[ -f "$(gateway_client_dir "$gateway" "$client")/client.cfg" ]]; then
+        gateway_client_load "$gateway" "$client"
+        [[ "${STATUS:-}" == active ]] || {
+            release_lock remote-auto-pools
+            die "Public client '$client' is revoked. Use a new client name to issue fresh credentials."
+        }
+    else
+        gateway_client_add "$gateway" "$client" >&2
+    fi
+
+    active_count=$(remote_auto_public_active_client_count "$pool_id")
+    load_gateway_cfg "$gateway"
+    printf '# nns-app public client: %s; pool: %s; active public clients: %s\n' \
+        "$client" "$pool_id" "$active_count" >&2
+    printf '# Public endpoint: %s:%s/%s\n' \
+        "$PUBLIC_HOST" "$PUBLIC_PORT" "$LISTEN_PROTO" >&2
+    warn "Ensure the remote host firewall, cloud security group, and upstream NAT allow $LISTEN_PROTO port $LISTEN_PORT."
+
+    gateway_client_export "$gateway" "$client" - ovpn
+    release_lock remote-auto-pools
+}
+
+remote_auto_public_revoke_internal() {
+    require_root
+    local owner=$1 client=$2 pool_id gateway remaining
+    validate_remote_owner_id "$owner"
+    validate_gateway_client_name "$client"
+
+    acquire_lock remote-auto-pools
+    remote_auto_load_state "$owner"
+    pool_id=$RA_POOL_ID
+    gateway=$(remote_auto_public_gateway_name "$pool_id")
+    [[ -f "$(gateway_cfg_file "$gateway")" ]] || {
+        release_lock remote-auto-pools
+        die "No public OpenVPN gateway exists for automatic pool '$pool_id'."
+    }
+    load_gateway_cfg "$gateway"
+    [[ "$VIA_APP" == "$RA_EXIT_APP" && "${TRANSPORT:-direct}" == direct &&
+       "${REMOTE_MANAGED_OWNER_ID:-}" == "$pool_id" ]] || {
+        release_lock remote-auto-pools
+        die "Refusing public revoke: gateway '$gateway' ownership is inconsistent."
+    }
+
+    gateway_client_revoke "$gateway" "$client" >&2
+    remaining=$(remote_auto_public_active_client_count "$pool_id")
+    if (( remaining == 0 )); then
+        # With no export clients left, close the public listener completely.
+        # A later export recreates a new gateway CA and listener on demand.
+        gateway_remove "$gateway" >&2
+        log "Revoked public client '$client'; removed the now-unused public gateway '$gateway'." >&2
+    else
+        log "Revoked public client '$client'; $remaining public client(s) remain active." >&2
+    fi
+    release_lock remote-auto-pools
+}
+
 remote_auto_rotate_internal() {
     require_root
     local owner=$1
@@ -7678,7 +7850,7 @@ remote_auto_status_internal() {
 
 remote_auto_start_internal() {
     require_root
-    local owner=$1 provider_ipv4
+    local owner=$1 provider_ipv4 public_gateway public_clients=0
     remote_auto_reconcile_owner_markers "$owner"
     remote_auto_load_state "$owner"
 
@@ -7699,6 +7871,17 @@ remote_auto_start_internal() {
         die "Refusing to start gateway '$RA_GATEWAY': pool marker mismatch."
     gateway_start "$RA_GATEWAY"
 
+    public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID")
+    public_clients=$(remote_auto_public_active_client_count "$RA_POOL_ID")
+    if (( public_clients > 0 )) && [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
+        load_gateway_cfg "$public_gateway"
+        [[ "$VIA_APP" == "$RA_EXIT_APP" && "${TRANSPORT:-direct}" == direct &&
+           "${REMOTE_MANAGED_OWNER_ID:-}" == "$RA_POOL_ID" ]] ||
+            die "Refusing to start public gateway '$public_gateway': pool relationship mismatch."
+        gateway_start "$public_gateway"
+        systemctl enable "nns-gateway@${public_gateway}.service" >/dev/null 2>&1 || true
+    fi
+
     systemctl enable         "nns-netns@${RA_EXIT_APP}.service"         "nns-openvpn@${RA_EXIT_APP}.service"         "nns-online@${RA_EXIT_APP}.service"         "nns-gateway@${RA_GATEWAY}.service"         >/dev/null
     provider_ipv4=$(remote_auto_provider_ipv4 "$RA_EXIT_APP" 2>/dev/null || true)
     [[ -n "$provider_ipv4" ]] || provider_ipv4=$RA_PROVIDER_VPN_IPV4
@@ -7709,6 +7892,7 @@ remote_auto_start_internal() {
 remote_auto_stop_internal() {
     require_root
     local owner=$1 exit_app gateway client pool_id provider_ipv4 profile_sha256
+    local public_clients=0
     remote_auto_reconcile_owner_markers "$owner"
     remote_auto_load_state "$owner"
     exit_app=$RA_EXIT_APP
@@ -7732,6 +7916,12 @@ remote_auto_stop_internal() {
         [[ "${REMOTE_MANAGED_OWNER_ID:-}" == "$pool_id" ]] ||
             die "Refusing to stop gateway '$gateway': pool marker mismatch."
         gateway_stop "$gateway"
+    fi
+
+    public_clients=$(remote_auto_public_active_client_count "$pool_id")
+    if (( public_clients > 0 )); then
+        log "Stopped automatic client '$owner'; provider exit '$exit_app' remains online for $public_clients exported OpenVPN client(s)."
+        return 0
     fi
 
     if [[ -f "$(cfg_file "$exit_app")" ]]; then
@@ -7838,6 +8028,28 @@ remote_auto_cleanup_internal() {
         client=$(remote_auto_client_name "$owner")
     fi
 
+    local public_gateway
+    public_gateway=$(remote_auto_public_gateway_name "$pool_id")
+    if [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
+        load_gateway_cfg "$public_gateway"
+        [[ "$VIA_APP" == "$exit_app" && "${TRANSPORT:-direct}" == direct ]] ||
+            die "Refusing to remove public gateway '$public_gateway': it is inconsistent with '$exit_app'."
+        marker=${REMOTE_MANAGED_OWNER_ID:-}
+        [[ -z "$marker" || "$marker" == "$pool_id" ]] ||
+            die "Refusing to remove public gateway '$public_gateway': pool marker mismatch."
+        log "Removing automatic public gateway '$public_gateway' and all exported OpenVPN client keys."
+        gateway_remove "$public_gateway"
+    else
+        systemctl disable --now \
+            "nns-gateway@${public_gateway}.service" \
+            "nns-gateway-crl-refresh@${public_gateway}.timer" \
+            >/dev/null 2>&1 || true
+        rm -rf -- \
+            "$(gateway_dropin_dir "$public_gateway")" \
+            "$(gateway_dir "$public_gateway")" \
+            "$(gateway_runtime_dir "$public_gateway")"
+    fi
+
     if [[ -f "$(gateway_cfg_file "$gateway")" ]]; then
         load_gateway_cfg "$gateway"
         [[ "$VIA_APP" == "$exit_app" ]] ||
@@ -7892,6 +8104,16 @@ remote_auto_dispatch() {
         export)
             [[ $# -eq 1 ]] || die "_remote-auto export requires owner."
             remote_auto_export_internal "$1"
+            ;;
+        public-export)
+            [[ $# -eq 4 ]] ||
+                die "_remote-auto public-export requires owner, client, public endpoint and protocol."
+            remote_auto_public_export_internal "$@"
+            ;;
+        public-revoke)
+            [[ $# -eq 2 ]] ||
+                die "_remote-auto public-revoke requires owner and client."
+            remote_auto_public_revoke_internal "$1" "$2"
             ;;
         rotate)
             [[ $# -eq 1 ]] || die "_remote-auto rotate requires owner."
@@ -8268,6 +8490,91 @@ remote_auto_cleanup_app() {
     fi
     cfg_set "$app" REMOTE_CLEANED on
     log "Automatic remote resources for '$app' were removed."
+}
+
+remote_auto_prepare_management() {
+    require_root
+    local app=$1 alias owner target port
+    validate_app_name "$app"
+    load_cfg "$app"
+    [[ "${REMOTE_MODE:-}" == auto ]] ||
+        die "App '$app' is not configured with 'via --remote'."
+    alias=${REMOTE_ALIAS:-}
+    owner=${REMOTE_OWNER_ID:-}
+    [[ -n "$alias" && -n "$owner" ]] ||
+        die "Automatic remote app '$app' has incomplete management metadata."
+    [[ -f "$(remote_cfg_file "$alias")" ]] ||
+        die "Automatic remote app '$app' has no SSH registration for '$alias'."
+
+    load_remote_cfg "$alias"
+    target=$SSH_TARGET
+    port=$SSH_PORT
+    if ! remote_auto_is_current "$alias" "$target" "$port"; then
+        log "Upgrading automatic-remote support on '$target' before public-client management..." >&2
+        remote_auto_bootstrap "$app" "$target" "$port" "$alias" "$owner" >&2
+        remote_auto_register "$alias" "$target" "$port" \
+            "$(remote_dir "$alias")/id_ed25519"
+    fi
+
+    REMOTE_MANAGE_ALIAS=$alias
+    REMOTE_MANAGE_OWNER=$owner
+}
+
+remote_auto_export_public_ovpn() {
+    require_root
+    local app=$1 client=$2 public=${3:--} proto=${4:-auto} output=${5:--}
+    local tmp owner group
+    validate_gateway_client_name "$client"
+    case "$proto" in auto|tcp|udp) ;; *) die "--proto requires tcp or udp." ;; esac
+    [[ "$public" == - ]] || parse_public_endpoint "$public" >/dev/null
+
+    remote_auto_prepare_management "$app"
+
+    if [[ "$output" == - ]]; then
+        remote_auto_command "$REMOTE_MANAGE_ALIAS" public-export \
+            "$REMOTE_MANAGE_OWNER" "$client" "$public" "$proto"
+        return
+    fi
+
+    output=$(readlink -m "$output")
+    [[ ! -e "$output" ]] || die "Output already exists: $output"
+    [[ -d "$(dirname "$output")" ]] ||
+        die "Output directory does not exist: $(dirname "$output")"
+    tmp=$(mktemp --suffix=.ovpn)
+    if ! remote_auto_command "$REMOTE_MANAGE_ALIAS" public-export \
+        "$REMOTE_MANAGE_OWNER" "$client" "$public" "$proto" >"$tmp"; then
+        rm -f "$tmp"
+        die "Could not export public OpenVPN client '$client'."
+    fi
+    [[ -s "$tmp" ]] || {
+        rm -f "$tmp"
+        die "Remote public export returned an empty OpenVPN profile."
+    }
+    grep -Fq '<ca>' "$tmp" && grep -Fq '<cert>' "$tmp" &&
+        grep -Fq '<key>' "$tmp" && grep -Fq '<tls-crypt-v2>' "$tmp" || {
+        rm -f "$tmp"
+        die "Remote public export returned an incomplete OpenVPN profile."
+    }
+
+    owner=${SUDO_USER:-root}
+    if [[ "$owner" != root ]] && id "$owner" >/dev/null 2>&1; then
+        group=$(id -gn "$owner")
+        install -o "$owner" -g "$group" -m 0600 "$tmp" "$output"
+    else
+        install -o root -g root -m 0600 "$tmp" "$output"
+    fi
+    rm -f "$tmp"
+    log "Exported public OpenVPN client '$client' for '$app'."
+    log "Output: $output"
+}
+
+remote_auto_revoke_public_ovpn() {
+    require_root
+    local app=$1 client=$2
+    validate_gateway_client_name "$client"
+    remote_auto_prepare_management "$app"
+    remote_auto_command "$REMOTE_MANAGE_ALIAS" public-revoke \
+        "$REMOTE_MANAGE_OWNER" "$client"
 }
 
 remote_auto_finish_profile_deployment() {
@@ -9640,6 +9947,46 @@ main() {
         myip)
             (( $# <= 2 )) || die "Usage: nns-app myip [<app_name>]"
             myip_command "${2:-}"
+            ;;
+        export)
+            (( $# >= 4 )) ||
+                die "Usage: nns-app export ovpn <app_name> --client <client_name> [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]"
+            [[ "$2" == ovpn ]] ||
+                die "Only 'nns-app export ovpn ...' is currently supported."
+            local export_app=$3 export_client="" export_public="-" export_proto="auto" export_output="-"
+            shift 3
+            while (( $# > 0 )); do
+                case "$1" in
+                    --client)
+                        (( $# >= 2 )) || die "--client requires a client name."
+                        export_client=$2; shift 2 ;;
+                    --client=*)
+                        export_client=${1#--client=}; shift ;;
+                    --public)
+                        (( $# >= 2 )) || die "--public requires host:port."
+                        export_public=$2; shift 2 ;;
+                    --public=*)
+                        export_public=${1#--public=}; shift ;;
+                    --proto)
+                        (( $# >= 2 )) || die "--proto requires tcp or udp."
+                        export_proto=$2; shift 2 ;;
+                    --proto=*)
+                        export_proto=${1#--proto=}; shift ;;
+                    --output)
+                        (( $# >= 2 )) || die "--output requires a file path or '-'."
+                        export_output=$2; shift 2 ;;
+                    --output=*)
+                        export_output=${1#--output=}; shift ;;
+                    *) die "Unknown export option '$1'." ;;
+                esac
+            done
+            [[ -n "$export_client" ]] || die "export ovpn requires --client <client_name>."
+            remote_auto_export_public_ovpn "$export_app" "$export_client" \
+                "$export_public" "$export_proto" "$export_output"
+            ;;
+        revoke)
+            [[ $# -eq 3 ]] || die "Usage: nns-app revoke <app_name> <client_name>"
+            remote_auto_revoke_public_ovpn "$2" "$3"
             ;;
         add)
             (( $# >= 3 )) ||

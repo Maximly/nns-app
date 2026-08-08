@@ -241,6 +241,46 @@ main() {
             (( $# <= 2 )) || die "Usage: nns-app myip [<app_name>]"
             myip_command "${2:-}"
             ;;
+        export)
+            (( $# >= 4 )) ||
+                die "Usage: nns-app export ovpn <app_name> --client <client_name> [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]"
+            [[ "$2" == ovpn ]] ||
+                die "Only 'nns-app export ovpn ...' is currently supported."
+            local export_app=$3 export_client="" export_public="-" export_proto="auto" export_output="-"
+            shift 3
+            while (( $# > 0 )); do
+                case "$1" in
+                    --client)
+                        (( $# >= 2 )) || die "--client requires a client name."
+                        export_client=$2; shift 2 ;;
+                    --client=*)
+                        export_client=${1#--client=}; shift ;;
+                    --public)
+                        (( $# >= 2 )) || die "--public requires host:port."
+                        export_public=$2; shift 2 ;;
+                    --public=*)
+                        export_public=${1#--public=}; shift ;;
+                    --proto)
+                        (( $# >= 2 )) || die "--proto requires tcp or udp."
+                        export_proto=$2; shift 2 ;;
+                    --proto=*)
+                        export_proto=${1#--proto=}; shift ;;
+                    --output)
+                        (( $# >= 2 )) || die "--output requires a file path or '-'."
+                        export_output=$2; shift 2 ;;
+                    --output=*)
+                        export_output=${1#--output=}; shift ;;
+                    *) die "Unknown export option '$1'." ;;
+                esac
+            done
+            [[ -n "$export_client" ]] || die "export ovpn requires --client <client_name>."
+            remote_auto_export_public_ovpn "$export_app" "$export_client" \
+                "$export_public" "$export_proto" "$export_output"
+            ;;
+        revoke)
+            [[ $# -eq 3 ]] || die "Usage: nns-app revoke <app_name> <client_name>"
+            remote_auto_revoke_public_ovpn "$2" "$3"
+            ;;
         add)
             (( $# >= 3 )) ||
                 die "Usage: nns-app add <app_name> <profile.ovpn|wireguard.conf>|any [country] [--refresh] [--via <upstream-app>|host]"

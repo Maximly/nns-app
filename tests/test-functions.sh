@@ -850,7 +850,13 @@ printf '%s\n' exit >"$cleanup_exit_cfg"
     require_root() { :; }
     remote_auto_state_file() { printf '%s\n' "$cleanup_state"; }
     remote_auto_assert_state() { :; }
-    gateway_cfg_file() { printf '%s\n' "$cleanup_gateway_cfg"; }
+    gateway_cfg_file() {
+        if [[ "$1" == ra-0123456789ab-gw ]]; then
+            printf '%s\n' "$cleanup_gateway_cfg"
+        else
+            printf '%s/missing-%s.cfg\n' "$TEST_TMP" "$1"
+        fi
+    }
     cfg_file() { printf '%s\n' "$cleanup_exit_cfg"; }
     load_gateway_cfg() {
         VIA_APP=ra-0123456789ab-exit
@@ -897,7 +903,13 @@ if (
         RA_ACTIVE=off
     }
     remote_auto_pool_member_count() { printf '%s\n' 0; }
-    gateway_cfg_file() { printf '%s\n' "$cleanup_gateway_cfg"; }
+    gateway_cfg_file() {
+        if [[ "$1" == ra-0123456789ab-gw ]]; then
+            printf '%s\n' "$cleanup_gateway_cfg"
+        else
+            printf '%s/missing-%s.cfg\n' "$TEST_TMP" "$1"
+        fi
+    }
     cfg_file() { printf '%s\n' "$cleanup_exit_cfg"; }
     load_gateway_cfg() {
         VIA_APP=ra-0123456789ab-exit
@@ -1275,6 +1287,45 @@ manual_payload=$(remote_command_payload gateway client export \
         fail 'shared follower credential was not revoked'
     grep -Fq 'shared pool' <<<"$output" || fail 'shared cleanup did not preserve the pool'
     [[ ! -e "$state" ]] || fail 'shared cleanup retained removed member state'
+)
+
+# Automatic-remote public OpenVPN export/revoke must use deterministic pool
+# gateway names and preserve every CLI argument through dispatch.
+[[ "$(remote_auto_public_gateway_name 0123456789abcdef)" == ra-0123456789ab-public ]] ||
+    fail 'automatic public gateway naming'
+
+(
+    require_root() { :; }
+    remote_auto_public_export_internal() {
+        printf 'public-export:%s:%s:%s:%s\n' "$1" "$2" "$3" "$4"
+    }
+    remote_auto_public_revoke_internal() {
+        printf 'public-revoke:%s:%s\n' "$1" "$2"
+    }
+    output=$(remote_auto_dispatch public-export 0123456789abcdef my-phone vpn.example.net:443 tcp)
+    [[ "$output" == 'public-export:0123456789abcdef:my-phone:vpn.example.net:443:tcp' ]] ||
+        fail "automatic public export dispatch: $output"
+    output=$(remote_auto_dispatch public-revoke 0123456789abcdef my-phone)
+    [[ "$output" == 'public-revoke:0123456789abcdef:my-phone' ]] ||
+        fail "automatic public revoke dispatch: $output"
+)
+
+(
+    remote_auto_export_public_ovpn() {
+        printf 'EXPORT:%s:%s:%s:%s:%s\n' "$1" "$2" "$3" "$4" "$5"
+    }
+    remote_auto_revoke_public_ovpn() {
+        printf 'REVOKE:%s:%s\n' "$1" "$2"
+    }
+    output=$(main export ovpn my-app --client my-phone --public vpn.example.net:443 --proto udp --output /tmp/my-phone.ovpn)
+    [[ "$output" == 'EXPORT:my-app:my-phone:vpn.example.net:443:udp:/tmp/my-phone.ovpn' ]] ||
+        fail "public export CLI parsing: $output"
+    output=$(main export ovpn my-app --client my-laptop)
+    [[ "$output" == 'EXPORT:my-app:my-laptop:-:auto:-' ]] ||
+        fail "public export reuse CLI parsing: $output"
+    output=$(main revoke my-app my-phone)
+    [[ "$output" == 'REVOKE:my-app:my-phone' ]] ||
+        fail "public revoke CLI parsing: $output"
 )
 
 echo 'Function tests passed.'

@@ -28,6 +28,9 @@
 #   list
 #   status  <app_name>
 #   myip    [<app_name>]
+#   export  ovpn <app_name> --client <name> [--public <host>:<port>]
+#                  [--proto tcp|udp] [--output <file|->]
+#   revoke  <app_name> <client_name>
 #   add     <app_name> <profile.ovpn|wireguard.conf>
 #   add     <app_name> any [country] [--refresh] [--via <upstream-app>|host]
 #   start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
@@ -47,7 +50,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.23"
+readonly VERSION="1.3.24"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -276,6 +279,10 @@ Usage:
   nns-app list
   nns-app status  <app_name>
   nns-app myip [<app_name>]
+  nns-app export ovpn <app_name> --client <client_name>
+                  [--public <host>:<port>] [--proto tcp|udp]
+                  [--output <file|->]
+  nns-app revoke <app_name> <client_name>
   nns-app add     <app_name> <profile.ovpn|wireguard.conf>
   nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
   nns-app start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
@@ -333,6 +340,12 @@ Examples:
   nns-app status my-private-app
   nns-app myip
   nns-app myip my-private-app
+
+  # Export a standard OpenVPN profile for a client that does not run nns-app.
+  # --public is required when the public gateway is created for the first time.
+  nns-app export ovpn my-private-app --client my-laptop \
+      --public vpn.example.net:443 --output ~/my-laptop.ovpn
+  nns-app revoke my-private-app my-laptop
 
   # On a remote Linux box where `my-remote-exit` is already online:
   sudo nns-app gateway create my-relay \

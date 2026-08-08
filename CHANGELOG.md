@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.3.24
+
+- Added `nns-app export ovpn <app> --client <name> --public <host>:<port>` for
+  automatic-remote apps. It creates a separate direct OpenVPN gateway on the
+  remote host, reuses the existing provider exit, and emits a self-contained
+  profile suitable for ordinary OpenVPN client software.
+- Added `nns-app revoke <app> <client>` for the exported public clients.
+- Reuse the public gateway for additional clients; each client receives unique
+  certificate, private-key, and TLS Crypt v2 material.
+- Remove the public listener when its final exported client is revoked, and
+  clean the public gateway automatically when the final nns-app pool member is
+  removed or purged.
+- Keep the provider exit online when local nns-app clients are stopped but
+  exported public OpenVPN clients still depend on it.
+
 ## 1.3.23
 
 - Fixed remote and local `add <app> any` selection of VPN Gate relays that request username/password authentication after the TLS peer connection has already been established.

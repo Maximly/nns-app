@@ -9,7 +9,7 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fq 'nns-app 1.3.23' <<<"$version"
+grep -Fq 'nns-app 1.3.24' <<<"$version"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -203,13 +203,20 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 1.3.23' "$ROOT/README.md"
+grep -Fq '**Release:** 1.3.24' "$ROOT/README.md"
 grep -Fq '## Quick start' "$ROOT/README.md"
 grep -Fq '### Run a VPN locally' "$ROOT/README.md"
 grep -Fq 'nns-app install my-private-app' "$ROOT/README.md"
 grep -Fq '### Run a VPN on a remote Linux host' "$ROOT/README.md"
 grep -Fq 'nns-app install my-private-app via --remote user@remote-host' "$ROOT/README.md"
 grep -Fq 'nns-app run my-private-app ping -c 4 1.1.1.1' "$ROOT/README.md"
+grep -Fq 'nns-app export ovpn my-private-app --client my-laptop' "$ROOT/README.md"
+grep -Fq 'nns-app revoke my-private-app my-phone' "$ROOT/README.md"
+grep -Fq 'remote_auto_public_export_internal' "$INSTALLER"
+grep -Fq 'remote_auto_public_revoke_internal' "$INSTALLER"
+grep -Fq 'remote_auto_public_gateway_name' "$INSTALLER"
+grep -Fq 'public-export)' "$INSTALLER"
+grep -Fq 'public-revoke)' "$INSTALLER"
 grep -Fq 'nns-app add my-private-app any' "$ROOT/README.md"
 grep -Fq 'nns-app add my-private-app any JP' "$ROOT/README.md"
 grep -Fq 'VPN Gate relay list is downloaded and candidates are probed' "$ROOT/README.md"

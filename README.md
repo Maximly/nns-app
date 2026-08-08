@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.23
+**Release:** 1.3.24
 
 **Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
@@ -79,6 +79,47 @@ VPN Gate is a volunteer-operated public network. Relays may disappear, log
 traffic, or provide inconsistent performance. Use end-to-end encryption and a
 provider-managed profile for reliable or sensitive use.
 
+### Export a normal OpenVPN profile for another client
+
+An automatic-remote app can also expose a separate direct OpenVPN gateway for
+devices that do not run nns-app. The provider VPN session is reused; nns-app
+does not open a second provider connection.
+
+On the machine that manages the automatic-remote app:
+
+```bash
+nns-app export ovpn my-private-app --client my-laptop \
+    --public vpn.example.net:443 --output ~/my-laptop.ovpn
+```
+
+Import `my-laptop.ovpn` into OpenVPN Connect, NetworkManager, Tunnelblick, or
+another compatible OpenVPN client. `--proto tcp` is the default on the first
+export; use `--proto udp` if desired. After the public gateway exists,
+`--public` and `--proto` may be omitted when exporting additional clients:
+
+```bash
+nns-app export ovpn my-private-app --client my-phone \
+    --output ~/my-phone.ovpn
+```
+
+The public endpoint must be reachable by the external client. Ensure the
+remote host firewall, cloud security group, and any upstream NAT/router allow
+the selected port. nns-app can configure the OpenVPN listener but cannot modify
+an external cloud security group or router.
+
+Each exported client receives a separate certificate, private key, and TLS
+Crypt v2 key. Revoke one without affecting the other clients:
+
+```bash
+nns-app revoke my-private-app my-phone
+```
+
+When the last exported public client is revoked, nns-app removes the public
+gateway and closes its listener. The normal SSH-only nns-app gateway remains
+separate. Removing the final nns-app member of a remote pool also removes its
+public gateway and all exported client keys, so public credentials are not left
+orphaned on the remote host.
+
 ## Highlights
 
 - One isolated network namespace per named application environment.
@@ -91,6 +132,7 @@ provider-managed profile for reliable or sensitive use.
 - Snap desktop-application support inside private mount namespaces.
 - Managed remote OpenVPN gateways routed through a selected remote nns-app exit.
 - Three-command automatic remote deployment over SSH, with automatic sharing of matching provider exits plus manual enrollment, synchronization, credential rotation, and status.
+- Standard self-contained `.ovpn` export and revocation for non-nns-app clients, using a separate public gateway on the same remote provider exit.
 - Direct, SSH-forward, stunnel, and Cloak gateway transports with portable `.nnslink` bundles.
 - Unique client certificates and TLS Crypt v2 keys for gateway clients.
 - Collision-safe network, routing-table, and policy-priority allocation.
