@@ -51,6 +51,11 @@ load_gateway_cfg() {
     [[ "${GATEWAY_BACKEND:-}" == openvpn ]] ||
         die "Unsupported gateway backend '${GATEWAY_BACKEND:-}'."
     TRANSPORT=${TRANSPORT:-direct}
+    OPENVPN_COMPAT=${OPENVPN_COMPAT:-modern}
+    case "$OPENVPN_COMPAT" in
+        modern|embedded) ;;
+        *) die "Unsupported OpenVPN compatibility mode '$OPENVPN_COMPAT'." ;;
+    esac
     OPENVPN_LISTEN_PROTO=${OPENVPN_LISTEN_PROTO:-$LISTEN_PROTO}
     OPENVPN_LISTEN_PORT=${OPENVPN_LISTEN_PORT:-$LISTEN_PORT}
     TRANSPORT_SERVER_NAME=${TRANSPORT_SERVER_NAME:-$PUBLIC_HOST}
@@ -633,9 +638,10 @@ gateway_crl_refresh() {
 }
 
 gateway_generate_pki() {
-    local gateway=$1 root=${2:-$(gateway_dir "$gateway")} pki server_cn
+    local gateway=$1 root=${2:-$(gateway_dir "$gateway")} compat=${3:-modern} pki server_cn
     pki="$root/pki"
     server_cn="nns-gateway-$gateway"
+    case "$compat" in modern|embedded) ;; *) return 1 ;; esac
 
     install -d -o root -g root -m 0755 \
         "$pki" "$pki/newcerts" "$pki/issued" || return 1
@@ -665,19 +671,35 @@ gateway_generate_pki() {
         -in "$pki/server.csr" \
         -out "$pki/server.crt" >/dev/null 2>&1 || return 1
 
-    openvpn --genkey tls-crypt-v2-server \
-        "$pki/tls-crypt-v2-server.key" || return 1
+    if [[ "$compat" == embedded ]]; then
+        # Embedded/vendor clients such as TP-Link routers interoperate with
+        # the older tls-auth control-channel protection. Keep the historical
+        # filename for seamless upgrades from 1.3.31; the static key format is
+        # identical and only the OpenVPN directive/direction changes.
+        openvpn --genkey secret "$pki/tls-crypt.key" || return 1
+    else
+        openvpn --genkey tls-crypt-v2-server \
+            "$pki/tls-crypt-v2-server.key" || return 1
+    fi
     gateway_generate_crl_at "$pki" || return 1
     rm -f "$pki/server.csr"
 
     chown root:root "$pki/ca.crt" "$pki/server.crt" "$pki/crl.pem" ||
         return 1
-    chown root:root "$pki/server.key" "$pki/tls-crypt-v2-server.key" ||
-        return 1
+    chown root:root "$pki/server.key" || return 1
+    if [[ "$compat" == embedded ]]; then
+        chown root:root "$pki/tls-crypt.key" || return 1
+    else
+        chown root:root "$pki/tls-crypt-v2-server.key" || return 1
+    fi
     chmod 0644 "$pki/ca.crt" "$pki/server.crt" "$pki/crl.pem" ||
         return 1
-    chmod 0600 "$pki/server.key" "$pki/tls-crypt-v2-server.key" ||
-        return 1
+    chmod 0600 "$pki/server.key" || return 1
+    if [[ "$compat" == embedded ]]; then
+        chmod 0600 "$pki/tls-crypt.key" || return 1
+    else
+        chmod 0600 "$pki/tls-crypt-v2-server.key" || return 1
+    fi
 }
 
 gateway_write_server_config() {
@@ -732,14 +754,26 @@ PY_GATEWAY_POOL
         printf 'key %s\n' "$pki/server.key"
         printf 'dh none\n'
         printf 'crl-verify %s\n' "$pki/crl.pem"
-        printf 'tls-crypt-v2 %s force-cookie\n' \
-            "$pki/tls-crypt-v2-server.key"
+        if [[ "$OPENVPN_COMPAT" == embedded ]]; then
+            printf 'tls-auth %s 0\n' "$pki/tls-crypt.key"
+        else
+            printf 'tls-crypt-v2 %s force-cookie\n' \
+                "$pki/tls-crypt-v2-server.key"
+        fi
         printf 'verify-client-cert require\n'
         printf 'remote-cert-tls client\n'
         printf 'tls-version-min 1.2\n'
-        printf 'data-ciphers AES-256-GCM:CHACHA20-POLY1305:AES-128-GCM\n'
+        if [[ "$OPENVPN_COMPAT" == embedded ]]; then
+            # Keep the public router-facing profile conservative while
+            # retaining an explicit server-side fallback for modern daemons.
+            printf 'cipher AES-256-GCM\n'
+            printf 'data-ciphers AES-256-GCM:AES-128-GCM\n'
+            printf 'data-ciphers-fallback AES-256-GCM\n'
+        else
+            printf 'data-ciphers AES-256-GCM:CHACHA20-POLY1305:AES-128-GCM\n'
+            printf 'allow-compression no\n'
+        fi
         printf 'auth SHA256\n'
-        printf 'allow-compression no\n'
         printf 'keepalive 10 60\n'
         printf 'persist-tun\n'
         printf 'script-security 2\n'
@@ -755,7 +789,9 @@ PY_GATEWAY_POOL
         [[ "$LISTEN_PROTO" == udp ]] &&
             printf 'explicit-exit-notify 1\n'
         printf 'verb 3\n'
-        printf 'mute 10\n'
+        # Do not hide handshake diagnostics for constrained/vendor clients.
+        # Their UIs frequently expose only a generic "Connecting" state.
+        [[ "$OPENVPN_COMPAT" == embedded ]] || printf 'mute 10\n'
     } >"$output" || {
         rm -f "$output"
         return 1
@@ -774,16 +810,28 @@ PY_GATEWAY_POOL
 }
 
 gateway_validate_staging() {
-    local gateway=$1 root=$2 pki="$2/pki" transport
+    local gateway=$1 root=$2 pki="$2/pki" transport compat
     [[ -s "$root/gateway.cfg" && -s "$root/server.conf" ]] || return 1
     [[ -s "$pki/ca.crt" && -s "$pki/server.crt" &&
        -s "$pki/server.key" ]] || return 1
-    [[ -s "$pki/tls-crypt-v2-server.key" &&
-       -s "$pki/crl.pem" ]] || return 1
+    [[ -s "$pki/crl.pem" ]] || return 1
+    compat=$(awk -F= '/^OPENVPN_COMPAT=/{gsub(/^"|"$/, "", $2); print $2; exit}' "$root/gateway.cfg")
+    compat=${compat:-modern}
+    case "$compat" in modern|embedded) ;; *) return 1 ;; esac
+    if [[ "$compat" == embedded ]]; then
+        [[ -s "$pki/tls-crypt.key" ]] || return 1
+    else
+        [[ -s "$pki/tls-crypt-v2-server.key" ]] || return 1
+    fi
     openssl verify -CAfile "$pki/ca.crt" \
         "$pki/server.crt" >/dev/null 2>&1 || return 1
     gateway_crl_valid_for "$pki/crl.pem" 1 || return 1
-    grep -Eq '^tls-crypt-v2[[:space:]]+' "$root/server.conf" || return 1
+    if [[ "$compat" == embedded ]]; then
+        grep -Eq '^tls-auth[[:space:]]+.+[[:space:]]+0$' "$root/server.conf" || return 1
+        grep -Eq '^tls-crypt(-v2)?[[:space:]]+' "$root/server.conf" && return 1
+    else
+        grep -Eq '^tls-crypt-v2[[:space:]]+' "$root/server.conf" || return 1
+    fi
     grep -Eq '^up[[:space:]]+' "$root/server.conf" || return 1
     transport=$(awk -F= '/^TRANSPORT=/{gsub(/^"|"$/, "", $2); print $2; exit}' "$root/gateway.cfg")
     case "${transport:-direct}" in
@@ -804,6 +852,21 @@ gateway_validate_staging() {
     esac
 }
 
+gateway_ensure_runtime_access() {
+    local gateway=$1 root
+    root=$(gateway_dir "$gateway")
+    [[ -d "$root" ]] || return 1
+
+    # OpenVPN reads private key material while privileged, then drops to the
+    # configured unprivileged account. It must still be able to traverse the
+    # gateway root to stat/reload the world-readable CRL. mktemp -d creates
+    # 0700, so normalize the installed managed gateway root to execute-only
+    # traversal for non-root users without allowing directory listings.
+    chmod 0711 "$root" || return 1
+    [[ ! -d "$root/pki" ]] || chmod 0755 "$root/pki" || return 1
+    [[ ! -f "$root/pki/crl.pem" ]] || chmod 0644 "$root/pki/crl.pem" || return 1
+}
+
 gateway_create() {
     require_root
     local gateway=$1 via_app=$2 listen=$3 public=$4
@@ -811,11 +874,15 @@ gateway_create() {
     local dns_input=${6:-"1.1.1.1 9.9.9.9"}
     local transport=${7:-direct}
     local transport_server_name=${8:-}
+    local openvpn_compat=${9:-modern}
     local staging=""
 
     validate_gateway_name "$gateway"
     validate_app_name "$via_app"
     case "$transport" in direct|stunnel|cloak|ssh) ;; *) die "Unsupported transport '$transport'." ;; esac
+    case "$openvpn_compat" in modern|embedded) ;; *) die "Unsupported OpenVPN compatibility mode '$openvpn_compat'." ;; esac
+    [[ "$openvpn_compat" == modern || "$transport" == direct ]] ||
+        die "Embedded OpenVPN compatibility is supported only with direct transport."
     if [[ "$transport" == cloak ]]; then
         transport_server_name=${transport_server_name:-www.bing.com}
         validate_transport_server_name "$transport_server_name"
@@ -894,6 +961,7 @@ PUBLIC_HOST="$public_host"
 PUBLIC_PORT="$public_port"
 OPENVPN_LISTEN_PROTO="$openvpn_listen_proto"
 OPENVPN_LISTEN_PORT="$openvpn_listen_port"
+OPENVPN_COMPAT="$openvpn_compat"
 TRANSPORT_SERVER_NAME="$transport_server_name"
 CLIENT_POOL="$client_pool"
 DNS_SERVERS="$dns_servers"
@@ -920,7 +988,7 @@ GATEWAY_CONFIG_EOF
     local failed_stage=""
     if ! gateway_prepare_transport "$gateway" "$staging" "$transport"; then
         failed_stage="transport preparation"
-    elif ! gateway_generate_pki "$gateway" "$staging"; then
+    elif ! gateway_generate_pki "$gateway" "$staging" "$openvpn_compat"; then
         failed_stage="PKI generation"
     elif ! gateway_write_server_config "$gateway" "$staging"; then
         failed_stage="OpenVPN server configuration"
@@ -936,8 +1004,17 @@ GATEWAY_CONFIG_EOF
         die "Failed to create gateway '$gateway' during $failed_stage; staged files were removed."
     fi
 
+    # mktemp -d creates staging with 0700. The final gateway root needs 0711
+    # so the privilege-dropped OpenVPN process can traverse to pki/crl.pem.
+    chmod 0711 "$staging" || {
+        rm -rf "$staging"
+        release_lock "gateway-$gateway"
+        release_lock global
+        die "Failed to set runtime access on gateway '$gateway' staging directory."
+    }
     mv "$staging" "$(gateway_dir "$gateway")"
-    if ! gateway_write_openssl_config "$gateway" "$(gateway_dir "$gateway")" ||
+    if ! gateway_ensure_runtime_access "$gateway" ||
+       ! gateway_write_openssl_config "$gateway" "$(gateway_dir "$gateway")" ||
        ! gateway_write_server_config "$gateway" "$(gateway_dir "$gateway")" ||
        ! gateway_write_transport_config "$gateway" "$(gateway_dir "$gateway")"; then
         rm -rf "$(gateway_dir "$gateway")"
@@ -1354,14 +1431,22 @@ gateway_server_exec() {
 
 gateway_start() {
     require_root
-    local gateway=$1 deadline pki
+    local gateway=$1 deadline pki config_before="" config_after=""
     validate_gateway_name "$gateway"
     acquire_lock "gateway-$gateway"
     load_gateway_cfg "$gateway"
+    gateway_ensure_runtime_access "$gateway" || {
+        release_lock "gateway-$gateway"
+        die "Could not normalize runtime access for gateway '$gateway'."
+    }
     ensure_upstream_ready "$gateway" "$VIA_APP" >/dev/null
 
+    [[ ! -f "$(gateway_dir "$gateway")/server.conf" ]] ||
+        config_before=$(sha256sum "$(gateway_dir "$gateway")/server.conf" 2>/dev/null | awk '{print $1}')
     write_gateway_unit_dropin "$gateway"
     gateway_write_server_config "$gateway"
+    [[ ! -f "$(gateway_dir "$gateway")/server.conf" ]] ||
+        config_after=$(sha256sum "$(gateway_dir "$gateway")/server.conf" 2>/dev/null | awk '{print $1}')
     gateway_write_transport_config "$gateway"
     systemctl daemon-reload
     systemctl enable --now "nns-gateway-crl-refresh@${gateway}.timer" \
@@ -1379,11 +1464,19 @@ gateway_start() {
     release_lock "gateway-$gateway"
 
     if systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
-        log "Gateway '$gateway' is already running."
-        return 0
-    fi
-
-    if ! systemctl start "nns-gateway@${gateway}.service"; then
+        if [[ -n "$config_before" && "$config_before" != "$config_after" ]]; then
+            log "Gateway '$gateway' configuration changed; restarting it."
+            if ! systemctl restart "nns-gateway@${gateway}.service"; then
+                warn "Gateway '$gateway' failed to restart after configuration update."
+                journalctl -u "nns-gateway@${gateway}.service" \
+                    -n 80 -o cat --no-pager >&2 2>/dev/null || true
+                return 1
+            fi
+        else
+            log "Gateway '$gateway' is already running."
+            return 0
+        fi
+    elif ! systemctl start "nns-gateway@${gateway}.service"; then
         warn "Gateway '$gateway' failed to start."
         journalctl -u "nns-gateway@${gateway}.service" \
             -n 80 -o cat --no-pager >&2 2>/dev/null || true
@@ -1566,10 +1659,10 @@ gateway_client_add() {
             -out "$staging/client.crt" >/dev/null 2>&1 || rc=1
     fi
 
-    if (( rc == 0 )); then
+    if (( rc == 0 )) && [[ "${OPENVPN_COMPAT:-modern}" != embedded ]]; then
         metadata=$(printf '%s' "$client" | base64 -w0) || rc=1
     fi
-    if (( rc == 0 )); then
+    if (( rc == 0 )) && [[ "${OPENVPN_COMPAT:-modern}" != embedded ]]; then
         openvpn \
             --tls-crypt-v2 "$pki/tls-crypt-v2-server.key" \
             --genkey tls-crypt-v2-client \
@@ -1604,10 +1697,10 @@ CLIENT_CFG_EOF
     if (( rc == 0 )); then
         chown -R root:root "$staging" || rc=1
         chmod 0700 "$staging" || rc=1
-        chmod 0600 \
-            "$staging/client.key" \
-            "$staging/tls-crypt-v2-client.key" \
-            "$staging/client.cfg" || rc=1
+        chmod 0600 "$staging/client.key" "$staging/client.cfg" || rc=1
+        if [[ "${OPENVPN_COMPAT:-modern}" != embedded ]]; then
+            chmod 0600 "$staging/tls-crypt-v2-client.key" || rc=1
+        fi
         chmod 0644 "$staging/client.crt" || rc=1
     fi
 

@@ -1,0 +1,4 @@
+nns-app release: 1.3.32
+Feature marker: --embedded OpenVPN export uses TP-Link-compatible tls-auth + AES-256-GCM on a separate public gateway
+Installer SHA256: d598a140d988717517e1d77c2fb6720002efeb146b9cc69ea6eb750de606d4ff
+Tests: make test PASS (static + function tests)

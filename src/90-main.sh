@@ -273,10 +273,10 @@ main() {
             ;;
         export)
             (( $# >= 4 )) ||
-                die "Usage: nns-app export ovpn <app_name> --client <client_name> [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]"
+                die "Usage: nns-app export ovpn <app_name> --client <client_name> [--embedded] [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]"
             [[ "$2" == ovpn ]] ||
                 die "Only 'nns-app export ovpn ...' is currently supported."
-            local export_app=$3 export_client="" export_public="-" export_proto="auto" export_output="-"
+            local export_app=$3 export_client="" export_public="-" export_proto="auto" export_output="-" export_compat="modern"
             shift 3
             while (( $# > 0 )); do
                 case "$1" in
@@ -285,6 +285,8 @@ main() {
                         export_client=$2; shift 2 ;;
                     --client=*)
                         export_client=${1#--client=}; shift ;;
+                    --embedded)
+                        export_compat=embedded; shift ;;
                     --public)
                         (( $# >= 2 )) || die "--public requires host:port."
                         export_public=$2; shift 2 ;;
@@ -305,11 +307,20 @@ main() {
             done
             [[ -n "$export_client" ]] || die "export ovpn requires --client <client_name>."
             remote_auto_export_public_ovpn "$export_app" "$export_client" \
-                "$export_public" "$export_proto" "$export_output"
+                "$export_public" "$export_proto" "$export_output" "$export_compat"
             ;;
         revoke)
-            [[ $# -eq 3 ]] || die "Usage: nns-app revoke <app_name> <client_name>"
-            remote_auto_revoke_public_ovpn "$2" "$3"
+            (( $# >= 3 && $# <= 4 )) ||
+                die "Usage: nns-app revoke <app_name> <client_name> [--modern|--embedded]"
+            local revoke_scope=all
+            if (( $# == 4 )); then
+                case "$4" in
+                    --modern) revoke_scope=modern ;;
+                    --embedded) revoke_scope=embedded ;;
+                    *) die "Usage: nns-app revoke <app_name> <client_name> [--modern|--embedded]" ;;
+                esac
+            fi
+            remote_auto_revoke_public_ovpn "$2" "$3" "$revoke_scope"
             ;;
         add)
             (( $# >= 3 )) ||

@@ -286,22 +286,25 @@ repair_gateway_abandoned_certs() {
 }
 
 repair_gateway_expected_running() {
-    local gateway=$1 marker active_public
+    local gateway=$1 marker active_public compat
     systemctl is-enabled --quiet "nns-gateway@${gateway}.service" 2>/dev/null && return 0
     marker=${REMOTE_MANAGED_OWNER_ID:-}
     [[ "$marker" =~ ^[a-f0-9]{16}$ ]] || return 1
     if [[ "$gateway" == "$(remote_auto_gateway_name "$marker")" ]]; then
         repair_state_pool_has_member "$marker" active && return 0
-    elif [[ "$gateway" == "$(remote_auto_public_gateway_name "$marker")" ]]; then
-        active_public=$(remote_auto_public_active_client_count "$marker" 2>/dev/null || printf 0)
-        [[ "$active_public" =~ ^[0-9]+$ ]] && (( active_public > 0 )) && return 0
     fi
+    for compat in modern embedded; do
+        if [[ "$gateway" == "$(remote_auto_public_gateway_name "$marker" "$compat")" ]]; then
+            active_public=$(remote_auto_public_active_client_count "$marker" "$compat" 2>/dev/null || printf 0)
+            [[ "$active_public" =~ ^[0-9]+$ ]] && (( active_public > 0 )) && return 0
+        fi
+    done
     return 1
 }
 
 repair_gateway_one() {
     local gateway=$1 state pid restart_needed=no upstream_ns="" upstream_tun=""
-    local before_ufw=no
+    local before_ufw=no root_mode config_before="" config_after="" config_changed=no
     validate_gateway_name "$gateway"
     if ! ( load_gateway_cfg "$gateway" ) 2>/dev/null; then
         repair_unresolved "gateway '$gateway' has an invalid configuration"
@@ -309,9 +312,22 @@ repair_gateway_one() {
     fi
     acquire_lock "gateway-$gateway"
     load_gateway_cfg "$gateway"
+    root_mode=$(stat -c '%a' "$(gateway_dir "$gateway")" 2>/dev/null || true)
+    if [[ "$root_mode" != 711 ]]; then
+        if gateway_ensure_runtime_access "$gateway"; then
+            repair_fixed "gateway '$gateway' root mode ${root_mode:-unknown} -> 0711 for privilege-dropped CRL access"
+        else
+            repair_unresolved "could not normalize runtime access on gateway '$gateway'"
+        fi
+    fi
+    [[ ! -f "$(gateway_dir "$gateway")/server.conf" ]] ||
+        config_before=$(sha256sum "$(gateway_dir "$gateway")/server.conf" 2>/dev/null | awk '{print $1}')
     write_gateway_unit_dropin "$gateway"
     gateway_write_openssl_config "$gateway" "$(gateway_dir "$gateway")"
     gateway_write_server_config "$gateway"
+    [[ ! -f "$(gateway_dir "$gateway")/server.conf" ]] ||
+        config_after=$(sha256sum "$(gateway_dir "$gateway")/server.conf" 2>/dev/null | awk '{print $1}')
+    [[ -z "$config_before" || "$config_before" == "$config_after" ]] || config_changed=yes
     gateway_write_transport_config "$gateway"
 
     repair_gateway_abandoned_certs "$gateway" || true
@@ -334,11 +350,16 @@ repair_gateway_one() {
         ip link show dev "$GATEWAY_TUN" up >/dev/null 2>&1 || restart_needed=yes
         gateway_listener_ready "${pid:-0}" || restart_needed=yes
         gateway_policy_ready || restart_needed=yes
+        [[ "$config_changed" == no ]] || restart_needed=yes
         if [[ "$restart_needed" == yes ]]; then
             release_lock "gateway-$gateway"
             if ( gateway_stop "$gateway" >/dev/null 2>&1 ) &&
                ( gateway_start "$gateway" >/dev/null 2>&1 ); then
-                repair_fixed "restarted stale gateway '$gateway' and rebuilt its data plane"
+                if [[ "$config_changed" == yes ]]; then
+                    repair_fixed "restarted gateway '$gateway' after generated configuration changed"
+                else
+                    repair_fixed "restarted stale gateway '$gateway' and rebuilt its data plane"
+                fi
                 return 0
             fi
             repair_unresolved "gateway '$gateway' is configured active but its listener/data plane could not be rebuilt"
@@ -608,7 +629,7 @@ repair_detect_duplicate_exits() {
 
 remote_auto_repair_internal() {
     require_root
-    local owner=$1 expected_active=${2:-off} public_gateway
+    local owner=$1 expected_active=${2:-off} public_gateway compat
     validate_remote_owner_id "$owner"
     [[ "$expected_active" == on || "$expected_active" == off ]] ||
         die "_remote-auto repair active state must be on or off."
@@ -629,10 +650,12 @@ remote_auto_repair_internal() {
         else
             repair_unresolved "private gateway '$RA_GATEWAY' referenced by owner '$owner' is missing"
         fi
-        public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID")
-        if [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
-            repair_gateway_one "$public_gateway" || true
-        fi
+        for compat in modern embedded; do
+            public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID" "$compat")
+            if [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
+                repair_gateway_one "$public_gateway" || true
+            fi
+        done
     fi
     repair_remote_owned_orphans
     repair_detect_duplicate_exits

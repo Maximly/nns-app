@@ -30,8 +30,8 @@
 #   list
 #   status  <app_name>
 #   myip    [<app_name>]
-#   export  ovpn <app_name> --client <name> [--public <host>:<port>]
-#                  [--proto tcp|udp] [--output <file|->]
+#   export  ovpn <app_name> --client <name> [--embedded]
+#                  [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]
 #   revoke  <app_name> <client_name>
 #   add     <app_name> <profile.ovpn|wireguard.conf>
 #   add     <app_name> any [country] [--refresh] [--via <upstream-app>|host]
@@ -52,7 +52,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.30"
+readonly VERSION="1.3.32"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -186,7 +186,7 @@ reset_app_cfg_vars() {
 reset_gateway_cfg_vars() {
     GATEWAY_NAME="" GATEWAY_BACKEND="" VIA_APP=""
     LISTEN_PROTO="" LISTEN_PORT="" PUBLIC_HOST="" PUBLIC_PORT=""
-    TRANSPORT="" OPENVPN_LISTEN_PROTO="" OPENVPN_LISTEN_PORT=""
+    TRANSPORT="" OPENVPN_LISTEN_PROTO="" OPENVPN_LISTEN_PORT="" OPENVPN_COMPAT=""
     TRANSPORT_SERVER_NAME="" TRANSPORT_PUBLIC_KEY="" TRANSPORT_PRIVATE_KEY=""
     CLIENT_POOL="" DNS_SERVERS="" TRANSIT_CIDR=""
     TRANSIT_HOST_ADDR="" TRANSIT_NS_ADDR="" GATEWAY_TUN=""
@@ -283,10 +283,10 @@ Usage:
   nns-app list [all|gateway|clients]
   nns-app status  <app_name>
   nns-app myip [<app_name>]
-  nns-app export ovpn <app_name> --client <client_name>
+  nns-app export ovpn <app_name> --client <client_name> [--embedded]
                   [--public <host>:<port>] [--proto tcp|udp]
                   [--output <file|->]
-  nns-app revoke <app_name> <client_name>
+  nns-app revoke <app_name> <client_name> [--modern|--embedded]
   nns-app add     <app_name> <profile.ovpn|wireguard.conf>
   nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
   nns-app start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
@@ -354,6 +354,9 @@ Examples:
   # The current automatic-remote host and a free OpenVPN port are used by default.
   nns-app export ovpn my-private-app --client my-laptop \
       --output ~/my-laptop.ovpn
+  # Embedded/vendor-router profile (verified with TP-Link Archer AX80):
+  nns-app export ovpn my-private-app --client my-router --embedded \
+      --output ~/my-router.ovpn
   # Optional override: --public vpn.example.net:443
   nns-app revoke my-private-app my-laptop
 

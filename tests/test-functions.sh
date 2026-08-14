@@ -416,6 +416,94 @@ dev_type_line=$(grep -nFx 'dev-type tun' "$gateway_cfg_root/server.conf" | cut -
 dev_line=$(grep -nFx 'dev ngwdeadbeef' "$gateway_cfg_root/server.conf" | cut -d: -f1)
 (( dev_type_line < dev_line )) || fail 'dev-type must precede the custom dev line'
 
+# Embedded/vendor mode must emit a TLS-Auth server profile and avoid
+# requiring TLS-Crypt material.
+embedded_gateway_root="$TEST_TMP/gateway-config-embedded"
+mkdir -p "$embedded_gateway_root/pki"
+cat >"$embedded_gateway_root/gateway.cfg" <<'EOF_TEST_GATEWAY_EMBEDDED'
+GATEWAY_NAME=embedded-gateway
+GATEWAY_BACKEND=openvpn
+VIA_APP=unit-exit
+TRANSPORT=direct
+LISTEN_PROTO=tcp
+LISTEN_PORT=24444
+OPENVPN_LISTEN_PROTO=tcp
+OPENVPN_LISTEN_PORT=24444
+OPENVPN_COMPAT=embedded
+PUBLIC_HOST=router.example.net
+PUBLIC_PORT=24444
+CLIENT_POOL=10.253.100.0/24
+DNS_SERVERS='1.1.1.1 9.9.9.9'
+GATEWAY_TUN=ngwcafebabe
+SERVER_CN=nns-gateway-embedded-gateway
+EOF_TEST_GATEWAY_EMBEDDED
+gateway_write_server_config embedded-gateway "$embedded_gateway_root"
+grep -Eq '^tls-auth[[:space:]]+.+[[:space:]]+0$' "$embedded_gateway_root/server.conf" ||
+    fail 'embedded gateway omitted tls-auth direction 0'
+if grep -Eq '^tls-crypt(-v2)?[[:space:]]+' "$embedded_gateway_root/server.conf"; then
+    fail 'embedded gateway unexpectedly emitted tls-crypt'
+fi
+grep -Fxq 'cipher AES-256-GCM' "$embedded_gateway_root/server.conf" ||
+    fail 'embedded gateway omitted AES-256-GCM compatibility cipher'
+
+# Embedded exported client profiles must remain acceptable to constrained
+# vendor firmware: no v2/DCO directives, with inline TLS-Auth direction 1.
+(
+    profile_root="$TEST_TMP/embedded-client-profile"
+    mkdir -p "$profile_root/pki" "$profile_root/client"
+    printf 'CA\n' >"$profile_root/pki/ca.crt"
+    printf 'TLSKEY\n' >"$profile_root/pki/tls-crypt.key"
+    printf 'CERT\n' >"$profile_root/client/client.crt"
+    printf 'KEY\n' >"$profile_root/client/client.key"
+    load_gateway_cfg() {
+        LISTEN_PROTO=tcp
+        PUBLIC_HOST=router.example.net
+        PUBLIC_PORT=24444
+        SERVER_CN=nns-gateway-embedded-gateway
+        OPENVPN_COMPAT=embedded
+    }
+    gateway_client_load() { STATUS=active; }
+    gateway_client_dir() { printf '%s\n' "$profile_root/client"; }
+    gateway_pki_dir() { printf '%s\n' "$profile_root/pki"; }
+    gateway_write_client_profile_file embedded-gateway router "$profile_root/router.ovpn" public
+    grep -Fxq 'cipher AES-256-GCM' "$profile_root/router.ovpn" ||
+        fail 'embedded client profile omitted compatibility cipher'
+    grep -Fxq 'key-direction 1' "$profile_root/router.ovpn" ||
+        fail 'embedded client profile omitted tls-auth key direction'
+    grep -Fq '<tls-auth>' "$profile_root/router.ovpn" ||
+        fail 'embedded client profile omitted inline tls-auth'
+    for forbidden in '<tls-crypt>' '<tls-crypt-v2>' 'data-ciphers ' 'allow-compression ' 'disable-dco'; do
+        if grep -Fq "$forbidden" "$profile_root/router.ovpn"; then
+            fail "embedded client profile contains unsupported directive: $forbidden"
+        fi
+    done
+)
+
+# Export diagnostics copied together with stdout must remain valid OpenVPN
+# comments instead of becoming accidental directives such as "Remote".
+(
+    output=$(printf '%s\n' 'plain diagnostic' '# existing comment' 'WARNING: test' | ovpn_commentize_stream)
+    [[ "$output" == $'# plain diagnostic\n# existing comment\n# WARNING: test' ]] ||
+        fail "OpenVPN diagnostic commentization: $output"
+)
+
+# Managed gateway roots must allow traversal after OpenVPN drops privileges so
+# it can re-stat/reload pki/crl.pem, without allowing directory listings.
+(
+    access_root="$TEST_TMP/gateway-runtime-access"
+    mkdir -p "$access_root/pki"
+    : >"$access_root/pki/crl.pem"
+    chmod 0700 "$access_root"
+    gateway_dir() { printf '%s\n' "$access_root"; }
+    gateway_ensure_runtime_access runtime-access-gateway
+    [[ "$(stat -c '%a' "$access_root")" == 711 ]] ||
+        fail 'gateway runtime root mode was not normalized to 0711'
+    [[ "$(stat -c '%a' "$access_root/pki")" == 755 ]] ||
+        fail 'gateway PKI directory mode was not normalized to 0755'
+    [[ "$(stat -c '%a' "$access_root/pki/crl.pem")" == 644 ]] ||
+        fail 'gateway CRL mode was not normalized to 0644'
+)
+
 # OpenVPN appends tun_dev, tun_mtu, a compatibility zero, local/remote
 # addresses, and init/restart after the configured --up command arguments.
 # The dispatcher must retain the configured gateway name and ignore the rest.
@@ -1405,20 +1493,22 @@ manual_payload=$(remote_command_payload gateway client export \
 # gateway names and preserve every CLI argument through dispatch.
 [[ "$(remote_auto_public_gateway_name 0123456789abcdef)" == ra-0123456789ab-public ]] ||
     fail 'automatic public gateway naming'
+[[ "$(remote_auto_public_gateway_name 0123456789abcdef embedded)" == ra-0123456789ab-public-emb ]] ||
+    fail 'automatic embedded public gateway naming'
 
 (
     require_root() { :; }
     remote_auto_public_export_internal() {
-        printf 'public-export:%s:%s:%s:%s\n' "$1" "$2" "$3" "$4"
+        printf 'public-export:%s:%s:%s:%s:%s\n' "$1" "$2" "$3" "$4" "$5"
     }
     remote_auto_public_revoke_internal() {
-        printf 'public-revoke:%s:%s\n' "$1" "$2"
+        printf 'public-revoke:%s:%s:%s\n' "$1" "$2" "$3"
     }
-    output=$(remote_auto_dispatch public-export 0123456789abcdef my-phone vpn.example.net:443 tcp)
-    [[ "$output" == 'public-export:0123456789abcdef:my-phone:vpn.example.net:443:tcp' ]] ||
+    output=$(remote_auto_dispatch public-export 0123456789abcdef my-phone vpn.example.net:443 tcp modern)
+    [[ "$output" == 'public-export:0123456789abcdef:my-phone:vpn.example.net:443:tcp:modern' ]] ||
         fail "automatic public export dispatch: $output"
-    output=$(remote_auto_dispatch public-revoke 0123456789abcdef my-phone)
-    [[ "$output" == 'public-revoke:0123456789abcdef:my-phone' ]] ||
+    output=$(remote_auto_dispatch public-revoke 0123456789abcdef my-phone embedded)
+    [[ "$output" == 'public-revoke:0123456789abcdef:my-phone:embedded' ]] ||
         fail "automatic public revoke dispatch: $output"
 )
 
@@ -1504,20 +1594,29 @@ manual_payload=$(remote_command_payload gateway client export \
 
 (
     remote_auto_export_public_ovpn() {
-        printf 'EXPORT:%s:%s:%s:%s:%s\n' "$1" "$2" "$3" "$4" "$5"
+        printf 'EXPORT:%s:%s:%s:%s:%s:%s\n' "$1" "$2" "$3" "$4" "$5" "$6"
     }
     remote_auto_revoke_public_ovpn() {
-        printf 'REVOKE:%s:%s\n' "$1" "$2"
+        printf 'REVOKE:%s:%s:%s\n' "$1" "$2" "$3"
     }
     output=$(main export ovpn my-app --client my-phone --public vpn.example.net:443 --proto udp --output /tmp/my-phone.ovpn)
-    [[ "$output" == 'EXPORT:my-app:my-phone:vpn.example.net:443:udp:/tmp/my-phone.ovpn' ]] ||
+    [[ "$output" == 'EXPORT:my-app:my-phone:vpn.example.net:443:udp:/tmp/my-phone.ovpn:modern' ]] ||
         fail "public export CLI parsing: $output"
     output=$(main export ovpn my-app --client my-laptop)
-    [[ "$output" == 'EXPORT:my-app:my-laptop:-:auto:-' ]] ||
+    [[ "$output" == 'EXPORT:my-app:my-laptop:-:auto:-:modern' ]] ||
         fail "public export reuse CLI parsing: $output"
+    output=$(main export ovpn my-app --client my-router --embedded)
+    [[ "$output" == 'EXPORT:my-app:my-router:-:auto:-:embedded' ]] ||
+        fail "embedded public export CLI parsing: $output"
     output=$(main revoke my-app my-phone)
-    [[ "$output" == 'REVOKE:my-app:my-phone' ]] ||
+    [[ "$output" == 'REVOKE:my-app:my-phone:all' ]] ||
         fail "public revoke CLI parsing: $output"
+    output=$(main revoke my-app my-phone --modern)
+    [[ "$output" == 'REVOKE:my-app:my-phone:modern' ]] ||
+        fail "modern-scoped public revoke CLI parsing: $output"
+    output=$(main revoke my-app my-phone --embedded)
+    [[ "$output" == 'REVOKE:my-app:my-phone:embedded' ]] ||
+        fail "embedded-scoped public revoke CLI parsing: $output"
 )
 
 
@@ -1622,7 +1721,7 @@ manual_payload=$(remote_command_payload gateway client export \
     remote_auto_register() { fail 'current remote was unnecessarily registered'; }
     log() { printf 'log:%s\n' "$*"; }
     output=$(remote_auto_refresh_configured_app my-app)
-    grep -Fq 'already runs nns-app 1.3.30' <<<"$output" ||
+    grep -Fq 'already runs nns-app 1.3.32' <<<"$output" ||
         fail 'current remote refresh status missing'
 )
 
@@ -1674,6 +1773,9 @@ EOF_REPAIR_STATE
         TRANSPORT=direct LISTEN_PORT=25108 LISTEN_PROTO=tcp
         GATEWAY_TUN=ngwtest REMOTE_MANAGED_OWNER_ID=""
     }
+    mkdir -p "$TEST_TMP/repair-gw"
+    chmod 0711 "$TEST_TMP/repair-gw"
+    gateway_dir() { printf '%s\n' "$TEST_TMP/repair-gw"; }
     write_gateway_unit_dropin() { :; }
     gateway_write_openssl_config() { :; }
     gateway_write_server_config() { :; }

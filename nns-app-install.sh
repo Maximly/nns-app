@@ -30,8 +30,8 @@
 #   list
 #   status  <app_name>
 #   myip    [<app_name>]
-#   export  ovpn <app_name> --client <name> [--public <host>:<port>]
-#                  [--proto tcp|udp] [--output <file|->]
+#   export  ovpn <app_name> --client <name> [--embedded]
+#                  [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]
 #   revoke  <app_name> <client_name>
 #   add     <app_name> <profile.ovpn|wireguard.conf>
 #   add     <app_name> any [country] [--refresh] [--via <upstream-app>|host]
@@ -52,7 +52,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.30"
+readonly VERSION="1.3.32"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -186,7 +186,7 @@ reset_app_cfg_vars() {
 reset_gateway_cfg_vars() {
     GATEWAY_NAME="" GATEWAY_BACKEND="" VIA_APP=""
     LISTEN_PROTO="" LISTEN_PORT="" PUBLIC_HOST="" PUBLIC_PORT=""
-    TRANSPORT="" OPENVPN_LISTEN_PROTO="" OPENVPN_LISTEN_PORT=""
+    TRANSPORT="" OPENVPN_LISTEN_PROTO="" OPENVPN_LISTEN_PORT="" OPENVPN_COMPAT=""
     TRANSPORT_SERVER_NAME="" TRANSPORT_PUBLIC_KEY="" TRANSPORT_PRIVATE_KEY=""
     CLIENT_POOL="" DNS_SERVERS="" TRANSIT_CIDR=""
     TRANSIT_HOST_ADDR="" TRANSIT_NS_ADDR="" GATEWAY_TUN=""
@@ -283,10 +283,10 @@ Usage:
   nns-app list [all|gateway|clients]
   nns-app status  <app_name>
   nns-app myip [<app_name>]
-  nns-app export ovpn <app_name> --client <client_name>
+  nns-app export ovpn <app_name> --client <client_name> [--embedded]
                   [--public <host>:<port>] [--proto tcp|udp]
                   [--output <file|->]
-  nns-app revoke <app_name> <client_name>
+  nns-app revoke <app_name> <client_name> [--modern|--embedded]
   nns-app add     <app_name> <profile.ovpn|wireguard.conf>
   nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
   nns-app start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
@@ -354,6 +354,9 @@ Examples:
   # The current automatic-remote host and a free OpenVPN port are used by default.
   nns-app export ovpn my-private-app --client my-laptop \
       --output ~/my-laptop.ovpn
+  # Embedded/vendor-router profile (verified with TP-Link Archer AX80):
+  nns-app export ovpn my-private-app --client my-router --embedded \
+      --output ~/my-router.ovpn
   # Optional override: --public vpn.example.net:443
   nns-app revoke my-private-app my-laptop
 
@@ -4096,6 +4099,11 @@ load_gateway_cfg() {
     [[ "${GATEWAY_BACKEND:-}" == openvpn ]] ||
         die "Unsupported gateway backend '${GATEWAY_BACKEND:-}'."
     TRANSPORT=${TRANSPORT:-direct}
+    OPENVPN_COMPAT=${OPENVPN_COMPAT:-modern}
+    case "$OPENVPN_COMPAT" in
+        modern|embedded) ;;
+        *) die "Unsupported OpenVPN compatibility mode '$OPENVPN_COMPAT'." ;;
+    esac
     OPENVPN_LISTEN_PROTO=${OPENVPN_LISTEN_PROTO:-$LISTEN_PROTO}
     OPENVPN_LISTEN_PORT=${OPENVPN_LISTEN_PORT:-$LISTEN_PORT}
     TRANSPORT_SERVER_NAME=${TRANSPORT_SERVER_NAME:-$PUBLIC_HOST}
@@ -4678,9 +4686,10 @@ gateway_crl_refresh() {
 }
 
 gateway_generate_pki() {
-    local gateway=$1 root=${2:-$(gateway_dir "$gateway")} pki server_cn
+    local gateway=$1 root=${2:-$(gateway_dir "$gateway")} compat=${3:-modern} pki server_cn
     pki="$root/pki"
     server_cn="nns-gateway-$gateway"
+    case "$compat" in modern|embedded) ;; *) return 1 ;; esac
 
     install -d -o root -g root -m 0755 \
         "$pki" "$pki/newcerts" "$pki/issued" || return 1
@@ -4710,19 +4719,35 @@ gateway_generate_pki() {
         -in "$pki/server.csr" \
         -out "$pki/server.crt" >/dev/null 2>&1 || return 1
 
-    openvpn --genkey tls-crypt-v2-server \
-        "$pki/tls-crypt-v2-server.key" || return 1
+    if [[ "$compat" == embedded ]]; then
+        # Embedded/vendor clients such as TP-Link routers interoperate with
+        # the older tls-auth control-channel protection. Keep the historical
+        # filename for seamless upgrades from 1.3.31; the static key format is
+        # identical and only the OpenVPN directive/direction changes.
+        openvpn --genkey secret "$pki/tls-crypt.key" || return 1
+    else
+        openvpn --genkey tls-crypt-v2-server \
+            "$pki/tls-crypt-v2-server.key" || return 1
+    fi
     gateway_generate_crl_at "$pki" || return 1
     rm -f "$pki/server.csr"
 
     chown root:root "$pki/ca.crt" "$pki/server.crt" "$pki/crl.pem" ||
         return 1
-    chown root:root "$pki/server.key" "$pki/tls-crypt-v2-server.key" ||
-        return 1
+    chown root:root "$pki/server.key" || return 1
+    if [[ "$compat" == embedded ]]; then
+        chown root:root "$pki/tls-crypt.key" || return 1
+    else
+        chown root:root "$pki/tls-crypt-v2-server.key" || return 1
+    fi
     chmod 0644 "$pki/ca.crt" "$pki/server.crt" "$pki/crl.pem" ||
         return 1
-    chmod 0600 "$pki/server.key" "$pki/tls-crypt-v2-server.key" ||
-        return 1
+    chmod 0600 "$pki/server.key" || return 1
+    if [[ "$compat" == embedded ]]; then
+        chmod 0600 "$pki/tls-crypt.key" || return 1
+    else
+        chmod 0600 "$pki/tls-crypt-v2-server.key" || return 1
+    fi
 }
 
 gateway_write_server_config() {
@@ -4777,14 +4802,26 @@ PY_GATEWAY_POOL
         printf 'key %s\n' "$pki/server.key"
         printf 'dh none\n'
         printf 'crl-verify %s\n' "$pki/crl.pem"
-        printf 'tls-crypt-v2 %s force-cookie\n' \
-            "$pki/tls-crypt-v2-server.key"
+        if [[ "$OPENVPN_COMPAT" == embedded ]]; then
+            printf 'tls-auth %s 0\n' "$pki/tls-crypt.key"
+        else
+            printf 'tls-crypt-v2 %s force-cookie\n' \
+                "$pki/tls-crypt-v2-server.key"
+        fi
         printf 'verify-client-cert require\n'
         printf 'remote-cert-tls client\n'
         printf 'tls-version-min 1.2\n'
-        printf 'data-ciphers AES-256-GCM:CHACHA20-POLY1305:AES-128-GCM\n'
+        if [[ "$OPENVPN_COMPAT" == embedded ]]; then
+            # Keep the public router-facing profile conservative while
+            # retaining an explicit server-side fallback for modern daemons.
+            printf 'cipher AES-256-GCM\n'
+            printf 'data-ciphers AES-256-GCM:AES-128-GCM\n'
+            printf 'data-ciphers-fallback AES-256-GCM\n'
+        else
+            printf 'data-ciphers AES-256-GCM:CHACHA20-POLY1305:AES-128-GCM\n'
+            printf 'allow-compression no\n'
+        fi
         printf 'auth SHA256\n'
-        printf 'allow-compression no\n'
         printf 'keepalive 10 60\n'
         printf 'persist-tun\n'
         printf 'script-security 2\n'
@@ -4800,7 +4837,9 @@ PY_GATEWAY_POOL
         [[ "$LISTEN_PROTO" == udp ]] &&
             printf 'explicit-exit-notify 1\n'
         printf 'verb 3\n'
-        printf 'mute 10\n'
+        # Do not hide handshake diagnostics for constrained/vendor clients.
+        # Their UIs frequently expose only a generic "Connecting" state.
+        [[ "$OPENVPN_COMPAT" == embedded ]] || printf 'mute 10\n'
     } >"$output" || {
         rm -f "$output"
         return 1
@@ -4819,16 +4858,28 @@ PY_GATEWAY_POOL
 }
 
 gateway_validate_staging() {
-    local gateway=$1 root=$2 pki="$2/pki" transport
+    local gateway=$1 root=$2 pki="$2/pki" transport compat
     [[ -s "$root/gateway.cfg" && -s "$root/server.conf" ]] || return 1
     [[ -s "$pki/ca.crt" && -s "$pki/server.crt" &&
        -s "$pki/server.key" ]] || return 1
-    [[ -s "$pki/tls-crypt-v2-server.key" &&
-       -s "$pki/crl.pem" ]] || return 1
+    [[ -s "$pki/crl.pem" ]] || return 1
+    compat=$(awk -F= '/^OPENVPN_COMPAT=/{gsub(/^"|"$/, "", $2); print $2; exit}' "$root/gateway.cfg")
+    compat=${compat:-modern}
+    case "$compat" in modern|embedded) ;; *) return 1 ;; esac
+    if [[ "$compat" == embedded ]]; then
+        [[ -s "$pki/tls-crypt.key" ]] || return 1
+    else
+        [[ -s "$pki/tls-crypt-v2-server.key" ]] || return 1
+    fi
     openssl verify -CAfile "$pki/ca.crt" \
         "$pki/server.crt" >/dev/null 2>&1 || return 1
     gateway_crl_valid_for "$pki/crl.pem" 1 || return 1
-    grep -Eq '^tls-crypt-v2[[:space:]]+' "$root/server.conf" || return 1
+    if [[ "$compat" == embedded ]]; then
+        grep -Eq '^tls-auth[[:space:]]+.+[[:space:]]+0$' "$root/server.conf" || return 1
+        grep -Eq '^tls-crypt(-v2)?[[:space:]]+' "$root/server.conf" && return 1
+    else
+        grep -Eq '^tls-crypt-v2[[:space:]]+' "$root/server.conf" || return 1
+    fi
     grep -Eq '^up[[:space:]]+' "$root/server.conf" || return 1
     transport=$(awk -F= '/^TRANSPORT=/{gsub(/^"|"$/, "", $2); print $2; exit}' "$root/gateway.cfg")
     case "${transport:-direct}" in
@@ -4849,6 +4900,21 @@ gateway_validate_staging() {
     esac
 }
 
+gateway_ensure_runtime_access() {
+    local gateway=$1 root
+    root=$(gateway_dir "$gateway")
+    [[ -d "$root" ]] || return 1
+
+    # OpenVPN reads private key material while privileged, then drops to the
+    # configured unprivileged account. It must still be able to traverse the
+    # gateway root to stat/reload the world-readable CRL. mktemp -d creates
+    # 0700, so normalize the installed managed gateway root to execute-only
+    # traversal for non-root users without allowing directory listings.
+    chmod 0711 "$root" || return 1
+    [[ ! -d "$root/pki" ]] || chmod 0755 "$root/pki" || return 1
+    [[ ! -f "$root/pki/crl.pem" ]] || chmod 0644 "$root/pki/crl.pem" || return 1
+}
+
 gateway_create() {
     require_root
     local gateway=$1 via_app=$2 listen=$3 public=$4
@@ -4856,11 +4922,15 @@ gateway_create() {
     local dns_input=${6:-"1.1.1.1 9.9.9.9"}
     local transport=${7:-direct}
     local transport_server_name=${8:-}
+    local openvpn_compat=${9:-modern}
     local staging=""
 
     validate_gateway_name "$gateway"
     validate_app_name "$via_app"
     case "$transport" in direct|stunnel|cloak|ssh) ;; *) die "Unsupported transport '$transport'." ;; esac
+    case "$openvpn_compat" in modern|embedded) ;; *) die "Unsupported OpenVPN compatibility mode '$openvpn_compat'." ;; esac
+    [[ "$openvpn_compat" == modern || "$transport" == direct ]] ||
+        die "Embedded OpenVPN compatibility is supported only with direct transport."
     if [[ "$transport" == cloak ]]; then
         transport_server_name=${transport_server_name:-www.bing.com}
         validate_transport_server_name "$transport_server_name"
@@ -4939,6 +5009,7 @@ PUBLIC_HOST="$public_host"
 PUBLIC_PORT="$public_port"
 OPENVPN_LISTEN_PROTO="$openvpn_listen_proto"
 OPENVPN_LISTEN_PORT="$openvpn_listen_port"
+OPENVPN_COMPAT="$openvpn_compat"
 TRANSPORT_SERVER_NAME="$transport_server_name"
 CLIENT_POOL="$client_pool"
 DNS_SERVERS="$dns_servers"
@@ -4965,7 +5036,7 @@ GATEWAY_CONFIG_EOF
     local failed_stage=""
     if ! gateway_prepare_transport "$gateway" "$staging" "$transport"; then
         failed_stage="transport preparation"
-    elif ! gateway_generate_pki "$gateway" "$staging"; then
+    elif ! gateway_generate_pki "$gateway" "$staging" "$openvpn_compat"; then
         failed_stage="PKI generation"
     elif ! gateway_write_server_config "$gateway" "$staging"; then
         failed_stage="OpenVPN server configuration"
@@ -4981,8 +5052,17 @@ GATEWAY_CONFIG_EOF
         die "Failed to create gateway '$gateway' during $failed_stage; staged files were removed."
     fi
 
+    # mktemp -d creates staging with 0700. The final gateway root needs 0711
+    # so the privilege-dropped OpenVPN process can traverse to pki/crl.pem.
+    chmod 0711 "$staging" || {
+        rm -rf "$staging"
+        release_lock "gateway-$gateway"
+        release_lock global
+        die "Failed to set runtime access on gateway '$gateway' staging directory."
+    }
     mv "$staging" "$(gateway_dir "$gateway")"
-    if ! gateway_write_openssl_config "$gateway" "$(gateway_dir "$gateway")" ||
+    if ! gateway_ensure_runtime_access "$gateway" ||
+       ! gateway_write_openssl_config "$gateway" "$(gateway_dir "$gateway")" ||
        ! gateway_write_server_config "$gateway" "$(gateway_dir "$gateway")" ||
        ! gateway_write_transport_config "$gateway" "$(gateway_dir "$gateway")"; then
         rm -rf "$(gateway_dir "$gateway")"
@@ -5399,14 +5479,22 @@ gateway_server_exec() {
 
 gateway_start() {
     require_root
-    local gateway=$1 deadline pki
+    local gateway=$1 deadline pki config_before="" config_after=""
     validate_gateway_name "$gateway"
     acquire_lock "gateway-$gateway"
     load_gateway_cfg "$gateway"
+    gateway_ensure_runtime_access "$gateway" || {
+        release_lock "gateway-$gateway"
+        die "Could not normalize runtime access for gateway '$gateway'."
+    }
     ensure_upstream_ready "$gateway" "$VIA_APP" >/dev/null
 
+    [[ ! -f "$(gateway_dir "$gateway")/server.conf" ]] ||
+        config_before=$(sha256sum "$(gateway_dir "$gateway")/server.conf" 2>/dev/null | awk '{print $1}')
     write_gateway_unit_dropin "$gateway"
     gateway_write_server_config "$gateway"
+    [[ ! -f "$(gateway_dir "$gateway")/server.conf" ]] ||
+        config_after=$(sha256sum "$(gateway_dir "$gateway")/server.conf" 2>/dev/null | awk '{print $1}')
     gateway_write_transport_config "$gateway"
     systemctl daemon-reload
     systemctl enable --now "nns-gateway-crl-refresh@${gateway}.timer" \
@@ -5424,11 +5512,19 @@ gateway_start() {
     release_lock "gateway-$gateway"
 
     if systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
-        log "Gateway '$gateway' is already running."
-        return 0
-    fi
-
-    if ! systemctl start "nns-gateway@${gateway}.service"; then
+        if [[ -n "$config_before" && "$config_before" != "$config_after" ]]; then
+            log "Gateway '$gateway' configuration changed; restarting it."
+            if ! systemctl restart "nns-gateway@${gateway}.service"; then
+                warn "Gateway '$gateway' failed to restart after configuration update."
+                journalctl -u "nns-gateway@${gateway}.service" \
+                    -n 80 -o cat --no-pager >&2 2>/dev/null || true
+                return 1
+            fi
+        else
+            log "Gateway '$gateway' is already running."
+            return 0
+        fi
+    elif ! systemctl start "nns-gateway@${gateway}.service"; then
         warn "Gateway '$gateway' failed to start."
         journalctl -u "nns-gateway@${gateway}.service" \
             -n 80 -o cat --no-pager >&2 2>/dev/null || true
@@ -5611,10 +5707,10 @@ gateway_client_add() {
             -out "$staging/client.crt" >/dev/null 2>&1 || rc=1
     fi
 
-    if (( rc == 0 )); then
+    if (( rc == 0 )) && [[ "${OPENVPN_COMPAT:-modern}" != embedded ]]; then
         metadata=$(printf '%s' "$client" | base64 -w0) || rc=1
     fi
-    if (( rc == 0 )); then
+    if (( rc == 0 )) && [[ "${OPENVPN_COMPAT:-modern}" != embedded ]]; then
         openvpn \
             --tls-crypt-v2 "$pki/tls-crypt-v2-server.key" \
             --genkey tls-crypt-v2-client \
@@ -5649,10 +5745,10 @@ CLIENT_CFG_EOF
     if (( rc == 0 )); then
         chown -R root:root "$staging" || rc=1
         chmod 0700 "$staging" || rc=1
-        chmod 0600 \
-            "$staging/client.key" \
-            "$staging/tls-crypt-v2-client.key" \
-            "$staging/client.cfg" || rc=1
+        chmod 0600 "$staging/client.key" "$staging/client.cfg" || rc=1
+        if [[ "${OPENVPN_COMPAT:-modern}" != embedded ]]; then
+            chmod 0600 "$staging/tls-crypt-v2-client.key" || rc=1
+        fi
         chmod 0644 "$staging/client.crt" || rc=1
     fi
 
@@ -7274,15 +7370,23 @@ gateway_write_client_profile_file() {
         printf 'proto %s\n' "$proto"
         printf 'remote %s %s\n' "$remote_host" "$remote_port"
         printf 'nobind\n'
+        printf 'persist-key\n'
         printf 'persist-tun\n'
-        printf 'auth-nocache\n'
+        if [[ "${OPENVPN_COMPAT:-modern}" != embedded ]]; then
+            printf 'auth-nocache\n'
+        fi
         printf 'remote-cert-tls server\n'
         printf 'verify-x509-name %s name\n' "$SERVER_CN"
         printf 'tls-version-min 1.2\n'
-        printf 'data-ciphers AES-256-GCM:CHACHA20-POLY1305:AES-128-GCM\n'
+        if [[ "${OPENVPN_COMPAT:-modern}" == embedded ]]; then
+            # Embedded/vendor OpenVPN clients may reject 2.5+/DCO directives.
+            printf 'cipher AES-256-GCM\n'
+        else
+            printf 'data-ciphers AES-256-GCM:CHACHA20-POLY1305:AES-128-GCM\n'
+            printf 'allow-compression no\n'
+            printf 'disable-dco\n'
+        fi
         printf 'auth SHA256\n'
-        printf 'allow-compression no\n'
-        printf 'disable-dco\n'
         if [[ "$target_mode" == public && "$LISTEN_PROTO" == udp ]]; then
             printf 'explicit-exit-notify 2\n'
         fi
@@ -7290,7 +7394,12 @@ gateway_write_client_profile_file() {
         printf '\n<ca>\n'; cat "$pki/ca.crt"; printf '</ca>\n'
         printf '\n<cert>\n'; cat "$cdir/client.crt"; printf '</cert>\n'
         printf '\n<key>\n'; cat "$cdir/client.key"; printf '</key>\n'
-        printf '\n<tls-crypt-v2>\n'; cat "$cdir/tls-crypt-v2-client.key"; printf '</tls-crypt-v2>\n'
+        if [[ "${OPENVPN_COMPAT:-modern}" == embedded ]]; then
+            printf 'key-direction 1\n'
+            printf '\n<tls-auth>\n'; cat "$pki/tls-crypt.key"; printf '</tls-auth>\n'
+        else
+            printf '\n<tls-crypt-v2>\n'; cat "$cdir/tls-crypt-v2-client.key"; printf '</tls-crypt-v2>\n'
+        fi
     } >"$output"
     chmod 0600 "$output"
 }
@@ -7493,14 +7602,19 @@ remote_auto_client_name() {
 }
 
 remote_auto_public_gateway_name() {
-    validate_remote_owner_id "$1"
-    printf 'ra-%s-public\n' "${1:0:12}"
+    local pool_id=$1 compat=${2:-modern}
+    validate_remote_owner_id "$pool_id"
+    case "$compat" in
+        modern) printf 'ra-%s-public\n' "${pool_id:0:12}" ;;
+        embedded) printf 'ra-%s-public-emb\n' "${pool_id:0:12}" ;;
+        *) die "Unsupported OpenVPN compatibility mode '$compat'." ;;
+    esac
 }
 
 remote_auto_public_active_client_count() {
-    local pool_id=$1 gateway dir client count=0
+    local pool_id=$1 compat=${2:-modern} gateway dir client count=0
     validate_remote_owner_id "$pool_id"
-    gateway=$(remote_auto_public_gateway_name "$pool_id")
+    gateway=$(remote_auto_public_gateway_name "$pool_id" "$compat")
     [[ -f "$(gateway_cfg_file "$gateway")" ]] || {
         printf '0\n'
         return 0
@@ -7518,6 +7632,14 @@ remote_auto_public_active_client_count() {
     shopt -u nullglob
     printf '%s\n' "$count"
 }
+
+remote_auto_public_total_active_client_count() {
+    local pool_id=$1 modern embedded
+    modern=$(remote_auto_public_active_client_count "$pool_id" modern)
+    embedded=$(remote_auto_public_active_client_count "$pool_id" embedded)
+    printf '%s\n' "$((modern + embedded))"
+}
+
 
 remote_auto_state_file() {
     validate_remote_owner_id "$1"
@@ -8093,19 +8215,20 @@ remote_auto_export_internal() {
 
 remote_auto_public_export_internal() {
     require_root
-    local owner=$1 client=$2 public=${3:--} proto=${4:-auto}
+    local owner=$1 client=$2 public=${3:--} proto=${4:-auto} compat=${5:-modern}
     local pool_id exit_app gateway public_host public_port active_count
 
     validate_remote_owner_id "$owner"
     validate_gateway_client_name "$client"
     case "$proto" in auto|tcp|udp) ;; *) die "Public OpenVPN protocol must be tcp or udp." ;; esac
+    case "$compat" in modern|embedded) ;; *) die "Public OpenVPN compatibility must be modern or embedded." ;; esac
 
     acquire_lock remote-auto-pools
     remote_auto_reconcile_owner_markers "$owner" >&2
     remote_auto_load_state "$owner"
     pool_id=$RA_POOL_ID
     exit_app=$RA_EXIT_APP
-    gateway=$(remote_auto_public_gateway_name "$pool_id")
+    gateway=$(remote_auto_public_gateway_name "$pool_id" "$compat")
 
     [[ -f "$(cfg_file "$exit_app")" ]] || {
         release_lock remote-auto-pools
@@ -8119,9 +8242,10 @@ remote_auto_public_export_internal() {
 
     if [[ -f "$(gateway_cfg_file "$gateway")" ]]; then
         load_gateway_cfg "$gateway"
-        [[ "$VIA_APP" == "$exit_app" && "${TRANSPORT:-direct}" == direct ]] || {
+        [[ "$VIA_APP" == "$exit_app" && "${TRANSPORT:-direct}" == direct &&
+           "${OPENVPN_COMPAT:-modern}" == "$compat" ]] || {
             release_lock remote-auto-pools
-            die "Public gateway '$gateway' is inconsistent with automatic pool '$pool_id'."
+            die "Public gateway '$gateway' is inconsistent with automatic pool '$pool_id' or compatibility mode '$compat'."
         }
         [[ "${REMOTE_MANAGED_OWNER_ID:-}" == "$pool_id" ]] || {
             release_lock remote-auto-pools
@@ -8173,7 +8297,7 @@ remote_auto_public_export_internal() {
         # give it a distinct direct gateway that shares the same provider exit.
         start_app "$exit_app" off __default__ >&2
         gateway_create "$gateway" "$exit_app" "$proto:$public_port" \
-            "$public_host:$public_port" "" "1.1.1.1 9.9.9.9" direct "" >&2
+            "$public_host:$public_port" "" "1.1.1.1 9.9.9.9" direct "" "$compat" >&2
         gateway_cfg_set "$gateway" REMOTE_MANAGED_OWNER_ID "$pool_id"
     fi
 
@@ -8198,14 +8322,16 @@ remote_auto_public_export_internal() {
         gateway_client_add "$gateway" "$client" >&2
     fi
 
-    active_count=$(remote_auto_public_active_client_count "$pool_id")
+    active_count=$(remote_auto_public_active_client_count "$pool_id" "$compat")
     load_gateway_cfg "$gateway"
-    printf '# nns-app public client: %s; pool: %s; active public clients: %s\n' \
-        "$client" "$pool_id" "$active_count" >&2
+    printf '# nns-app public client: %s; pool: %s; mode: %s; active public clients: %s\n' \
+        "$client" "$pool_id" "$compat" "$active_count" >&2
     printf '# Public endpoint: %s:%s/%s\n' \
         "$PUBLIC_HOST" "$PUBLIC_PORT" "$LISTEN_PROTO" >&2
-    log "Remote host firewall access for $LISTEN_PORT/$LISTEN_PROTO is managed by nns-app while the public gateway is running." >&2
-    warn "External cloud security groups and upstream NAT/router forwarding must still allow $LISTEN_PROTO port $LISTEN_PORT."
+    printf '# Remote host firewall access for %s/%s is managed by nns-app while the public gateway is running.\n' \
+        "$LISTEN_PORT" "$LISTEN_PROTO" >&2
+    printf '# WARNING: External cloud security groups and upstream NAT/router forwarding must still allow %s port %s.\n' \
+        "$LISTEN_PROTO" "$LISTEN_PORT" >&2
 
     gateway_client_export "$gateway" "$client" - ovpn
     release_lock remote-auto-pools
@@ -8213,34 +8339,53 @@ remote_auto_public_export_internal() {
 
 remote_auto_public_revoke_internal() {
     require_root
-    local owner=$1 client=$2 pool_id gateway remaining
+    local owner=$1 client=$2 scope=${3:-all} pool_id gateway remaining compat found=0
+    local -a compat_modes=()
     validate_remote_owner_id "$owner"
     validate_gateway_client_name "$client"
+    case "$scope" in
+        all) compat_modes=(modern embedded) ;;
+        modern|embedded) compat_modes=("$scope") ;;
+        *) die "Public revoke scope must be all, modern, or embedded." ;;
+    esac
 
     acquire_lock remote-auto-pools
     remote_auto_load_state "$owner"
     pool_id=$RA_POOL_ID
-    gateway=$(remote_auto_public_gateway_name "$pool_id")
-    [[ -f "$(gateway_cfg_file "$gateway")" ]] || {
-        release_lock remote-auto-pools
-        die "No public OpenVPN gateway exists for automatic pool '$pool_id'."
-    }
-    load_gateway_cfg "$gateway"
-    [[ "$VIA_APP" == "$RA_EXIT_APP" && "${TRANSPORT:-direct}" == direct &&
-       "${REMOTE_MANAGED_OWNER_ID:-}" == "$pool_id" ]] || {
-        release_lock remote-auto-pools
-        die "Refusing public revoke: gateway '$gateway' ownership is inconsistent."
-    }
 
-    gateway_client_revoke "$gateway" "$client" >&2
-    remaining=$(remote_auto_public_active_client_count "$pool_id")
-    if (( remaining == 0 )); then
-        # With no export clients left, close the public listener completely.
-        # A later export recreates a new gateway CA and listener on demand.
-        gateway_remove "$gateway" >&2
-        log "Revoked public client '$client'; removed the now-unused public gateway '$gateway'." >&2
-    else
-        log "Revoked public client '$client'; $remaining public client(s) remain active." >&2
+    for compat in "${compat_modes[@]}"; do
+        gateway=$(remote_auto_public_gateway_name "$pool_id" "$compat")
+        [[ -f "$(gateway_cfg_file "$gateway")" ]] || continue
+        [[ -f "$(gateway_client_dir "$gateway" "$client")/client.cfg" ]] || continue
+        load_gateway_cfg "$gateway"
+        [[ "$VIA_APP" == "$RA_EXIT_APP" && "${TRANSPORT:-direct}" == direct &&
+           "${OPENVPN_COMPAT:-modern}" == "$compat" &&
+           "${REMOTE_MANAGED_OWNER_ID:-}" == "$pool_id" ]] || {
+            release_lock remote-auto-pools
+            die "Refusing public revoke: gateway '$gateway' ownership or compatibility mode is inconsistent."
+        }
+        gateway_client_load "$gateway" "$client"
+        found=1
+        if [[ "${STATUS:-}" != active ]]; then
+            log "Public client '$client' is already revoked on $compat gateway '$gateway'." >&2
+            continue
+        fi
+
+        gateway_client_revoke "$gateway" "$client" >&2
+        remaining=$(remote_auto_public_active_client_count "$pool_id" "$compat")
+        if (( remaining == 0 )); then
+            # With no export clients left in this compatibility class, close
+            # its listener completely. A later export recreates it on demand.
+            gateway_remove "$gateway" >&2
+            log "Revoked $compat public client '$client'; removed the now-unused public gateway '$gateway'." >&2
+        else
+            log "Revoked $compat public client '$client'; $remaining public client(s) remain active on '$gateway'." >&2
+        fi
+    done
+
+    if (( found == 0 )); then
+        release_lock remote-auto-pools
+        die "Public client '$client' does not exist for automatic pool '$pool_id'."
     fi
     release_lock remote-auto-pools
 }
@@ -8262,10 +8407,12 @@ remote_auto_locate_internal() {
 
 remote_auto_topology_internal() {
     require_root
-    local owner=$1 members exit_state private_state public_gateway public_state
+    local owner=$1 members exit_state private_state
     local private_counts private_total private_active private_revoked private_connected
-    local public_counts="0|0|0" public_total=0 public_active=0 public_revoked=0 public_connected=0
-    local public_endpoint="-" dir client connected
+    local compat public_gateway public_state public_endpoint public_counts
+    local public_total public_active public_revoked public_connected
+    local all_public_active=0 all_public_revoked=0 all_public_connected=0
+    local any_public=0 dir client connected
 
     remote_auto_load_state "$owner"
     members=$(remote_auto_pool_member_count "$RA_POOL_ID")
@@ -8282,8 +8429,17 @@ remote_auto_topology_internal() {
         private_total=0 private_active=0 private_revoked=0 private_connected=0
     fi
 
-    public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID")
-    if [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
+    printf 'Remote pool:        %s\n' "$RA_POOL_ID"
+    printf 'Pool members:       %s\n' "$members"
+    printf 'Provider exit:      %s (%s; VPN IPv4=%s)\n' \
+        "$RA_EXIT_APP" "$exit_state" "${RA_PROVIDER_VPN_IPV4:-unknown}"
+    printf 'Private gateway:    %s (%s; clients=%s active/%s revoked; connected=%s)\n' \
+        "$RA_GATEWAY" "$private_state" "$private_active" "$private_revoked" "$private_connected"
+
+    for compat in modern embedded; do
+        public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID" "$compat")
+        [[ -f "$(gateway_cfg_file "$public_gateway")" ]] || continue
+        any_public=1
         load_gateway_cfg "$public_gateway"
         public_state=$(systemctl is-active "nns-gateway@${public_gateway}.service" 2>/dev/null || true)
         [[ "$public_state" == active ]] || public_state=stopped
@@ -8291,33 +8447,34 @@ remote_auto_topology_internal() {
         public_counts=$(gateway_client_counts "$public_gateway")
         IFS='|' read -r public_total public_active public_revoked <<<"$public_counts"
         public_connected=$(gateway_connected_client_count "$public_gateway")
-    else
-        public_state=none
-    fi
+        all_public_active=$((all_public_active + public_active))
+        all_public_revoked=$((all_public_revoked + public_revoked))
+        all_public_connected=$((all_public_connected + public_connected))
+        if [[ "$compat" == modern ]]; then
+            printf 'Public gateway:     %s (%s; %s; modern)\n' \
+                "$public_gateway" "$public_state" "$public_endpoint"
+        else
+            printf 'Embedded gateway:   %s (%s; %s; OpenVPN 2.4/vendor)\n' \
+                "$public_gateway" "$public_state" "$public_endpoint"
+        fi
+    done
 
-    printf 'Remote pool:        %s\n' "$RA_POOL_ID"
-    printf 'Pool members:       %s\n' "$members"
-    printf 'Provider exit:      %s (%s; VPN IPv4=%s)\n' \
-        "$RA_EXIT_APP" "$exit_state" "${RA_PROVIDER_VPN_IPV4:-unknown}"
-    printf 'Private gateway:    %s (%s; clients=%s active/%s revoked; connected=%s)\n' \
-        "$RA_GATEWAY" "$private_state" "$private_active" "$private_revoked" "$private_connected"
-    if [[ "$public_state" == none ]]; then
+    if (( any_public == 0 )); then
         printf 'Public gateway:     none\n'
         printf 'External clients:   0\n'
         return 0
     fi
-
-    printf 'Public gateway:     %s (%s; %s)\n' \
-        "$public_gateway" "$public_state" "$public_endpoint"
     printf 'External clients:   %s active/%s revoked; connected=%s\n' \
-        "$public_active" "$public_revoked" "$public_connected"
+        "$all_public_active" "$all_public_revoked" "$all_public_connected"
 
-    if (( public_total > 0 )); then
-        printf '\nExternal client details:\n'
-        printf '%-24s %-10s %-10s %s\n' \
-            'Client' 'Status' 'Connected' 'Created'
-        printf '%-24s %-10s %-10s %s\n' \
-            '------------------------' '----------' '----------' '--------------------'
+    printf '\nExternal client details:\n'
+    printf '%-10s %-24s %-10s %-10s %s\n' \
+        'Mode' 'Client' 'Status' 'Connected' 'Created'
+    printf '%-10s %-24s %-10s %-10s %s\n' \
+        '----------' '------------------------' '----------' '----------' '--------------------'
+    for compat in modern embedded; do
+        public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID" "$compat")
+        [[ -f "$(gateway_cfg_file "$public_gateway")" ]] || continue
         shopt -s nullglob
         for dir in "$(gateway_clients_dir "$public_gateway")"/*; do
             [[ -f "$dir/client.cfg" ]] || continue
@@ -8328,50 +8485,55 @@ remote_auto_topology_internal() {
                gateway_client_is_connected "$public_gateway" "$client"; then
                 connected=yes
             fi
-            printf '%-24s %-10s %-10s %s\n' \
-                "$client" "${STATUS:-unknown}" "$connected" "${CREATED_AT:-unknown}"
+            printf '%-10s %-24s %-10s %-10s %s\n' \
+                "$compat" "$client" "${STATUS:-unknown}" "$connected" "${CREATED_AT:-unknown}"
         done
         shopt -u nullglob
-    fi
+    done
 }
 
 remote_auto_inventory_gateways_internal() {
     require_root
-    local owner=$1 public_gateway
+    local owner=$1 public_gateway compat
     remote_auto_load_state "$owner"
     if [[ -f "$(gateway_cfg_file "$RA_GATEWAY")" ]]; then
         gateway_inventory_record "$RA_GATEWAY" "remote"
     fi
-    public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID")
-    if [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
-        gateway_inventory_record "$public_gateway" "remote"
-    fi
+    for compat in modern embedded; do
+        public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID" "$compat")
+        if [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
+            gateway_inventory_record "$public_gateway" "remote"
+        fi
+    done
 }
 
 remote_auto_inventory_clients_internal() {
     require_root
-    local owner=$1 public_gateway
+    local owner=$1 public_gateway compat
     remote_auto_load_state "$owner"
-    public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID")
-    [[ -f "$(gateway_cfg_file "$public_gateway")" ]] || return 0
-    gateway_external_client_records "$public_gateway" "remote"
+    for compat in modern embedded; do
+        public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID" "$compat")
+        [[ -f "$(gateway_cfg_file "$public_gateway")" ]] || continue
+        gateway_external_client_records "$public_gateway" "remote"
+    done
 }
 
 remote_auto_status_internal() {
     require_root
-    local owner=$1
+    local owner=$1 public_gateway compat
     remote_auto_load_state "$owner"
     printf 'Automatic owner:    %s\n' "$owner"
     printf 'Remote client:      %s\n\n' "$RA_CLIENT"
     remote_auto_topology_internal "$owner"
     printf '\nPrivate gateway status:\n'
     gateway_status "$RA_GATEWAY"
-    local public_gateway
-    public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID")
-    if [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
-        printf '\nPublic gateway status:\n'
-        gateway_status "$public_gateway"
-    fi
+    for compat in modern embedded; do
+        public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID" "$compat")
+        if [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
+            printf '\n%s public gateway status:\n' "${compat^}"
+            gateway_status "$public_gateway"
+        fi
+    done
 }
 
 remote_auto_start_internal() {
@@ -8397,16 +8559,20 @@ remote_auto_start_internal() {
         die "Refusing to start gateway '$RA_GATEWAY': pool marker mismatch."
     gateway_start "$RA_GATEWAY"
 
-    public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID")
-    public_clients=$(remote_auto_public_active_client_count "$RA_POOL_ID")
-    if (( public_clients > 0 )) && [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
-        load_gateway_cfg "$public_gateway"
-        [[ "$VIA_APP" == "$RA_EXIT_APP" && "${TRANSPORT:-direct}" == direct &&
-           "${REMOTE_MANAGED_OWNER_ID:-}" == "$RA_POOL_ID" ]] ||
-            die "Refusing to start public gateway '$public_gateway': pool relationship mismatch."
-        gateway_start "$public_gateway"
-        systemctl enable "nns-gateway@${public_gateway}.service" >/dev/null 2>&1 || true
-    fi
+    local compat
+    for compat in modern embedded; do
+        public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID" "$compat")
+        public_clients=$(remote_auto_public_active_client_count "$RA_POOL_ID" "$compat")
+        if (( public_clients > 0 )) && [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
+            load_gateway_cfg "$public_gateway"
+            [[ "$VIA_APP" == "$RA_EXIT_APP" && "${TRANSPORT:-direct}" == direct &&
+               "${OPENVPN_COMPAT:-modern}" == "$compat" &&
+               "${REMOTE_MANAGED_OWNER_ID:-}" == "$RA_POOL_ID" ]] ||
+                die "Refusing to start public gateway '$public_gateway': pool relationship or compatibility mismatch."
+            gateway_start "$public_gateway"
+            systemctl enable "nns-gateway@${public_gateway}.service" >/dev/null 2>&1 || true
+        fi
+    done
 
     systemctl enable         "nns-netns@${RA_EXIT_APP}.service"         "nns-openvpn@${RA_EXIT_APP}.service"         "nns-online@${RA_EXIT_APP}.service"         "nns-gateway@${RA_GATEWAY}.service"         >/dev/null
     provider_ipv4=$(remote_auto_provider_ipv4 "$RA_EXIT_APP" 2>/dev/null || true)
@@ -8444,7 +8610,7 @@ remote_auto_stop_internal() {
         gateway_stop "$gateway"
     fi
 
-    public_clients=$(remote_auto_public_active_client_count "$pool_id")
+    public_clients=$(remote_auto_public_total_active_client_count "$pool_id")
     if (( public_clients > 0 )); then
         log "Stopped automatic client '$owner'; provider exit '$exit_app' remains online for $public_clients exported OpenVPN client(s)."
         return 0
@@ -8554,27 +8720,30 @@ remote_auto_cleanup_internal() {
         client=$(remote_auto_client_name "$owner")
     fi
 
-    local public_gateway
-    public_gateway=$(remote_auto_public_gateway_name "$pool_id")
-    if [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
-        load_gateway_cfg "$public_gateway"
-        [[ "$VIA_APP" == "$exit_app" && "${TRANSPORT:-direct}" == direct ]] ||
-            die "Refusing to remove public gateway '$public_gateway': it is inconsistent with '$exit_app'."
-        marker=${REMOTE_MANAGED_OWNER_ID:-}
-        [[ -z "$marker" || "$marker" == "$pool_id" ]] ||
-            die "Refusing to remove public gateway '$public_gateway': pool marker mismatch."
-        log "Removing automatic public gateway '$public_gateway' and all exported OpenVPN client keys."
-        gateway_remove "$public_gateway"
-    else
-        systemctl disable --now \
-            "nns-gateway@${public_gateway}.service" \
-            "nns-gateway-crl-refresh@${public_gateway}.timer" \
-            >/dev/null 2>&1 || true
-        rm -rf -- \
-            "$(gateway_dropin_dir "$public_gateway")" \
-            "$(gateway_dir "$public_gateway")" \
-            "$(gateway_runtime_dir "$public_gateway")"
-    fi
+    local public_gateway compat
+    for compat in modern embedded; do
+        public_gateway=$(remote_auto_public_gateway_name "$pool_id" "$compat")
+        if [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
+            load_gateway_cfg "$public_gateway"
+            [[ "$VIA_APP" == "$exit_app" && "${TRANSPORT:-direct}" == direct &&
+               "${OPENVPN_COMPAT:-modern}" == "$compat" ]] ||
+                die "Refusing to remove public gateway '$public_gateway': it is inconsistent with '$exit_app' or compatibility mode '$compat'."
+            marker=${REMOTE_MANAGED_OWNER_ID:-}
+            [[ -z "$marker" || "$marker" == "$pool_id" ]] ||
+                die "Refusing to remove public gateway '$public_gateway': pool marker mismatch."
+            log "Removing automatic $compat public gateway '$public_gateway' and all exported OpenVPN client keys."
+            gateway_remove "$public_gateway"
+        else
+            systemctl disable --now \
+                "nns-gateway@${public_gateway}.service" \
+                "nns-gateway-crl-refresh@${public_gateway}.timer" \
+                >/dev/null 2>&1 || true
+            rm -rf -- \
+                "$(gateway_dropin_dir "$public_gateway")" \
+                "$(gateway_dir "$public_gateway")" \
+                "$(gateway_runtime_dir "$public_gateway")"
+        fi
+    done
 
     if [[ -f "$(gateway_cfg_file "$gateway")" ]]; then
         load_gateway_cfg "$gateway"
@@ -8586,8 +8755,14 @@ remote_auto_cleanup_internal() {
         log "Removing automatic gateway '$gateway'."
         gateway_remove "$gateway"
     else
-        systemctl disable --now             "nns-gateway@${gateway}.service"             "nns-gateway-crl-refresh@${gateway}.timer"             >/dev/null 2>&1 || true
-        rm -rf --             "$(gateway_dropin_dir "$gateway")"             "$(gateway_dir "$gateway")"             "$(gateway_runtime_dir "$gateway")"
+        systemctl disable --now \
+            "nns-gateway@${gateway}.service" \
+            "nns-gateway-crl-refresh@${gateway}.timer" \
+            >/dev/null 2>&1 || true
+        rm -rf -- \
+            "$(gateway_dropin_dir "$gateway")" \
+            "$(gateway_dir "$gateway")" \
+            "$(gateway_runtime_dir "$gateway")"
     fi
 
     if [[ -f "$(cfg_file "$exit_app")" ]]; then
@@ -8598,7 +8773,12 @@ remote_auto_cleanup_internal() {
         log "Removing automatic provider exit '$exit_app'."
         remove_app "$exit_app" local-only
     else
-        systemctl disable --now             "nns-watchdog@${exit_app}.timer"             "nns-online@${exit_app}.service"             "nns-openvpn@${exit_app}.service"             "nns-netns@${exit_app}.service"             >/dev/null 2>&1 || true
+        systemctl disable --now \
+            "nns-watchdog@${exit_app}.timer" \
+            "nns-online@${exit_app}.service" \
+            "nns-openvpn@${exit_app}.service" \
+            "nns-netns@${exit_app}.service" \
+            >/dev/null 2>&1 || true
     fi
 
     # Commit owner-state deletion only after the gateway and exit are gone.
@@ -8632,14 +8812,14 @@ remote_auto_dispatch() {
             remote_auto_export_internal "$1"
             ;;
         public-export)
-            [[ $# -eq 4 ]] ||
-                die "_remote-auto public-export requires owner, client, public endpoint and protocol."
+            [[ $# -eq 5 ]] ||
+                die "_remote-auto public-export requires owner, client, public endpoint, protocol and compatibility mode."
             remote_auto_public_export_internal "$@"
             ;;
         public-revoke)
-            [[ $# -eq 2 ]] ||
-                die "_remote-auto public-revoke requires owner and client."
-            remote_auto_public_revoke_internal "$1" "$2"
+            [[ $# -eq 3 ]] ||
+                die "_remote-auto public-revoke requires owner, client and scope."
+            remote_auto_public_revoke_internal "$1" "$2" "$3"
             ;;
         rotate)
             [[ $# -eq 1 ]] || die "_remote-auto rotate requires owner."
@@ -9126,19 +9306,34 @@ remote_auto_prepare_management() {
     REMOTE_MANAGE_OWNER=$owner
 }
 
+ovpn_commentize_stream() {
+    # Make diagnostic output safe to copy together with stdout into an .ovpn
+    # file. Preserve existing OpenVPN comments and prefix every other line.
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == \#* ]]; then
+            printf '%s\n' "$line"
+        else
+            printf '# %s\n' "$line"
+        fi
+    done
+}
+
 remote_auto_export_public_ovpn() {
     require_root
-    local app=$1 client=$2 public=${3:--} proto=${4:-auto} output=${5:--}
+    local app=$1 client=$2 public=${3:--} proto=${4:-auto} output=${5:--} compat=${6:-modern}
     local tmp owner group
     validate_gateway_client_name "$client"
     case "$proto" in auto|tcp|udp) ;; *) die "--proto requires tcp or udp." ;; esac
+    case "$compat" in modern|embedded) ;; *) die "OpenVPN compatibility must be modern or embedded." ;; esac
     [[ "$public" == - ]] || parse_public_endpoint "$public" >/dev/null
 
     remote_auto_prepare_management "$app"
 
     if [[ "$output" == - ]]; then
         remote_auto_command "$REMOTE_MANAGE_ALIAS" public-export \
-            "$REMOTE_MANAGE_OWNER" "$client" "$public" "$proto"
+            "$REMOTE_MANAGE_OWNER" "$client" "$public" "$proto" "$compat" \
+            2> >(ovpn_commentize_stream >&2)
         return
     fi
 
@@ -9148,7 +9343,8 @@ remote_auto_export_public_ovpn() {
         die "Output directory does not exist: $(dirname "$output")"
     tmp=$(mktemp --suffix=.ovpn)
     if ! remote_auto_command "$REMOTE_MANAGE_ALIAS" public-export \
-        "$REMOTE_MANAGE_OWNER" "$client" "$public" "$proto" >"$tmp"; then
+        "$REMOTE_MANAGE_OWNER" "$client" "$public" "$proto" "$compat" >"$tmp" \
+        2> >(ovpn_commentize_stream >&2); then
         rm -f "$tmp"
         die "Could not export public OpenVPN client '$client'."
     fi
@@ -9156,11 +9352,21 @@ remote_auto_export_public_ovpn() {
         rm -f "$tmp"
         die "Remote public export returned an empty OpenVPN profile."
     }
-    grep -Fq '<ca>' "$tmp" && grep -Fq '<cert>' "$tmp" &&
-        grep -Fq '<key>' "$tmp" && grep -Fq '<tls-crypt-v2>' "$tmp" || {
-        rm -f "$tmp"
-        die "Remote public export returned an incomplete OpenVPN profile."
-    }
+    if [[ "$compat" == embedded ]]; then
+        grep -Fq '<ca>' "$tmp" && grep -Fq '<cert>' "$tmp" &&
+            grep -Fq '<key>' "$tmp" && grep -Fq '<tls-auth>' "$tmp" &&
+            grep -Fxq 'key-direction 1' "$tmp" &&
+            ! grep -Eq '<tls-crypt(-v2)?>' "$tmp" || {
+            rm -f "$tmp"
+            die "Remote embedded public export returned an incomplete OpenVPN profile."
+        }
+    else
+        grep -Fq '<ca>' "$tmp" && grep -Fq '<cert>' "$tmp" &&
+            grep -Fq '<key>' "$tmp" && grep -Fq '<tls-crypt-v2>' "$tmp" || {
+            rm -f "$tmp"
+            die "Remote public export returned an incomplete OpenVPN profile."
+        }
+    fi
 
     owner=${SUDO_USER:-root}
     if [[ "$owner" != root ]] && id "$owner" >/dev/null 2>&1; then
@@ -9170,17 +9376,22 @@ remote_auto_export_public_ovpn() {
         install -o root -g root -m 0600 "$tmp" "$output"
     fi
     rm -f "$tmp"
-    log "Exported public OpenVPN client '$client' for '$app'."
+    if [[ "$compat" == embedded ]]; then
+        log "Exported embedded OpenVPN client '$client' for '$app'."
+    else
+        log "Exported public OpenVPN client '$client' for '$app'."
+    fi
     log "Output: $output"
 }
 
 remote_auto_revoke_public_ovpn() {
     require_root
-    local app=$1 client=$2
+    local app=$1 client=$2 scope=${3:-all}
     validate_gateway_client_name "$client"
+    case "$scope" in all|modern|embedded) ;; *) die "Invalid public revoke scope '$scope'." ;; esac
     remote_auto_prepare_management "$app"
     remote_auto_command "$REMOTE_MANAGE_ALIAS" public-revoke \
-        "$REMOTE_MANAGE_OWNER" "$client"
+        "$REMOTE_MANAGE_OWNER" "$client" "$scope"
 }
 
 remote_auto_finish_profile_deployment() {
@@ -10755,22 +10966,25 @@ repair_gateway_abandoned_certs() {
 }
 
 repair_gateway_expected_running() {
-    local gateway=$1 marker active_public
+    local gateway=$1 marker active_public compat
     systemctl is-enabled --quiet "nns-gateway@${gateway}.service" 2>/dev/null && return 0
     marker=${REMOTE_MANAGED_OWNER_ID:-}
     [[ "$marker" =~ ^[a-f0-9]{16}$ ]] || return 1
     if [[ "$gateway" == "$(remote_auto_gateway_name "$marker")" ]]; then
         repair_state_pool_has_member "$marker" active && return 0
-    elif [[ "$gateway" == "$(remote_auto_public_gateway_name "$marker")" ]]; then
-        active_public=$(remote_auto_public_active_client_count "$marker" 2>/dev/null || printf 0)
-        [[ "$active_public" =~ ^[0-9]+$ ]] && (( active_public > 0 )) && return 0
     fi
+    for compat in modern embedded; do
+        if [[ "$gateway" == "$(remote_auto_public_gateway_name "$marker" "$compat")" ]]; then
+            active_public=$(remote_auto_public_active_client_count "$marker" "$compat" 2>/dev/null || printf 0)
+            [[ "$active_public" =~ ^[0-9]+$ ]] && (( active_public > 0 )) && return 0
+        fi
+    done
     return 1
 }
 
 repair_gateway_one() {
     local gateway=$1 state pid restart_needed=no upstream_ns="" upstream_tun=""
-    local before_ufw=no
+    local before_ufw=no root_mode config_before="" config_after="" config_changed=no
     validate_gateway_name "$gateway"
     if ! ( load_gateway_cfg "$gateway" ) 2>/dev/null; then
         repair_unresolved "gateway '$gateway' has an invalid configuration"
@@ -10778,9 +10992,22 @@ repair_gateway_one() {
     fi
     acquire_lock "gateway-$gateway"
     load_gateway_cfg "$gateway"
+    root_mode=$(stat -c '%a' "$(gateway_dir "$gateway")" 2>/dev/null || true)
+    if [[ "$root_mode" != 711 ]]; then
+        if gateway_ensure_runtime_access "$gateway"; then
+            repair_fixed "gateway '$gateway' root mode ${root_mode:-unknown} -> 0711 for privilege-dropped CRL access"
+        else
+            repair_unresolved "could not normalize runtime access on gateway '$gateway'"
+        fi
+    fi
+    [[ ! -f "$(gateway_dir "$gateway")/server.conf" ]] ||
+        config_before=$(sha256sum "$(gateway_dir "$gateway")/server.conf" 2>/dev/null | awk '{print $1}')
     write_gateway_unit_dropin "$gateway"
     gateway_write_openssl_config "$gateway" "$(gateway_dir "$gateway")"
     gateway_write_server_config "$gateway"
+    [[ ! -f "$(gateway_dir "$gateway")/server.conf" ]] ||
+        config_after=$(sha256sum "$(gateway_dir "$gateway")/server.conf" 2>/dev/null | awk '{print $1}')
+    [[ -z "$config_before" || "$config_before" == "$config_after" ]] || config_changed=yes
     gateway_write_transport_config "$gateway"
 
     repair_gateway_abandoned_certs "$gateway" || true
@@ -10803,11 +11030,16 @@ repair_gateway_one() {
         ip link show dev "$GATEWAY_TUN" up >/dev/null 2>&1 || restart_needed=yes
         gateway_listener_ready "${pid:-0}" || restart_needed=yes
         gateway_policy_ready || restart_needed=yes
+        [[ "$config_changed" == no ]] || restart_needed=yes
         if [[ "$restart_needed" == yes ]]; then
             release_lock "gateway-$gateway"
             if ( gateway_stop "$gateway" >/dev/null 2>&1 ) &&
                ( gateway_start "$gateway" >/dev/null 2>&1 ); then
-                repair_fixed "restarted stale gateway '$gateway' and rebuilt its data plane"
+                if [[ "$config_changed" == yes ]]; then
+                    repair_fixed "restarted gateway '$gateway' after generated configuration changed"
+                else
+                    repair_fixed "restarted stale gateway '$gateway' and rebuilt its data plane"
+                fi
                 return 0
             fi
             repair_unresolved "gateway '$gateway' is configured active but its listener/data plane could not be rebuilt"
@@ -11077,7 +11309,7 @@ repair_detect_duplicate_exits() {
 
 remote_auto_repair_internal() {
     require_root
-    local owner=$1 expected_active=${2:-off} public_gateway
+    local owner=$1 expected_active=${2:-off} public_gateway compat
     validate_remote_owner_id "$owner"
     [[ "$expected_active" == on || "$expected_active" == off ]] ||
         die "_remote-auto repair active state must be on or off."
@@ -11098,10 +11330,12 @@ remote_auto_repair_internal() {
         else
             repair_unresolved "private gateway '$RA_GATEWAY' referenced by owner '$owner' is missing"
         fi
-        public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID")
-        if [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
-            repair_gateway_one "$public_gateway" || true
-        fi
+        for compat in modern embedded; do
+            public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID" "$compat")
+            if [[ -f "$(gateway_cfg_file "$public_gateway")" ]]; then
+                repair_gateway_one "$public_gateway" || true
+            fi
+        done
     fi
     repair_remote_owned_orphans
     repair_detect_duplicate_exits
@@ -11490,10 +11724,10 @@ main() {
             ;;
         export)
             (( $# >= 4 )) ||
-                die "Usage: nns-app export ovpn <app_name> --client <client_name> [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]"
+                die "Usage: nns-app export ovpn <app_name> --client <client_name> [--embedded] [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]"
             [[ "$2" == ovpn ]] ||
                 die "Only 'nns-app export ovpn ...' is currently supported."
-            local export_app=$3 export_client="" export_public="-" export_proto="auto" export_output="-"
+            local export_app=$3 export_client="" export_public="-" export_proto="auto" export_output="-" export_compat="modern"
             shift 3
             while (( $# > 0 )); do
                 case "$1" in
@@ -11502,6 +11736,8 @@ main() {
                         export_client=$2; shift 2 ;;
                     --client=*)
                         export_client=${1#--client=}; shift ;;
+                    --embedded)
+                        export_compat=embedded; shift ;;
                     --public)
                         (( $# >= 2 )) || die "--public requires host:port."
                         export_public=$2; shift 2 ;;
@@ -11522,11 +11758,20 @@ main() {
             done
             [[ -n "$export_client" ]] || die "export ovpn requires --client <client_name>."
             remote_auto_export_public_ovpn "$export_app" "$export_client" \
-                "$export_public" "$export_proto" "$export_output"
+                "$export_public" "$export_proto" "$export_output" "$export_compat"
             ;;
         revoke)
-            [[ $# -eq 3 ]] || die "Usage: nns-app revoke <app_name> <client_name>"
-            remote_auto_revoke_public_ovpn "$2" "$3"
+            (( $# >= 3 && $# <= 4 )) ||
+                die "Usage: nns-app revoke <app_name> <client_name> [--modern|--embedded]"
+            local revoke_scope=all
+            if (( $# == 4 )); then
+                case "$4" in
+                    --modern) revoke_scope=modern ;;
+                    --embedded) revoke_scope=embedded ;;
+                    *) die "Usage: nns-app revoke <app_name> <client_name> [--modern|--embedded]" ;;
+                esac
+            fi
+            remote_auto_revoke_public_ovpn "$2" "$3" "$revoke_scope"
             ;;
         add)
             (( $# >= 3 )) ||

@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.30
+**Release:** 1.3.32
 
 **Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
@@ -117,6 +117,23 @@ use `--proto tcp` or `--proto udp` to force a protocol. Once a public gateway
 exists, later exports reuse its current host, port, and protocol unless an
 override is supplied.
 
+For embedded/vendor OpenVPN clients such as TP-Link routers, add `--embedded`:
+
+```bash
+nns-app export ovpn hidemy --client mlhome --embedded \
+    --output ~/mlhome.ovpn
+```
+
+Embedded mode deliberately uses a separate public OpenVPN gateway and listener,
+so it can coexist with modern exported clients. With no `--public` override,
+nns-app allocates another free port automatically. The embedded gateway uses classic `tls-auth` (server key direction 0,
+client `key-direction 1`) and emits a conservative router-friendly profile with
+`cipher AES-256-GCM`, without `tls-crypt`, `tls-crypt-v2`, `data-ciphers`,
+`allow-compression`, or `disable-dco`. This combination is verified with a
+TP-Link Archer AX80. The server side keeps certificate authentication, SHA-256
+authentication, and TLS 1.2 minimums. Use the default modern export for normal
+current OpenVPN clients.
+
 The public endpoint must be reachable by the external client. While a public
 gateway is running, nns-app automatically opens its TCP/UDP listener in an
 active UFW or firewalld configuration; on hosts without either manager it uses
@@ -125,18 +142,23 @@ gateway stops or is removed. Pre-existing administrator firewall rules are
 left untouched. External cloud security groups and upstream NAT/router port
 forwarding are outside the host and still need to allow the selected port.
 
-Each exported client receives a separate certificate, private key, and TLS
-Crypt v2 key. Revoke one without affecting the other clients:
+Each modern exported client receives a separate certificate, private key, and
+TLS Crypt v2 key. Embedded clients receive separate certificates/private keys
+and use the compatibility gateway's shared `tls-auth` key. By default, revoke
+by client name searches both export modes. Scope it when the same client name
+exists in both modes:
 
 ```bash
 nns-app revoke my-private-app my-phone
+nns-app revoke my-private-app my-phone --modern
+nns-app revoke my-private-app my-router --embedded
 ```
 
-When the last exported public client is revoked, nns-app removes the public
-gateway and closes its listener. The normal SSH-only nns-app gateway remains
-separate. Removing the final nns-app member of a remote pool also removes its
-public gateway and all exported client keys, so public credentials are not left
-orphaned on the remote host.
+When the last client in an export mode is revoked, nns-app removes that mode's
+public gateway and closes its listener. The normal SSH-only nns-app gateway
+remains separate. Removing the final nns-app member of a remote pool also
+removes both modern and embedded public gateways and all exported client keys,
+so public credentials are not left orphaned on the remote host.
 
 ## Highlights
 

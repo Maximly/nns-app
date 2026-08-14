@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.3.32
+
+- Fixed `--embedded` OpenVPN compatibility for TP-Link/vendor routers: use classic `tls-auth` with server direction 0 and client `key-direction 1`, while retaining `AES-256-GCM`, SHA-256, certificate authentication, and TLS 1.2 minimums.
+- Kept default modern exports unchanged on TLS Crypt v2; embedded and modern listeners remain separate.
+- Fixed exported profile diagnostics so firewall/security-group notices are OpenVPN-comment-safe when terminal output is copied into an `.ovpn` file.
+- Fixed managed gateway root permissions from inherited `0700` to `0711`, allowing privilege-dropped OpenVPN to traverse to and re-stat/reload `pki/crl.pem` without exposing directory listings.
+- `nns-app repair` now detects and fixes legacy gateway-root permissions and reports the repair. Gateway start also normalizes runtime access.
+- Existing embedded gateways are upgraded in place when started/exported/repaired: regenerated server configuration switches from `tls-crypt` to `tls-auth`, and an active gateway is restarted when its generated configuration changes.
+- Added scoped public-client revocation: `--modern` or `--embedded`; the unscoped command retains the existing behavior of searching both modes.
+- Embedded server logs no longer use `mute 10`, preserving handshake diagnostics on router firmware that only shows a generic `Connecting` state.
+- Updated regression tests for TP-Link-compatible TLS-Auth profiles, scoped revoke parsing/dispatch, and generated-profile constraints.
+
+## 1.3.31
+
+- Added `nns-app export ovpn <app> --client <name> --embedded` for constrained/vendor OpenVPN clients such as TP-Link routers.
+- Embedded exports use a separate deterministic public gateway/listener so modern TLS Crypt v2 clients and OpenVPN-2.4-class devices can coexist on the same provider exit.
+- Embedded gateway/client profiles use TLS Crypt v1 plus `cipher AES-256-GCM`, and omit client directives commonly rejected by older firmware: `tls-crypt-v2`, `data-ciphers`, `allow-compression`, and `disable-dco`.
+- Added embedded-gateway lifecycle integration for start, status, inventory, repair, revoke, and final automatic-pool cleanup.
+- `nns-app revoke <app> <client>` now searches both modern and embedded public gateways and removes matching credentials in either mode.
+
 ## 1.3.30
 
 - Fixed `nns-app help` / `--help`: the public `nns-app repair [--local-only]` command is now present in the primary Usage command list.
