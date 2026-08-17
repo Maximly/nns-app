@@ -9,7 +9,7 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fq 'nns-app 1.3.32' <<<"$version"
+grep -Fq 'nns-app 1.3.33' <<<"$version"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -73,7 +73,13 @@ if grep -Eq 'install[[:space:]]+-d[^[:cntrl:]]*(/sys/fs/cgroup|/sys/kernel/secur
     exit 1
 fi
 grep -Fq 'mkdir -p -- "$mountpoint"' "$INSTALLER"
-grep -Fq 'command_needs_namespaced_snap_mounts "$1"' "$INSTALLER"
+grep -Fq 'command_needs_namespaced_snap_mounts "$command_name"' "$INSTALLER"
+grep -Fq 'desktop_session_can_launch_helpers' "$INSTALLER"
+compat_call_count=$(grep -Fc 'if run_context_needs_snap_compat "$1"; then' "$INSTALLER")
+(( compat_call_count >= 2 )) || {
+    echo 'desktop descendant Snap compatibility is not applied to both mounts and DNS proxy' >&2
+    exit 1
+}
 if grep -Fq 'prepare_namespaced_desktop_mounts' "$INSTALLER"; then
     echo 'obsolete unconditional desktop-mount helper found' >&2
     exit 1
@@ -204,7 +210,7 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 1.3.32' "$ROOT/README.md"
+grep -Fq '**Release:** 1.3.33' "$ROOT/README.md"
 grep -Fq '## Quick start' "$ROOT/README.md"
 grep -Fq '### Run a VPN locally' "$ROOT/README.md"
 grep -Fq 'nns-app install my-private-app' "$ROOT/README.md"

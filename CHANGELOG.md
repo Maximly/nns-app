@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.33
+
+- Fixed desktop applications that launch a Snap helper after `nns-app run` starts, such as ChatGPT/Electron opening an OAuth URL through `xdg-open` into Ubuntu's Snap Firefox.
+- Added descendant-aware Snap compatibility detection: a real graphical session (display plus session D-Bus) now prepares command-local cgroup2/securityfs mounts before privileges are dropped, even when the initial application is not a Snap.
+- Start the namespace-local Snap DNS compatibility proxy for the same desktop-descendant condition, so a later Snap browser remains inside the nns-app resolver/data path instead of inheriting the host Snap resolver view.
+- Preserve the lightweight path for headless/SSH commands that do not have both a graphical display and session bus, and retain direct Snap/wrapper detection for non-desktop launches.
+- Added regression coverage for native desktop -> `xdg-open` -> Snap-browser descendant preparation and for headless commands remaining lightweight.
+
 ## 1.3.32
 
 - Fixed `--embedded` OpenVPN compatibility for TP-Link/vendor routers: use classic `tls-auth` with server direction 0 and client `key-direction 1`, while retaining `AES-256-GCM`, SHA-256, certificate authentication, and TLS 1.2 minimums.

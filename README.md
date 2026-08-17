@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.32
+**Release:** 1.3.33
 
 **Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
@@ -1058,10 +1058,14 @@ Namespace DNS remains authoritative instead of being delegated to `wg-quick`.
 `ip netns exec` creates a private mount namespace for namespace-specific
 resolver files. Snap launchers also require cgroup v2 and securityfs there.
 `nns-app run` detects direct Snap aliases, the Snap launcher itself, and distro
-transition wrappers such as a distribution-provided `/usr/bin/firefox` wrapper. It mounts those
-filesystems inside the private command mount namespace before dropping to the
-configured desktop user. Ordinary commands and non-Snap desktop applications
-skip this extra mount preparation.
+transition wrappers such as a distribution-provided `/usr/bin/firefox` wrapper.
+It also prepares the same command-local Snap compatibility for a real graphical
+desktop session even when the initial application is native: desktop apps can
+open OAuth/help URLs through `xdg-open`/GIO and cause GNOME to start a Snap
+browser after the initial process has already dropped privileges. The matching
+namespace DNS compatibility proxy is started up front as well, keeping such
+Snap descendants on the same nns-app resolver/data path. Headless runs without
+both a graphical display and session D-Bus keep the lightweight path.
 
 ```bash
 nns-app run my-private-app firefox --no-remote

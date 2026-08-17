@@ -380,6 +380,46 @@ if command_needs_namespaced_snap_mounts "$native_script"; then
     fail 'ordinary script incorrectly requires Snap mounts'
 fi
 
+# Native desktop applications can start Snap descendants later via xdg-open/GIO.
+# The run context must therefore prepare Snap compatibility before privileges
+# are dropped, while headless commands retain the lightweight path.
+(
+    unset DISPLAY WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS
+    if desktop_session_can_launch_helpers; then
+        fail 'headless environment incorrectly classified as a graphical desktop session'
+    fi
+    if run_context_needs_snap_compat "$native_script"; then
+        fail 'headless native command incorrectly requires descendant Snap compatibility'
+    fi
+)
+(
+    DISPLAY=:0
+    DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+    export DISPLAY DBUS_SESSION_BUS_ADDRESS
+    desktop_session_can_launch_helpers ||
+        fail 'X11 desktop session was not detected for descendant helpers'
+    run_context_needs_snap_compat "$native_script" ||
+        fail 'native desktop command did not prepare descendant Snap compatibility'
+)
+(
+    unset DISPLAY
+    WAYLAND_DISPLAY=wayland-0
+    DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+    export WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS
+    desktop_session_can_launch_helpers ||
+        fail 'Wayland desktop session was not detected for descendant helpers'
+    run_context_needs_snap_compat "$native_script" ||
+        fail 'Wayland desktop command did not prepare descendant Snap compatibility'
+)
+(
+    DISPLAY=:0
+    unset DBUS_SESSION_BUS_ADDRESS
+    export DISPLAY
+    if desktop_session_can_launch_helpers; then
+        fail 'display without a session bus incorrectly enables descendant helper support'
+    fi
+)
+
 IFS='|' read -r tun host ns host_fwd host_mangle ns_fwd ns_nat ns_mangle \
     <<<"$(make_gateway_names my-relay)"
 [[ -n "$tun" && -n "$host" && -n "$ns" ]] || fail 'gateway interface names'
@@ -1721,7 +1761,7 @@ manual_payload=$(remote_command_payload gateway client export \
     remote_auto_register() { fail 'current remote was unnecessarily registered'; }
     log() { printf 'log:%s\n' "$*"; }
     output=$(remote_auto_refresh_configured_app my-app)
-    grep -Fq 'already runs nns-app 1.3.32' <<<"$output" ||
+    grep -Fq 'already runs nns-app 1.3.33' <<<"$output" ||
         fail 'current remote refresh status missing'
 )
 

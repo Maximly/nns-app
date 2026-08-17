@@ -107,6 +107,26 @@ command_needs_namespaced_snap_mounts() {
     return 1
 }
 
+# A non-Snap desktop application can launch a Snap helper later through the
+# desktop session (the common example is an OAuth flow doing
+# `xdg-open https://...`, which GNOME dispatches to Snap Firefox).  At that
+# point the process is already unprivileged inside the private mount namespace,
+# so it is too late to add Snap's required cgroup2/securityfs mounts.  Detect a
+# real graphical desktop session up front and prepare descendant compatibility
+# before dropping privileges.  Requiring both a display and the session bus
+# avoids changing headless/SSH runs that merely carry one stale desktop value.
+desktop_session_can_launch_helpers() {
+    [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] || return 1
+    [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]
+}
+
+run_context_needs_snap_compat() {
+    local command_name=$1
+
+    command_needs_namespaced_snap_mounts "$command_name" && return 0
+    desktop_session_can_launch_helpers
+}
+
 dns_proxy_exec() {
     require_root
     local app=$1
@@ -306,11 +326,12 @@ run_user_exec() {
     [[ "$current_netns" == "$expected_netns" ]] ||
         die "_run-user is not inside the expected namespace '$NS_NAME'."
 
-    # Most commands need only the network namespace and namespace-specific
-    # resolver bind. Preparing cgroup2/securityfs for every process is both
-    # unnecessary and can fail on kernel-managed mount points. Do it only for
-    # commands that actually resolve to Snap/snap-confine.
-    if command_needs_namespaced_snap_mounts "$1"; then
+    # Prepare Snap's mount prerequisites for a direct Snap launch or for a
+    # graphical desktop run that can spawn a Snap descendant later via
+    # xdg-open/GIO/D-Bus.  The latter must happen here, while still root inside
+    # the command-local mount namespace; a later unprivileged helper cannot
+    # repair the tracking-cgroup/securityfs view itself.
+    if run_context_needs_snap_compat "$1"; then
         prepare_namespaced_snap_mounts
     fi
 
@@ -385,10 +406,12 @@ run_in_app() {
             die "VPN data path for '$app' is not online yet."
     fi
 
-    # Snap keeps its own mount namespace and can bypass the resolver file that
-    # `ip netns exec` bind-mounts.  Start a namespace-local 127.0.0.53 proxy
-    # only for Snap/snap-confine launches; ordinary commands remain unchanged.
-    if command_needs_namespaced_snap_mounts "$1"; then
+    # Snap keeps its own persistent mount namespace and can bypass the resolver
+    # file that `ip netns exec` bind-mounts.  A non-Snap desktop application may
+    # launch a Snap browser later through xdg-open/GIO, so start the namespace
+    # DNS compatibility proxy for the same direct-or-descendant condition used
+    # by _run-user's mount preparation.
+    if run_context_needs_snap_compat "$1"; then
         ensure_snap_dns_proxy "$app"
     fi
 
