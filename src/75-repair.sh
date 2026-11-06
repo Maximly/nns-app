@@ -350,6 +350,11 @@ repair_gateway_one() {
         ip link show dev "$GATEWAY_TUN" up >/dev/null 2>&1 || restart_needed=yes
         gateway_listener_ready "${pid:-0}" || restart_needed=yes
         gateway_policy_ready || restart_needed=yes
+        if [[ "$VIA_APP" == host ]]; then
+            local host_wan
+            host_wan=$(detect_wan_iface auto 2>/dev/null || true)
+            gateway_firewall_ready "$gateway" "" "$host_wan" || restart_needed=yes
+        fi
         [[ "$config_changed" == no ]] || restart_needed=yes
         if [[ "$restart_needed" == yes ]]; then
             release_lock "gateway-$gateway"

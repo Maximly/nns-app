@@ -1,4 +1,4 @@
-nns-app release: 1.3.33
-Feature marker: desktop nns-app run prepares Snap descendant cgroup/securityfs + namespace DNS compatibility for later xdg-open/GIO browser launches
-Installer SHA256: 3d07bd5210e7ba1f561c8c84e7b85611f9e4b79c1087de473db734666670a301
-Tests: make test PASS (static + function tests)
+nns-app release: 1.3.34
+Feature marker: install <name> --server provisions a host-egress OpenVPN server, managed PKI, scoped IPv4 NAT and exported client profiles
+Installer SHA256: 00836b688ed22aea06ce3ecc051df04eef9bbb8cc7ede000810c3babee8438f1
+Tests: make test PASS (static + function tests; live OpenVPN/server-to-client traffic not tested in this container)

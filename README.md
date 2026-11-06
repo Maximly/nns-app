@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.33
+**Release:** 1.3.34
 
 **Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
@@ -457,7 +457,55 @@ forwarding only into its verified tunnel. If the upstream stops, systemd binds
 the child lifecycle to it and the forwarding/NAT path disappears; no host-uplink
 fallback is installed. Inherit mode deliberately rejects `--via host`.
 
-### Managed remote gateway
+### Stand-alone OpenVPN server (`install --server`)
+
+Create an OpenVPN server that forwards VPN clients through **this Linux host's
+normal IPv4 uplink**, without requiring an upstream nns-app VPN profile:
+
+```bash
+sudo nns-app install office-vpn --server
+# Optional explicit listener/public endpoint, pool and DNS:
+sudo nns-app install office-vpn --server \
+    --listen udp:1194 --public vpn.example.com:1194 \
+    --pool 10.253.50.0/24 --dns "1.1.1.1 9.9.9.9"
+```
+
+The first form automatically detects the public IPv4 address (using
+`https://api.ipify.org`) and defaults to UDP/1194. If the public lookup fails,
+the host interface IPv4 is used as a fallback and a warning is printed; supply
+`--public` when behind NAT, port forwarding, or a cloud load balancer. Repeating
+`install office-vpn --server` **preserves the CA and existing client keys**.
+The server is enabled for automatic start at boot and opens an nns-app-owned
+host firewall listener while running. Cloud security group rules and upstream
+NAT/UDP port forwarding must be configured separately. Client traffic is
+MASQUERADEd only from the server's managed tunnel/pool to the host WAN device;
+other host forwarding rules are not flushed. Starting the server sets the
+system runtime `net.ipv4.ip_forward=1` (the previous value is not restored on
+stop). IPv6 client traffic is not redirected or protected by this mode.
+
+```bash
+nns-app export ovpn office-vpn --client laptop --output ~/laptop.ovpn
+nns-app export ovpn office-vpn --client phone --output ~/phone.ovpn
+nns-app status office-vpn
+sudo nns-app stop office-vpn
+sudo nns-app start office-vpn
+sudo nns-app revoke office-vpn phone
+sudo nns-app remove office-vpn
+```
+
+`export ovpn` issues a unique certificate for a new client and safely re-exports
+an existing active client's profile. File outputs are mode `0600`. You can also
+use `gateway client add|list|export|revoke` for explicit management. Removing a
+server permanently deletes its CA and all its client private keys. A server
+name cannot also name an NNS app. Its gateway appears under `nns-app list gateway`
+and `nns-app list all` rather than `nns-app list` (which lists client apps).
+
+For a different public endpoint, listener or subnet after creation, remove and
+recreate the server (this invalidates previous client credentials). The server
+supports IPv4 full-tunnel NAT, not IPv6 forwarding or site-to-site route
+advertisement. VPN clients need access to the host's published UDP/TCP port.
+
+## Managed remote gateway
 
 ```text
 local application

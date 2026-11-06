@@ -134,10 +134,38 @@ main() {
                 install_engine off
             else
                 local install_app_name=$2 install_via="__default__" install_backend="__default__"
-                local install_remote="" install_remote_port=22
+                [[ -n "$install_app_name" && "$install_app_name" != --* ]] ||
+                    die "Usage: nns-app install <name> --server"
+                local install_remote="" install_remote_port=22 install_remote_port_set=off
+                local install_server=off install_listen="" install_public=""
+                local install_pool="" install_dns=""
                 shift 2
                 while (( $# > 0 )); do
                     case "$1" in
+                        --server)
+                            install_server=on
+                            shift
+                            ;;
+                        --listen)
+                            (( $# >= 2 )) || die "--listen requires tcp:<port> or udp:<port>."
+                            install_listen=$2; shift 2 ;;
+                        --listen=*)
+                            install_listen=${1#--listen=}; shift ;;
+                        --public)
+                            (( $# >= 2 )) || die "--public requires host:port."
+                            install_public=$2; shift 2 ;;
+                        --public=*)
+                            install_public=${1#--public=}; shift ;;
+                        --pool)
+                            (( $# >= 2 )) || die "--pool requires an IPv4 CIDR."
+                            install_pool=$2; shift 2 ;;
+                        --pool=*)
+                            install_pool=${1#--pool=}; shift ;;
+                        --dns)
+                            (( $# >= 2 )) || die "--dns requires quoted space-separated IPv4 addresses."
+                            install_dns=$2; shift 2 ;;
+                        --dns=*)
+                            install_dns=${1#--dns=}; shift ;;
                         --via)
                             (( $# >= 2 )) || die "--via requires an upstream app name or 'host'."
                             install_via=$2
@@ -176,10 +204,12 @@ main() {
                         --remote-port)
                             (( $# >= 2 )) || die "--remote-port requires a number."
                             install_remote_port=$2
+                            install_remote_port_set=on
                             shift 2
                             ;;
                         --remote-port=*)
                             install_remote_port=${1#--remote-port=}
+                            install_remote_port_set=on
                             shift
                             ;;
                         --backend)
@@ -192,29 +222,43 @@ main() {
                             shift
                             ;;
                         *)
-                            die "Usage: nns-app install <app_name> via --remote <user@host>"
+                            die "Unknown install option '$1'. See nns-app --help."
                             ;;
                     esac
                 done
-                if [[ -n "$install_remote" ]]; then
-                    [[ "$install_via" == __default__ && "$install_backend" == __default__ ]] ||
-                        die "--via-remote cannot be combined with --via or --backend."
-                    install_app "$install_app_name" __default__
-                    remote_auto_install "$install_app_name" "$install_remote" "$install_remote_port"
+                if [[ "$install_server" == on ]]; then
+                    [[ -z "$install_remote" && "$install_remote_port_set" == off &&
+                       "$install_via" == __default__ && "$install_backend" == __default__ ]] ||
+                        die "--server cannot be combined with --via, --remote, or --backend."
+                    install_openvpn_server "$install_app_name" \
+                        "$install_listen" "$install_public" "$install_pool" "$install_dns"
                 else
-                    case "$install_backend" in
-                        __default__) install_app "$install_app_name" "$install_via" ;;
-                        inherit)
-                            install_app "$install_app_name" "$install_via"
-                            set_inherit_backend "$install_app_name" "$install_via"
-                            ;;
-                        *) die "Unsupported app backend '$install_backend'; only 'inherit' is valid without a profile." ;;
-                    esac
+                    [[ -z "$install_listen$install_public$install_pool$install_dns" ]] ||
+                        die "--listen, --public, --pool and --dns require --server."
+                    if [[ -n "$install_remote" ]]; then
+                        [[ "$install_via" == __default__ && "$install_backend" == __default__ ]] ||
+                            die "--via-remote cannot be combined with --via or --backend."
+                        install_app "$install_app_name" __default__
+                        remote_auto_install "$install_app_name" "$install_remote" "$install_remote_port"
+                    else
+                        [[ "$install_remote_port_set" == off ]] ||
+                            die "--remote-port requires --remote."
+                        case "$install_backend" in
+                            __default__) install_app "$install_app_name" "$install_via" ;;
+                            inherit)
+                                install_app "$install_app_name" "$install_via"
+                                set_inherit_backend "$install_app_name" "$install_via"
+                                ;;
+                            *) die "Unsupported app backend '$install_backend'; only 'inherit' is valid without a profile." ;;
+                        esac
+                    fi
                 fi
             fi
             ;;
         remove)
-            if [[ $# -eq 2 ]]; then
+            if [[ $# -eq 2 ]] && server_gateway_exists "$2"; then
+                gateway_remove "$2"
+            elif [[ $# -eq 2 ]]; then
                 remove_app "$2"
             elif [[ $# -eq 3 && "$3" == --local-only ]]; then
                 remove_app "$2" local-only
@@ -265,7 +309,11 @@ main() {
             ;;
         status)
             [[ $# -eq 2 ]] || die "Usage: nns-app status <app_name>"
-            status_app "$2"
+            if server_gateway_exists "$2"; then
+                gateway_status "$2"
+            else
+                status_app "$2"
+            fi
             ;;
         myip)
             (( $# <= 2 )) || die "Usage: nns-app myip [<app_name>]"
@@ -306,8 +354,13 @@ main() {
                 esac
             done
             [[ -n "$export_client" ]] || die "export ovpn requires --client <client_name>."
-            remote_auto_export_public_ovpn "$export_app" "$export_client" \
-                "$export_public" "$export_proto" "$export_output" "$export_compat"
+            if server_gateway_exists "$export_app"; then
+                server_export_ovpn "$export_app" "$export_client" \
+                    "$export_output" "$export_public" "$export_proto" "$export_compat"
+            else
+                remote_auto_export_public_ovpn "$export_app" "$export_client" \
+                    "$export_public" "$export_proto" "$export_output" "$export_compat"
+            fi
             ;;
         revoke)
             (( $# >= 3 && $# <= 4 )) ||
@@ -320,7 +373,13 @@ main() {
                     *) die "Usage: nns-app revoke <app_name> <client_name> [--modern|--embedded]" ;;
                 esac
             fi
-            remote_auto_revoke_public_ovpn "$2" "$3" "$revoke_scope"
+            if server_gateway_exists "$2"; then
+                [[ "$revoke_scope" != embedded ]] ||
+                    die "--embedded is not supported for a modern OpenVPN server."
+                gateway_client_revoke "$2" "$3"
+            else
+                remote_auto_revoke_public_ovpn "$2" "$3" "$revoke_scope"
+            fi
             ;;
         add)
             (( $# >= 3 )) ||
@@ -373,11 +432,23 @@ main() {
         start)
             shift
             parse_start_cli "$@"
-            start_app "$START_APP_NAME" "$START_IGNORE" "$START_VIA"
+            if server_gateway_exists "$START_APP_NAME"; then
+                [[ "$START_VIA" == __default__ && "$START_IGNORE" == off ]] ||
+                    die "An OpenVPN server cannot use --via or --ignore-start-error."
+                gateway_start "$START_APP_NAME"
+            else
+                start_app "$START_APP_NAME" "$START_IGNORE" "$START_VIA"
+            fi
             ;;
         stop)
             case $# in
-                2) stop_app_cli "$2" remote ;;
+                2)
+                    if server_gateway_exists "$2"; then
+                        gateway_stop "$2"
+                    else
+                        stop_app_cli "$2" remote
+                    fi
+                    ;;
                 3)
                     [[ "$3" == --local-only ]] ||
                         die "Usage: nns-app stop <app_name> [--local-only]"

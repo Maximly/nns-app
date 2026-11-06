@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.34
+
+- Added `install <name> --server` to create a stand-alone, host-egress OpenVPN server over the existing managed-gateway PKI and systemd backend. Default listener: UDP/1194; public IPv4 is discovered automatically with an explicit override.
+- Added scoped host WAN forwarding, NAT and MSS clamping in dedicated gateway iptables chains, without an upstream NNS app or VPN profile.
+- Server names now work with top-level `start`, `stop`, `status`, `remove`, `export ovpn --client` and `revoke`. Repeat installation preserves CA and client credentials.
+- Added boot enablement, server-specific status and repair checks, and CLI/firewall regression tests.
+- Documented public endpoint and NAT/firewall requirements; live OpenVPN connectivity requires an actual Linux host test.
+
 ## 1.3.33
 
 - Fixed desktop applications that launch a Snap helper after `nns-app run` starts, such as ChatGPT/Electron opening an OAuth URL through `xdg-open` into Ubuntu's Snap Firefox.

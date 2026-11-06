@@ -22,6 +22,8 @@
 #
 # Public commands:
 #   install [--local-only]
+#   install <name> --server [--listen udp:1194] [--public host:port]
+#                         [--pool CIDR] [--dns "IPv4 IPv4"]
 #   install [<app_name> [--backend inherit] [--via <upstream-app>|host]
 #                         [--via-remote <user@host> [--remote-port <port>]]]
 #   remove  <app_name>
@@ -52,7 +54,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.33"
+readonly VERSION="1.3.34"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -275,6 +277,8 @@ usage() {
     cat <<'USAGE'
 Usage:
   nns-app install [--local-only]
+  nns-app install <name> --server [--listen udp:1194] [--public host:port]
+                  [--pool IPv4-CIDR] [--dns "IPv4 IPv4"]
   nns-app install <app_name> [--backend inherit] [--via <upstream-app>|host]
   nns-app install <app_name> via --remote <user@host> [--remote-port <port>]
   nns-app remove  <app_name> [--local-only]
@@ -327,6 +331,8 @@ Examples:
   sudo ./nns-app.sh install
   sudo ./nns-app.sh install --local-only
   sudo nns-app install my-upstream-vpn
+  sudo nns-app install office-vpn --server
+  nns-app export ovpn office-vpn --client laptop --output ~/laptop.ovpn
   nns-app install my-private-app via --remote user@remote-host
   nns-app add my-private-app ~/my-base-profile.ovpn
   nns-app run my-private-app ping 1.1.1.1
@@ -1200,6 +1206,8 @@ write_gateway_unit_dropin() {
     via=$VIA_APP
     dir=$(gateway_dropin_dir "$gateway")
     rm -rf "$dir"
+    # Host-egress OpenVPN servers have no nns-online@ upstream dependency.
+    [[ "$via" != host ]] || return 0
     install -d -o root -g root -m 0755 "$dir"
     cat >"$dir/10-upstream.conf" <<GATEWAY_DROPIN_EOF
 [Unit]
@@ -4939,8 +4947,10 @@ gateway_create() {
     fi
     [[ ! -f "$(cfg_file "$gateway")" ]] ||
         die "An NNS app named '$gateway' already exists."
-    [[ -f "$(cfg_file "$via_app")" ]] ||
-        die "Upstream NNS app '$via_app' is not installed."
+    if [[ "$via_app" != host ]]; then
+        [[ -f "$(cfg_file "$via_app")" ]] ||
+            die "Upstream NNS app '$via_app' is not installed."
+    fi
     [[ ! -e "$(gateway_cfg_file "$gateway")" ]] ||
         die "Gateway '$gateway' already exists."
 
@@ -5087,7 +5097,7 @@ GATEWAY_CONFIG_EOF
         [[ "$transport" == direct ]] || log "Private OpenVPN listener: 127.0.0.1:$openvpn_listen_port/tcp"
     fi
     log "Client pool:     $client_pool"
-    log "Remote exit:     $via_app"
+    log "Exit:            $via_app"
     if [[ "$transport" != ssh ]]; then
         log "Host firewall:    nns-app opens $listen_port/$listen_proto while the gateway is running and removes its owned rule when stopped/removed."
         warn "External cloud security groups and upstream NAT/router forwarding are not managed by nns-app."
@@ -5189,6 +5199,53 @@ gateway_host_rules_down() {
     iptables -w -t filter -X "$HOST_FWD_CHAIN" 2>/dev/null || true
     iptables -w -t mangle -F "$HOST_MANGLE_CHAIN" 2>/dev/null || true
     iptables -w -t mangle -X "$HOST_MANGLE_CHAIN" 2>/dev/null || true
+}
+
+# Stand-alone OpenVPN server: VPN clients exit through the host's IPv4
+# default uplink, not a provider VPN namespace. Rules are scoped to the
+# managed tunnel, pool and detected egress device. No existing rules flushed.
+gateway_host_exit_rules_down() {
+    local comment="nns-app:gateway:$GATEWAY_NAME"
+    iptables_jump_delete_all filter FORWARD "$HOST_FWD_CHAIN" "$comment:forward"
+    iptables_jump_delete_all mangle FORWARD "$HOST_MANGLE_CHAIN" "$comment:mangle"
+    iptables_jump_delete_all nat POSTROUTING "$NS_NAT_CHAIN" "$comment:host-nat"
+    iptables -w -t filter -F "$HOST_FWD_CHAIN" 2>/dev/null || true
+    iptables -w -t filter -X "$HOST_FWD_CHAIN" 2>/dev/null || true
+    iptables -w -t mangle -F "$HOST_MANGLE_CHAIN" 2>/dev/null || true
+    iptables -w -t mangle -X "$HOST_MANGLE_CHAIN" 2>/dev/null || true
+    iptables -w -t nat -F "$NS_NAT_CHAIN" 2>/dev/null || true
+    iptables -w -t nat -X "$NS_NAT_CHAIN" 2>/dev/null || true
+}
+
+gateway_host_exit_rules_up() {
+    local wan=$1 comment="nns-app:gateway:$GATEWAY_NAME"
+    [[ "$wan" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] ||
+        die "Invalid host WAN interface '$wan'."
+    gateway_host_exit_rules_down
+
+    iptables_chain_ensure filter "$HOST_FWD_CHAIN"
+    iptables -w -t filter -A "$HOST_FWD_CHAIN" \
+        -i "$GATEWAY_TUN" -s "$CLIENT_POOL" -o "$wan" -j ACCEPT
+    iptables -w -t filter -A "$HOST_FWD_CHAIN" \
+        -i "$wan" -o "$GATEWAY_TUN" -m conntrack \
+        --ctstate ESTABLISHED,RELATED -j ACCEPT
+    iptables -w -t filter -A "$HOST_FWD_CHAIN" \
+        -i "$GATEWAY_TUN" -s "$CLIENT_POOL" -j DROP
+    iptables -w -t filter -A "$HOST_FWD_CHAIN" -j RETURN
+    iptables_jump_add_once filter FORWARD "$HOST_FWD_CHAIN" "$comment:forward"
+
+    iptables_chain_ensure mangle "$HOST_MANGLE_CHAIN"
+    iptables -w -t mangle -A "$HOST_MANGLE_CHAIN" \
+        -i "$GATEWAY_TUN" -s "$CLIENT_POOL" -o "$wan" -p tcp \
+        --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    iptables -w -t mangle -A "$HOST_MANGLE_CHAIN" -j RETURN
+    iptables_jump_add_once mangle FORWARD "$HOST_MANGLE_CHAIN" "$comment:mangle"
+
+    iptables_chain_ensure nat "$NS_NAT_CHAIN"
+    iptables -w -t nat -A "$NS_NAT_CHAIN" \
+        -s "$CLIENT_POOL" -o "$wan" -j MASQUERADE
+    iptables -w -t nat -A "$NS_NAT_CHAIN" -j RETURN
+    iptables_jump_add_once nat POSTROUTING "$NS_NAT_CHAIN" "$comment:host-nat"
 }
 
 gateway_namespace_rules_up() {
@@ -5308,6 +5365,16 @@ gateway_down_locked() {
     [[ -f "$(gateway_cfg_file "$gateway")" ]] || return 0
     load_gateway_cfg "$gateway"
 
+    # Host exit does not own a transit veth, NNS route or policy table.
+    # Remove only its own INPUT, forward and NAT rules.
+    if [[ "$VIA_APP" == host ]]; then
+        gateway_public_firewall_down "$gateway" || true
+        gateway_host_exit_rules_down || true
+        ip link del "$GATEWAY_TUN" 2>/dev/null || true
+        rm -rf "$(gateway_runtime_dir "$gateway")"
+        return 0
+    fi
+
     runtime=$(gateway_runtime_file "$gateway")
     if [[ -f "$runtime" ]]; then
         upstream_ns=$(runtime_read_value \
@@ -5360,6 +5427,25 @@ gateway_up() {
 
     acquire_lock "gateway-$gateway"
     load_gateway_cfg "$gateway"
+
+    if [[ "$VIA_APP" == host ]]; then
+        # OpenVPN's --up callback installs host NAT only after the TUN exists.
+        gateway_down_locked "$gateway" >/dev/null 2>&1 || true
+        load_gateway_cfg "$gateway"
+        local unpriv_user unpriv_group
+        unpriv_user=$(nns_unprivileged_user)
+        unpriv_group=$(nns_unprivileged_group)
+        install -d -o "$unpriv_user" -g "$unpriv_group" -m 0750 \
+            "$(gateway_runtime_dir "$gateway")"
+        sysctl -q -w net.ipv4.ip_forward=1
+        if ! gateway_public_firewall_up "$gateway"; then
+            release_lock "gateway-$gateway"
+            die "Could not open host firewall for OpenVPN server '$gateway'."
+        fi
+        release_lock "gateway-$gateway"
+        log "OpenVPN server '$gateway' is ready to start on the host uplink."
+        return 0
+    fi
 
     upstream_data=$(ensure_upstream_ready "$gateway" "$VIA_APP")
     IFS='|' read -r upstream_ns upstream_tun <<<"$upstream_data"
@@ -5452,6 +5538,18 @@ gateway_tun_up() {
         "net.ipv4.conf.${tunnel_dev}.rp_filter=2" || true
     firewalld_interface_add "$tunnel_dev"
 
+    if [[ "$VIA_APP" == host ]]; then
+        local wan
+        wan=$(detect_wan_iface auto) || {
+            release_lock "gateway-$gateway"
+            die "Cannot detect the host IPv4 default WAN interface."
+        }
+        sysctl -q -w net.ipv4.ip_forward=1
+        gateway_host_exit_rules_up "$wan"
+        release_lock "gateway-$gateway"
+        return 0
+    fi
+
     # Match both the server TUN and client pool. Source-only matching could
     # capture unrelated host-generated packets that use an address from the pool.
     gateway_rule_delete_exact || true
@@ -5487,7 +5585,9 @@ gateway_start() {
         release_lock "gateway-$gateway"
         die "Could not normalize runtime access for gateway '$gateway'."
     }
-    ensure_upstream_ready "$gateway" "$VIA_APP" >/dev/null
+    if [[ "$VIA_APP" != host ]]; then
+        ensure_upstream_ready "$gateway" "$VIA_APP" >/dev/null
+    fi
 
     [[ ! -f "$(gateway_dir "$gateway")/server.conf" ]] ||
         config_before=$(sha256sum "$(gateway_dir "$gateway")/server.conf" 2>/dev/null | awk '{print $1}')
@@ -5578,7 +5678,8 @@ gateways_using_app() {
         [[ -f "$dir/gateway.cfg" ]] || continue
         gateway=$(basename "$dir")
         via=$(gateway_cfg_value "$gateway" VIA_APP 2>/dev/null || true)
-        [[ "$via" == "$app" ]] && printf '%s\n' "$gateway"
+        # 'host' denotes a direct host exit, not an app dependency.
+        [[ "$via" == "$app" && "$via" != host ]] && printf '%s\n' "$gateway"
     done
 
     # This is an enumerator, not a predicate. A different gateway—or no
@@ -6116,6 +6217,7 @@ gateway_listener_ready() {
 }
 
 gateway_policy_ready() {
+    [[ "$VIA_APP" != host ]] || return 0
     local rule_pattern_a rule_pattern_b
     rule_pattern_a="^${RULE_PRIORITY}:[[:space:]]+from ${CLIENT_POOL}[[:space:]]+iif ${GATEWAY_TUN}[[:space:]]+lookup ${ROUTE_TABLE}([[:space:]]|$)"
     rule_pattern_b="^${RULE_PRIORITY}:[[:space:]]+from ${CLIENT_POOL}[[:space:]]+lookup ${ROUTE_TABLE}[[:space:]]+iif ${GATEWAY_TUN}([[:space:]]|$)"
@@ -6131,6 +6233,25 @@ gateway_policy_ready() {
 gateway_firewall_ready() {
     local gateway=$1 upstream_ns=$2 upstream_tun=$3
     local comment="nns-app:gateway:$gateway"
+    if [[ "$VIA_APP" == host ]]; then
+        [[ -n "$upstream_tun" ]] || return 1
+        iptables -w -t filter -C FORWARD \
+            -m comment --comment "$comment:forward" \
+            -j "$HOST_FWD_CHAIN" 2>/dev/null || return 1
+        iptables -w -t filter -C "$HOST_FWD_CHAIN" \
+            -i "$GATEWAY_TUN" -s "$CLIENT_POOL" \
+            -o "$upstream_tun" -j ACCEPT 2>/dev/null || return 1
+        iptables -w -t mangle -C FORWARD \
+            -m comment --comment "$comment:mangle" \
+            -j "$HOST_MANGLE_CHAIN" 2>/dev/null || return 1
+        iptables -w -t nat -C POSTROUTING \
+            -m comment --comment "$comment:host-nat" \
+            -j "$NS_NAT_CHAIN" 2>/dev/null || return 1
+        iptables -w -t nat -C "$NS_NAT_CHAIN" \
+            -s "$CLIENT_POOL" -o "$upstream_tun" \
+            -j MASQUERADE 2>/dev/null || return 1
+        return 0
+    fi
     [[ -n "$upstream_ns" && -n "$upstream_tun" ]] || return 1
 
     iptables -w -t filter -C FORWARD \
@@ -6197,7 +6318,14 @@ gateway_status() {
     pid=$(systemctl show "$unit" -p MainPID --value 2>/dev/null || true)
     restarts=$(systemctl show "$unit" -p NRestarts --value 2>/dev/null || true)
 
-    if app_is_started "$VIA_APP" && vpn_route_ready "$VIA_APP"; then
+    if [[ "$VIA_APP" == host ]]; then
+        upstream_iface=$(detect_wan_iface auto 2>/dev/null || true)
+        if [[ -n "$upstream_iface" ]]; then
+            upstream_state=ready
+        else
+            upstream_state="host uplink unavailable"
+        fi
+    elif app_is_started "$VIA_APP" && vpn_route_ready "$VIA_APP"; then
         upstream_state=ready
         upstream_iface=$(vpn_route_iface "$VIA_APP" 2>/dev/null || true)
         upstream_ns=$(cfg_read_value "$VIA_APP" NS_NAME 2>/dev/null || true)
@@ -6209,7 +6337,9 @@ gateway_status() {
         tunnel=yes
     gateway_listener_ready "${pid:-0}" && listening=yes
 
-    if ip link show "$GATEWAY_VETH_HOST" up >/dev/null 2>&1 &&
+    if [[ "$VIA_APP" == host ]]; then
+        veth_ok=yes  # No transit veth required for the host exit.
+    elif ip link show "$GATEWAY_VETH_HOST" up >/dev/null 2>&1 &&
        [[ -n "$upstream_ns" ]] &&
        ip -n "$upstream_ns" link show "$GATEWAY_VETH_NS" \
            up >/dev/null 2>&1; then
@@ -6274,14 +6404,18 @@ gateway_status() {
             "$LISTEN_PORT" "$LISTEN_PROTO" "$listening" "${pid:-0}"
     fi
     printf 'Client pool:       %s\n' "$CLIENT_POOL"
-    printf 'Remote NNS exit:   %s (%s)\n' \
+    printf 'Exit:              %s (%s)\n' \
         "$VIA_APP" "$upstream_state"
     [[ -z "$upstream_iface" ]] ||
         printf 'Exit tunnel:       %s\n' "$upstream_iface"
     printf 'Server interface:  %s (%s)\n' \
         "$GATEWAY_TUN" "$tunnel"
-    printf 'Transit veth:      %s\n' "$veth_ok"
-    printf 'Policy routing:    %s\n' "$policy_ok"
+    if [[ "$VIA_APP" == host ]]; then
+        printf 'Host uplink:       %s\n' "${upstream_iface:-unavailable}"
+    else
+        printf 'Transit veth:      %s\n' "$veth_ok"
+        printf 'Policy routing:    %s\n' "$policy_ok"
+    fi
     printf 'Firewall chains:  %s\n' "$firewall_ok"
     printf 'Service:           %s/%s; result=%s; restarts=%s\n' \
         "${state:-unknown}" "${sub:-unknown}" \
@@ -6334,6 +6468,103 @@ gateway_list() {
         found=1
     done
     (( found )) || log "No managed gateways configured."
+}
+
+# The --server convenience form creates a direct public gateway with the
+# host's normal uplink as its exit. Credentials and service state remain under
+# the existing gateway subsystem; no second PKI/service implementation.
+server_public_host() {
+    local value
+    value=$(curl -4fsS --connect-timeout 3 --max-time 7 \
+        https://api.ipify.org 2>/dev/null || true)
+    if python3 - "$value" <<'PY_SERVER_PUBLIC_IP'
+import ipaddress, sys
+try:
+    ipaddress.IPv4Address(sys.argv[1])
+except ipaddress.AddressValueError:
+    raise SystemExit(1)
+PY_SERVER_PUBLIC_IP
+    then
+        printf '%s\n' "$value"
+        return 0
+    fi
+
+    # Offline/captive hosts can still create a server, but must eventually
+    # override a private address with their public port-forwarding endpoint.
+    value=$(ip -4 route get 1.1.1.1 2>/dev/null | \
+        sed -nE 's/.*[[:space:]]src[[:space:]]([0-9.]+).*/\1/p' | head -n1)
+    [[ -n "$value" ]] || return 1
+    warn "Public IPv4 discovery failed. Using local $value; specify --public for NAT or a cloud ingress."
+    printf '%s\n' "$value"
+}
+
+server_gateway_exists() {
+    local name=$1
+    # This lookup happens before normal app/gateway validation in the CLI.
+    # Never construct or source a config path from a path traversal or flag.
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]] || return 1
+    [[ -f "$(gateway_cfg_file "$name")" ]] || return 1
+    [[ "$(gateway_cfg_value "$name" VIA_APP 2>/dev/null || true)" == host ]]
+}
+
+install_openvpn_server() {
+    require_root
+    local name=$1 listen=${2:-} public=${3:-} pool=${4:-} dns=${5:-}
+    local protocol port public_host
+    validate_gateway_name "$name"
+    [[ ! -f "$(cfg_file "$name")" ]] ||
+        die "'$name' is an NNS app; remove it or choose another server name."
+    if [[ -f "$(gateway_cfg_file "$name")" ]]; then
+        server_gateway_exists "$name" ||
+            die "'$name' is already a gateway with a non-host exit."
+        # Never regenerate a CA or silently change an existing listener.
+        load_gateway_cfg "$name"
+        [[ -z "$listen" || "$listen" == "$LISTEN_PROTO:$LISTEN_PORT" ]] ||
+            die "Server '$name' is installed on $LISTEN_PROTO:$LISTEN_PORT; options cannot change it in place."
+        [[ -z "$public" || "$public" == "$PUBLIC_HOST:$PUBLIC_PORT" ]] ||
+            die "Server '$name' already has public endpoint $PUBLIC_HOST:$PUBLIC_PORT."
+        [[ -z "$pool" || "$pool" == "$CLIENT_POOL" ]] ||
+            die "Server '$name' already uses pool $CLIENT_POOL."
+        [[ -z "$dns" || "$dns" == "$DNS_SERVERS" ]] ||
+            die "Server '$name' already uses DNS $DNS_SERVERS."
+        log "OpenVPN server '$name' is already installed; preserving CA and client certificates."
+    else
+        listen=${listen:-udp:1194}
+        IFS='|' read -r protocol port <<<"$(parse_gateway_listen "$listen")"
+        if [[ -z "$public" ]]; then
+            ensure_dependencies
+            public_host=$(server_public_host) ||
+                die "Cannot discover host IPv4. Pass --public <host>:<port>."
+            public="$public_host:$port"
+        fi
+        gateway_create "$name" host "$listen" "$public" "$pool" \
+            "${dns:-1.1.1.1 9.9.9.9}" direct
+    fi
+    # This service must start after reboot; gateway_create only installs PKI.
+    systemctl enable "nns-gateway@${name}.service" >/dev/null
+    gateway_start "$name" ||
+        die "OpenVPN server '$name' was installed but failed to start; inspect: nns-app status $name"
+    log "OpenVPN server '$name' is enabled at boot."
+    log "Create client:  nns-app export ovpn $name --client laptop --output laptop.ovpn"
+    log "Check status:   nns-app status $name"
+}
+
+server_export_ovpn() {
+    require_root
+    local gateway=$1 client=$2 output=$3 public=$4 proto=$5 compat=$6
+    server_gateway_exists "$gateway" || die "Server '$gateway' does not exist."
+    load_gateway_cfg "$gateway"
+    [[ "$compat" == modern && "$OPENVPN_COMPAT" == modern ]] ||
+        die "This server uses modern OpenVPN profiles; --embedded is not supported."
+    [[ "$public" == - || "$public" == "$PUBLIC_HOST:$PUBLIC_PORT" ]] ||
+        die "Server public endpoint is $PUBLIC_HOST:$PUBLIC_PORT; export override is not supported."
+    [[ "$proto" == auto || "$proto" == "$LISTEN_PROTO" ]] ||
+        die "Server listener uses $LISTEN_PROTO, not $proto."
+    if [[ ! -e "$(gateway_client_dir "$gateway" "$client")" ]]; then
+        # Keep stdout pure so --output - can safely be redirected to an .ovpn.
+        gateway_client_add "$gateway" "$client" >&2
+    fi
+    gateway_client_export "$gateway" "$client" "$output" ovpn
 }
 
 gateway_remove() {
@@ -11053,6 +11284,11 @@ repair_gateway_one() {
         ip link show dev "$GATEWAY_TUN" up >/dev/null 2>&1 || restart_needed=yes
         gateway_listener_ready "${pid:-0}" || restart_needed=yes
         gateway_policy_ready || restart_needed=yes
+        if [[ "$VIA_APP" == host ]]; then
+            local host_wan
+            host_wan=$(detect_wan_iface auto 2>/dev/null || true)
+            gateway_firewall_ready "$gateway" "" "$host_wan" || restart_needed=yes
+        fi
         [[ "$config_changed" == no ]] || restart_needed=yes
         if [[ "$restart_needed" == yes ]]; then
             release_lock "gateway-$gateway"
@@ -11608,10 +11844,38 @@ main() {
                 install_engine off
             else
                 local install_app_name=$2 install_via="__default__" install_backend="__default__"
-                local install_remote="" install_remote_port=22
+                [[ -n "$install_app_name" && "$install_app_name" != --* ]] ||
+                    die "Usage: nns-app install <name> --server"
+                local install_remote="" install_remote_port=22 install_remote_port_set=off
+                local install_server=off install_listen="" install_public=""
+                local install_pool="" install_dns=""
                 shift 2
                 while (( $# > 0 )); do
                     case "$1" in
+                        --server)
+                            install_server=on
+                            shift
+                            ;;
+                        --listen)
+                            (( $# >= 2 )) || die "--listen requires tcp:<port> or udp:<port>."
+                            install_listen=$2; shift 2 ;;
+                        --listen=*)
+                            install_listen=${1#--listen=}; shift ;;
+                        --public)
+                            (( $# >= 2 )) || die "--public requires host:port."
+                            install_public=$2; shift 2 ;;
+                        --public=*)
+                            install_public=${1#--public=}; shift ;;
+                        --pool)
+                            (( $# >= 2 )) || die "--pool requires an IPv4 CIDR."
+                            install_pool=$2; shift 2 ;;
+                        --pool=*)
+                            install_pool=${1#--pool=}; shift ;;
+                        --dns)
+                            (( $# >= 2 )) || die "--dns requires quoted space-separated IPv4 addresses."
+                            install_dns=$2; shift 2 ;;
+                        --dns=*)
+                            install_dns=${1#--dns=}; shift ;;
                         --via)
                             (( $# >= 2 )) || die "--via requires an upstream app name or 'host'."
                             install_via=$2
@@ -11650,10 +11914,12 @@ main() {
                         --remote-port)
                             (( $# >= 2 )) || die "--remote-port requires a number."
                             install_remote_port=$2
+                            install_remote_port_set=on
                             shift 2
                             ;;
                         --remote-port=*)
                             install_remote_port=${1#--remote-port=}
+                            install_remote_port_set=on
                             shift
                             ;;
                         --backend)
@@ -11666,29 +11932,43 @@ main() {
                             shift
                             ;;
                         *)
-                            die "Usage: nns-app install <app_name> via --remote <user@host>"
+                            die "Unknown install option '$1'. See nns-app --help."
                             ;;
                     esac
                 done
-                if [[ -n "$install_remote" ]]; then
-                    [[ "$install_via" == __default__ && "$install_backend" == __default__ ]] ||
-                        die "--via-remote cannot be combined with --via or --backend."
-                    install_app "$install_app_name" __default__
-                    remote_auto_install "$install_app_name" "$install_remote" "$install_remote_port"
+                if [[ "$install_server" == on ]]; then
+                    [[ -z "$install_remote" && "$install_remote_port_set" == off &&
+                       "$install_via" == __default__ && "$install_backend" == __default__ ]] ||
+                        die "--server cannot be combined with --via, --remote, or --backend."
+                    install_openvpn_server "$install_app_name" \
+                        "$install_listen" "$install_public" "$install_pool" "$install_dns"
                 else
-                    case "$install_backend" in
-                        __default__) install_app "$install_app_name" "$install_via" ;;
-                        inherit)
-                            install_app "$install_app_name" "$install_via"
-                            set_inherit_backend "$install_app_name" "$install_via"
-                            ;;
-                        *) die "Unsupported app backend '$install_backend'; only 'inherit' is valid without a profile." ;;
-                    esac
+                    [[ -z "$install_listen$install_public$install_pool$install_dns" ]] ||
+                        die "--listen, --public, --pool and --dns require --server."
+                    if [[ -n "$install_remote" ]]; then
+                        [[ "$install_via" == __default__ && "$install_backend" == __default__ ]] ||
+                            die "--via-remote cannot be combined with --via or --backend."
+                        install_app "$install_app_name" __default__
+                        remote_auto_install "$install_app_name" "$install_remote" "$install_remote_port"
+                    else
+                        [[ "$install_remote_port_set" == off ]] ||
+                            die "--remote-port requires --remote."
+                        case "$install_backend" in
+                            __default__) install_app "$install_app_name" "$install_via" ;;
+                            inherit)
+                                install_app "$install_app_name" "$install_via"
+                                set_inherit_backend "$install_app_name" "$install_via"
+                                ;;
+                            *) die "Unsupported app backend '$install_backend'; only 'inherit' is valid without a profile." ;;
+                        esac
+                    fi
                 fi
             fi
             ;;
         remove)
-            if [[ $# -eq 2 ]]; then
+            if [[ $# -eq 2 ]] && server_gateway_exists "$2"; then
+                gateway_remove "$2"
+            elif [[ $# -eq 2 ]]; then
                 remove_app "$2"
             elif [[ $# -eq 3 && "$3" == --local-only ]]; then
                 remove_app "$2" local-only
@@ -11739,7 +12019,11 @@ main() {
             ;;
         status)
             [[ $# -eq 2 ]] || die "Usage: nns-app status <app_name>"
-            status_app "$2"
+            if server_gateway_exists "$2"; then
+                gateway_status "$2"
+            else
+                status_app "$2"
+            fi
             ;;
         myip)
             (( $# <= 2 )) || die "Usage: nns-app myip [<app_name>]"
@@ -11780,8 +12064,13 @@ main() {
                 esac
             done
             [[ -n "$export_client" ]] || die "export ovpn requires --client <client_name>."
-            remote_auto_export_public_ovpn "$export_app" "$export_client" \
-                "$export_public" "$export_proto" "$export_output" "$export_compat"
+            if server_gateway_exists "$export_app"; then
+                server_export_ovpn "$export_app" "$export_client" \
+                    "$export_output" "$export_public" "$export_proto" "$export_compat"
+            else
+                remote_auto_export_public_ovpn "$export_app" "$export_client" \
+                    "$export_public" "$export_proto" "$export_output" "$export_compat"
+            fi
             ;;
         revoke)
             (( $# >= 3 && $# <= 4 )) ||
@@ -11794,7 +12083,13 @@ main() {
                     *) die "Usage: nns-app revoke <app_name> <client_name> [--modern|--embedded]" ;;
                 esac
             fi
-            remote_auto_revoke_public_ovpn "$2" "$3" "$revoke_scope"
+            if server_gateway_exists "$2"; then
+                [[ "$revoke_scope" != embedded ]] ||
+                    die "--embedded is not supported for a modern OpenVPN server."
+                gateway_client_revoke "$2" "$3"
+            else
+                remote_auto_revoke_public_ovpn "$2" "$3" "$revoke_scope"
+            fi
             ;;
         add)
             (( $# >= 3 )) ||
@@ -11847,11 +12142,23 @@ main() {
         start)
             shift
             parse_start_cli "$@"
-            start_app "$START_APP_NAME" "$START_IGNORE" "$START_VIA"
+            if server_gateway_exists "$START_APP_NAME"; then
+                [[ "$START_VIA" == __default__ && "$START_IGNORE" == off ]] ||
+                    die "An OpenVPN server cannot use --via or --ignore-start-error."
+                gateway_start "$START_APP_NAME"
+            else
+                start_app "$START_APP_NAME" "$START_IGNORE" "$START_VIA"
+            fi
             ;;
         stop)
             case $# in
-                2) stop_app_cli "$2" remote ;;
+                2)
+                    if server_gateway_exists "$2"; then
+                        gateway_stop "$2"
+                    else
+                        stop_app_cli "$2" remote
+                    fi
+                    ;;
                 3)
                     [[ "$3" == --local-only ]] ||
                         die "Usage: nns-app stop <app_name> [--local-only]"

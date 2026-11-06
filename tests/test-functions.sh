@@ -1761,7 +1761,7 @@ manual_payload=$(remote_command_payload gateway client export \
     remote_auto_register() { fail 'current remote was unnecessarily registered'; }
     log() { printf 'log:%s\n' "$*"; }
     output=$(remote_auto_refresh_configured_app my-app)
-    grep -Fq 'already runs nns-app 1.3.33' <<<"$output" ||
+    grep -Fq 'already runs nns-app 1.3.34' <<<"$output" ||
         fail 'current remote refresh status missing'
 )
 
@@ -1834,6 +1834,105 @@ EOF_REPAIR_STATE
     repair_gateway_expected_running() { return 1; }
     repair_gateway_one gw >/dev/null
     [[ -f "$TEST_TMP/repair-ufw" ]] || fail 'repair did not close stale UFW gateway rule'
+)
+
+# Stand-alone host OpenVPN server routes through the existing gateway API.
+(
+    reexec_as_root_if_needed() { :; }
+    server_gateway_exists() { [[ "$1" == office-vpn ]]; }
+    install_openvpn_server() { printf 'server-install:%s|%s|%s|%s|%s\n' "$@"; }
+    gateway_start() { printf 'server-start:%s\n' "$1"; }
+    gateway_stop() { printf 'server-stop:%s\n' "$1"; }
+    gateway_remove() { printf 'server-remove:%s\n' "$1"; }
+    gateway_status() { printf 'server-status:%s\n' "$1"; }
+    gateway_client_revoke() { printf 'server-revoke:%s:%s\n' "$1" "$2"; }
+    server_export_ovpn() { printf 'server-export:%s|%s|%s|%s|%s|%s\n' "$@"; }
+
+    if server_gateway_exists '../malicious'; then
+        fail 'server gateway lookup accepted path traversal'
+    fi
+    output=$(main install office-vpn --server)
+    [[ "$output" == 'server-install:office-vpn||||' ]] ||
+        fail "minimal --server CLI parsing: $output"
+    output=$(main install office-vpn --server --listen udp:443 \
+        --public vpn.example.net:443 --pool 10.253.60.0/24 --dns '1.1.1.1 9.9.9.9')
+    [[ "$output" == 'server-install:office-vpn|udp:443|vpn.example.net:443|10.253.60.0/24|1.1.1.1 9.9.9.9' ]] ||
+        fail "--server extended CLI parsing: $output"
+    if ( main install office-vpn --server --via upstream ) >/dev/null 2>&1; then
+        fail '--server accepted --via'
+    fi
+    if ( main install office-vpn --server --remote-port 22 ) >/dev/null 2>&1; then
+        fail '--server accepted --remote-port'
+    fi
+    if ( main install office-vpn --listen udp:1194 ) >/dev/null 2>&1; then
+        fail '--listen accepted without --server'
+    fi
+
+    [[ $(main start office-vpn) == 'server-start:office-vpn' ]] || fail 'server start CLI'
+    [[ $(main stop office-vpn) == 'server-stop:office-vpn' ]] || fail 'server stop CLI'
+    [[ $(main status office-vpn) == 'server-status:office-vpn' ]] || fail 'server status CLI'
+    [[ $(main remove office-vpn) == 'server-remove:office-vpn' ]] || fail 'server remove CLI'
+    output=$(main export ovpn office-vpn --client laptop --output /tmp/laptop.ovpn)
+    [[ "$output" == 'server-export:office-vpn|laptop|/tmp/laptop.ovpn|-|auto|modern' ]] ||
+        fail "server export CLI: $output"
+    [[ $(main revoke office-vpn laptop) == 'server-revoke:office-vpn:laptop' ]] ||
+        fail 'server revoke CLI'
+)
+
+# NAT and forwarding must remain restricted to this server's tunnel, client
+# pool and detected host WAN; system-wide NAT/FORWARD rules are not flushed.
+(
+    logfile="$TEST_TMP/server-iptables.log"
+    : > "$logfile"
+    GATEWAY_NAME=office-vpn
+    GATEWAY_TUN=ngwserver
+    CLIENT_POOL=10.253.60.0/24
+    HOST_FWD_CHAIN=NGH999F
+    HOST_MANGLE_CHAIN=NGH999M
+    NS_NAT_CHAIN=NGN999N
+    iptables() {
+        printf '%s ' "$@" >> "$logfile"
+        printf '\n' >> "$logfile"
+        local arg
+        for arg in "$@"; do [[ "$arg" != -C ]] || return 1; done
+        return 0
+    }
+    iptables_jump_delete_all() { :; }
+    gateway_host_exit_rules_up ens3
+    grep -Fq -- '-i ngwserver -s 10.253.60.0/24 -o ens3 -j ACCEPT' "$logfile" ||
+        fail 'host server forwarding not scoped to TUN/pool/WAN'
+    grep -Fq -- '-s 10.253.60.0/24 -o ens3 -j MASQUERADE' "$logfile" ||
+        fail 'host server NAT not scoped to client pool/WAN'
+    grep -Fq -- '-t nat -I POSTROUTING 1 -m comment --comment nns-app:gateway:office-vpn:host-nat -j NGN999N' "$logfile" ||
+        fail 'host server NAT lacks owned POSTROUTING jump'
+    if grep -Eq 'POSTROUTING.*-j MASQUERADE| -F (POSTROUTING|FORWARD)([[:space:]]|$)' "$logfile"; then
+        fail 'host server touched global iptables forwarding/NAT state'
+    fi
+)
+
+# Host-egress startup and TUN callback must not require an upstream NNS app.
+(
+    require_root() { :; }
+    acquire_lock() { :; }
+    release_lock() { :; }
+    load_gateway_cfg() { VIA_APP=host; GATEWAY_TUN=ngwserver; }
+    ensure_upstream_ready() { fail 'host server tried to resolve an upstream VPN'; }
+    gateway_down_locked() { :; }
+    nns_unprivileged_user() { printf 'nobody\n'; }
+    nns_unprivileged_group() { printf 'nogroup\n'; }
+    gateway_runtime_dir() { printf '%s\n' "$TEST_TMP/server-runtime"; }
+    install() { :; }
+    sysctl() { :; }
+    gateway_public_firewall_up() { :; }
+    firewalld_interface_add() { :; }
+    detect_wan_iface() { printf 'ens3\n'; }
+    gateway_host_exit_rules_up() { printf 'host-rules:%s\n' "$1"; }
+    ip() { :; }
+    output=$(gateway_up office-vpn)
+    grep -Fq 'ready to start' <<< "$output" || fail 'host server gateway_up'
+    dev=ngwserver
+    output=$(gateway_tun_up office-vpn)
+    [[ "$output" == 'host-rules:ens3' ]] || fail 'host server TUN callback'
 )
 
 echo 'Function tests passed.'

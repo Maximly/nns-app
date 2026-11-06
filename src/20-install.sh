@@ -458,6 +458,8 @@ write_gateway_unit_dropin() {
     via=$VIA_APP
     dir=$(gateway_dropin_dir "$gateway")
     rm -rf "$dir"
+    # Host-egress OpenVPN servers have no nns-online@ upstream dependency.
+    [[ "$via" != host ]] || return 0
     install -d -o root -g root -m 0755 "$dir"
     cat >"$dir/10-upstream.conf" <<GATEWAY_DROPIN_EOF
 [Unit]

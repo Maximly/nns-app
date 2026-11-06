@@ -22,6 +22,8 @@
 #
 # Public commands:
 #   install [--local-only]
+#   install <name> --server [--listen udp:1194] [--public host:port]
+#                         [--pool CIDR] [--dns "IPv4 IPv4"]
 #   install [<app_name> [--backend inherit] [--via <upstream-app>|host]
 #                         [--via-remote <user@host> [--remote-port <port>]]]
 #   remove  <app_name>
@@ -52,7 +54,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.33"
+readonly VERSION="1.3.34"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -275,6 +277,8 @@ usage() {
     cat <<'USAGE'
 Usage:
   nns-app install [--local-only]
+  nns-app install <name> --server [--listen udp:1194] [--public host:port]
+                  [--pool IPv4-CIDR] [--dns "IPv4 IPv4"]
   nns-app install <app_name> [--backend inherit] [--via <upstream-app>|host]
   nns-app install <app_name> via --remote <user@host> [--remote-port <port>]
   nns-app remove  <app_name> [--local-only]
@@ -327,6 +331,8 @@ Examples:
   sudo ./nns-app.sh install
   sudo ./nns-app.sh install --local-only
   sudo nns-app install my-upstream-vpn
+  sudo nns-app install office-vpn --server
+  nns-app export ovpn office-vpn --client laptop --output ~/laptop.ovpn
   nns-app install my-private-app via --remote user@remote-host
   nns-app add my-private-app ~/my-base-profile.ovpn
   nns-app run my-private-app ping 1.1.1.1
