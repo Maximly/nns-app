@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.3.37
+
+- `nns-app list` now shows all locally managed instances, including OpenVPN servers created using `install <name> --server`, in separate Applications and Gateways sections.
+- `nns-app list apps` remains namespace-only; `list gateways` shows managed local and associated remote gateways, with `list gateway` retained as an alias. `list all` includes exported clients.
+- Keep empty sections hidden and avoid remote inventory lookups for the default local view. Added regression coverage for gateway-only, app-only, mixed, and remote-only inventories.
+
+
+## 1.3.36
+
+- Added `install <name> --server --client-to-client[=on|off]` and `--no-client-to-client`; repeat installs can enable or disable client forwarding without recreating PKI.
+- Added `client-to-client <server> on|off` and `gateway client-to-client <gateway> on|off` to update existing stand-alone or upstream managed OpenVPN servers, persisting the setting and restarting active instances.
+- Default remains isolated; enabled mode explicitly disables OpenVPN DCO so internal client-to-client routing works and host forwarding rules do not need to be widened.
+- Added status visibility and regression tests for configuration generation, toggling, and CLI behavior.
+
 ## 1.3.35
 
 - Hide empty inventory sections and column headers in `nns-app list all`, showing a single concise message only when every section is empty.

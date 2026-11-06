@@ -31,6 +31,9 @@ gateway_inventory_record() {
 }
 gateway_external_client_records() { :; }
 
+output=$(list_managed_objects)
+[[ "$output" == 'No applications or local gateways configured.' ]] ||
+    fail 'default empty inventory should show one short message and no headers'
 output=$(list_all_objects)
 [[ "$output" == 'No applications, gateways, or external clients configured.' ]] ||
     fail 'combined empty inventory should show one short message and no headers'
@@ -45,6 +48,10 @@ output=$(list_all_objects)
 
 mkdir "$BASE_DIR/editor"
 touch "$BASE_DIR/editor/config"
+output=$(list_managed_objects)
+grep -Fq 'Applications:' <<<"$output" || fail 'default inventory missing installed app'
+grep -Fq 'editor' <<<"$output" || fail 'default inventory missing app row'
+! grep -Fq 'Gateways:' <<<"$output" || fail 'default inventory shows empty gateway section'
 output=$(list_all_objects)
 grep -Fq 'Applications:' <<<"$output" || fail 'present app section missing'
 grep -Fq 'editor' <<<"$output" || fail 'present app row missing'
@@ -54,15 +61,28 @@ grep -Fq 'editor' <<<"$output" || fail 'present app row missing'
 
 mkdir "$GATEWAY_BASE_DIR/vpn"
 touch "$GATEWAY_BASE_DIR/vpn/gateway.cfg"
+output=$(list_managed_objects)
+grep -Fq 'Applications:' <<<"$output" || fail 'default mixed inventory missing app section'
+grep -Fq 'Gateways:' <<<"$output" || fail 'default mixed inventory missing local gateway'
+grep -Fq 'vpn' <<<"$output" || fail 'default mixed inventory missing gateway row'
+! grep -Fq 'External clients:' <<<"$output" || fail 'default inventory should exclude clients'
 output=$(list_all_objects)
 grep -Fq 'Applications:' <<<"$output" || fail 'app section missing in mixed inventory'
 grep -Fq 'Gateways:' <<<"$output" || fail 'gateway section missing in mixed inventory'
 ! grep -Fq 'External clients:' <<<"$output" || fail 'empty client section shown in mixed inventory'
 [[ "$(grep -c '^Gateway ' <<<"$output")" == 1 ]] || fail 'gateway header repeated'
 
+# A server-only host should show its gateway, but not an empty app table.
+rm -rf "$BASE_DIR/editor"
+output=$(list_managed_objects)
+! grep -Fq 'Applications:' <<<"$output" || fail 'server-only inventory shows empty apps'
+grep -Fq 'Gateways:' <<<"$output" || fail 'server-only inventory hides OpenVPN server'
+grep -Fq 'vpn' <<<"$output" || fail 'server-only inventory missing OpenVPN server row'
+[[ "$(list_apps)" == 'No NNS apps installed.' ]] || fail 'list apps should stay namespace-only'
+
 # Only clients can be present (no local apps/gateways) when remote inventory
 # supplies them; ensure those records still render without empty sections.
-rm -rf "$BASE_DIR/editor" "$GATEWAY_BASE_DIR/vpn"
+rm -rf "$GATEWAY_BASE_DIR/vpn"
 list_remote_auto_records() {
     case "$1" in
         inventory-clients)
@@ -70,6 +90,9 @@ list_remote_auto_records() {
             ;;
     esac
 }
+output=$(list_managed_objects)
+[[ "$output" == 'No applications or local gateways configured.' ]] ||
+    fail 'default local list must exclude remote-only client records'
 output=$(list_all_objects)
 ! grep -Fq 'Applications:' <<<"$output" || fail 'empty apps section shown for remote client'
 ! grep -Fq 'Gateways:' <<<"$output" || fail 'empty gateways section shown for remote client'
@@ -82,10 +105,31 @@ list_remote_auto_records() {
         inventory-gateways) printf 'WARN|app|inventory-gateways\n' ;;
     esac
 }
+output=$(list_managed_objects)
+[[ "$output" == 'No applications or local gateways configured.' ]] ||
+    fail 'default list must not display remote gateway failure as a local instance'
+output=$(list_gateways_overview)
+grep -Fq 'offline' <<<"$output" || fail 'list gateways should retain remote offline state'
 output=$(list_all_objects)
 grep -Fq 'Gateways:' <<<"$output" || fail 'offline remote gateway section hidden'
 grep -Fq 'offline' <<<"$output" || fail 'offline remote status hidden'
 ! grep -Fq 'Applications:' <<<"$output" || fail 'empty apps section shown for offline remote'
 ! grep -Fq 'External clients:' <<<"$output" || fail 'empty clients section shown for offline remote'
 
-printf 'List rendering tests passed.\n'
+# Exercise the user-facing CLI dispatch without touching the actual host.
+NNS_APP_SOURCE_ONLY=1 source "$ROOT/src/90-main.sh"
+reexec_as_root_if_needed() { :; }
+# CLI 'list' must include a server. Explicit 'list apps' must not.
+list_remote_auto_records() { :; }
+mkdir "$GATEWAY_BASE_DIR/mlvpn"
+touch "$GATEWAY_BASE_DIR/mlvpn/gateway.cfg"
+output=$(main list)
+grep -Fq 'mlvpn' <<<"$output" || fail 'CLI list does not show locally managed OpenVPN server'
+! grep -Fq 'Applications:' <<<"$output" || fail 'CLI list shows empty apps table'
+! grep -Fq 'External clients:' <<<"$output" || fail 'CLI list shows exported clients'
+[[ "$(main list apps)" == 'No NNS apps installed.' ]] || fail 'CLI list apps includes gateway'
+grep -Fq 'mlvpn' <<<"$(main list gateways)" || fail 'CLI list gateways omits server'
+grep -Fq 'mlvpn' <<<"$(main list gateway)" || fail 'legacy gateway alias broken'
+grep -Fq 'mlvpn' <<<"$(main list all)" || fail 'CLI list all omits server'
+
+printf 'List rendering tests passed.\n' 

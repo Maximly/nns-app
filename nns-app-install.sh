@@ -24,12 +24,13 @@
 #   install [--local-only]
 #   install <name> --server [--listen udp:1194] [--public host:port]
 #                         [--pool CIDR] [--dns "IPv4 IPv4"]
+#                         [--client-to-client[=on|off]]
 #   install [<app_name> [--backend inherit] [--via <upstream-app>|host]
 #                         [--via-remote <user@host> [--remote-port <port>]]]
 #   remove  <app_name>
 #   purge
 #   repair [--local-only]
-#   list
+#   list [apps|gateways|clients|all]
 #   status  <app_name>
 #   myip    [<app_name>]
 #   export  ovpn <app_name> --client <name> [--embedded]
@@ -43,6 +44,9 @@
 #   gateway create <gateway> --via <app> --listen tcp|udp:<port>
 #                  --public <host>:<port> [--transport direct|stunnel|cloak]
 #                  [--server-name <cloak-decoy-host>]
+#                  [--client-to-client[=on|off]]
+#   client-to-client <server> [on|off]
+#   gateway client-to-client <gateway> [on|off]
 #   remote add|connect|sync|rotate|status ...
 #   link import <app> <bundle.nnslink>
 #   gateway start|stop|status|list|remove ...
@@ -54,7 +58,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.35"
+readonly VERSION="1.3.37"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -190,7 +194,7 @@ reset_gateway_cfg_vars() {
     LISTEN_PROTO="" LISTEN_PORT="" PUBLIC_HOST="" PUBLIC_PORT=""
     TRANSPORT="" OPENVPN_LISTEN_PROTO="" OPENVPN_LISTEN_PORT="" OPENVPN_COMPAT=""
     TRANSPORT_SERVER_NAME="" TRANSPORT_PUBLIC_KEY="" TRANSPORT_PRIVATE_KEY=""
-    CLIENT_POOL="" DNS_SERVERS="" TRANSIT_CIDR=""
+    CLIENT_POOL="" DNS_SERVERS="" CLIENT_TO_CLIENT="off" TRANSIT_CIDR=""
     TRANSIT_HOST_ADDR="" TRANSIT_NS_ADDR="" GATEWAY_TUN=""
     GATEWAY_VETH_HOST="" GATEWAY_VETH_NS="" ROUTE_TABLE=""
     RULE_PRIORITY="" SERVER_CN="" HOST_FWD_CHAIN=""
@@ -279,12 +283,13 @@ Usage:
   nns-app install [--local-only]
   nns-app install <name> --server [--listen udp:1194] [--public host:port]
                   [--pool IPv4-CIDR] [--dns "IPv4 IPv4"]
+                  [--client-to-client[=on|off] | --no-client-to-client]
   nns-app install <app_name> [--backend inherit] [--via <upstream-app>|host]
   nns-app install <app_name> via --remote <user@host> [--remote-port <port>]
   nns-app remove  <app_name> [--local-only]
   nns-app purge [--local-only]
   nns-app repair [--local-only]
-  nns-app list [all|gateway|clients]
+  nns-app list [apps|gateways|clients|all]
   nns-app status  <app_name>
   nns-app myip [<app_name>]
   nns-app export ovpn <app_name> --client <client_name> [--embedded]
@@ -303,6 +308,9 @@ Usage:
                   [--pool <IPv4-CIDR>] [--dns "<IPv4> ..."]
                   [--transport direct|stunnel|cloak]
                   [--server-name <cloak-decoy-host>]
+                  [--client-to-client[=on|off]]
+  nns-app gateway client-to-client <gateway_name> [on|off]
+  nns-app client-to-client <server_name> [on|off]
   nns-app gateway start  <gateway_name>
   nns-app gateway stop   <gateway_name>
   nns-app gateway status <gateway_name>
@@ -348,10 +356,11 @@ Examples:
   nns-app run my-private-app firefox --no-remote
   sudo nns-app purge
   sudo nns-app repair
-  nns-app list
-  nns-app list all
-  nns-app list gateway
-  nns-app list clients
+  nns-app list            # local apps + local OpenVPN servers/gateways
+  nns-app list apps       # network namespace applications only
+  nns-app list gateways   # managed local and associated remote gateways
+  nns-app list clients    # exported OpenVPN clients
+  nns-app list all        # full inventory
   nns-app status my-private-app
   nns-app myip
   nns-app myip my-private-app
@@ -4114,6 +4123,8 @@ load_gateway_cfg() {
     esac
     OPENVPN_LISTEN_PROTO=${OPENVPN_LISTEN_PROTO:-$LISTEN_PROTO}
     OPENVPN_LISTEN_PORT=${OPENVPN_LISTEN_PORT:-$LISTEN_PORT}
+    CLIENT_TO_CLIENT=${CLIENT_TO_CLIENT:-off}
+    validate_client_to_client "$CLIENT_TO_CLIENT"
     TRANSPORT_SERVER_NAME=${TRANSPORT_SERVER_NAME:-$PUBLIC_HOST}
     case "$TRANSPORT" in
         direct|stunnel|cloak|ssh) ;;
@@ -4138,6 +4149,13 @@ load_gateway_cfg() {
             NS_FWD_CHAIN NS_NAT_CHAIN NS_MANGLE_CHAIN \
             <<<"$(make_gateway_names "$gateway")"
     fi
+}
+
+validate_client_to_client() {
+    case "${1:-}" in
+        on|off) ;;
+        *) die "Invalid client-to-client setting '${1:-}'; expected on or off." ;;
+    esac
 }
 
 gateway_cfg_value() {
@@ -4805,6 +4823,13 @@ PY_GATEWAY_POOL
         printf 'dev %s\n' "$GATEWAY_TUN"
         printf 'topology subnet\n'
         printf 'server %s %s\n' "$network" "$netmask"
+        # Force userspace routing for this setting: with OpenVPN DCO enabled,
+        # client-to-client is ignored and Linux would need separate tun->tun
+        # forwarding rules. Never widen the host firewall for other traffic.
+        if [[ "${CLIENT_TO_CLIENT:-off}" == on ]]; then
+            printf 'disable-dco\n'
+            printf 'client-to-client\n'
+        fi
         printf 'ca %s\n' "$pki/ca.crt"
         printf 'cert %s\n' "$pki/server.crt"
         printf 'key %s\n' "$pki/server.key"
@@ -4931,12 +4956,14 @@ gateway_create() {
     local transport=${7:-direct}
     local transport_server_name=${8:-}
     local openvpn_compat=${9:-modern}
+    local client_to_client=${10:-off}
     local staging=""
 
     validate_gateway_name "$gateway"
     validate_app_name "$via_app"
     case "$transport" in direct|stunnel|cloak|ssh) ;; *) die "Unsupported transport '$transport'." ;; esac
     case "$openvpn_compat" in modern|embedded) ;; *) die "Unsupported OpenVPN compatibility mode '$openvpn_compat'." ;; esac
+    validate_client_to_client "$client_to_client"
     [[ "$openvpn_compat" == modern || "$transport" == direct ]] ||
         die "Embedded OpenVPN compatibility is supported only with direct transport."
     if [[ "$transport" == cloak ]]; then
@@ -5023,6 +5050,7 @@ OPENVPN_COMPAT="$openvpn_compat"
 TRANSPORT_SERVER_NAME="$transport_server_name"
 CLIENT_POOL="$client_pool"
 DNS_SERVERS="$dns_servers"
+CLIENT_TO_CLIENT="$client_to_client"
 
 TRANSIT_CIDR="$transit_cidr"
 TRANSIT_HOST_ADDR="$transit_host_addr"
@@ -6404,6 +6432,7 @@ gateway_status() {
             "$LISTEN_PORT" "$LISTEN_PROTO" "$listening" "${pid:-0}"
     fi
     printf 'Client pool:       %s\n' "$CLIENT_POOL"
+    printf 'Client-to-client:  %s\n' "$CLIENT_TO_CLIENT"
     printf 'Exit:              %s (%s)\n' \
         "$VIA_APP" "$upstream_state"
     [[ -z "$upstream_iface" ]] ||
@@ -6513,7 +6542,9 @@ server_gateway_exists() {
 install_openvpn_server() {
     require_root
     local name=$1 listen=${2:-} public=${3:-} pool=${4:-} dns=${5:-}
+    local client_to_client=${6:-}
     local protocol port public_host
+    [[ -z "$client_to_client" ]] || validate_client_to_client "$client_to_client"
     validate_gateway_name "$name"
     [[ ! -f "$(cfg_file "$name")" ]] ||
         die "'$name' is an NNS app; remove it or choose another server name."
@@ -6530,6 +6561,10 @@ install_openvpn_server() {
             die "Server '$name' already uses pool $CLIENT_POOL."
         [[ -z "$dns" || "$dns" == "$DNS_SERVERS" ]] ||
             die "Server '$name' already uses DNS $DNS_SERVERS."
+        if [[ -n "$client_to_client" ]]; then
+            gateway_set_client_to_client "$name" "$client_to_client" ||
+                die "Failed to change client-to-client mode for '$name'."
+        fi
         log "OpenVPN server '$name' is already installed; preserving CA and client certificates."
     else
         listen=${listen:-udp:1194}
@@ -6541,7 +6576,7 @@ install_openvpn_server() {
             public="$public_host:$port"
         fi
         gateway_create "$name" host "$listen" "$public" "$pool" \
-            "${dns:-1.1.1.1 9.9.9.9}" direct
+            "${dns:-1.1.1.1 9.9.9.9}" direct "" modern "${client_to_client:-off}"
     fi
     # This service must start after reboot; gateway_create only installs PKI.
     systemctl enable "nns-gateway@${name}.service" >/dev/null
@@ -6550,6 +6585,50 @@ install_openvpn_server() {
     log "OpenVPN server '$name' is enabled at boot."
     log "Create client:  nns-app export ovpn $name --client laptop --output laptop.ovpn"
     log "Check status:   nns-app status $name"
+}
+
+gateway_set_client_to_client() {
+    require_root
+    local gateway=$1 requested=$2 previous was_active=off
+    validate_gateway_name "$gateway"
+    validate_client_to_client "$requested"
+    load_gateway_cfg "$gateway"
+    previous=$CLIENT_TO_CLIENT
+    if [[ "$requested" == "$previous" ]]; then
+        log "Gateway '$gateway': client-to-client is already $requested."
+        return 0
+    fi
+
+    if systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
+        was_active=on
+    fi
+    acquire_lock "gateway-$gateway"
+    gateway_cfg_set "$gateway" CLIENT_TO_CLIENT "$requested"
+    release_lock "gateway-$gateway"
+
+    # Regeneration is also necessary for a stopped gateway so a later start
+    # cannot accidentally reuse the previous policy from server.conf.
+    if [[ "$was_active" == on ]]; then
+        if ! gateway_start "$gateway"; then
+            warn "Failed to apply client-to-client=$requested to '$gateway'; restoring $previous."
+            gateway_cfg_set "$gateway" CLIENT_TO_CLIENT "$previous"
+            gateway_write_server_config "$gateway" || true
+            gateway_start "$gateway" ||
+                warn "Gateway '$gateway' could not be restarted after rollback."
+            return 1
+        fi
+    elif ! gateway_write_server_config "$gateway"; then
+        gateway_cfg_set "$gateway" CLIENT_TO_CLIENT "$previous"
+        gateway_write_server_config "$gateway" || true
+        die "Could not regenerate OpenVPN configuration for '$gateway'."
+    fi
+    log "Gateway '$gateway': client-to-client is now $requested."
+}
+
+gateway_show_client_to_client() {
+    local gateway=$1
+    load_gateway_cfg "$gateway"
+    printf '%s: client-to-client=%s\n' "$gateway" "$CLIENT_TO_CLIENT"
 }
 
 server_export_ovpn() {
@@ -10876,7 +10955,14 @@ list_external_clients_header() {
 
 list_gateways_overview() {
     require_root
-    local dir gateway record found=0 app operation
+    local dir gateway record found=0 app operation quiet_empty=off local_only=off opt
+    for opt in "$@"; do
+        case "$opt" in
+            --quiet-empty) quiet_empty=on ;;
+            --local-only) local_only=on ;;
+            *) die "Unknown gateway inventory option '$opt'." ;;
+        esac
+    done
 
     shopt -s nullglob
     for dir in "$GATEWAY_BASE_DIR"/*; do
@@ -10891,22 +10977,24 @@ list_gateways_overview() {
     done
     shopt -u nullglob
 
-    while IFS= read -r record; do
-        [[ -n "$record" ]] || continue
-        if (( ! found )); then
-            list_gateways_header
-            found=1
-        fi
-        if [[ "$record" == WARN\|* ]]; then
-            IFS='|' read -r _ app operation <<<"$record"
-            printf '%-22s %-9s %-8s %-20s %-28s %-11s %-9s %s\n' \
-                '-' 'offline' '-' '-' '-' '-' '-' "remote:$app"
-            continue
-        fi
-        list_gateway_record_print "$record"
-    done < <(list_remote_auto_records inventory-gateways)
+    if [[ "$local_only" == off ]]; then
+        while IFS= read -r record; do
+            [[ -n "$record" ]] || continue
+            if (( ! found )); then
+                list_gateways_header
+                found=1
+            fi
+            if [[ "$record" == WARN\|* ]]; then
+                IFS='|' read -r _ app operation <<<"$record"
+                printf '%-22s %-9s %-8s %-20s %-28s %-11s %-9s %s\n' \
+                    '-' 'offline' '-' '-' '-' '-' '-' "remote:$app"
+                continue
+            fi
+            list_gateway_record_print "$record"
+        done < <(list_remote_auto_records inventory-gateways)
+    fi
 
-    if (( ! found )) && [[ "${1:-}" != --quiet-empty ]]; then
+    if (( ! found )) && [[ "$quiet_empty" == off ]]; then
         log 'No managed gateways configured.'
     fi
 }
@@ -10950,34 +11038,51 @@ list_external_clients_overview() {
     fi
 }
 
-list_all_objects() {
+list_inventory_objects() {
     require_root
-    local rows emitted=0
+    local view=$1 rows emitted=0
 
-    # Suppress both the empty section and its column headings in combined
-    # inventory; an unreachable remote still produces an offline row.
+    # The default view contains only objects managed on this host: network
+    # namespace applications and local OpenVPN servers/gateways. The full
+    # inventory additionally includes associated remote gateways and clients.
+    # Never print empty sections or column headings.
     rows=$(list_apps --quiet-empty)
     if [[ -n "$rows" ]]; then
         printf 'Applications:\n%s\n' "$rows"
         emitted=1
     fi
 
-    rows=$(list_gateways_overview --quiet-empty)
+    if [[ "$view" == managed ]]; then
+        rows=$(list_gateways_overview --local-only --quiet-empty)
+    else
+        rows=$(list_gateways_overview --quiet-empty)
+    fi
     if [[ -n "$rows" ]]; then
         (( ! emitted )) || printf '\n'
         printf 'Gateways:\n%s\n' "$rows"
         emitted=1
     fi
 
-    rows=$(list_external_clients_overview --quiet-empty)
-    if [[ -n "$rows" ]]; then
-        (( ! emitted )) || printf '\n'
-        printf 'External clients:\n%s\n' "$rows"
-        emitted=1
+    if [[ "$view" == all ]]; then
+        rows=$(list_external_clients_overview --quiet-empty)
+        if [[ -n "$rows" ]]; then
+            (( ! emitted )) || printf '\n'
+            printf 'External clients:\n%s\n' "$rows"
+            emitted=1
+        fi
     fi
 
-    (( emitted )) || log 'No applications, gateways, or external clients configured.'
+    if (( ! emitted )); then
+        if [[ "$view" == managed ]]; then
+            log 'No applications or local gateways configured.'
+        else
+            log 'No applications, gateways, or external clients configured.'
+        fi
+    fi
 }
+
+list_managed_objects() { list_inventory_objects managed; }
+list_all_objects() { list_inventory_objects all; }
 
 
 
@@ -11898,7 +12003,7 @@ main() {
                     die "Usage: nns-app install <name> --server"
                 local install_remote="" install_remote_port=22 install_remote_port_set=off
                 local install_server=off install_listen="" install_public=""
-                local install_pool="" install_dns=""
+                local install_pool="" install_dns="" install_c2c=""
                 shift 2
                 while (( $# > 0 )); do
                     case "$1" in
@@ -11906,6 +12011,18 @@ main() {
                             install_server=on
                             shift
                             ;;
+                        --client-to-client)
+                            install_c2c=on
+                            if (( $# >= 2 )) && [[ "$2" == on || "$2" == off ]]; then
+                                install_c2c=$2; shift 2
+                            else
+                                shift
+                            fi
+                            ;;
+                        --client-to-client=*)
+                            install_c2c=${1#--client-to-client=}; shift ;;
+                        --no-client-to-client)
+                            install_c2c=off; shift ;;
                         --listen)
                             (( $# >= 2 )) || die "--listen requires tcp:<port> or udp:<port>."
                             install_listen=$2; shift 2 ;;
@@ -11991,10 +12108,10 @@ main() {
                        "$install_via" == __default__ && "$install_backend" == __default__ ]] ||
                         die "--server cannot be combined with --via, --remote, or --backend."
                     install_openvpn_server "$install_app_name" \
-                        "$install_listen" "$install_public" "$install_pool" "$install_dns"
+                        "$install_listen" "$install_public" "$install_pool" "$install_dns" "$install_c2c"
                 else
-                    [[ -z "$install_listen$install_public$install_pool$install_dns" ]] ||
-                        die "--listen, --public, --pool and --dns require --server."
+                    [[ -z "$install_listen$install_public$install_pool$install_dns$install_c2c" ]] ||
+                        die "--listen, --public, --pool, --dns and --client-to-client require --server."
                     if [[ -n "$install_remote" ]]; then
                         [[ "$install_via" == __default__ && "$install_backend" == __default__ ]] ||
                             die "--via-remote cannot be combined with --via or --backend."
@@ -12045,9 +12162,13 @@ main() {
             fi
             ;;
         list)
-            case "${2:-apps}" in
+            case "${2:-managed}" in
+                managed)
+                    [[ $# -eq 1 ]] || die "Usage: nns-app list [apps|gateways|clients|all]"
+                    list_managed_objects
+                    ;;
                 apps)
-                    [[ $# -le 2 ]] || die "Usage: nns-app list [all|gateway|clients]"
+                    [[ $# -eq 2 ]] || die "Usage: nns-app list apps"
                     list_apps
                     ;;
                 all)
@@ -12063,7 +12184,7 @@ main() {
                     list_external_clients_overview
                     ;;
                 *)
-                    die "Usage: nns-app list [all|gateway|clients]"
+                    die "Usage: nns-app list [apps|gateways|clients|all]"
                     ;;
             esac
             ;;
@@ -12217,13 +12338,24 @@ main() {
                 *) die "Usage: nns-app stop <app_name> [--local-only]" ;;
             esac
             ;;
+        client-to-client)
+            (( $# == 2 || $# == 3 )) ||
+                die "Usage: nns-app client-to-client <server_name> [on|off]"
+            server_gateway_exists "$2" ||
+                die "'$2' is not an installed host OpenVPN server."
+            if (( $# == 2 )); then
+                gateway_show_client_to_client "$2"
+            else
+                gateway_set_client_to_client "$2" "$3"
+            fi
+            ;;
         gateway)
-            (( $# >= 2 )) || die "Usage: nns-app gateway <create|start|stop|status|list|remove|client> ..."
+            (( $# >= 2 )) || die "Usage: nns-app gateway <create|start|stop|status|list|remove|client|client-to-client> ..."
             case "$2" in
                 create)
                     (( $# >= 3 )) ||
                         die "Usage: nns-app gateway create <name> --via <app> --listen tcp|udp:<port> --public <host>:<port> [--pool CIDR] [--dns \"IP ...\"]"
-                    local gw_name=$3 gw_via="" gw_listen="" gw_public="" gw_pool="" gw_dns="1.1.1.1 9.9.9.9" gw_transport="direct" gw_server_name=""
+                    local gw_name=$3 gw_via="" gw_listen="" gw_public="" gw_pool="" gw_dns="1.1.1.1 9.9.9.9" gw_transport="direct" gw_server_name="" gw_c2c=off
                     shift 3
                     while (( $# > 0 )); do
                         case "$1" in
@@ -12262,6 +12394,18 @@ main() {
                                 gw_server_name=$2; shift 2 ;;
                             --server-name=*)
                                 gw_server_name=${1#--server-name=}; shift ;;
+                            --client-to-client)
+                                gw_c2c=on
+                                if (( $# >= 2 )) && [[ "$2" == on || "$2" == off ]]; then
+                                    gw_c2c=$2; shift 2
+                                else
+                                    shift
+                                fi
+                                ;;
+                            --client-to-client=*)
+                                gw_c2c=${1#--client-to-client=}; shift ;;
+                            --no-client-to-client)
+                                gw_c2c=off; shift ;;
                             *)
                                 die "Unknown gateway create option '$1'."
                                 ;;
@@ -12271,7 +12415,16 @@ main() {
                         die "gateway create requires --via, --listen and --public."
                     [[ "$gw_transport" != ssh ]] ||
                         die "Transport 'ssh' is managed internally by install --via-remote."
-                    gateway_create "$gw_name" "$gw_via" "$gw_listen" "$gw_public" "$gw_pool" "$gw_dns" "$gw_transport" "$gw_server_name"
+                    gateway_create "$gw_name" "$gw_via" "$gw_listen" "$gw_public" "$gw_pool" "$gw_dns" "$gw_transport" "$gw_server_name" modern "$gw_c2c"
+                    ;;
+                client-to-client)
+                    (( $# == 3 || $# == 4 )) ||
+                        die "Usage: nns-app gateway client-to-client <gateway_name> [on|off]"
+                    if (( $# == 3 )); then
+                        gateway_show_client_to_client "$3"
+                    else
+                        gateway_set_client_to_client "$3" "$4"
+                    fi
                     ;;
                 start)
                     [[ $# -eq 3 ]] || die "Usage: nns-app gateway start <gateway_name>"

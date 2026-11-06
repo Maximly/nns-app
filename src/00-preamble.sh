@@ -24,12 +24,13 @@
 #   install [--local-only]
 #   install <name> --server [--listen udp:1194] [--public host:port]
 #                         [--pool CIDR] [--dns "IPv4 IPv4"]
+#                         [--client-to-client[=on|off]]
 #   install [<app_name> [--backend inherit] [--via <upstream-app>|host]
 #                         [--via-remote <user@host> [--remote-port <port>]]]
 #   remove  <app_name>
 #   purge
 #   repair [--local-only]
-#   list
+#   list [apps|gateways|clients|all]
 #   status  <app_name>
 #   myip    [<app_name>]
 #   export  ovpn <app_name> --client <name> [--embedded]
@@ -43,6 +44,9 @@
 #   gateway create <gateway> --via <app> --listen tcp|udp:<port>
 #                  --public <host>:<port> [--transport direct|stunnel|cloak]
 #                  [--server-name <cloak-decoy-host>]
+#                  [--client-to-client[=on|off]]
+#   client-to-client <server> [on|off]
+#   gateway client-to-client <gateway> [on|off]
 #   remote add|connect|sync|rotate|status ...
 #   link import <app> <bundle.nnslink>
 #   gateway start|stop|status|list|remove ...
@@ -54,7 +58,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.35"
+readonly VERSION="1.3.37"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -190,7 +194,7 @@ reset_gateway_cfg_vars() {
     LISTEN_PROTO="" LISTEN_PORT="" PUBLIC_HOST="" PUBLIC_PORT=""
     TRANSPORT="" OPENVPN_LISTEN_PROTO="" OPENVPN_LISTEN_PORT="" OPENVPN_COMPAT=""
     TRANSPORT_SERVER_NAME="" TRANSPORT_PUBLIC_KEY="" TRANSPORT_PRIVATE_KEY=""
-    CLIENT_POOL="" DNS_SERVERS="" TRANSIT_CIDR=""
+    CLIENT_POOL="" DNS_SERVERS="" CLIENT_TO_CLIENT="off" TRANSIT_CIDR=""
     TRANSIT_HOST_ADDR="" TRANSIT_NS_ADDR="" GATEWAY_TUN=""
     GATEWAY_VETH_HOST="" GATEWAY_VETH_NS="" ROUTE_TABLE=""
     RULE_PRIORITY="" SERVER_CN="" HOST_FWD_CHAIN=""
@@ -279,12 +283,13 @@ Usage:
   nns-app install [--local-only]
   nns-app install <name> --server [--listen udp:1194] [--public host:port]
                   [--pool IPv4-CIDR] [--dns "IPv4 IPv4"]
+                  [--client-to-client[=on|off] | --no-client-to-client]
   nns-app install <app_name> [--backend inherit] [--via <upstream-app>|host]
   nns-app install <app_name> via --remote <user@host> [--remote-port <port>]
   nns-app remove  <app_name> [--local-only]
   nns-app purge [--local-only]
   nns-app repair [--local-only]
-  nns-app list [all|gateway|clients]
+  nns-app list [apps|gateways|clients|all]
   nns-app status  <app_name>
   nns-app myip [<app_name>]
   nns-app export ovpn <app_name> --client <client_name> [--embedded]
@@ -303,6 +308,9 @@ Usage:
                   [--pool <IPv4-CIDR>] [--dns "<IPv4> ..."]
                   [--transport direct|stunnel|cloak]
                   [--server-name <cloak-decoy-host>]
+                  [--client-to-client[=on|off]]
+  nns-app gateway client-to-client <gateway_name> [on|off]
+  nns-app client-to-client <server_name> [on|off]
   nns-app gateway start  <gateway_name>
   nns-app gateway stop   <gateway_name>
   nns-app gateway status <gateway_name>
@@ -348,10 +356,11 @@ Examples:
   nns-app run my-private-app firefox --no-remote
   sudo nns-app purge
   sudo nns-app repair
-  nns-app list
-  nns-app list all
-  nns-app list gateway
-  nns-app list clients
+  nns-app list            # local apps + local OpenVPN servers/gateways
+  nns-app list apps       # network namespace applications only
+  nns-app list gateways   # managed local and associated remote gateways
+  nns-app list clients    # exported OpenVPN clients
+  nns-app list all        # full inventory
   nns-app status my-private-app
   nns-app myip
   nns-app myip my-private-app

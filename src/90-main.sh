@@ -138,7 +138,7 @@ main() {
                     die "Usage: nns-app install <name> --server"
                 local install_remote="" install_remote_port=22 install_remote_port_set=off
                 local install_server=off install_listen="" install_public=""
-                local install_pool="" install_dns=""
+                local install_pool="" install_dns="" install_c2c=""
                 shift 2
                 while (( $# > 0 )); do
                     case "$1" in
@@ -146,6 +146,18 @@ main() {
                             install_server=on
                             shift
                             ;;
+                        --client-to-client)
+                            install_c2c=on
+                            if (( $# >= 2 )) && [[ "$2" == on || "$2" == off ]]; then
+                                install_c2c=$2; shift 2
+                            else
+                                shift
+                            fi
+                            ;;
+                        --client-to-client=*)
+                            install_c2c=${1#--client-to-client=}; shift ;;
+                        --no-client-to-client)
+                            install_c2c=off; shift ;;
                         --listen)
                             (( $# >= 2 )) || die "--listen requires tcp:<port> or udp:<port>."
                             install_listen=$2; shift 2 ;;
@@ -231,10 +243,10 @@ main() {
                        "$install_via" == __default__ && "$install_backend" == __default__ ]] ||
                         die "--server cannot be combined with --via, --remote, or --backend."
                     install_openvpn_server "$install_app_name" \
-                        "$install_listen" "$install_public" "$install_pool" "$install_dns"
+                        "$install_listen" "$install_public" "$install_pool" "$install_dns" "$install_c2c"
                 else
-                    [[ -z "$install_listen$install_public$install_pool$install_dns" ]] ||
-                        die "--listen, --public, --pool and --dns require --server."
+                    [[ -z "$install_listen$install_public$install_pool$install_dns$install_c2c" ]] ||
+                        die "--listen, --public, --pool, --dns and --client-to-client require --server."
                     if [[ -n "$install_remote" ]]; then
                         [[ "$install_via" == __default__ && "$install_backend" == __default__ ]] ||
                             die "--via-remote cannot be combined with --via or --backend."
@@ -285,9 +297,13 @@ main() {
             fi
             ;;
         list)
-            case "${2:-apps}" in
+            case "${2:-managed}" in
+                managed)
+                    [[ $# -eq 1 ]] || die "Usage: nns-app list [apps|gateways|clients|all]"
+                    list_managed_objects
+                    ;;
                 apps)
-                    [[ $# -le 2 ]] || die "Usage: nns-app list [all|gateway|clients]"
+                    [[ $# -eq 2 ]] || die "Usage: nns-app list apps"
                     list_apps
                     ;;
                 all)
@@ -303,7 +319,7 @@ main() {
                     list_external_clients_overview
                     ;;
                 *)
-                    die "Usage: nns-app list [all|gateway|clients]"
+                    die "Usage: nns-app list [apps|gateways|clients|all]"
                     ;;
             esac
             ;;
@@ -457,13 +473,24 @@ main() {
                 *) die "Usage: nns-app stop <app_name> [--local-only]" ;;
             esac
             ;;
+        client-to-client)
+            (( $# == 2 || $# == 3 )) ||
+                die "Usage: nns-app client-to-client <server_name> [on|off]"
+            server_gateway_exists "$2" ||
+                die "'$2' is not an installed host OpenVPN server."
+            if (( $# == 2 )); then
+                gateway_show_client_to_client "$2"
+            else
+                gateway_set_client_to_client "$2" "$3"
+            fi
+            ;;
         gateway)
-            (( $# >= 2 )) || die "Usage: nns-app gateway <create|start|stop|status|list|remove|client> ..."
+            (( $# >= 2 )) || die "Usage: nns-app gateway <create|start|stop|status|list|remove|client|client-to-client> ..."
             case "$2" in
                 create)
                     (( $# >= 3 )) ||
                         die "Usage: nns-app gateway create <name> --via <app> --listen tcp|udp:<port> --public <host>:<port> [--pool CIDR] [--dns \"IP ...\"]"
-                    local gw_name=$3 gw_via="" gw_listen="" gw_public="" gw_pool="" gw_dns="1.1.1.1 9.9.9.9" gw_transport="direct" gw_server_name=""
+                    local gw_name=$3 gw_via="" gw_listen="" gw_public="" gw_pool="" gw_dns="1.1.1.1 9.9.9.9" gw_transport="direct" gw_server_name="" gw_c2c=off
                     shift 3
                     while (( $# > 0 )); do
                         case "$1" in
@@ -502,6 +529,18 @@ main() {
                                 gw_server_name=$2; shift 2 ;;
                             --server-name=*)
                                 gw_server_name=${1#--server-name=}; shift ;;
+                            --client-to-client)
+                                gw_c2c=on
+                                if (( $# >= 2 )) && [[ "$2" == on || "$2" == off ]]; then
+                                    gw_c2c=$2; shift 2
+                                else
+                                    shift
+                                fi
+                                ;;
+                            --client-to-client=*)
+                                gw_c2c=${1#--client-to-client=}; shift ;;
+                            --no-client-to-client)
+                                gw_c2c=off; shift ;;
                             *)
                                 die "Unknown gateway create option '$1'."
                                 ;;
@@ -511,7 +550,16 @@ main() {
                         die "gateway create requires --via, --listen and --public."
                     [[ "$gw_transport" != ssh ]] ||
                         die "Transport 'ssh' is managed internally by install --via-remote."
-                    gateway_create "$gw_name" "$gw_via" "$gw_listen" "$gw_public" "$gw_pool" "$gw_dns" "$gw_transport" "$gw_server_name"
+                    gateway_create "$gw_name" "$gw_via" "$gw_listen" "$gw_public" "$gw_pool" "$gw_dns" "$gw_transport" "$gw_server_name" modern "$gw_c2c"
+                    ;;
+                client-to-client)
+                    (( $# == 3 || $# == 4 )) ||
+                        die "Usage: nns-app gateway client-to-client <gateway_name> [on|off]"
+                    if (( $# == 3 )); then
+                        gateway_show_client_to_client "$3"
+                    else
+                        gateway_set_client_to_client "$3" "$4"
+                    fi
                     ;;
                 start)
                     [[ $# -eq 3 ]] || die "Usage: nns-app gateway start <gateway_name>"

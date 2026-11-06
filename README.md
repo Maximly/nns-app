@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.35
+**Release:** 1.3.37
 
 **Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
@@ -468,6 +468,8 @@ sudo nns-app install office-vpn --server
 sudo nns-app install office-vpn --server \
     --listen udp:1194 --public vpn.example.com:1194 \
     --pool 10.253.50.0/24 --dns "1.1.1.1 9.9.9.9"
+# Optional: allow connected VPN clients to communicate with one another:
+sudo nns-app install team-vpn --server --client-to-client
 ```
 
 The first form automatically detects the public IPv4 address (using
@@ -493,12 +495,48 @@ sudo nns-app revoke office-vpn phone
 sudo nns-app remove office-vpn
 ```
 
+### Client-to-client traffic
+
+New and existing managed OpenVPN servers **isolate clients by default**. To
+allow connected clients to reach one another over their assigned VPN IPv4
+addresses, enable `client-to-client` explicitly. Either command updates an
+already-installed stand-alone server **without reissuing certificates**:
+
+```bash
+sudo nns-app client-to-client office-vpn on
+# Or repeat the idempotent install command:
+sudo nns-app install office-vpn --server --client-to-client
+
+nns-app client-to-client office-vpn       # show current setting
+sudo nns-app client-to-client office-vpn off
+# Equivalent: sudo nns-app install office-vpn --server --no-client-to-client
+```
+
+The switch is persisted in `gateway.cfg`. For running servers, nns-app rewrites
+the generated OpenVPN configuration and **restarts the service**, so clients
+must reconnect; stopped servers remain stopped and pick up the new setting on
+next start. Existing deployments without this setting remain `off`. The same
+feature works for managed upstream gateways via
+`sudo nns-app gateway client-to-client <gateway> on|off`, and at creation time
+with `nns-app gateway create ... --client-to-client`.
+
+When enabled, nns-app sets `disable-dco` alongside OpenVPN's
+`client-to-client` directive: without it, OpenVPN data-channel offload ignores
+the directive. Client-to-client packets are then forwarded *inside OpenVPN*,
+**not through Linux FORWARD/iptables**, so per-client firewalling there will
+not restrict them. To enforce per-client ACLs, leave this mode off and use a
+separately designed routed/firewalled configuration. The mode permits client
+connectivity; individual client device firewalls or routing may still block
+applications. The server's host-side tunnel and WAN firewall remains scoped
+as before; on/off does not expose the host LAN or change Internet NAT rules.
+
 `export ovpn` issues a unique certificate for a new client and safely re-exports
 an existing active client's profile. File outputs are mode `0600`. You can also
 use `gateway client add|list|export|revoke` for explicit management. Removing a
 server permanently deletes its CA and all its client private keys. A server
-name cannot also name an NNS app. Its gateway appears under `nns-app list gateway`
-and `nns-app list all` rather than `nns-app list` (which lists client apps).
+name cannot also name an NNS app. The server appears in the default `nns-app list`
+as a **Gateway**, and also in `nns-app list gateways` and `nns-app list all`.
+It does not appear in `nns-app list apps`, which is namespace-only.
 
 For a different public endpoint, listener or subnet after creation, remove and
 recreate the server (this invalidates previous client credentials). The server
@@ -728,22 +766,21 @@ deployments.
 
 ## Status commands
 
-List application environments (the default remains app-only):
+The default view lists **all locally managed instances**, including per-app
+network namespaces and OpenVPN servers created with `install <name> --server`:
 
 ```bash
-nns-app list
-```
-
-Use the extended inventory views when gateways or exported clients matter:
-
-```bash
+nns-app list           # local apps and OpenVPN servers/gateways
+nns-app list apps      # namespace applications only
+nns-app list gateways  # local gateways and associated remote gateways
+nns-app list clients   # exported OpenVPN clients only
 nns-app list all       # apps, gateways, external clients
-nns-app list gateway   # gateways only
-nns-app list clients   # externally exported gateway clients only
 ```
 
-Empty inventories omit their column headers. `list all` only displays sections
-with entries, or a single message when no objects exist.
+`list gateway` (singular) remains an alias of `list gateways` for backward
+compatibility. The default `list` excludes remote gateway records and exported
+clients; `list all` includes both. Empty sections and their column headers are
+omitted in combined views, with a single message if no entries exist.
 
 For automatic-remote apps these inventory views also query the associated
 remote pool. Remote rows are marked with the local app that owns the

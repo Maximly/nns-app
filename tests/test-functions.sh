@@ -1761,7 +1761,7 @@ manual_payload=$(remote_command_payload gateway client export \
     remote_auto_register() { fail 'current remote was unnecessarily registered'; }
     log() { printf 'log:%s\n' "$*"; }
     output=$(remote_auto_refresh_configured_app my-app)
-    grep -Fq 'already runs nns-app 1.3.35' <<<"$output" ||
+    grep -Fq 'already runs nns-app 1.3.37' <<<"$output" ||
         fail 'current remote refresh status missing'
 )
 
@@ -1840,7 +1840,7 @@ EOF_REPAIR_STATE
 (
     reexec_as_root_if_needed() { :; }
     server_gateway_exists() { [[ "$1" == office-vpn ]]; }
-    install_openvpn_server() { printf 'server-install:%s|%s|%s|%s|%s\n' "$@"; }
+    install_openvpn_server() { printf 'server-install:%s|%s|%s|%s|%s|%s\n' "$@"; }
     gateway_start() { printf 'server-start:%s\n' "$1"; }
     gateway_stop() { printf 'server-stop:%s\n' "$1"; }
     gateway_remove() { printf 'server-remove:%s\n' "$1"; }
@@ -1852,12 +1852,27 @@ EOF_REPAIR_STATE
         fail 'server gateway lookup accepted path traversal'
     fi
     output=$(main install office-vpn --server)
-    [[ "$output" == 'server-install:office-vpn||||' ]] ||
+    [[ "$output" == 'server-install:office-vpn|||||' ]] ||
         fail "minimal --server CLI parsing: $output"
     output=$(main install office-vpn --server --listen udp:443 \
         --public vpn.example.net:443 --pool 10.253.60.0/24 --dns '1.1.1.1 9.9.9.9')
-    [[ "$output" == 'server-install:office-vpn|udp:443|vpn.example.net:443|10.253.60.0/24|1.1.1.1 9.9.9.9' ]] ||
+    [[ "$output" == 'server-install:office-vpn|udp:443|vpn.example.net:443|10.253.60.0/24|1.1.1.1 9.9.9.9|' ]] ||
         fail "--server extended CLI parsing: $output"
+    output=$(main install office-vpn --server --client-to-client)
+    [[ "$output" == 'server-install:office-vpn|||||on' ]] ||
+        fail "--client-to-client install argument: $output"
+    output=$(main install office-vpn --server --client-to-client=off)
+    [[ "$output" == 'server-install:office-vpn|||||off' ]] ||
+        fail "--client-to-client=off install argument: $output"
+    output=$(main install office-vpn --server --client-to-client off)
+    [[ "$output" == 'server-install:office-vpn|||||off' ]] ||
+        fail "--client-to-client off install argument: $output"
+    output=$(main install office-vpn --server --no-client-to-client)
+    [[ "$output" == 'server-install:office-vpn|||||off' ]] ||
+        fail "--no-client-to-client install argument: $output"
+    if ( main install office-vpn --client-to-client ) >/dev/null 2>&1; then
+        fail '--client-to-client accepted without --server'
+    fi
     if ( main install office-vpn --server --via upstream ) >/dev/null 2>&1; then
         fail '--server accepted --via'
     fi
@@ -1877,6 +1892,21 @@ EOF_REPAIR_STATE
         fail "server export CLI: $output"
     [[ $(main revoke office-vpn laptop) == 'server-revoke:office-vpn:laptop' ]] ||
         fail 'server revoke CLI'
+    gateway_show_client_to_client() { printf 'mode:%s\n' "$1"; }
+    gateway_set_client_to_client() { printf 'set-mode:%s:%s\n' "$1" "$2"; }
+    [[ $(main client-to-client office-vpn) == 'mode:office-vpn' ]] ||
+        fail 'server client-to-client status CLI'
+    [[ $(main client-to-client office-vpn on) == 'set-mode:office-vpn:on' ]] ||
+        fail 'server client-to-client enable CLI'
+    [[ $(main client-to-client office-vpn off) == 'set-mode:office-vpn:off' ]] ||
+        fail 'server client-to-client disable CLI'
+    [[ $(main gateway client-to-client upstream-gw on) == 'set-mode:upstream-gw:on' ]] ||
+        fail 'upstream gateway enable CLI'
+    [[ $(main gateway client-to-client upstream-gw) == 'mode:upstream-gw' ]] ||
+        fail 'upstream gateway status CLI'
+    gateway_create() { printf 'created:%s\n' "${10:-off}"; }
+    [[ $(main gateway create other-gw --via upstream --listen udp:1194 --public vpn.example.net:1194 --client-to-client) == 'created:on' ]] ||
+        fail 'gateway create --client-to-client argument'
 )
 
 # NAT and forwarding must remain restricted to this server's tunnel, client
@@ -1935,4 +1965,86 @@ EOF_REPAIR_STATE
     [[ "$output" == 'host-rules:ens3' ]] || fail 'host server TUN callback'
 )
 
-echo 'Function tests passed.'
+# Regeneration must emit both OpenVPN directives when enabled, and neither
+# when disabled (including pre-upgrade configs that omit the flag).
+(
+    root="$TEST_TMP/c2c-config"
+    mkdir -p "$root/pki"
+    cat > "$root/gateway.cfg" <<'EOF_C2C_CONFIG'
+GATEWAY_NAME=c2c-test
+CLIENT_POOL=10.253.70.0/24
+GATEWAY_TUN=ngwc2c
+LISTEN_PROTO=udp
+LISTEN_PORT=1194
+OPENVPN_LISTEN_PROTO=udp
+OPENVPN_LISTEN_PORT=1194
+OPENVPN_COMPAT=modern
+TRANSPORT=direct
+DNS_SERVERS="1.1.1.1"
+EOF_C2C_CONFIG
+    gateway_write_server_config c2c-test "$root" || fail 'legacy OpenVPN config generation'
+    ! grep -Fxq 'client-to-client' "$root/server.conf" ||
+        fail 'legacy server unexpectedly enables client-to-client'
+    ! grep -Fxq 'disable-dco' "$root/server.conf" ||
+        fail 'legacy server unexpectedly disables DCO'
+    echo 'CLIENT_TO_CLIENT=on' >> "$root/gateway.cfg"
+    gateway_write_server_config c2c-test "$root" || fail 'c2c OpenVPN config generation'
+    grep -Fxq 'client-to-client' "$root/server.conf" ||
+        fail 'OpenVPN server lacks client-to-client directive'
+    grep -Fxq 'disable-dco' "$root/server.conf" ||
+        fail 'OpenVPN server c2c mode must disable DCO'
+    sed -i 's/^CLIENT_TO_CLIENT=on$/CLIENT_TO_CLIENT=off/' "$root/gateway.cfg"
+    gateway_write_server_config c2c-test "$root" || fail 'disabled OpenVPN config generation'
+    ! grep -Fxq 'client-to-client' "$root/server.conf" ||
+        fail 'OpenVPN server left client-to-client enabled'
+    ! grep -Fxq 'disable-dco' "$root/server.conf" ||
+        fail 'OpenVPN server left DCO disabled'
+)
+
+# Updating an installed gateway must keep its credentials, apply immediately
+# when active, and only regenerate config when inactive. Roll back on failure.
+(
+    root="$TEST_TMP/c2c-existing"
+    mkdir -p "$root"
+    cfg="$root/gateway.cfg"
+    printf 'CLIENT_TO_CLIENT=off\n' > "$cfg"
+    gateway_cfg_file() { printf '%s\n' "$cfg"; }
+    load_gateway_cfg() {
+        CLIENT_TO_CLIENT=off
+        # shellcheck disable=SC1090
+        source "$cfg"
+    }
+    require_root() { :; }
+    acquire_lock() { :; }
+    release_lock() { :; }
+    gateway_write_server_config() { load_gateway_cfg "$1"; printf 'regen:%s\n' "$CLIENT_TO_CLIENT" >> "$root/events"; }
+    gateway_start() {
+        load_gateway_cfg "$1"
+        printf 'start:%s\n' "$CLIENT_TO_CLIENT" >> "$root/events"
+        if [[ "${FAIL_RESTART:-off}" == on && "$CLIENT_TO_CLIENT" == on ]]; then
+            return 1
+        fi
+    }
+    systemctl() { [[ "$1" == is-active ]] && [[ "${MOCK_ACTIVE:-on}" == on ]]; }
+    gateway_set_client_to_client c2c-test on >/dev/null || fail 'active enable operation'
+    grep -Fxq 'CLIENT_TO_CLIENT=on' "$cfg" || fail 'c2c enable was not persisted'
+    grep -Fxq 'start:on' "$root/events" || fail 'c2c enable did not restart active server'
+    : > "$root/events"
+    MOCK_ACTIVE=off
+    gateway_set_client_to_client c2c-test off >/dev/null || fail 'stopped disable operation'
+    grep -Fxq 'CLIENT_TO_CLIENT=off' "$cfg" || fail 'c2c disable was not persisted'
+    grep -Fxq 'regen:off' "$root/events" || fail 'stopped server config was not regenerated'
+    ! grep -Fq 'start:' "$root/events" || fail 'stopped server was started by toggle'
+    : > "$root/events"
+    MOCK_ACTIVE=on FAIL_RESTART=on
+    if gateway_set_client_to_client c2c-test on >/dev/null 2>&1; then
+        fail 'c2c restart failure was not reported'
+    fi
+    grep -Fxq 'CLIENT_TO_CLIENT=off' "$cfg" || fail 'failed enable was not rolled back'
+    grep -Fxq 'start:off' "$root/events" || fail 'failed enable was not restarted with old settings'
+    if ( gateway_set_client_to_client c2c-test invalid ) >/dev/null 2>&1; then
+        fail 'invalid client-to-client mode accepted'
+    fi
+)
+
+echo 'Function tests passed.' 

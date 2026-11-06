@@ -1157,7 +1157,14 @@ list_external_clients_header() {
 
 list_gateways_overview() {
     require_root
-    local dir gateway record found=0 app operation
+    local dir gateway record found=0 app operation quiet_empty=off local_only=off opt
+    for opt in "$@"; do
+        case "$opt" in
+            --quiet-empty) quiet_empty=on ;;
+            --local-only) local_only=on ;;
+            *) die "Unknown gateway inventory option '$opt'." ;;
+        esac
+    done
 
     shopt -s nullglob
     for dir in "$GATEWAY_BASE_DIR"/*; do
@@ -1172,22 +1179,24 @@ list_gateways_overview() {
     done
     shopt -u nullglob
 
-    while IFS= read -r record; do
-        [[ -n "$record" ]] || continue
-        if (( ! found )); then
-            list_gateways_header
-            found=1
-        fi
-        if [[ "$record" == WARN\|* ]]; then
-            IFS='|' read -r _ app operation <<<"$record"
-            printf '%-22s %-9s %-8s %-20s %-28s %-11s %-9s %s\n' \
-                '-' 'offline' '-' '-' '-' '-' '-' "remote:$app"
-            continue
-        fi
-        list_gateway_record_print "$record"
-    done < <(list_remote_auto_records inventory-gateways)
+    if [[ "$local_only" == off ]]; then
+        while IFS= read -r record; do
+            [[ -n "$record" ]] || continue
+            if (( ! found )); then
+                list_gateways_header
+                found=1
+            fi
+            if [[ "$record" == WARN\|* ]]; then
+                IFS='|' read -r _ app operation <<<"$record"
+                printf '%-22s %-9s %-8s %-20s %-28s %-11s %-9s %s\n' \
+                    '-' 'offline' '-' '-' '-' '-' '-' "remote:$app"
+                continue
+            fi
+            list_gateway_record_print "$record"
+        done < <(list_remote_auto_records inventory-gateways)
+    fi
 
-    if (( ! found )) && [[ "${1:-}" != --quiet-empty ]]; then
+    if (( ! found )) && [[ "$quiet_empty" == off ]]; then
         log 'No managed gateways configured.'
     fi
 }
@@ -1231,34 +1240,51 @@ list_external_clients_overview() {
     fi
 }
 
-list_all_objects() {
+list_inventory_objects() {
     require_root
-    local rows emitted=0
+    local view=$1 rows emitted=0
 
-    # Suppress both the empty section and its column headings in combined
-    # inventory; an unreachable remote still produces an offline row.
+    # The default view contains only objects managed on this host: network
+    # namespace applications and local OpenVPN servers/gateways. The full
+    # inventory additionally includes associated remote gateways and clients.
+    # Never print empty sections or column headings.
     rows=$(list_apps --quiet-empty)
     if [[ -n "$rows" ]]; then
         printf 'Applications:\n%s\n' "$rows"
         emitted=1
     fi
 
-    rows=$(list_gateways_overview --quiet-empty)
+    if [[ "$view" == managed ]]; then
+        rows=$(list_gateways_overview --local-only --quiet-empty)
+    else
+        rows=$(list_gateways_overview --quiet-empty)
+    fi
     if [[ -n "$rows" ]]; then
         (( ! emitted )) || printf '\n'
         printf 'Gateways:\n%s\n' "$rows"
         emitted=1
     fi
 
-    rows=$(list_external_clients_overview --quiet-empty)
-    if [[ -n "$rows" ]]; then
-        (( ! emitted )) || printf '\n'
-        printf 'External clients:\n%s\n' "$rows"
-        emitted=1
+    if [[ "$view" == all ]]; then
+        rows=$(list_external_clients_overview --quiet-empty)
+        if [[ -n "$rows" ]]; then
+            (( ! emitted )) || printf '\n'
+            printf 'External clients:\n%s\n' "$rows"
+            emitted=1
+        fi
     fi
 
-    (( emitted )) || log 'No applications, gateways, or external clients configured.'
+    if (( ! emitted )); then
+        if [[ "$view" == managed ]]; then
+            log 'No applications or local gateways configured.'
+        else
+            log 'No applications, gateways, or external clients configured.'
+        fi
+    fi
 }
+
+list_managed_objects() { list_inventory_objects managed; }
+list_all_objects() { list_inventory_objects all; }
 
 
 

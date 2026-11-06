@@ -58,6 +58,8 @@ load_gateway_cfg() {
     esac
     OPENVPN_LISTEN_PROTO=${OPENVPN_LISTEN_PROTO:-$LISTEN_PROTO}
     OPENVPN_LISTEN_PORT=${OPENVPN_LISTEN_PORT:-$LISTEN_PORT}
+    CLIENT_TO_CLIENT=${CLIENT_TO_CLIENT:-off}
+    validate_client_to_client "$CLIENT_TO_CLIENT"
     TRANSPORT_SERVER_NAME=${TRANSPORT_SERVER_NAME:-$PUBLIC_HOST}
     case "$TRANSPORT" in
         direct|stunnel|cloak|ssh) ;;
@@ -82,6 +84,13 @@ load_gateway_cfg() {
             NS_FWD_CHAIN NS_NAT_CHAIN NS_MANGLE_CHAIN \
             <<<"$(make_gateway_names "$gateway")"
     fi
+}
+
+validate_client_to_client() {
+    case "${1:-}" in
+        on|off) ;;
+        *) die "Invalid client-to-client setting '${1:-}'; expected on or off." ;;
+    esac
 }
 
 gateway_cfg_value() {
@@ -749,6 +758,13 @@ PY_GATEWAY_POOL
         printf 'dev %s\n' "$GATEWAY_TUN"
         printf 'topology subnet\n'
         printf 'server %s %s\n' "$network" "$netmask"
+        # Force userspace routing for this setting: with OpenVPN DCO enabled,
+        # client-to-client is ignored and Linux would need separate tun->tun
+        # forwarding rules. Never widen the host firewall for other traffic.
+        if [[ "${CLIENT_TO_CLIENT:-off}" == on ]]; then
+            printf 'disable-dco\n'
+            printf 'client-to-client\n'
+        fi
         printf 'ca %s\n' "$pki/ca.crt"
         printf 'cert %s\n' "$pki/server.crt"
         printf 'key %s\n' "$pki/server.key"
@@ -875,12 +891,14 @@ gateway_create() {
     local transport=${7:-direct}
     local transport_server_name=${8:-}
     local openvpn_compat=${9:-modern}
+    local client_to_client=${10:-off}
     local staging=""
 
     validate_gateway_name "$gateway"
     validate_app_name "$via_app"
     case "$transport" in direct|stunnel|cloak|ssh) ;; *) die "Unsupported transport '$transport'." ;; esac
     case "$openvpn_compat" in modern|embedded) ;; *) die "Unsupported OpenVPN compatibility mode '$openvpn_compat'." ;; esac
+    validate_client_to_client "$client_to_client"
     [[ "$openvpn_compat" == modern || "$transport" == direct ]] ||
         die "Embedded OpenVPN compatibility is supported only with direct transport."
     if [[ "$transport" == cloak ]]; then
@@ -967,6 +985,7 @@ OPENVPN_COMPAT="$openvpn_compat"
 TRANSPORT_SERVER_NAME="$transport_server_name"
 CLIENT_POOL="$client_pool"
 DNS_SERVERS="$dns_servers"
+CLIENT_TO_CLIENT="$client_to_client"
 
 TRANSIT_CIDR="$transit_cidr"
 TRANSIT_HOST_ADDR="$transit_host_addr"
@@ -2348,6 +2367,7 @@ gateway_status() {
             "$LISTEN_PORT" "$LISTEN_PROTO" "$listening" "${pid:-0}"
     fi
     printf 'Client pool:       %s\n' "$CLIENT_POOL"
+    printf 'Client-to-client:  %s\n' "$CLIENT_TO_CLIENT"
     printf 'Exit:              %s (%s)\n' \
         "$VIA_APP" "$upstream_state"
     [[ -z "$upstream_iface" ]] ||
@@ -2457,7 +2477,9 @@ server_gateway_exists() {
 install_openvpn_server() {
     require_root
     local name=$1 listen=${2:-} public=${3:-} pool=${4:-} dns=${5:-}
+    local client_to_client=${6:-}
     local protocol port public_host
+    [[ -z "$client_to_client" ]] || validate_client_to_client "$client_to_client"
     validate_gateway_name "$name"
     [[ ! -f "$(cfg_file "$name")" ]] ||
         die "'$name' is an NNS app; remove it or choose another server name."
@@ -2474,6 +2496,10 @@ install_openvpn_server() {
             die "Server '$name' already uses pool $CLIENT_POOL."
         [[ -z "$dns" || "$dns" == "$DNS_SERVERS" ]] ||
             die "Server '$name' already uses DNS $DNS_SERVERS."
+        if [[ -n "$client_to_client" ]]; then
+            gateway_set_client_to_client "$name" "$client_to_client" ||
+                die "Failed to change client-to-client mode for '$name'."
+        fi
         log "OpenVPN server '$name' is already installed; preserving CA and client certificates."
     else
         listen=${listen:-udp:1194}
@@ -2485,7 +2511,7 @@ install_openvpn_server() {
             public="$public_host:$port"
         fi
         gateway_create "$name" host "$listen" "$public" "$pool" \
-            "${dns:-1.1.1.1 9.9.9.9}" direct
+            "${dns:-1.1.1.1 9.9.9.9}" direct "" modern "${client_to_client:-off}"
     fi
     # This service must start after reboot; gateway_create only installs PKI.
     systemctl enable "nns-gateway@${name}.service" >/dev/null
@@ -2494,6 +2520,50 @@ install_openvpn_server() {
     log "OpenVPN server '$name' is enabled at boot."
     log "Create client:  nns-app export ovpn $name --client laptop --output laptop.ovpn"
     log "Check status:   nns-app status $name"
+}
+
+gateway_set_client_to_client() {
+    require_root
+    local gateway=$1 requested=$2 previous was_active=off
+    validate_gateway_name "$gateway"
+    validate_client_to_client "$requested"
+    load_gateway_cfg "$gateway"
+    previous=$CLIENT_TO_CLIENT
+    if [[ "$requested" == "$previous" ]]; then
+        log "Gateway '$gateway': client-to-client is already $requested."
+        return 0
+    fi
+
+    if systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
+        was_active=on
+    fi
+    acquire_lock "gateway-$gateway"
+    gateway_cfg_set "$gateway" CLIENT_TO_CLIENT "$requested"
+    release_lock "gateway-$gateway"
+
+    # Regeneration is also necessary for a stopped gateway so a later start
+    # cannot accidentally reuse the previous policy from server.conf.
+    if [[ "$was_active" == on ]]; then
+        if ! gateway_start "$gateway"; then
+            warn "Failed to apply client-to-client=$requested to '$gateway'; restoring $previous."
+            gateway_cfg_set "$gateway" CLIENT_TO_CLIENT "$previous"
+            gateway_write_server_config "$gateway" || true
+            gateway_start "$gateway" ||
+                warn "Gateway '$gateway' could not be restarted after rollback."
+            return 1
+        fi
+    elif ! gateway_write_server_config "$gateway"; then
+        gateway_cfg_set "$gateway" CLIENT_TO_CLIENT "$previous"
+        gateway_write_server_config "$gateway" || true
+        die "Could not regenerate OpenVPN configuration for '$gateway'."
+    fi
+    log "Gateway '$gateway': client-to-client is now $requested."
+}
+
+gateway_show_client_to_client() {
+    local gateway=$1
+    load_gateway_cfg "$gateway"
+    printf '%s: client-to-client=%s\n' "$gateway" "$CLIENT_TO_CLIENT"
 }
 
 server_export_ovpn() {
