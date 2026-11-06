@@ -6,6 +6,7 @@ build:
 test: build
 	./tests/test-static.sh
 	./tests/test-functions.sh
+	./tests/test-list.sh
 
 clean:
 	rm -f nns-app-install.sh

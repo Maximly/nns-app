@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.34
+**Release:** 1.3.35
 
 **Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
@@ -741,6 +741,9 @@ nns-app list all       # apps, gateways, external clients
 nns-app list gateway   # gateways only
 nns-app list clients   # externally exported gateway clients only
 ```
+
+Empty inventories omit their column headers. `list all` only displays sections
+with entries, or a single message when no objects exist.
 
 For automatic-remote apps these inventory views also query the associated
 remote pool. Remote rows are marked with the local app that owns the

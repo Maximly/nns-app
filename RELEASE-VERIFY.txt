@@ -1,4 +1,4 @@
-nns-app release: 1.3.34
-Feature marker: install <name> --server provisions a host-egress OpenVPN server, managed PKI, scoped IPv4 NAT and exported client profiles
-Installer SHA256: 00836b688ed22aea06ce3ecc051df04eef9bbb8cc7ede000810c3babee8438f1
-Tests: make test PASS (static + function tests; live OpenVPN/server-to-client traffic not tested in this container)
+nns-app release: 1.3.35
+Change: suppress empty table headers/sections in inventory (list, list all, list gateway, list clients, gateway list)
+Installer SHA256: 920936dbffafee741a9cdfedc19b8b766657a611c383123f5a0b0ef47b56eac8
+Tests: make test PASS (static + function + inventory rendering tests; no live OpenVPN traffic tested)

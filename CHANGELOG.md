@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.35
+
+- Hide empty inventory sections and column headers in `nns-app list all`, showing a single concise message only when every section is empty.
+- Individual `nns-app list`, `list gateway`, `list clients`, and `gateway list` commands also omit empty tables while retaining their existing empty-state messages.
+- Preserve offline/unreachable remote entries in inventories instead of treating them as empty.
+
 ## 1.3.34
 
 - Added `install <name> --server` to create a stand-alone, host-egress OpenVPN server over the existing managed-gateway PKI and systemd backend. Default listener: UDP/1194; public IPv4 is discovered automatically with an explicit override.

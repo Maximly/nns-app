@@ -2395,13 +2395,16 @@ gateway_status() {
 gateway_list() {
     require_root
     local dir gateway state via endpoint pool found=0
-    printf '%-18s %-10s %-18s %-26s %s\n' \
-        "Gateway" "Status" "Via" "Public endpoint" "Client pool"
-    printf '%-18s %-10s %-18s %-26s %s\n' \
-        "------------------" "----------" "------------------" "--------------------------" "------------------"
     shopt -s nullglob
     for dir in "$GATEWAY_BASE_DIR"/*; do
         [[ -f "$dir/gateway.cfg" ]] || continue
+        if (( ! found )); then
+            printf '%-18s %-10s %-18s %-26s %s\n' \
+                "Gateway" "Status" "Via" "Public endpoint" "Client pool"
+            printf '%-18s %-10s %-18s %-26s %s\n' \
+                "------------------" "----------" "------------------" "--------------------------" "------------------"
+            found=1
+        fi
         gateway=$(basename "$dir")
         load_gateway_cfg "$gateway"
         state=$(systemctl is-active "nns-gateway@${gateway}.service" 2>/dev/null || true)
@@ -2409,10 +2412,10 @@ gateway_list() {
         endpoint="$PUBLIC_HOST:$PUBLIC_PORT/$LISTEN_PROTO"
         printf '%-18s %-10s %-18s %-26s %s\n' \
             "$gateway" "$state" "$VIA_APP" "$endpoint" "$CLIENT_POOL"
-        found=1
     done
     (( found )) || log "No managed gateways configured."
 }
+
 
 # The --server convenience form creates a direct public gateway with the
 # host's normal uplink as its exit. Credentials and service state remain under

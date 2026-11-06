@@ -54,7 +54,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.34"
+readonly VERSION="1.3.35"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -6451,13 +6451,16 @@ gateway_status() {
 gateway_list() {
     require_root
     local dir gateway state via endpoint pool found=0
-    printf '%-18s %-10s %-18s %-26s %s\n' \
-        "Gateway" "Status" "Via" "Public endpoint" "Client pool"
-    printf '%-18s %-10s %-18s %-26s %s\n' \
-        "------------------" "----------" "------------------" "--------------------------" "------------------"
     shopt -s nullglob
     for dir in "$GATEWAY_BASE_DIR"/*; do
         [[ -f "$dir/gateway.cfg" ]] || continue
+        if (( ! found )); then
+            printf '%-18s %-10s %-18s %-26s %s\n' \
+                "Gateway" "Status" "Via" "Public endpoint" "Client pool"
+            printf '%-18s %-10s %-18s %-26s %s\n' \
+                "------------------" "----------" "------------------" "--------------------------" "------------------"
+            found=1
+        fi
         gateway=$(basename "$dir")
         load_gateway_cfg "$gateway"
         state=$(systemctl is-active "nns-gateway@${gateway}.service" 2>/dev/null || true)
@@ -6465,10 +6468,10 @@ gateway_list() {
         endpoint="$PUBLIC_HOST:$PUBLIC_PORT/$LISTEN_PROTO"
         printf '%-18s %-10s %-18s %-26s %s\n' \
             "$gateway" "$state" "$VIA_APP" "$endpoint" "$CLIENT_POOL"
-        found=1
     done
     (( found )) || log "No managed gateways configured."
 }
+
 
 # The --server convenience form creates a direct public gateway with the
 # host's normal uplink as its exit. Credentials and service state remain under
@@ -10740,12 +10743,14 @@ status_app() {
     rm -rf "$tmpdir"
 }
 
+list_apps_header() {
+    printf '%-18s %-9s %-11s %-12s %s\n' "Name" "Status" "Backend" "Via" "Online"
+    printf '%-18s %-9s %-11s %-12s %s\n' "------------------" "---------" "-----------" "------------" "-----------------------------------------------"
+}
+
 list_apps() {
     require_root
     install -d -o root -g root -m 0755 "$BASE_DIR" "$RUN_DIR"
-
-    printf '%-18s %-9s %-11s %-12s %s\n' "Name" "Status" "Backend" "Via" "Online"
-    printf '%-18s %-9s %-11s %-12s %s\n' "------------------" "---------" "-----------" "------------" "-----------------------------------------------"
 
     local found=0 dir app status profile local_ip external online via type type_label
     shopt -s nullglob
@@ -10753,7 +10758,10 @@ list_apps() {
         [[ -d "$dir" ]] || continue
         app=$(basename "$dir")
         [[ -f "$(cfg_file "$app")" ]] || continue
-        found=1
+        if (( ! found )); then
+            list_apps_header
+            found=1
+        fi
 
         load_cfg "$app"
         profile=${DEFAULT_PROFILE:-none}
@@ -10792,7 +10800,9 @@ list_apps() {
             "$app" "$status" "$type_label" "$via" "$online"
     done
 
-    (( found )) || log "No NNS apps installed."
+    if (( ! found )) && [[ "${1:-}" != --quiet-empty ]]; then
+        log "No NNS apps installed."
+    fi
 }
 
 list_gateway_record_print() {
@@ -10848,49 +10858,62 @@ list_remote_auto_records() {
     shopt -u nullglob
 }
 
-list_gateways_overview() {
-    require_root
-    local dir gateway record found=0 app operation
+list_gateways_header() {
     printf '%-22s %-9s %-8s %-20s %-28s %-11s %-9s %s\n' \
         'Gateway' 'Status' 'Type' 'Via' 'Endpoint' 'Clients A/R' 'Connected' 'Source'
     printf '%-22s %-9s %-8s %-20s %-28s %-11s %-9s %s\n' \
         '----------------------' '---------' '--------' '--------------------' \
         '----------------------------' '-----------' '---------' '----------------'
+}
+
+list_external_clients_header() {
+    printf '%-24s %-10s %-22s %-28s %-10s %-20s %s\n' \
+        'Client' 'Status' 'Gateway' 'Endpoint' 'Connected' 'Created' 'Source'
+    printf '%-24s %-10s %-22s %-28s %-10s %-20s %s\n' \
+        '------------------------' '----------' '----------------------' \
+        '----------------------------' '----------' '--------------------' '----------------'
+}
+
+list_gateways_overview() {
+    require_root
+    local dir gateway record found=0 app operation
 
     shopt -s nullglob
     for dir in "$GATEWAY_BASE_DIR"/*; do
         [[ -f "$dir/gateway.cfg" ]] || continue
         gateway=$(basename "$dir")
         record=$(gateway_inventory_record "$gateway" local)
+        if (( ! found )); then
+            list_gateways_header
+            found=1
+        fi
         list_gateway_record_print "$record"
-        found=1
     done
     shopt -u nullglob
 
     while IFS= read -r record; do
         [[ -n "$record" ]] || continue
+        if (( ! found )); then
+            list_gateways_header
+            found=1
+        fi
         if [[ "$record" == WARN\|* ]]; then
             IFS='|' read -r _ app operation <<<"$record"
             printf '%-22s %-9s %-8s %-20s %-28s %-11s %-9s %s\n' \
                 '-' 'offline' '-' '-' '-' '-' '-' "remote:$app"
-            found=1
             continue
         fi
         list_gateway_record_print "$record"
-        found=1
     done < <(list_remote_auto_records inventory-gateways)
 
-    (( found )) || log 'No managed gateways configured.'
+    if (( ! found )) && [[ "${1:-}" != --quiet-empty ]]; then
+        log 'No managed gateways configured.'
+    fi
 }
 
 list_external_clients_overview() {
     require_root
     local dir gateway record found=0 app operation
-    printf '%-24s %-10s %-22s %-28s %-10s %-20s %s\n' \
-        'Client' 'Status' 'Gateway' 'Endpoint' 'Connected' 'Created' 'Source'
-    printf '%-24s %-10s %-22s %-28s %-10s %-20s %s\n' \
-        '------------------------' '----------' '----------------------' \
-        '----------------------------' '----------' '--------------------' '----------------'
 
     shopt -s nullglob
     for dir in "$GATEWAY_BASE_DIR"/*; do
@@ -10898,37 +10921,64 @@ list_external_clients_overview() {
         gateway=$(basename "$dir")
         while IFS= read -r record; do
             [[ -n "$record" ]] || continue
+            if (( ! found )); then
+                list_external_clients_header
+                found=1
+            fi
             list_client_record_print "$record"
-            found=1
         done < <(gateway_external_client_records "$gateway" local)
     done
     shopt -u nullglob
 
     while IFS= read -r record; do
         [[ -n "$record" ]] || continue
+        if (( ! found )); then
+            list_external_clients_header
+            found=1
+        fi
         if [[ "$record" == WARN\|* ]]; then
             IFS='|' read -r _ app operation <<<"$record"
             printf '%-24s %-10s %-22s %-28s %-10s %-20s %s\n' \
                 '-' 'offline' '-' '-' '-' '-' "remote:$app"
-            found=1
             continue
         fi
         list_client_record_print "$record"
-        found=1
     done < <(list_remote_auto_records inventory-clients)
 
-    (( found )) || log 'No external gateway clients configured.'
+    if (( ! found )) && [[ "${1:-}" != --quiet-empty ]]; then
+        log 'No external gateway clients configured.'
+    fi
 }
 
 list_all_objects() {
     require_root
-    printf 'Applications:\n'
-    list_apps
-    printf '\nGateways:\n'
-    list_gateways_overview
-    printf '\nExternal clients:\n'
-    list_external_clients_overview
+    local rows emitted=0
+
+    # Suppress both the empty section and its column headings in combined
+    # inventory; an unreachable remote still produces an offline row.
+    rows=$(list_apps --quiet-empty)
+    if [[ -n "$rows" ]]; then
+        printf 'Applications:\n%s\n' "$rows"
+        emitted=1
+    fi
+
+    rows=$(list_gateways_overview --quiet-empty)
+    if [[ -n "$rows" ]]; then
+        (( ! emitted )) || printf '\n'
+        printf 'Gateways:\n%s\n' "$rows"
+        emitted=1
+    fi
+
+    rows=$(list_external_clients_overview --quiet-empty)
+    if [[ -n "$rows" ]]; then
+        (( ! emitted )) || printf '\n'
+        printf 'External clients:\n%s\n' "$rows"
+        emitted=1
+    fi
+
+    (( emitted )) || log 'No applications, gateways, or external clients configured.'
 }
+
 
 
 
