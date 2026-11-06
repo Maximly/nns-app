@@ -290,6 +290,107 @@ fi
     [[ "$output" == $'ROOT\nAPP:named-app:namespace' ]] ||
         fail "explicit myip app selection failed: $output"
 )
+# Named OpenVPN servers are gateways in the default inventory, not apps.
+# Inspection must dispatch correctly and preserve the app-only path.
+(
+    gateway_cfg_file() { printf '%s/myip-gateway.cfg\n' "$TEST_TMP"; }
+    : >"$TEST_TMP/myip-gateway.cfg"
+    myip_report_gateway() { printf 'GATEWAY:%s\n' "$1"; }
+    myip_report_app() { fail 'gateway myip incorrectly loaded app config'; }
+    require_root() { fail 'host gateway myip unnecessarily requested root'; }
+    output=$(myip_command mlvpn)
+    [[ "$output" == 'GATEWAY:mlvpn' ]] ||
+        fail "explicit gateway myip dispatch: $output"
+    load_gateway_cfg() { VIA_APP=host; }
+    myip_host_gateway_readable mlvpn || fail 'host gateway was not readable without root'
+    load_gateway_cfg() { VIA_APP=upstream-app; }
+    if myip_host_gateway_readable mlvpn; then
+        fail 'upstream gateway must retain namespace sudo escalation'
+    fi
+    if myip_host_gateway_readable '../../etc/passwd'; then
+        fail 'host gateway check accepted unsafe name'
+    fi
+)
+# Host-egress report must distinguish the inbound address, exit IP, and VPN
+# client pool. Never infer public listener reachability from systemd alone.
+(
+    load_gateway_cfg() {
+        VIA_APP=host
+        PUBLIC_HOST=vpn.example.net
+        PUBLIC_PORT=443
+        LISTEN_PROTO=udp
+        TRANSPORT=direct
+        CLIENT_POOL=10.253.50.0/24
+        GATEWAY_TUN=ngwtest
+        CLIENT_TO_CLIENT=on
+    }
+    systemctl() { [[ "$1" == is-active ]] && printf 'active\n'; }
+    myip_host_namespace() { return 0; }
+    myip_route_snapshot_current() { printf 'eth0|192.0.2.1|192.0.2.10\n'; }
+    myip_external_current() { printf '198.51.100.42\n'; }
+    output=$(myip_report_gateway mlvpn)
+    grep -Fq 'Gateway:           mlvpn' <<<"$output" || fail 'gateway report missing name'
+    grep -Fq 'Public endpoint:   vpn.example.net:443/udp' <<<"$output" ||
+        fail 'gateway report missing inbound address'
+    grep -Fq 'Exit external IPv4:    198.51.100.42' <<<"$output" ||
+        fail 'gateway report missing distinct exit IP'
+    grep -Fq 'Client pool:       10.253.50.0/24' <<<"$output" ||
+        fail 'gateway report missing client subnet'
+    grep -Fq 'Client-to-client:  on' <<<"$output" ||
+        fail 'gateway report missing peer policy'
+    grep -Fq 'Route interface:   eth0' <<<"$output" ||
+        fail 'gateway report missing host route'
+)
+# An explicit host gateway query from inside a different namespace must not
+# mistake the caller's public IP for the server host's exit IP.
+(
+    load_gateway_cfg() {
+        VIA_APP=host
+        PUBLIC_HOST=vpn.example.net
+        PUBLIC_PORT=1194
+        LISTEN_PROTO=udp
+        TRANSPORT=direct
+        CLIENT_POOL=10.253.50.0/24
+        GATEWAY_TUN=ngwtest
+        CLIENT_TO_CLIENT=off
+    }
+    myip_host_namespace() { return 1; }
+    myip_route_snapshot_current() { fail 'host server route probed from wrong namespace'; }
+    myip_external_current() { fail 'host server IP probed from wrong namespace'; }
+    systemctl() { printf 'active\n'; }
+    output=$(myip_report_gateway mlvpn)
+    grep -Fq 'Exit external IPv4:    unavailable' <<<"$output" ||
+        fail 'nested namespace must not claim host exit IPv4'
+    grep -Fq 'Public endpoint:   vpn.example.net:1194/udp' <<<"$output" ||
+        fail 'public server endpoint must remain visible in nested namespace'
+)
+# Chained gateway reports the selected exit namespace rather than the host.
+(
+    load_gateway_cfg() {
+        VIA_APP=upstream-app
+        PUBLIC_HOST=198.51.100.55
+        PUBLIC_PORT=1194
+        LISTEN_PROTO=udp
+        TRANSPORT=direct
+        CLIENT_POOL=10.253.70.0/24
+        GATEWAY_TUN=ngwchained
+        CLIENT_TO_CLIENT=off
+    }
+    systemctl() { [[ "$1" == is-active ]] && printf 'inactive\n'; }
+    app_is_started() { return 0; }
+    cfg_read_value() { [[ "$2" == NS_NAME ]] && printf 'nns-upstream\n'; }
+    myip_route_snapshot_namespace() { [[ "$1" == nns-upstream ]] && printf 'tun0||10.8.0.2\n'; }
+    myip_external_namespace() { [[ "$1" == nns-upstream ]] && printf '203.0.113.10\n'; }
+    output=$(myip_report_gateway chained)
+    grep -Fq 'Exit:              app:upstream-app' <<<"$output" ||
+        fail 'chained gateway must identify upstream app'
+    grep -Fq 'Exit external IPv4:    203.0.113.10' <<<"$output" ||
+        fail 'chained gateway must inspect upstream namespace'
+    grep -Fq 'State:             stopped' <<<"$output" ||
+        fail 'gateway state not preserved'
+    grep -Fq 'stopped (clients cannot use this server)' <<<"$output" ||
+        fail 'stopped gateway should not claim internet route'
+)
 [[ "$(myip_ssh_host 'user@remote-host')" == remote-host ]] ||
     fail 'myip SSH route report did not remove the account name'
 (
@@ -1761,7 +1862,7 @@ manual_payload=$(remote_command_payload gateway client export \
     remote_auto_register() { fail 'current remote was unnecessarily registered'; }
     log() { printf 'log:%s\n' "$*"; }
     output=$(remote_auto_refresh_configured_app my-app)
-    grep -Fq 'already runs nns-app 1.3.37' <<<"$output" ||
+    grep -Fq 'already runs nns-app 1.3.40' <<<"$output" ||
         fail 'current remote refresh status missing'
 )
 
@@ -1846,7 +1947,7 @@ EOF_REPAIR_STATE
     gateway_remove() { printf 'server-remove:%s\n' "$1"; }
     gateway_status() { printf 'server-status:%s\n' "$1"; }
     gateway_client_revoke() { printf 'server-revoke:%s:%s\n' "$1" "$2"; }
-    server_export_ovpn() { printf 'server-export:%s|%s|%s|%s|%s|%s\n' "$@"; }
+    server_export_ovpn() { printf 'server-export:%s|%s|%s|%s|%s|%s|%s\n' "$@"; }
 
     if server_gateway_exists '../malicious'; then
         fail 'server gateway lookup accepted path traversal'
@@ -1888,8 +1989,32 @@ EOF_REPAIR_STATE
     [[ $(main status office-vpn) == 'server-status:office-vpn' ]] || fail 'server status CLI'
     [[ $(main remove office-vpn) == 'server-remove:office-vpn' ]] || fail 'server remove CLI'
     output=$(main export ovpn office-vpn --client laptop --output /tmp/laptop.ovpn)
-    [[ "$output" == 'server-export:office-vpn|laptop|/tmp/laptop.ovpn|-|auto|modern' ]] ||
+    [[ "$output" == 'server-export:office-vpn|laptop|/tmp/laptop.ovpn|-|auto|modern|off' ]] ||
         fail "server export CLI: $output"
+    output=$(main export ovpn office-vpn --client laptop --fixed-ip --output /tmp/static.ovpn)
+    [[ "$output" == 'server-export:office-vpn|laptop|/tmp/static.ovpn|-|auto|modern|on' ]] ||
+        fail "server --fixed-ip export CLI: $output"
+    if ( main export ovpn other-vpn --client laptop --fixed-ip ) >/dev/null 2>&1; then
+        fail '--fixed-ip was accepted for a non-managed server'
+    fi
+    gateway_client_fixed_ip() {
+        case "$3" in on|off|show) ;; *) return 1 ;; esac
+        printf 'fixed-ip:%s|%s|%s\n' "$@"
+    }
+    [[ $(main fixed-ip office-vpn laptop) == 'fixed-ip:office-vpn|laptop|show' ]] ||
+        fail 'server fixed-ip show CLI'
+    [[ $(main fixed-ip office-vpn laptop on) == 'fixed-ip:office-vpn|laptop|on' ]] ||
+        fail 'server fixed-ip enable CLI'
+    [[ $(main fixed-ip office-vpn laptop off) == 'fixed-ip:office-vpn|laptop|off' ]] ||
+        fail 'server fixed-ip disable CLI'
+    if ( main fixed-ip office-vpn laptop 192.168.1.1 ) >/dev/null 2>&1; then
+        fail 'explicit IP incorrectly accepted instead of automatic server assignment'
+    fi
+    gateway_client_add() { printf 'client-add:%s|%s\n' "$@"; }
+    [[ $(main gateway client add office-vpn phone --fixed-ip) == $'client-add:office-vpn|phone\nfixed-ip:office-vpn|phone|on' ]] ||
+        fail 'gateway client add --fixed-ip CLI'
+    [[ $(main gateway client fixed-ip office-vpn laptop off) == 'fixed-ip:office-vpn|laptop|off' ]] ||
+        fail 'gateway client fixed-ip CLI'
     [[ $(main revoke office-vpn laptop) == 'server-revoke:office-vpn:laptop' ]] ||
         fail 'server revoke CLI'
     gateway_show_client_to_client() { printf 'mode:%s\n' "$1"; }
@@ -2047,4 +2172,4 @@ EOF_C2C_CONFIG
     fi
 )
 
-echo 'Function tests passed.' 
+echo 'Function tests passed.'

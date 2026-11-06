@@ -299,11 +299,15 @@ main() {
         list)
             case "${2:-managed}" in
                 managed)
-                    [[ $# -eq 1 ]] || die "Usage: nns-app list [apps|gateways|clients|all]"
+                    [[ $# -eq 1 ]] || die "Usage: nns-app list [apps|namespaces|gateways|clients|all]"
                     list_managed_objects
                     ;;
                 apps)
                     [[ $# -eq 2 ]] || die "Usage: nns-app list apps"
+                    list_managed_objects
+                    ;;
+                namespaces|local-clients)
+                    [[ $# -eq 2 ]] || die "Usage: nns-app list namespaces"
                     list_apps
                     ;;
                 all)
@@ -319,7 +323,7 @@ main() {
                     list_external_clients_overview
                     ;;
                 *)
-                    die "Usage: nns-app list [apps|gateways|clients|all]"
+                    die "Usage: nns-app list [apps|namespaces|gateways|clients|all]"
                     ;;
             esac
             ;;
@@ -332,7 +336,7 @@ main() {
             fi
             ;;
         myip)
-            (( $# <= 2 )) || die "Usage: nns-app myip [<app_name>]"
+            (( $# <= 2 )) || die "Usage: nns-app myip [<app_or_gateway_name>]"
             myip_command "${2:-}"
             ;;
         export)
@@ -340,7 +344,7 @@ main() {
                 die "Usage: nns-app export ovpn <app_name> --client <client_name> [--embedded] [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]"
             [[ "$2" == ovpn ]] ||
                 die "Only 'nns-app export ovpn ...' is currently supported."
-            local export_app=$3 export_client="" export_public="-" export_proto="auto" export_output="-" export_compat="modern"
+            local export_app=$3 export_client="" export_public="-" export_proto="auto" export_output="-" export_compat="modern" export_fixed_ip="off"
             shift 3
             while (( $# > 0 )); do
                 case "$1" in
@@ -351,6 +355,8 @@ main() {
                         export_client=${1#--client=}; shift ;;
                     --embedded)
                         export_compat=embedded; shift ;;
+                    --fixed-ip)
+                        export_fixed_ip=on; shift ;;
                     --public)
                         (( $# >= 2 )) || die "--public requires host:port."
                         export_public=$2; shift 2 ;;
@@ -372,8 +378,9 @@ main() {
             [[ -n "$export_client" ]] || die "export ovpn requires --client <client_name>."
             if server_gateway_exists "$export_app"; then
                 server_export_ovpn "$export_app" "$export_client" \
-                    "$export_output" "$export_public" "$export_proto" "$export_compat"
+                    "$export_output" "$export_public" "$export_proto" "$export_compat" "$export_fixed_ip"
             else
+                [[ "$export_fixed_ip" == off ]] || die "--fixed-ip is supported for locally managed OpenVPN servers only."
                 remote_auto_export_public_ovpn "$export_app" "$export_client" \
                     "$export_public" "$export_proto" "$export_output" "$export_compat"
             fi
@@ -472,6 +479,15 @@ main() {
                     ;;
                 *) die "Usage: nns-app stop <app_name> [--local-only]" ;;
             esac
+            ;;
+        fixed-ip)
+            (( $# >= 3 && $# <= 4 )) ||
+                die "Usage: nns-app fixed-ip <server_name> <client_name> [on|off]"
+            if (( $# == 3 )); then
+                gateway_client_fixed_ip "$2" "$3" show
+            else
+                gateway_client_fixed_ip "$2" "$3" "$4"
+            fi
             ;;
         client-to-client)
             (( $# == 2 || $# == 3 )) ||
@@ -586,9 +602,15 @@ main() {
                         die "Usage: nns-app gateway client <add|list|export|rotate|revoke> ..."
                     case "$3" in
                         add)
-                            [[ $# -eq 5 ]] ||
-                                die "Usage: nns-app gateway client add <gateway_name> <client_name>"
+                            [[ $# -eq 5 || ( $# -eq 6 && "$6" == --fixed-ip ) ]] ||
+                                die "Usage: nns-app gateway client add <gateway_name> <client_name> [--fixed-ip]"
                             gateway_client_add "$4" "$5"
+                            [[ $# -ne 6 ]] || gateway_client_fixed_ip "$4" "$5" on
+                            ;;
+                        fixed-ip)
+                            (( $# >= 5 && $# <= 6 )) ||
+                                die "Usage: nns-app gateway client fixed-ip <gateway_name> <client_name> [on|off]"
+                            gateway_client_fixed_ip "$4" "$5" "${6:-show}"
                             ;;
                         list)
                             [[ $# -eq 4 ]] ||
@@ -598,7 +620,7 @@ main() {
                         export)
                             (( $# >= 6 )) ||
                                 die "Usage: nns-app gateway client export <gateway_name> <client_name> --output <file.ovpn>"
-                            local export_gateway=$4 export_client=$5 export_output="" export_format="ovpn"
+                            local export_gateway=$4 export_client=$5 export_output="" export_format="ovpn" export_static="off"
                             shift 5
                             while (( $# > 0 )); do
                                 case "$1" in
@@ -612,12 +634,17 @@ main() {
                                         export_format=$2; shift 2 ;;
                                     --format=*)
                                         export_format=${1#--format=}; shift ;;
+                                    --fixed-ip)
+                                        export_static=on; shift ;;
                                     *)
                                         die "Unknown gateway client export option '$1'."
                                         ;;
                                 esac
                             done
                             [[ -n "$export_output" ]] || die "--output is required."
+                            if [[ "$export_static" == on ]]; then
+                                gateway_client_fixed_ip "$export_gateway" "$export_client" on >&2
+                            fi
                             gateway_client_export "$export_gateway" "$export_client" "$export_output" "$export_format"
                             ;;
                         rotate)

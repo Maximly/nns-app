@@ -1135,6 +1135,7 @@ gateway_client_rotate() {
     load_gateway_cfg "$gateway"
     gateway_client_load "$gateway" "$client"
     [[ "${STATUS:-}" == active ]] || die "Client '$client' is revoked and cannot be rotated."
+    local previous_fixed=${FIXED_IP:-}
     generation=$(( ${GENERATION:-1} + 1 ))
     pki=$(gateway_pki_dir "$gateway")
     final=$(gateway_client_dir "$gateway" "$client")
@@ -1170,10 +1171,14 @@ gateway_client_rotate() {
     fi
 
     tmp=$(mktemp)
-    awk -v generation="$generation" '
+    awk -v generation="$generation" -v fixed="$previous_fixed" '
         /^GENERATION=/ { print "GENERATION=\"" generation "\""; done=1; next }
+        /^FIXED_IP=/ { print "FIXED_IP=\"" fixed "\""; fixed_done=1; next }
         { print }
-        END { if (!done) print "GENERATION=\"" generation "\""" }
+        END {
+            if (!done) print "GENERATION=\"" generation "\""
+            if (!fixed_done) print "FIXED_IP=\"" fixed "\""
+        }
     ' "$final/client.cfg" >"$tmp"
     install -o root -g root -m 0600 "$tmp" "$final/client.cfg"
     rm -f "$tmp"

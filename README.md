@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.37
+**Release:** 1.3.40
 
 **Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
@@ -473,10 +473,25 @@ sudo nns-app install team-vpn --server --client-to-client
 ```
 
 The first form automatically detects the public IPv4 address (using
-`https://api.ipify.org`) and defaults to UDP/1194. If the public lookup fails,
+`https://api.ipify.org`) and selects UDP/1194 if available, otherwise the first
+unreserved UDP port through 1294. An explicitly requested busy port is rejected
+**before** any gateway files are created. If the public lookup fails,
 the host interface IPv4 is used as a fallback and a warning is printed; supply
 `--public` when behind NAT, port forwarding, or a cloud load balancer. Repeating
-`install office-vpn --server` **preserves the CA and existing client keys**.
+`install office-vpn --server` **reinstalls/reconciles the server while preserving
+its CA and existing client keys**. Existing servers can be reconfigured in place:
+
+```bash
+sudo nns-app install office-vpn --server --listen udp:1195 --client-to-client=on
+sudo nns-app install office-vpn --server --public vpn.example.com:1195
+```
+
+Updates restart the affected service (if settings change), remove the old
+listener/firewall rules and roll back the configuration on startup failure. An
+existing stopped server whose port was taken can automatically move to a free
+UDP port when reinstalled without an explicit `--listen`. Client profiles must
+be **re-exported** after public endpoint or port changes; the private keys and
+certificates remain valid.
 The server is enabled for automatic start at boot and opens an nns-app-owned
 host firewall listener while running. Cloud security group rules and upstream
 NAT/UDP port forwarding must be configured separately. Client traffic is
@@ -494,6 +509,44 @@ sudo nns-app start office-vpn
 sudo nns-app revoke office-vpn phone
 sudo nns-app remove office-vpn
 ```
+
+### Server-assigned fixed client IPs
+
+Fixed VPN addresses are configured **only on the OpenVPN server**. Pass
+`--fixed-ip` when issuing/exporting a client; the server selects the next
+available address, associates it with that client's certificate CN, and sends
+it automatically when the client reconnects. The exported `.ovpn` file contains
+**no static address** and needs no edits or re-export when this setting changes.
+
+```bash
+# New client (or enable a fixed IP for a previously exported client):
+sudo nns-app export ovpn team-vpn --client laptop --fixed-ip --output ~/laptop.ovpn
+
+# Existing client: enable, show, disable
+sudo nns-app fixed-ip team-vpn laptop on
+nns-app fixed-ip team-vpn laptop
+sudo nns-app fixed-ip team-vpn laptop off
+
+# Equivalent gateway-oriented commands:
+sudo nns-app gateway client add team-vpn phone --fixed-ip
+sudo nns-app gateway client fixed-ip team-vpn phone on
+sudo nns-app gateway client list team-vpn
+```
+
+Fixed assignments are persisted in each client's server-side `client.cfg` and
+rendered into OpenVPN `client-config-dir` files using `ifconfig-push`. They
+survive service restarts, server reinstallation, and client credential rotation.
+Revoked clients release their fixed address. Existing clients keep using their
+current exported profile; the server restarts to apply changes if it is running,
+so connected clients reconnect and then receive the new assigned IP.
+
+To avoid collisions, when the first client is given a fixed IP, nns-app changes
+the server's dynamic pool to the **lower half** of its VPN subnet and reserves
+the **upper half** for fixed clients. For `10.253.50.0/24`, dynamic clients
+receive `.2`–`.127` and fixed clients `.128`–`.254`. Existing dynamic clients
+may receive a new address on the first transition. Servers without fixed
+clients retain their original full dynamic pool. Client-to-client forwarding
+still requires enabling `--client-to-client` separately.
 
 ### Client-to-client traffic
 
@@ -533,13 +586,14 @@ as before; on/off does not expose the host LAN or change Internet NAT rules.
 `export ovpn` issues a unique certificate for a new client and safely re-exports
 an existing active client's profile. File outputs are mode `0600`. You can also
 use `gateway client add|list|export|revoke` for explicit management. Removing a
-server permanently deletes its CA and all its client private keys. A server
-name cannot also name an NNS app. The server appears in the default `nns-app list`
-as a **Gateway**, and also in `nns-app list gateways` and `nns-app list all`.
-It does not appear in `nns-app list apps`, which is namespace-only.
+server permanently deletes its CA and all its client private keys. An app name is unique across instance types; replacing a namespace app with
+a server requires an explicit remove first. A stand-alone OpenVPN server appears
+as type `openvpn-server` in `nns-app list` and `nns-app list apps`, and also
+in filtered `nns-app list gateways`.
 
-For a different public endpoint, listener or subnet after creation, remove and
-recreate the server (this invalidates previous client credentials). The server
+Listener, public endpoint, subnet, DNS, and client-to-client settings can be
+changed with `install <name> --server` without invalidating client certificates.
+The server
 supports IPv4 full-tunnel NAT, not IPv6 forwarding or site-to-site route
 advertisement. VPN clients need access to the host's published UDP/TCP port.
 
@@ -766,21 +820,24 @@ deployments.
 
 ## Status commands
 
-The default view lists **all locally managed instances**, including per-app
-network namespaces and OpenVPN servers created with `install <name> --server`:
+Every locally managed instance is an **app**, differentiated by its `Type`:
+`vpn-client/ovpn`, `vpn-client/wg`, `vpn-client/inherit`, `openvpn-server`,
+or `openvpn-gateway`. Exported client identities are credentials rather than
+installed apps and remain in a separate inventory.
 
 ```bash
-nns-app list           # local apps and OpenVPN servers/gateways
-nns-app list apps      # namespace applications only
-nns-app list gateways  # local gateways and associated remote gateways
-nns-app list clients   # exported OpenVPN clients only
-nns-app list all       # apps, gateways, external clients
+nns-app list             # unified local apps with Type column
+nns-app list apps        # same unified local inventory
+nns-app list namespaces  # namespace VPN clients only
+nns-app list gateways    # local gateways and associated remote gateways
+nns-app list clients     # exported OpenVPN credentials
+nns-app list all         # local and remote apps + exported clients
 ```
 
-`list gateway` (singular) remains an alias of `list gateways` for backward
-compatibility. The default `list` excludes remote gateway records and exported
-clients; `list all` includes both. Empty sections and their column headers are
-omitted in combined views, with a single message if no entries exist.
+`list gateway` (singular) and `list local-clients` remain supported aliases.
+The default `list` excludes remote gateway records and exported clients;
+`list all` includes both. Empty tables are omitted, with a single message if
+no entries exist.
 
 For automatic-remote apps these inventory views also query the associated
 remote pool. Remote rows are marked with the local app that owns the
@@ -815,8 +872,20 @@ nns-app myip my-private-app
 
 For an automatic-remote app, the report includes the SSH remote host, managed
 gateway and remote provider exit. The SSH account name is intentionally omitted
-from this concise route report. `myip <app>` is read-only and does not start a
-stopped environment.
+from this concise route report. `myip <name>` also accepts a locally managed OpenVPN server/gateway, such as
+one created with `install mlvpn --server`:
+
+```bash
+nns-app myip mlvpn
+```
+
+For a gateway this reports the **public listening endpoint** (potentially a
+DNS name or NAT-forwarded address), the client pool, and the **outbound exit
+IPv4** (the host's public egress for a `--server` installation, or the
+upstream namespace's egress for a chained gateway). Those addresses are not
+necessarily identical. Read-only inspection does not start stopped services.
+Host-egress servers can be inspected without sudo; other named namespaces
+continue to require their existing privileges.
 
 The report distinguishes `ONLINE`, `OFFLINE`, `STARTING`, `FAILED`, and
 `STOPPED` and includes:

@@ -533,8 +533,71 @@ print(" ".join(items))
 PY_GATEWAY_DNS
 }
 
+
+# Host OpenVPN servers bind on wildcard IPv4. Reject both reserved managed
+# listeners (including stopped units) and active, unmanaged host sockets.
+# Prints a diagnostic and returns success if occupied.
+server_listener_conflict() {
+    local proto=$1 port=$2 self=${3:-} self_active=${4:-off}
+    local dir other transport cfg_proto cfg_port backend_proto backend_port
+    local matched_socket=off
+    shopt -s nullglob
+    for dir in "$GATEWAY_BASE_DIR"/*; do
+        [[ -f "$dir/gateway.cfg" ]] || continue
+        other=${dir##*/}
+        [[ "$other" != "$self" ]] || continue
+        transport=$(gateway_cfg_value "$other" TRANSPORT 2>/dev/null || true)
+        cfg_proto=$(gateway_cfg_value "$other" LISTEN_PROTO 2>/dev/null || true)
+        cfg_port=$(gateway_cfg_value "$other" LISTEN_PORT 2>/dev/null || true)
+        backend_proto=$(gateway_cfg_value "$other" OPENVPN_LISTEN_PROTO 2>/dev/null || true)
+        backend_port=$(gateway_cfg_value "$other" OPENVPN_LISTEN_PORT 2>/dev/null || true)
+        # The public listener is on this host except for SSH tunneling.
+        if [[ "$transport" != ssh && "$cfg_proto" == "$proto" && "$cfg_port" == "$port" ]]; then
+            printf 'managed gateway %s reserves %s:%s' "$other" "$proto" "$port"
+            return 0
+        fi
+        if [[ "${backend_proto:-$cfg_proto}" == "$proto" &&
+              "${backend_port:-$cfg_port}" == "$port" ]]; then
+            printf 'managed gateway %s reserves OpenVPN backend %s:%s' "$other" "$proto" "$port"
+            return 0
+        fi
+    done
+    # ss is shipped by iproute2. A missing/broken ss must not silently
+    # let the installer accept an unknown listener state.
+    command -v ss >/dev/null 2>&1 || die "Cannot verify OpenVPN listener availability: 'ss' is missing."
+    local ss_out
+    if [[ "$proto" == udp ]]; then
+        ss_out=$(ss -H -lun) || die "Cannot inspect UDP listeners with ss."
+    else
+        ss_out=$(ss -H -ltn) || die "Cannot inspect TCP listeners with ss."
+    fi
+    if awk -v port="$port" '$4 ~ (":" port "$") {found=1} END {exit !found}' <<<"$ss_out"; then
+        matched_socket=on
+    fi
+    # A running instance is expected to own its existing port; reinstallation
+    # of the same listener does not constitute a collision.
+    if [[ "$matched_socket" == on && "$self_active" != on ]]; then
+        printf 'a host process already listens on %s:%s' "$proto" "$port"
+        return 0
+    fi
+    return 1
+}
+
+# Use 1194 by default, but allow additional servers without manual conflicts.
+server_choose_listener() {
+    local self=${1:-} port conflict
+    for ((port=1194; port<=1294; port++)); do
+        if ! conflict=$(server_listener_conflict udp "$port" "$self"); then
+            printf 'udp:%s\n' "$port"
+            return 0
+        fi
+    done
+    die 'No available UDP OpenVPN server port in 1194-1294; specify --listen.'
+}
+
 gateway_write_openssl_config() {
-    local gateway=$1 root=${2:-$(gateway_dir "$gateway")} pki output
+    local gateway=$1
+    local root=${2:-$(gateway_dir "$gateway")} pki output
     pki="$root/pki"
     output=$(mktemp "$pki/openssl.cnf.XXXXXX") || return 1
 
@@ -647,7 +710,8 @@ gateway_crl_refresh() {
 }
 
 gateway_generate_pki() {
-    local gateway=$1 root=${2:-$(gateway_dir "$gateway")} compat=${3:-modern} pki server_cn
+    local gateway=$1
+    local root=${2:-$(gateway_dir "$gateway")} compat=${3:-modern} pki server_cn
     pki="$root/pki"
     server_cn="nns-gateway-$gateway"
     case "$compat" in modern|embedded) ;; *) return 1 ;; esac
@@ -711,10 +775,111 @@ gateway_generate_pki() {
     fi
 }
 
+# OpenVPN fixed addresses live on the server, indexed by client certificate CN.
+# Dynamic clients use the lower half of the pool and fixed clients the upper
+# half. Never put ifconfig-push or the assigned address in exported profiles.
+gateway_active_fixed_assignments() {
+    local root=$1 file
+    for file in "$root"/clients/*/client.cfg; do
+        [[ -f "$file" ]] || continue
+        (
+            CLIENT_NAME='' STATUS='' FIXED_IP=''
+            # client.cfg is root-owned and validated by the normal client loader.
+            # shellcheck disable=SC1090
+            source "$file"
+            if [[ "$STATUS" == active && -n "$FIXED_IP" ]]; then
+                validate_gateway_client_name "$CLIENT_NAME"
+                printf '%s|%s\n' "$CLIENT_NAME" "$FIXED_IP"
+            fi
+        ) || return 1
+    done
+}
+
+gateway_fixed_ip_plan() {
+    local pool=$1 assignments=${2:-}
+    python3 - "$pool" "$assignments" <<'PY_NNS_FIXED_POOL'
+import ipaddress
+import sys
+
+try:
+    net = ipaddress.ip_network(sys.argv[1], strict=True)
+    if net.version != 4 or not 24 <= net.prefixlen <= 29:
+        raise ValueError('client pool must be IPv4 /24 through /29')
+    base = int(net.network_address)
+    size = net.num_addresses
+    dynamic_first = ipaddress.IPv4Address(base + 2)
+    dynamic_last = ipaddress.IPv4Address(base + size // 2 - 1)
+    static_first = base + size // 2
+    static_last = base + size - 2
+    used = set()
+    for entry in sys.argv[2].splitlines():
+        cn, address = entry.split('|', 1)
+        addr = ipaddress.IPv4Address(address)
+        if not static_first <= int(addr) <= static_last:
+            raise ValueError(f"fixed IP {addr} for '{cn}' is outside the reserved static range")
+        if addr in used:
+            raise ValueError(f'fixed IP {addr} is assigned to multiple clients')
+        used.add(addr)
+    print(f'{dynamic_first}|{dynamic_last}|{net.netmask}')
+except (ValueError, IndexError) as exc:
+    print(f'Invalid OpenVPN fixed address configuration: {exc}', file=sys.stderr)
+    sys.exit(1)
+PY_NNS_FIXED_POOL
+}
+
+gateway_allocate_fixed_ip() {
+    local pool=$1 assignments=${2:-}
+    python3 - "$pool" "$assignments" <<'PY_NNS_FIXED_ALLOC'
+import ipaddress
+import sys
+
+net = ipaddress.ip_network(sys.argv[1], strict=True)
+base = int(net.network_address)
+start = base + net.num_addresses // 2
+end = base + net.num_addresses - 2
+used = {int(ipaddress.IPv4Address(line.split('|', 1)[1]))
+        for line in sys.argv[2].splitlines() if line}
+for ip in range(start, end + 1):
+    if ip not in used:
+        print(ipaddress.IPv4Address(ip))
+        break
+else:
+    print(f'No fixed IP addresses available in {net}', file=sys.stderr)
+    sys.exit(1)
+PY_NNS_FIXED_ALLOC
+}
+
+gateway_sync_fixed_ip_ccd() {
+    local root=$1 assignments=${2:-} netmask=$3 group ccd client addr tmp file
+    local -A keep=()
+    group=$(nns_unprivileged_group)
+    ccd="$root/ccd"
+    [[ ! -L "$ccd" ]] || { warn "Refusing symlinked CCD directory: $ccd"; return 1; }
+    install -d -o root -g "$group" -m 0750 "$ccd" || return 1
+    # Atomically replace individual CN files before removing stale entries,
+    # so reconnecting clients never see a partially written CCD entry.
+    while IFS='|' read -r client addr; do
+        [[ -n "$client" ]] || continue
+        validate_gateway_client_name "$client"
+        keep[$client]=1
+        tmp=$(mktemp "$ccd/.new.XXXXXX") || return 1
+        printf 'ifconfig-push %s %s\n' "$addr" "$netmask" >"$tmp"
+        chown "root:$group" "$tmp" || return 1
+        chmod 0640 "$tmp" || return 1
+        mv -f -- "$tmp" "$ccd/$client" || return 1
+    done <<<"$assignments"
+    for file in "$ccd"/*; do
+        [[ -f "$file" && ! -L "$file" ]] || continue
+        client=${file##*/}
+        [[ -n "${keep[$client]:-}" ]] || rm -f -- "$file" || return 1
+    done
+}
+
 gateway_write_server_config() {
-    local gateway=$1 root=${2:-$(gateway_dir "$gateway")}
+    local gateway=$1
+    local root=${2:-$(gateway_dir "$gateway")}
     local config output pki proto_option network netmask dns
-    local unpriv_user unpriv_group
+    local unpriv_user unpriv_group fixed_assignments fixed_pool dynamic_first dynamic_last fixed_netmask
 
     if [[ "$root" == "$(gateway_dir "$gateway")" ]]; then
         load_gateway_cfg "$gateway"
@@ -735,13 +900,26 @@ gateway_write_server_config() {
     [[ "$OPENVPN_LISTEN_PROTO" == tcp ]] &&
         proto_option=tcp-server || proto_option=udp
 
-    read -r network netmask < <(
+    fixed_assignments=$(gateway_active_fixed_assignments "$root") || return 1
+    fixed_pool=off
+    if [[ -n "$fixed_assignments" ]]; then
+        local plan
+        plan=$(gateway_fixed_ip_plan "$CLIENT_POOL" "$fixed_assignments") || return 1
+        IFS='|' read -r dynamic_first dynamic_last fixed_netmask <<<"$plan"
+        fixed_pool=on
+        gateway_sync_fixed_ip_ccd "$root" "$fixed_assignments" "$fixed_netmask" || return 1
+    else
+        # Drop stale CCD entries after the last assignment was removed.
+        gateway_sync_fixed_ip_ccd "$root" '' '255.255.255.0' || return 1
+    fi
+
+    IFS='|' read -r network netmask < <(
         python3 - "$CLIENT_POOL" <<'PY_GATEWAY_POOL'
 import ipaddress
 import sys
 
 net = ipaddress.ip_network(sys.argv[1], strict=True)
-print(net.network_address, net.netmask)
+print(f'{net.network_address}|{net.netmask}')
 PY_GATEWAY_POOL
     )
 
@@ -757,7 +935,13 @@ PY_GATEWAY_POOL
         printf 'dev-type tun\n'
         printf 'dev %s\n' "$GATEWAY_TUN"
         printf 'topology subnet\n'
-        printf 'server %s %s\n' "$network" "$netmask"
+        if [[ "$fixed_pool" == on ]]; then
+            printf 'server %s %s nopool\n' "$network" "$netmask"
+            printf 'ifconfig-pool %s %s %s\n' "$dynamic_first" "$dynamic_last" "$fixed_netmask"
+            printf 'client-config-dir %s\n' "$root/ccd"
+        else
+            printf 'server %s %s\n' "$network" "$netmask"
+        fi
         # Force userspace routing for this setting: with OpenVPN DCO enabled,
         # client-to-client is ignored and Linux would need separate tun->tun
         # forwarding rules. Never widen the host firewall for other traffic.
@@ -929,6 +1113,16 @@ gateway_create() {
         <<<"$(parse_gateway_listen "$listen")"
     IFS='|' read -r public_host public_port \
         <<<"$(parse_public_endpoint "$public")"
+    # Check under the global creation lock so concurrent managed installs
+    # cannot reserve the same host port between preflight and commit.
+    if [[ "$via_app" == host && "$transport" == direct ]]; then
+        local conflict_reason
+        if conflict_reason=$(server_listener_conflict "$listen_proto" "$listen_port" "$gateway"); then
+            release_lock "gateway-$gateway"
+            release_lock global
+            die "Cannot create server '$gateway': $conflict_reason. Use --listen $listen_proto:<free-port>."
+        fi
+    fi
     if [[ "$transport" == cloak ]]; then
         [[ "$transport_server_name" != "$public_host" ]] ||
             die "Cloak --server-name must differ from the gateway public host."
@@ -1803,6 +1997,7 @@ CERT_SERIAL="$cert_serial"
 CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 GENERATION="$generation"
 CLOAK_UID="$cloak_uid"
+FIXED_IP=""
 CLIENT_CFG_EOF
     fi
 
@@ -1872,8 +2067,93 @@ gateway_client_load() {
     source "$file"
     GENERATION=${GENERATION:-1}
     CLOAK_UID=${CLOAK_UID:-}
+    FIXED_IP=${FIXED_IP:-}
     [[ "${CLIENT_NAME:-}" == "$client" ]] ||
         die "CLIENT_NAME mismatch in $file."
+}
+
+gateway_client_fixed_ip() {
+    require_root
+    local gateway=$1 client=$2 requested=${3:-show} previous assignments candidate
+    local cfg tmp backup was_active=off
+    validate_gateway_name "$gateway"
+    validate_gateway_client_name "$client"
+    case "$requested" in show|on|off) ;; *) die "Expected fixed-ip on or off." ;; esac
+    acquire_lock "gateway-$gateway"
+    load_gateway_cfg "$gateway"
+    gateway_client_load "$gateway" "$client"
+    previous=${FIXED_IP:-}
+    [[ "${STATUS:-}" == active ]] || die "Cannot change revoked client '$client'."
+    if [[ "$requested" == show ]]; then
+        release_lock "gateway-$gateway"
+        printf '%s/%s: fixed-ip=%s\n' "$gateway" "$client" "${previous:-off}"
+        return 0
+    fi
+    if [[ "$requested" == on && -n "$previous" ]]; then
+        release_lock "gateway-$gateway"
+        log "Client '$client' on '$gateway' already has fixed IP $previous."
+        return 0
+    fi
+    if [[ "$requested" == off && -z "$previous" ]]; then
+        release_lock "gateway-$gateway"
+        log "Client '$client' on '$gateway' already uses dynamic addressing."
+        return 0
+    fi
+    candidate=''
+    if [[ "$requested" == on ]]; then
+        assignments=$(gateway_active_fixed_assignments "$(gateway_dir "$gateway")") ||
+            die "Could not read existing fixed assignments."
+        gateway_fixed_ip_plan "$CLIENT_POOL" "$assignments" >/dev/null ||
+            die "Existing fixed assignments are invalid."
+        candidate=$(gateway_allocate_fixed_ip "$CLIENT_POOL" "$assignments") ||
+            die "No fixed VPN IP remains for '$gateway'."
+    fi
+    cfg="$(gateway_client_dir "$gateway" "$client")/client.cfg"
+    backup=$(mktemp) || return 1
+    cp -p "$cfg" "$backup" || { rm -f "$backup"; return 1; }
+    tmp=$(mktemp "${cfg}.XXXXXX") || { rm -f "$backup"; return 1; }
+    awk -v assigned="$candidate" '
+        /^FIXED_IP=/ { print "FIXED_IP=\"" assigned "\""; seen=1; next }
+        { print }
+        END { if (!seen) print "FIXED_IP=\"" assigned "\"" }
+    ' "$cfg" >"$tmp"
+    install -o root -g root -m 0600 "$tmp" "$cfg" || {
+        rm -f -- "$tmp" "$backup"; return 1;
+    }
+    rm -f "$tmp"
+    if ! gateway_write_server_config "$gateway"; then
+        cp -p "$backup" "$cfg"
+        gateway_write_server_config "$gateway" || true
+        rm -f "$backup"
+        release_lock "gateway-$gateway"
+        die "Failed updating fixed IP for '$client'."
+    fi
+    if systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
+        was_active=on
+    fi
+    release_lock "gateway-$gateway"
+    # A restart updates the dynamic pool and forces already connected clients
+    # to obtain their address afresh. Certificates and profiles do not change.
+    if [[ "$was_active" == on ]]; then
+        if ! systemctl restart "nns-gateway@${gateway}.service"; then
+            warn "Fixed IP update failed to restart gateway '$gateway'; rolling back."
+            acquire_lock "gateway-$gateway"
+            cp -p "$backup" "$cfg" || warn "Cannot restore previous client assignment."
+            gateway_write_server_config "$gateway" ||
+                warn "Could not rebuild previous OpenVPN configuration."
+            release_lock "gateway-$gateway"
+            systemctl restart "nns-gateway@${gateway}.service" ||
+                warn "Gateway '$gateway' could not restart after rollback."
+            rm -f "$backup"
+            return 1
+        fi
+    fi
+    rm -f "$backup"
+    if [[ "$requested" == on ]]; then
+        log "Client '$client' on '$gateway': fixed IP $candidate (server-assigned; reconnect to use)."
+    else
+        log "Client '$client' on '$gateway': fixed IP disabled (dynamic on reconnect)."
+    fi
 }
 
 gateway_client_export() {
@@ -2004,6 +2284,7 @@ gateway_client_revoke() {
     rm -f "$tmp"
     rm -rf "$backup"
     [[ "${TRANSPORT:-direct}" != cloak ]] || gateway_write_transport_config "$gateway"
+    gateway_write_server_config "$gateway" || warn "Unable to refresh CCD after revoking '$client'."
     systemctl is-active --quiet "nns-gateway@${gateway}.service" &&
         restart=yes
     release_lock "gateway-$gateway"
@@ -2019,12 +2300,12 @@ gateway_client_revoke() {
 
 gateway_client_list() {
     require_root
-    local gateway=$1 dir client status serial created
+    local gateway=$1 dir client status serial created fixed
     validate_gateway_name "$gateway"
     acquire_lock "gateway-$gateway" shared
     load_gateway_cfg "$gateway"
-    printf '%-24s %-10s %-20s %s\n' "Client" "Status" "Serial" "Created"
-    printf '%-24s %-10s %-20s %s\n' "------------------------" "----------" "--------------------" "--------------------"
+    printf '%-24s %-10s %-16s %-20s %s\n' "Client" "Status" "Fixed IP" "Serial" "Created"
+    printf '%-24s %-10s %-16s %-20s %s\n' "------------------------" "----------" "----------------" "--------------------" "--------------------"
     local found=0
     shopt -s nullglob
     for dir in "$(gateway_clients_dir "$gateway")"/*; do
@@ -2034,7 +2315,9 @@ gateway_client_list() {
         status=${STATUS:-unknown}
         serial=${CERT_SERIAL:-unknown}
         created=${CREATED_AT:-unknown}
-        printf '%-24s %-10s %-20s %s\n' "$client" "$status" "$serial" "$created"
+        fixed=${FIXED_IP:--}
+        [[ "$status" == active ]] || fixed=-
+        printf '%-24s %-10s %-16s %-20s %s\n' "$client" "$status" "$fixed" "$serial" "$created"
         found=1
     done
     (( found )) || log "No clients configured for gateway '$gateway'."
@@ -2474,49 +2757,165 @@ server_gateway_exists() {
     [[ "$(gateway_cfg_value "$name" VIA_APP 2>/dev/null || true)" == host ]]
 }
 
+# Idempotent install also reconciles an existing OpenVPN server. In-place
+# updates retain its CA, all client keys/certificates, and its tunnel identity.
+# A failed update restores the previous settings and (if running) service.
 install_openvpn_server() {
     require_root
     local name=$1 listen=${2:-} public=${3:-} pool=${4:-} dns=${5:-}
     local client_to_client=${6:-}
-    local protocol port public_host
-    [[ -z "$client_to_client" ]] || validate_client_to_client "$client_to_client"
+    local protocol port public_host current_proto current_port current_public_port old_public_host
+    local previous_cfg backup_dir changed=off was_active=off conflict_reason
+    local new_proto new_port new_host new_public_port new_pool new_dns new_c2c
     validate_gateway_name "$name"
+    [[ -z "$client_to_client" ]] || validate_client_to_client "$client_to_client"
     [[ ! -f "$(cfg_file "$name")" ]] ||
-        die "'$name' is an NNS app; remove it or choose another server name."
+        die "'$name' is an existing namespace app (type vpn-client); remove it before replacing its type."
+
+    acquire_lock global
+    # Install prerequisite files even when the server exists: this is a
+    # re-install/repair operation, not a no-op for existing instances.
+    ensure_dependencies
+    install_engine_files
+
     if [[ -f "$(gateway_cfg_file "$name")" ]]; then
         server_gateway_exists "$name" ||
-            die "'$name' is already a gateway with a non-host exit."
-        # Never regenerate a CA or silently change an existing listener.
+            die "'$name' is an existing gateway with a non-host exit; use 'gateway' commands."
         load_gateway_cfg "$name"
-        [[ -z "$listen" || "$listen" == "$LISTEN_PROTO:$LISTEN_PORT" ]] ||
-            die "Server '$name' is installed on $LISTEN_PROTO:$LISTEN_PORT; options cannot change it in place."
-        [[ -z "$public" || "$public" == "$PUBLIC_HOST:$PUBLIC_PORT" ]] ||
-            die "Server '$name' already has public endpoint $PUBLIC_HOST:$PUBLIC_PORT."
-        [[ -z "$pool" || "$pool" == "$CLIENT_POOL" ]] ||
-            die "Server '$name' already uses pool $CLIENT_POOL."
-        [[ -z "$dns" || "$dns" == "$DNS_SERVERS" ]] ||
-            die "Server '$name' already uses DNS $DNS_SERVERS."
-        if [[ -n "$client_to_client" ]]; then
-            gateway_set_client_to_client "$name" "$client_to_client" ||
-                die "Failed to change client-to-client mode for '$name'."
+        [[ "$TRANSPORT" == direct ]] ||
+            die "'$name' uses $TRANSPORT; --server supports direct transport only."
+        current_proto=$LISTEN_PROTO
+        current_port=$LISTEN_PORT
+        current_public_port=$PUBLIC_PORT
+        old_public_host=$PUBLIC_HOST
+        new_proto=$LISTEN_PROTO
+        new_port=$LISTEN_PORT
+        new_host=$PUBLIC_HOST
+        new_public_port=$PUBLIC_PORT
+        new_pool=$CLIENT_POOL
+        new_dns=$DNS_SERVERS
+        new_c2c=$CLIENT_TO_CLIENT
+        if systemctl is-active --quiet "nns-gateway@${name}.service"; then
+            was_active=on
         fi
-        log "OpenVPN server '$name' is already installed; preserving CA and client certificates."
+
+        if [[ -n "$listen" ]]; then
+            IFS='|' read -r new_proto new_port <<<"$(parse_gateway_listen "$listen")"
+        fi
+        if conflict_reason=$(server_listener_conflict "$new_proto" "$new_port" "$name"                                 "$([[ "$was_active" == on && "$new_proto:$new_port" == "$current_proto:$current_port" ]] && echo on || echo off)"); then
+            if [[ -n "$listen" ]]; then
+                die "Cannot reinstall '$name': $conflict_reason. Select a free --listen port."
+            fi
+            # The old unit may have failed to start because another server
+            # already owns its port. Repair it without destroying credentials.
+            listen=$(server_choose_listener "$name")
+            IFS='|' read -r new_proto new_port <<<"$(parse_gateway_listen "$listen")"
+            warn "Server '$name' cannot use $current_proto:$current_port ($conflict_reason); switching to $listen."
+        fi
+        if [[ -z "$public" && "$new_port" != "$current_port" &&
+              "$current_public_port" == "$current_port" ]]; then
+            new_public_port=$new_port
+        fi
+        if [[ -n "$public" ]]; then
+            IFS='|' read -r new_host new_public_port <<<"$(parse_public_endpoint "$public")"
+        fi
+        if [[ -n "$pool" && "$pool" != "$CLIENT_POOL" ]]; then
+            # The allocator checks overlap with all saved and live networks.
+            # Do not regenerate the transit or gateway PKI when changing pool.
+            local allocated unused_transit unused_a unused_b
+            IFS='|' read -r allocated unused_transit unused_a unused_b                 <<<"$(allocate_gateway_networks "$pool")"
+            [[ "$allocated" == "$pool" ]] || die "Invalid requested client pool '$pool'."
+            new_pool=$pool
+        fi
+        if [[ "$new_pool" != "$CLIENT_POOL" ]]; then
+            local old_fixed
+            old_fixed=$(gateway_active_fixed_assignments "$(gateway_dir "$name")") ||
+                die "Unable to read fixed client assignments for '$name'."
+            if [[ -n "$old_fixed" ]]; then
+                gateway_fixed_ip_plan "$new_pool" "$old_fixed" >/dev/null ||
+                    die "Cannot change client pool of '$name' while fixed IPs are outside the new reserved range."
+            fi
+        fi
+        [[ -z "$dns" ]] || new_dns=$(validate_gateway_dns "$dns")
+        [[ -z "$client_to_client" ]] || new_c2c=$client_to_client
+        if [[ "$new_proto" != "$LISTEN_PROTO" || "$new_port" != "$LISTEN_PORT" ||
+              "$new_host" != "$PUBLIC_HOST" || "$new_public_port" != "$PUBLIC_PORT" ||
+              "$new_pool" != "$CLIENT_POOL" || "$new_dns" != "$DNS_SERVERS" ||
+              "$new_c2c" != "$CLIENT_TO_CLIENT" ]]; then
+            changed=on
+        fi
+        if [[ "$changed" == on ]]; then
+            # Stop under the *old* configuration to remove old-port firewall
+            # entries and NAT rules before changing the config file.
+            gateway_stop "$name"
+            acquire_lock "gateway-$name"
+            backup_dir=$(mktemp -d "$(gateway_dir "$name")/.reinstall.XXXXXX")
+            cp -p "$(gateway_cfg_file "$name")" "$backup_dir/gateway.cfg"
+            if [[ -f "$(gateway_server_config "$name")" ]]; then
+                cp -p "$(gateway_server_config "$name")" "$backup_dir/server.conf"
+            fi
+            gateway_cfg_set "$name" LISTEN_PROTO "$new_proto"
+            gateway_cfg_set "$name" LISTEN_PORT "$new_port"
+            gateway_cfg_set "$name" OPENVPN_LISTEN_PROTO "$new_proto"
+            gateway_cfg_set "$name" OPENVPN_LISTEN_PORT "$new_port"
+            gateway_cfg_set "$name" PUBLIC_HOST "$new_host"
+            gateway_cfg_set "$name" PUBLIC_PORT "$new_public_port"
+            gateway_cfg_set "$name" TRANSPORT_SERVER_NAME "$new_host"
+            gateway_cfg_set "$name" CLIENT_POOL "$new_pool"
+            gateway_cfg_set "$name" DNS_SERVERS "$new_dns"
+            gateway_cfg_set "$name" CLIENT_TO_CLIENT "$new_c2c"
+            release_lock "gateway-$name"
+        fi
+        write_gateway_unit_dropin "$name"
+        systemctl daemon-reload
+        systemctl enable "nns-gateway@${name}.service" >/dev/null
+        if ! gateway_start "$name"; then
+            if [[ "$changed" == on ]]; then
+                gateway_stop "$name" >/dev/null 2>&1 || true
+                acquire_lock "gateway-$name"
+                cp -p "$backup_dir/gateway.cfg" "$(gateway_cfg_file "$name")"
+                if [[ -f "$backup_dir/server.conf" ]]; then
+                    cp -p "$backup_dir/server.conf" "$(gateway_server_config "$name")"
+                fi
+                rm -rf "$backup_dir"
+                release_lock "gateway-$name"
+                if [[ "$was_active" == on ]]; then
+                    gateway_start "$name" ||
+                        warn "Rollback restored '$name' settings, but the previous service failed to restart."
+                fi
+            fi
+            release_lock global
+            die "Server '$name' could not start. Previous settings were restored if reconfigured."
+        fi
+        [[ -z "$backup_dir" ]] || rm -rf "$backup_dir"
+        log "Reinstalled OpenVPN server '$name' (existing CA and client certificates preserved)."
+        if [[ "$new_host:$new_public_port" != "$old_public_host:$current_public_port" ||
+              "$new_proto:$new_port" != "$current_proto:$current_port" ]]; then
+            warn "Re-export existing client profiles: the server endpoint/listener changed."
+        fi
     else
-        listen=${listen:-udp:1194}
+        if [[ -z "$listen" ]]; then
+            listen=$(server_choose_listener "$name")
+        else
+            IFS='|' read -r protocol port <<<"$(parse_gateway_listen "$listen")"
+            if conflict_reason=$(server_listener_conflict "$protocol" "$port" "$name"); then
+                die "Cannot install '$name': $conflict_reason. Use another --listen port."
+            fi
+        fi
         IFS='|' read -r protocol port <<<"$(parse_gateway_listen "$listen")"
         if [[ -z "$public" ]]; then
-            ensure_dependencies
             public_host=$(server_public_host) ||
                 die "Cannot discover host IPv4. Pass --public <host>:<port>."
             public="$public_host:$port"
         fi
-        gateway_create "$name" host "$listen" "$public" "$pool" \
-            "${dns:-1.1.1.1 9.9.9.9}" direct "" modern "${client_to_client:-off}"
+        gateway_create "$name" host "$listen" "$public" "$pool"             "${dns:-1.1.1.1 9.9.9.9}" direct "" modern "${client_to_client:-off}"
+        systemctl enable "nns-gateway@${name}.service" >/dev/null
+        if ! gateway_start "$name"; then
+            release_lock global
+            die "OpenVPN server '$name' was installed but failed to start; inspect: nns-app status $name"
+        fi
     fi
-    # This service must start after reboot; gateway_create only installs PKI.
-    systemctl enable "nns-gateway@${name}.service" >/dev/null
-    gateway_start "$name" ||
-        die "OpenVPN server '$name' was installed but failed to start; inspect: nns-app status $name"
+    release_lock global
     log "OpenVPN server '$name' is enabled at boot."
     log "Create client:  nns-app export ovpn $name --client laptop --output laptop.ovpn"
     log "Check status:   nns-app status $name"
@@ -2568,7 +2967,7 @@ gateway_show_client_to_client() {
 
 server_export_ovpn() {
     require_root
-    local gateway=$1 client=$2 output=$3 public=$4 proto=$5 compat=$6
+    local gateway=$1 client=$2 output=$3 public=$4 proto=$5 compat=$6 fixed_ip=${7:-off}
     server_gateway_exists "$gateway" || die "Server '$gateway' does not exist."
     load_gateway_cfg "$gateway"
     [[ "$compat" == modern && "$OPENVPN_COMPAT" == modern ]] ||
@@ -2580,6 +2979,9 @@ server_export_ovpn() {
     if [[ ! -e "$(gateway_client_dir "$gateway" "$client")" ]]; then
         # Keep stdout pure so --output - can safely be redirected to an .ovpn.
         gateway_client_add "$gateway" "$client" >&2
+    fi
+    if [[ "$fixed_ip" == on ]]; then
+        gateway_client_fixed_ip "$gateway" "$client" on >&2
     fi
     gateway_client_export "$gateway" "$client" "$output" ovpn
 }

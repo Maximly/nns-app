@@ -630,12 +630,91 @@ myip_report_app() {
     printf 'Route path:        %s\n' "$path"
 }
 
+# A gateway represents an OpenVPN server, not an application namespace.
+# Its public listening address and its actual outbound address are independent:
+# the former may be DNS/NAT, while the latter is the host or upstream VPN exit.
+myip_report_gateway() {
+    local name=$1 unit_state via state route="" dev="" route_gateway="" local_ip="" external_ip=""
+    local upstream_ns="" exit_label endpoint route_path
+    validate_gateway_name "$name"
+    load_gateway_cfg "$name"
+    via=$VIA_APP
+
+    unit_state=$(systemctl is-active "nns-gateway@${name}.service" 2>/dev/null || true)
+    state=stopped
+    [[ "$unit_state" == active ]] && state=active
+    if [[ "${TRANSPORT:-direct}" == ssh ]]; then
+        endpoint="$PUBLIC_HOST:$PUBLIC_PORT/ssh"
+    else
+        endpoint="$PUBLIC_HOST:$PUBLIC_PORT/$LISTEN_PROTO"
+    fi
+
+    if [[ "$via" == host ]]; then
+        exit_label=host
+        # The caller may be inside an app namespace. Probing its current
+        # route/IP would falsely report that namespace as the host's exit.
+        if myip_host_namespace; then
+            route=$(myip_route_snapshot_current 2>/dev/null || true)
+            external_ip=$(myip_external_current 2>/dev/null || true)
+        fi
+    else
+        exit_label="app:$via"
+        if app_is_started "$via"; then
+            upstream_ns=$(cfg_read_value "$via" NS_NAME 2>/dev/null || true)
+            if [[ -n "$upstream_ns" ]]; then
+                route=$(myip_route_snapshot_namespace "$upstream_ns" 2>/dev/null || true)
+                external_ip=$(myip_external_namespace "$upstream_ns" 2>/dev/null || true)
+            fi
+        fi
+    fi
+    IFS='|' read -r dev route_gateway local_ip <<<"$route"
+
+    if [[ "$state" != active ]]; then
+        route_path="gateway:$name -> stopped (clients cannot use this server)"
+    elif [[ -z "$route" ]]; then
+        route_path="gateway:$name -> $exit_label -> exit route unavailable"
+    else
+        route_path="VPN clients -> gateway:$name -> $exit_label -> ${dev:-interface} -> Internet"
+    fi
+
+    printf 'Context:           gateway\n'
+    printf 'Gateway:           %s\n' "$name"
+    printf 'State:             %s\n' "$state"
+    printf 'Backend:           OpenVPN server\n'
+    printf 'Public endpoint:   %s\n' "$endpoint"
+    printf 'Client pool:       %s\n' "$CLIENT_POOL"
+    printf 'Server tunnel:     %s\n' "$GATEWAY_TUN"
+    printf 'Client-to-client:  %s\n' "$CLIENT_TO_CLIENT"
+    printf 'Exit:              %s\n' "$exit_label"
+    printf 'Exit local IPv4:   %s\n' "${local_ip:-unavailable}"
+    printf 'Exit external IPv4:    %s\n' "${external_ip:-unavailable}"
+    printf 'Route interface:   %s\n' "${dev:-unavailable}"
+    printf 'Default gateway:   %s\n' "${route_gateway:-direct or unavailable}"
+    printf 'Route path:        %s\n' "$route_path"
+}
+
+# Used before sudo re-exec: ordinary host-exit gateway IP reporting can read
+# its root-owned configuration (validated by load_gateway_cfg) without privilege.
+myip_host_gateway_readable() {
+    local name=${1:-}
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]] || return 1
+    [[ -r "$(gateway_cfg_file "$name")" ]] || return 1
+    (load_gateway_cfg "$name" >/dev/null 2>&1 && [[ "$VIA_APP" == host ]])
+}
+
 myip_command() {
     local requested_app=${1:-} detected_app
 
     if [[ -n "$requested_app" ]]; then
-        require_root
-        myip_report_app "$requested_app" namespace
+        # Application and gateway names occupy separate config trees. The
+        # installer prevents collisions, and gateways are listed by default.
+        if [[ "$requested_app" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ &&
+              -f "$(gateway_cfg_file "$requested_app")" ]]; then
+            myip_report_gateway "$requested_app"
+        else
+            require_root
+            myip_report_app "$requested_app" namespace
+        fi
         return 0
     fi
 
@@ -1240,51 +1319,128 @@ list_external_clients_overview() {
     fi
 }
 
+# A single managed-object inventory: a namespace VPN client and a managed
+# OpenVPN server/gateway are all nns-app apps, distinguished by Type. Exported
+# client credentials are *not* apps and live in a separate inventory.
+list_instance_header() {
+    printf '%-20s %-18s %-9s %-13s %-42s %s\n' \
+        'Name' 'Type' 'Status' 'Via' 'Endpoint / Online' 'Source'
+    printf '%-20s %-18s %-9s %-13s %-42s %s\n' \
+        '--------------------' '------------------' '---------' '-------------' \
+        '------------------------------------------' '----------'
+}
+
+list_local_instance_records() {
+    local dir app profile vpn_type status via local_ip external online
+    local gateway record kind state endpoint active revoked connected source app_type
+    shopt -s nullglob
+    for dir in "$BASE_DIR"/*; do
+        [[ -d "$dir" ]] || continue
+        app=${dir##*/}
+        [[ -f "$(cfg_file "$app")" ]] || continue
+        load_cfg "$app"
+        profile=${DEFAULT_PROFILE:-none}
+        vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+        if [[ "$vpn_type" == inherit ]]; then
+            profile=inherited
+        else
+            profile=${profile%.ovpn}
+            profile=${profile%.conf}
+        fi
+        case "$vpn_type" in
+            openvpn) app_type=vpn-client/ovpn ;;
+            wireguard) app_type=vpn-client/wg ;;
+            inherit) app_type=vpn-client/inherit ;;
+            *) app_type=vpn-client ;;
+        esac
+        status=stopped
+        via=$(effective_via_for_app "$app" __default__)
+        online="$profile | -"
+        if app_is_started "$app"; then
+            status=started
+            via=$(runtime_via_for_app "$app")
+            if [[ "$via" != host ]] && ! app_is_started "$via"; then
+                via="${via}!"
+            fi
+            local_ip=$(vpn_local_ipv4 "$app" 2>/dev/null || true)
+            [[ -n "$local_ip" ]] || local_ip=-
+            external=''
+            if vpn_route_ready "$app"; then
+                local ns
+                ns=$(cfg_read_value "$app" NS_NAME 2>/dev/null || true)
+                external=$(ip netns exec "$ns" curl -4fsS \
+                           --connect-timeout 2 --max-time 4 "$EXTERNAL_IP_URL" 2>/dev/null || true)
+            fi
+            [[ -n "$external" ]] || external=offline
+            online="$profile | $local_ip -> $external"
+        fi
+        printf '%s|%s|%s|%s|%s|local\n' "$app" "$app_type" "$status" "$via" "$online"
+    done
+    for dir in "$GATEWAY_BASE_DIR"/*; do
+        [[ -f "$dir/gateway.cfg" ]] || continue
+        gateway=${dir##*/}
+        record=$(gateway_inventory_record "$gateway" local)
+        IFS='|' read -r _ gateway kind state via endpoint active revoked connected source <<<"$record"
+        if [[ "$via" == host ]]; then
+            app_type=openvpn-server
+        else
+            app_type=openvpn-gateway
+        fi
+        printf '%s|%s|%s|%s|%s|local\n' "$gateway" "$app_type" "$state" "$via" "$endpoint"
+    done
+    shopt -u nullglob
+}
+
+list_instance_record_print() {
+    local row=$1 app type status via info source
+    IFS='|' read -r app type status via info source <<<"$row"
+    printf '%-20s %-18s %-9s %-13s %-42s %s\n' \
+        "$app" "$type" "$status" "$via" "$info" "$source"
+}
+
 list_inventory_objects() {
     require_root
-    local view=$1 rows emitted=0
-
-    # The default view contains only objects managed on this host: network
-    # namespace applications and local OpenVPN servers/gateways. The full
-    # inventory additionally includes associated remote gateways and clients.
-    # Never print empty sections or column headings.
-    rows=$(list_apps --quiet-empty)
+    local view=$1 record emitted=0 rows='' gateway kind state via endpoint active revoked connected source
+    # Collect records before printing the header so an empty inventory stays
+    # a single line, rather than rendering empty tables.
+    rows=$(list_local_instance_records)
+    if [[ "$view" == all ]]; then
+        while IFS= read -r record; do
+            [[ -n "$record" ]] || continue
+            if [[ "$record" == WARN\|* ]]; then
+                IFS='|' read -r _ gateway _ <<<"$record"
+                rows+="${rows:+$'\n'}$gateway|remote-gateway|offline|-|-|remote:$gateway"
+            else
+                IFS='|' read -r _ gateway kind state via endpoint active revoked connected source <<<"$record"
+                rows+="${rows:+$'\n'}$gateway|remote-gateway|$state|$via|$endpoint|$source"
+            fi
+        done < <(list_remote_auto_records inventory-gateways)
+    fi
     if [[ -n "$rows" ]]; then
-        printf 'Applications:\n%s\n' "$rows"
+        printf 'Apps:\n'
+        list_instance_header
+        while IFS= read -r record; do
+            [[ -n "$record" ]] || continue
+            list_instance_record_print "$record"
+        done <<<"$rows"
         emitted=1
     fi
-
-    if [[ "$view" == managed ]]; then
-        rows=$(list_gateways_overview --local-only --quiet-empty)
-    else
-        rows=$(list_gateways_overview --quiet-empty)
-    fi
-    if [[ -n "$rows" ]]; then
-        (( ! emitted )) || printf '\n'
-        printf 'Gateways:\n%s\n' "$rows"
-        emitted=1
-    fi
-
     if [[ "$view" == all ]]; then
         rows=$(list_external_clients_overview --quiet-empty)
         if [[ -n "$rows" ]]; then
             (( ! emitted )) || printf '\n'
-            printf 'External clients:\n%s\n' "$rows"
+            printf 'Exported clients:\n%s\n' "$rows"
             emitted=1
         fi
     fi
-
     if (( ! emitted )); then
         if [[ "$view" == managed ]]; then
-            log 'No applications or local gateways configured.'
+            log 'No apps configured.'
         else
-            log 'No applications, gateways, or external clients configured.'
+            log 'No apps or exported clients configured.'
         fi
     fi
 }
 
 list_managed_objects() { list_inventory_objects managed; }
 list_all_objects() { list_inventory_objects all; }
-
-
-

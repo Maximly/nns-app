@@ -30,11 +30,12 @@
 #   remove  <app_name>
 #   purge
 #   repair [--local-only]
-#   list [apps|gateways|clients|all]
+#   list [apps|namespaces|gateways|clients|all]
 #   status  <app_name>
-#   myip    [<app_name>]
+#   myip    [<app_or_gateway_name>]
 #   export  ovpn <app_name> --client <name> [--embedded]
 #                  [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]
+#   fixed-ip <server_name> <client_name> [on|off]
 #   revoke  <app_name> <client_name>
 #   add     <app_name> <profile.ovpn|wireguard.conf>
 #   add     <app_name> any [country] [--refresh] [--via <upstream-app>|host]
@@ -50,7 +51,7 @@
 #   remote add|connect|sync|rotate|status ...
 #   link import <app> <bundle.nnslink>
 #   gateway start|stop|status|list|remove ...
-#   gateway client add|list|export|revoke ...
+#   gateway client add|fixed-ip|list|export|revoke ...
 #
 # The script installs itself as /usr/local/sbin/nns_app.sh and creates the
 # convenience symlink /usr/local/bin/nns-app.
@@ -58,7 +59,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.37"
+readonly VERSION="1.3.40"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -204,7 +205,7 @@ reset_gateway_cfg_vars() {
 
 reset_gateway_client_vars() {
     CLIENT_NAME="" STATUS="" CERT_SERIAL="" CREATED_AT="" REVOKED_AT=""
-    GENERATION="" CLOAK_UID=""
+    GENERATION="" CLOAK_UID="" FIXED_IP=""
 }
 
 required_binary() {
@@ -289,12 +290,13 @@ Usage:
   nns-app remove  <app_name> [--local-only]
   nns-app purge [--local-only]
   nns-app repair [--local-only]
-  nns-app list [apps|gateways|clients|all]
+  nns-app list [apps|namespaces|gateways|clients|all]
   nns-app status  <app_name>
-  nns-app myip [<app_name>]
-  nns-app export ovpn <app_name> --client <client_name> [--embedded]
+  nns-app myip [<app_or_gateway_name>]
+  nns-app export ovpn <app_name> --client <client_name> [--embedded] [--fixed-ip]
                   [--public <host>:<port>] [--proto tcp|udp]
                   [--output <file|->]
+  nns-app fixed-ip <server_name> <client_name> [on|off]
   nns-app revoke <app_name> <client_name> [--modern|--embedded]
   nns-app add     <app_name> <profile.ovpn|wireguard.conf>
   nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
@@ -316,10 +318,11 @@ Usage:
   nns-app gateway status <gateway_name>
   nns-app gateway list
   nns-app gateway remove <gateway_name>
-  nns-app gateway client add    <gateway_name> <client_name>
+  nns-app gateway client add    <gateway_name> <client_name> [--fixed-ip]
+  nns-app gateway client fixed-ip <gateway_name> <client_name> [on|off]
   nns-app gateway client list   <gateway_name>
   nns-app gateway client export <gateway_name> <client_name>
-                  [--format ovpn|nnslink] --output <file|->
+                  [--fixed-ip] [--format ovpn|nnslink] --output <file|->
   nns-app gateway client rotate <gateway_name> <client_name>
   nns-app gateway client revoke <gateway_name> <client_name>
 
@@ -356,14 +359,16 @@ Examples:
   nns-app run my-private-app firefox --no-remote
   sudo nns-app purge
   sudo nns-app repair
-  nns-app list            # local apps + local OpenVPN servers/gateways
-  nns-app list apps       # network namespace applications only
+  nns-app list            # all locally managed apps, with Type column
+  nns-app list apps       # same unified local app inventory
+  nns-app list namespaces # namespace VPN clients only
   nns-app list gateways   # managed local and associated remote gateways
   nns-app list clients    # exported OpenVPN clients
   nns-app list all        # full inventory
   nns-app status my-private-app
   nns-app myip
   nns-app myip my-private-app
+  nns-app myip office-vpn   # managed OpenVPN server
 
   # Export a standard OpenVPN profile for a client that does not run nns-app.
   # The current automatic-remote host and a free OpenVPN port are used by default.

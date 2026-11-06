@@ -25,10 +25,14 @@ reexec_as_root_if_needed() {
     target=$(readlink -f "$0")
     [[ -x "$target" ]] || die "Cannot execute script: $target"
 
-    # Context-only `myip` reads the namespace it is already running in and
-    # does not need privilege escalation.  An explicit app name still needs
-    # root to enter that app's network namespace from the host or another app.
+    # Context-only `myip` needs no privilege escalation. For an explicit
+    # host-egress OpenVPN gateway the public listener and host exit are also
+    # readable without sudo. App and upstream-namespace inspection still
+    # needs root to enter the target namespace.
     if [[ "$cmd" == myip && $# -eq 1 ]]; then
+        return 0
+    fi
+    if [[ "$cmd" == myip && $# -eq 2 ]] && myip_host_gateway_readable "$2"; then
         return 0
     fi
 
@@ -37,7 +41,7 @@ reexec_as_root_if_needed() {
         list|status|myip|start|stop|run)
             sudo_args+=( -n )
             ;;
-        install|remove|add|purge|repair|gateway|remote|link|export|revoke)
+        install|remove|add|purge|repair|gateway|remote|link|export|revoke|fixed-ip)
             ;;
         *)
             die "Unknown command '$cmd'."

@@ -1,4 +1,4 @@
-nns-app release: 1.3.37
-Change: include locally managed OpenVPN gateways in default nns-app list; list apps stays namespace-only; list all includes exported clients.
-Installer SHA256: 56b4d9a1fc36c74c61922762b85334989eb912a94ef4c0f82d0c1d900f45e29f
-Tests: make test PASS (static + function + inventory rendering and CLI dispatch tests; no live OpenVPN server needed for inventory behavior)
+nns-app release: 1.3.40
+Changes: server-only per-client fixed IPv4 addressing, automatic reserved-range allocation, CCD management, dynamic-pool separation, existing-client enable/disable, certificate-rotation persistence, rollback and OpenVPN config parsing fixes.
+Installer SHA256: 8f3ac8e41b8644740f066148919446ccdf517bf840f06888ec99cc51d46bc077
+Tests: static, function, unified inventory, server reinstall/rollback, and fixed client IP regression suites PASS. Live OpenVPN peer connectivity not tested.

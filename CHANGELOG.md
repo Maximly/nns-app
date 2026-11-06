@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.3.40
+
+- Add `export ovpn <server> --client <name> --fixed-ip`: fixed IPv4 is server-assigned from the reserved half of the client pool, kept in server-side CCD, and never embedded in client profiles.
+- Add `fixed-ip <server> <client> [on|off]` and `gateway client fixed-ip` for existing clients, plus `gateway client add ... --fixed-ip`; show assignments with `gateway client list`.
+- Separate dynamic and fixed pools using OpenVPN `server ... nopool` plus `ifconfig-pool`, validate uniqueness and CIDR boundaries, and restore full dynamic behavior after the last fixed assignment is disabled or revoked.
+- Preserve fixed addressing through certificate rotation, and roll back fixed-IP updates on server restart failure.
+- Correct existing OpenVPN server config generation bugs: initialize the gateway name before resolving the root path; parse the pool IPv4/netmask with the script's non-space IFS.
+- Add fixed-IP allocator, CCD, profile, CLI, and rollback regression tests.
+
+- Treat every locally managed instance as an app and show one default Apps inventory with explicit Type (`vpn-client/*`, `openvpn-server`, `openvpn-gateway`); keep namespace-only and gateway-only filtered views.
+- `list apps` is an alias for the unified default inventory; `list namespaces` preserves the previous namespace-only behavior. `list all` includes remote gateways as typed apps and exported credentials separately.
+- Re-running `install <name> --server` reconciles existing servers in place, allowing listener, public endpoint, DNS, client pool, and client-to-client updates without deleting PKI or client identities.
+- Prevent duplicate UDP/TCP listeners by inspecting managed reservations and live host sockets. New servers automatically select the first available UDP port starting at 1194; a failed existing server may be reassigned on reinstall.
+- Stop with old configuration before changing firewall/listener, roll back on startup failure, and warn to re-export profiles after endpoint changes.
+
+## 1.3.38
+
+- Allow `nns-app myip <name>` to inspect both namespace apps and managed OpenVPN gateways/servers.
+- Report the VPN's public endpoint separately from the actual outbound exit IP and route, plus client pool and state.
+- Read-only IP inspection of host-egress OpenVPN servers works without sudo; namespace inspection retains root escalation.
+
 ## 1.3.37
 
 - `nns-app list` now shows all locally managed instances, including OpenVPN servers created using `install <name> --server`, in separate Applications and Gateways sections.

@@ -9,11 +9,11 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fq 'nns-app 1.3.37' <<<"$version"
+grep -Fq 'nns-app 1.3.40' <<<"$version"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
-grep -Fq 'nns-app myip [<app_name>]' <<<"$help"
+grep -Fq 'nns-app myip [<app_or_gateway_name>]' <<<"$help"
 grep -Fq 'nns-app gateway create' <<<"$help"
 grep -Fq 'nns-app gateway client export' <<<"$help"
 grep -Fq 'nns-app remote connect' <<<"$help"
@@ -210,7 +210,7 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 1.3.37' "$ROOT/README.md"
+grep -Fq '**Release:** 1.3.40' "$ROOT/README.md"
 grep -Fq '## Quick start' "$ROOT/README.md"
 grep -Fq '### Run a VPN locally' "$ROOT/README.md"
 grep -Fq 'nns-app install my-private-app' "$ROOT/README.md"
@@ -358,7 +358,7 @@ if grep -Fq '"Peer Connection Initiated" in log_text' "$INSTALLER"; then
 fi
 grep -Fq 'documented public OpenVPN credentials (`vpn` / `vpn`)' "$ROOT/README.md"
 
-grep -Fq 'nns-app list [apps|gateways|clients|all]' "$INSTALLER" || {
+grep -Fq 'nns-app list [apps|namespaces|gateways|clients|all]' "$INSTALLER" || {
     echo 'extended list usage is missing' >&2
     exit 1
 }
@@ -396,7 +396,7 @@ for list_form in 'list all' 'list gateway' 'list clients'; do
         exit 1
     }
 done
-grep -Fq 'nns-app list all       # apps, gateways, external clients' "$ROOT/README.md" || {
+grep -Fq 'nns-app list all         # local and remote apps + exported clients' "$ROOT/README.md" || {
     echo 'README does not document list all' >&2
     exit 1
 }
