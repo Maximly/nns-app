@@ -4,13 +4,41 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.41
+**Release:** 1.3.42
 
 **Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
 
 The release includes both the modular source tree and a pre-built,
 single-file installer: `nns-app-install.sh`.
+
+## AmneziaWG client profiles (v1.3.42)
+
+Import a provider `.conf` containing AmneziaWG (`Jc`, `Jmin`, `Jmax`, `S1`–`S4`,
+`H1`–`H4`, `I1`–`I5`, and the 3.1 header-protection/timing fields) with the
+same commands used for WireGuard:
+
+```bash
+sudo nns-app install amnezia-client
+sudo nns-app add amnezia-client ~/amnezia-client.conf
+sudo nns-app start amnezia-client
+nns-app status amnezia-client
+nns-app run amnezia-client curl -4 https://api.ipify.org
+```
+
+Profiles with AmneziaWG-only directives are automatically classified as
+`vpn-client/awg`; ordinary WireGuard profiles continue using `wg-quick`.
+AmneziaWG uses **`awg` and `awg-quick`**, which must be installed separately,
+with an operational AmneziaWG kernel module or compatible userspace backend.
+`nns-app` does not silently substitute standard WireGuard, install an
+unverified third-party repository, or build a kernel module. For Ubuntu, see
+[Amnezia's official Linux module guide](https://docs.amnezia.org/documentation/instructions/install-amneziawg-kernel-module-linux/)
+and install the matching `amneziawg-tools` package. Ensure your installed
+backend supports the generation (1.x, 2.x, or 3.1) used by your provider.
+
+Import rejects unsafe `PreUp`/`PostUp`/`PreDown`/`PostDown` hooks, as for
+ordinary WireGuard. Namespace DNS overrides profile `DNS`; IPv6 is disabled
+by default. Per-app watchdog and backup/restore work for the AWG backend.
 
 ## Full backup and clean-machine restore (v1.3.41)
 

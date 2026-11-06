@@ -270,10 +270,12 @@ vpn_route_iface() {
                   awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
             [[ "$dev" =~ ^(tun|tap) ]] || return 1
             ;;
-        wireguard)
+        wireguard|amneziawg)
+            local wgcmd=wg
+            [[ "$type" != amneziawg ]] || wgcmd=awg
             expected=$(wireguard_iface_name "$app")
             ip -n "$ns" link show dev "$expected" up >/dev/null 2>&1 || return 1
-            ip netns exec "$ns" wg show "$expected" >/dev/null 2>&1 || return 1
+            ip netns exec "$ns" "$wgcmd" show "$expected" >/dev/null 2>&1 || return 1
             dev=$expected
             ;;
         inherit)

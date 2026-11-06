@@ -414,7 +414,7 @@ main() {
             ;;
         add)
             (( $# >= 3 )) ||
-                die "Usage: nns-app add <app_name> <profile.ovpn|wireguard.conf>|any [country] [--refresh] [--via <upstream-app>|host]"
+                die "Usage: nns-app add <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf>|any [country] [--refresh] [--via <upstream-app>|host]"
             if [[ "$3" == any ]]; then
                 local add_app=$2 add_country="" add_refresh="off" add_via="__default__"
                 shift 3

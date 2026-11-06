@@ -1,5 +1,5 @@
-nns-app release: 1.3.41
-Changes: full-state backup and self-contained clean-machine restore; managed app/gateway configuration, all OpenVPN PKI and issued/revoked client records, fixed-IP assignments, provider profiles, cached and remote state, referenced external SSH identities, host nns-app overrides, service enabled/active state, checksum/archive validation, isolated restore and no-start support.
-Installer SHA256: 4d36f6bddf346c95d82203365288ba96cc1f6f2f69f8a030a0d8e0c0c3d50095
-Tests: static, function, unified inventory, server reinstall/rollback, fixed client IP, and full-state backup/restore unit tests PASS when run independently.
-Live clean-machine systemd/OpenVPN restore and peer connectivity: NOT TESTED.
+nns-app release: 1.3.42
+Feature: AmneziaWG client profile import and runtime
+Tests verified individually: static, functions, inventory, server reinstall, backup/restore, fixed-IP, AmneziaWG
+Note: sequential full-suite execution occasionally stalls in legacy fixed-IP/backup tests in this sandbox.
+No kernel/interface connectivity test: requires Linux with operational AmneziaWG tools and compatible kernel/userspace backend.

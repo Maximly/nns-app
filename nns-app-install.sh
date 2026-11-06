@@ -39,7 +39,7 @@
 #                  [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]
 #   fixed-ip <server_name> <client_name> [on|off]
 #   revoke  <app_name> <client_name>
-#   add     <app_name> <profile.ovpn|wireguard.conf>
+#   add     <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf>
 #   add     <app_name> any [country] [--refresh] [--via <upstream-app>|host]
 #   start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
 #   stop    <app_name> [--local-only]
@@ -61,7 +61,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.41"
+readonly VERSION="1.3.42"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -302,7 +302,7 @@ Usage:
                   [--output <file|->]
   nns-app fixed-ip <server_name> <client_name> [on|off]
   nns-app revoke <app_name> <client_name> [--modern|--embedded]
-  nns-app add     <app_name> <profile.ovpn|wireguard.conf>
+  nns-app add     <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf>
   nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
   nns-app start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
   nns-app stop    <app_name> [--local-only]
@@ -671,10 +671,12 @@ vpn_route_iface() {
                   awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
             [[ "$dev" =~ ^(tun|tap) ]] || return 1
             ;;
-        wireguard)
+        wireguard|amneziawg)
+            local wgcmd=wg
+            [[ "$type" != amneziawg ]] || wgcmd=awg
             expected=$(wireguard_iface_name "$app")
             ip -n "$ns" link show dev "$expected" up >/dev/null 2>&1 || return 1
-            ip netns exec "$ns" wg show "$expected" >/dev/null 2>&1 || return 1
+            ip netns exec "$ns" "$wgcmd" show "$expected" >/dev/null 2>&1 || return 1
             dev=$expected
             ;;
         inherit)
@@ -1447,7 +1449,15 @@ profile_type_from_file() {
 
     if grep -Eiq '^[[:space:]]*\[Interface\][[:space:]]*(#.*)?$' "$file" &&
        grep -Eiq '^[[:space:]]*\[Peer\][[:space:]]*(#.*)?$' "$file"; then
-        printf 'wireguard\n'
+        # AWG configs share the standard WireGuard INI shape. Detect their
+        # obfuscation directives before falling back to the standard backend.
+        # No generic `wg-quick` tool may process these fields.
+        if grep -Eiq '^[[:space:]]*(Jc|Jmin|Jmax|S[1-4]|H[1-4]|I[1-5]|HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts|RandomTrailers|DisableCookies)[[:space:]]*=' "$file" ||
+           [[ "$file" == *.awg || "$file" == *.awg.conf ]]; then
+            printf 'amneziawg\n'
+        else
+            printf 'wireguard\n'
+        fi
     elif grep -Eiq '^[[:space:]]*remote[[:space:]]+' "$file"; then
         printf 'openvpn\n'
     else
@@ -1459,7 +1469,7 @@ vpn_type_for_app() {
     local app=$1 configured profile file detected
     configured=$(cfg_read_value "$app" VPN_TYPE 2>/dev/null || true)
     case "$configured" in
-        openvpn|wireguard|inherit)
+        openvpn|wireguard|amneziawg|inherit)
             printf '%s
 ' "$configured"
             return 0
@@ -1482,6 +1492,8 @@ vpn_type_label() {
         openvpn) printf 'OpenVPN
 ' ;;
         wireguard) printf 'WireGuard
+' ;;
+        amneziawg) printf 'AmneziaWG
 ' ;;
         inherit) printf 'Inherit
 ' ;;
@@ -1511,20 +1523,24 @@ profile_name_from_path() {
     [[ -n "$name" ]] || name="profile"
     case "$type" in
         openvpn) suffix=ovpn ;;
-        wireguard) suffix=conf ;;
+        wireguard|amneziawg) suffix=conf ;;
         *) die "Unsupported VPN profile type '$type'." ;;
     esac
     printf '%.64s.%s\n' "$name" "$suffix"
 }
 
 validate_wireguard() {
-    local file=$1
+    local file=$1 protocol=${2:-wireguard}
+    case "$protocol" in
+        wireguard|amneziawg) ;;
+        *) die "Unsupported WireGuard-family backend '$protocol'." ;;
+    esac
     [[ -f "$file" ]] || die "Profile not found: $file"
     [[ -s "$file" ]] || die "Profile is empty: $file"
     (( $(stat -c '%s' "$file") <= 1048576 )) ||
         die "WireGuard profile is unexpectedly large (>1 MiB)."
 
-    if ! python3 - "$file" <<'PY_WG_VALIDATE'
+    if ! python3 - "$file" "$protocol" <<'PY_WG_VALIDATE'
 import base64
 import binascii
 import ipaddress
@@ -1533,11 +1549,22 @@ import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
+protocol = sys.argv[2]
+amnezia = protocol == "amneziawg"
 text = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n").decode("utf-8")
 
 allowed_interface = {
     "privatekey", "address", "dns", "mtu", "table", "listenport", "fwmark"
 }
+awg_options = {
+    "jc", "jmin", "jmax", "s1", "s2", "s3", "s4",
+    "h1", "h2", "h3", "h4", "i1", "i2", "i3", "i4", "i5",
+    "headerprotectionkey", "contentpaddingaddition", "rekeyaftertime",
+    "rekeytimeout", "rejectaftertime", "keepalivetimeout",
+    "maxhandshakeattempts", "randomtrailers", "disablecookies",
+}
+if amnezia:
+    allowed_interface.update(awg_options)
 allowed_peer = {
     "publickey", "presharedkey", "allowedips", "endpoint", "persistentkeepalive"
 }
@@ -1552,6 +1579,7 @@ allowed_networks = []
 endpoint_count = 0
 peer_public = False
 peer_allowed = False
+awg_values = {}
 
 
 def fail(line_no, message):
@@ -1565,6 +1593,54 @@ def validate_key(value, line_no, field):
         fail(line_no, f"{field} is not valid base64")
     if len(decoded) != 32:
         fail(line_no, f"{field} must decode to exactly 32 bytes")
+
+
+
+
+def validate_awg_value(key, value, line_no):
+    # Reject shell metacharacters, malformed intervals, and protocol options
+    # that awg-quick cannot interpret. Values are only ever copied as data.
+    def number(low=0, high=2147483647):
+        if not re.fullmatch(r"[0-9]+", value) or not low <= int(value) <= high:
+            fail(line_no, f"{key} must be an integer in {low}..{high}")
+
+    def interval(low=0, high=2147483647):
+        if not re.fullmatch(r"[0-9]+(?:-[0-9]+)?", value):
+            fail(line_no, f"{key} requires a number or numeric range")
+        parts = [int(x) for x in value.split("-")]
+        a, b = parts[0], parts[-1]
+        if a < low or b > high or a > b:
+            fail(line_no, f"{key} has an invalid range")
+        return (a, b)
+
+    if key == "jc":
+        number(0, 128)
+    elif key in {"jmin", "jmax"}:
+        number(0, 1280)
+    elif key in {"s1", "s2", "s3", "s4"}:
+        number(0, 65535)
+    elif key in {"h1", "h2", "h3", "h4"}:
+        interval(1, 2147483647)
+    elif key in {"i1", "i2", "i3", "i4", "i5"}:
+        # Signature-chain segments: no arbitrary text, commands or hooks.
+        if len(value) > 4096 or not re.fullmatch(
+            r"(?:\s*<(?:r [0-9]{1,5}|rc [0-9]{1,5}|rd [0-9]{1,5}|"
+            r"b 0x(?:[0-9A-Fa-f]{2})+|t|c)>)+\s*", value
+        ):
+            fail(line_no, f"{key} is not a valid AmneziaWG signature tag chain")
+    elif key == "headerprotectionkey":
+        validate_key(value, line_no, "HeaderProtectionKey")
+    elif key in {"contentpaddingaddition", "rekeyaftertime", "rekeytimeout",
+                 "rejectaftertime", "keepalivetimeout", "maxhandshakeattempts"}:
+        interval(0, 2147483647)
+    elif key in {"randomtrailers", "disablecookies"}:
+        if value.lower() not in {"on", "off", "yes", "no", "true", "false", "0", "1"}:
+            fail(line_no, f"{key} must be on or off")
+    else:
+        fail(line_no, f"unknown AmneziaWG field '{key}'")
+    if key in awg_values:
+        fail(line_no, f"duplicate AmneziaWG option {key}")
+    awg_values[key] = value
 
 
 def finish_peer(line_no):
@@ -1620,7 +1696,9 @@ for line_no, raw in enumerate(lines, 1):
         fail(line_no, f"unsupported {section} option '{key_raw.strip()}'")
 
     if section == "interface":
-        if key == "privatekey":
+        if key in awg_options:
+            validate_awg_value(key, value, line_no)
+        elif key == "privatekey":
             validate_key(value, line_no, "PrivateKey")
             private_keys.append(value)
         elif key == "address":
@@ -1679,6 +1757,25 @@ for line_no, raw in enumerate(lines, 1):
 
 finish_peer(len(lines) + 1)
 
+if amnezia:
+    if "jmin" in awg_values and "jmax" in awg_values:
+        if int(awg_values["jmin"]) > int(awg_values["jmax"]):
+            raise SystemExit("AmneziaWG Jmin exceeds Jmax")
+    headers = []
+    for key in ("h1", "h2", "h3", "h4"):
+        if key in awg_values:
+            parts = [int(x) for x in awg_values[key].split("-")]
+            headers.append((parts[0], parts[-1], key))
+    for i, (lo, hi, key) in enumerate(headers):
+        for olo, ohi, other in headers[:i]:
+            if lo <= ohi and olo <= hi:
+                raise SystemExit(f"AmneziaWG {key} overlaps {other}")
+    if "rekeyaftertime" in awg_values and "rejectaftertime" in awg_values:
+        a = [int(x) for x in awg_values["rekeyaftertime"].split("-")]
+        b = [int(x) for x in awg_values["rejectaftertime"].split("-")]
+        if a[-1] >= b[0]:
+            raise SystemExit("AmneziaWG RekeyAfterTime must be below RejectAfterTime")
+
 if interface_count != 1:
     raise SystemExit("profile must contain exactly one [Interface]")
 if len(private_keys) != 1:
@@ -1704,6 +1801,10 @@ PY_WG_VALIDATE
     then
         die "WireGuard profile validation failed."
     fi
+}
+
+validate_amneziawg() {
+    validate_wireguard "$1" amneziawg
 }
 
 prepare_wireguard_runtime_config() {
@@ -1983,11 +2084,12 @@ add_profile() {
     local type
     type=$(profile_type_from_file "$src" 2>/dev/null || true)
     [[ -n "$type" ]] ||
-        die "Cannot identify '$src' as an OpenVPN or WireGuard profile."
+        die "Cannot identify '$src' as an OpenVPN, WireGuard or AmneziaWG profile."
 
     case "$type" in
         openvpn) validate_ovpn "$src" ;;
         wireguard) validate_wireguard "$src" ;;
+        amneziawg) validate_amneziawg "$src" ;;
         *) die "Unsupported VPN profile type '$type'." ;;
     esac
 
@@ -2012,6 +2114,9 @@ add_profile() {
         wireguard)
             validate_wireguard "$tmp"
             ;;
+        amneziawg)
+            validate_amneziawg "$tmp"
+            ;;
     esac
 
     install -o root -g root -m 0600 "$tmp" "$dest"
@@ -2034,7 +2139,7 @@ add_profile() {
             log "OpenVPN profile fixups are disabled in $(cfg_file "$app")."
         fi
     elif grep -Eiq '^[[:space:]]*DNS[[:space:]]*=' "$dest"; then
-        log "WireGuard DNS setting will be ignored at runtime; namespace DNS_SERVERS remains authoritative."
+        log "VPN profile DNS setting is ignored at runtime; namespace DNS_SERVERS remains authoritative."
     fi
 
     log "Default profile is now '$name' ($(vpn_type_label "$type"))."
@@ -2754,7 +2859,7 @@ profile_endpoints() {
                 }
             ' "$profile"
             ;;
-        wireguard)
+        wireguard|amneziawg)
             python3 - "$profile" <<'PY_WG_ENDPOINTS'
 import re
 import sys
@@ -3070,7 +3175,7 @@ netns_up() {
     vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
     [[ -n "$vpn_type" ]] || die "Cannot determine VPN backend for '$app'. Re-add its profile or configure inherit."
     case "$vpn_type" in
-        wireguard) tunnel_iface=$(wireguard_iface_name "$app") ;;
+        wireguard|amneziawg) tunnel_iface=$(wireguard_iface_name "$app") ;;
         inherit)
             [[ "$via_app" != host ]] || die "Inherit backend '$app' requires an upstream NNS app."
             tunnel_iface=$VETH_NS
@@ -3306,30 +3411,43 @@ openvpn_exec() {
 }
 
 wireguard_exec() {
-    local app=$1 profile=$2 runtime_config iface wg_quick
+    local app=$1 profile=$2 protocol=${3:-wireguard} runtime_config iface wg_quick wg_cmd cleanup_cmd
     load_cfg "$app"
 
     iface=$(wireguard_iface_name "$app")
     runtime_config=$(wireguard_runtime_config_path "$app")
-    wg_quick=$(command -v wg-quick)
-    [[ -x "$wg_quick" ]] || die "wg-quick is not installed."
+    case "$protocol" in
+        wireguard) wg_cmd=wg; wg_quick=$(command -v wg-quick || true) ;;
+        amneziawg) wg_cmd=awg; wg_quick=$(command -v awg-quick || true) ;;
+        *) die "Unknown WireGuard-family backend '$protocol'." ;;
+    esac
+    [[ -n "$wg_quick" && -x "$wg_quick" ]] ||
+        die "$protocol requires ${wg_cmd} and ${wg_cmd}-quick. Install AmneziaWG tools (and its kernel module or userspace backend) before starting this app."
+    command -v "$wg_cmd" >/dev/null 2>&1 ||
+        die "$protocol requires '$wg_cmd'; install the matching tools before starting this app."
 
     prepare_wireguard_runtime_config \
         "$profile" "$runtime_config" "${DISABLE_IPV6:-on}"
 
     wireguard_cleanup() {
-        if ip netns list 2>/dev/null | awk '{print $1}' | grep -Fxq "$NS_NAME"; then
-            ip netns exec "$NS_NAME" "$wg_quick" down "$runtime_config" \
-                >/dev/null 2>&1 || ip -n "$NS_NAME" link del "$iface" 2>/dev/null || true
+        local ns=$1 quick=$2 runtime=$3 device=$4
+        if ip netns list 2>/dev/null | awk '{print $1}' | grep -Fxq "$ns"; then
+            ip netns exec "$ns" "$quick" down "$runtime" \
+                >/dev/null 2>&1 || ip -n "$ns" link del "$device" 2>/dev/null || true
         fi
-        rm -f "$runtime_config"
+        rm -f "$runtime"
     }
 
+    # EXIT executes after this function's locals go out of scope. Capture
+    # escaped arguments now, otherwise teardown fails with 'unbound variable'
+    # under set -u (affecting existing WireGuard as well as AmneziaWG).
+    printf -v cleanup_cmd 'wireguard_cleanup %q %q %q %q' \
+        "$NS_NAME" "$wg_quick" "$runtime_config" "$iface"
     trap 'exit 0' TERM INT HUP
-    trap wireguard_cleanup EXIT
+    trap "$cleanup_cmd" EXIT
 
     ip netns exec "$NS_NAME" "$wg_quick" up "$runtime_config"
-    log "WireGuard interface '$iface' is active in '$NS_NAME'."
+    log "$(vpn_type_label "$protocol") interface '$iface' is active in '$NS_NAME'."
 
     # Keep the service process alive after wg-quick configures the interface.
     # This lets the backend-neutral compatibility unit own WireGuard teardown
@@ -3374,7 +3492,7 @@ vpn_exec() {
                 *) die "Unsupported local transport '${TRANSPORT_TYPE}'." ;;
             esac
             ;;
-        wireguard) wireguard_exec "$app" "$profile" ;;
+        wireguard|amneziawg) wireguard_exec "$app" "$profile" "$type" ;;
         inherit)
             trap 'exit 0' TERM INT HUP
             while :; do sleep 3600 & wait $! || true; done
@@ -3430,11 +3548,11 @@ watchdog_enabled_for_type() {
     case "${mode,,}" in
         off|no|false|0|disabled) return 1 ;;
         auto|on|yes|true|1|enabled)
-            [[ "$type" == openvpn || "$type" == wireguard ]]
+            [[ "$type" == openvpn || "$type" == wireguard || "$type" == amneziawg ]]
             ;;
         *)
             warn "Invalid WATCHDOG_MODE='$mode'; treating it as auto."
-            [[ "$type" == openvpn || "$type" == wireguard ]]
+            [[ "$type" == openvpn || "$type" == wireguard || "$type" == amneziawg ]]
             ;;
     esac
 }
@@ -3678,7 +3796,7 @@ start_app() {
     if [[ "$vpn_type" == inherit ]]; then
         profile_marker="inherit:${UPSTREAM_APP:-host}"
     else
-        [[ -n "$DEFAULT_PROFILE" ]] || die "No profile configured. Use: nns-app add $app profile.ovpn|wireguard.conf"
+        [[ -n "$DEFAULT_PROFILE" ]] || die "No profile configured. Use: nns-app add $app profile.ovpn|wireguard.conf|amneziawg.conf"
         [[ -f "$(profiles_dir "$app")/$DEFAULT_PROFILE" ]] ||
             die "Configured profile '$DEFAULT_PROFILE' is missing."
         profile_marker=$DEFAULT_PROFILE
@@ -8692,10 +8810,11 @@ remote_auto_deploy_internal() {
     cat >"$temp"
     [[ -s "$temp" ]] || die "The uploaded VPN profile is empty."
     uploaded_type=$(profile_type_from_file "$temp" 2>/dev/null || true)
-    [[ -n "$uploaded_type" ]] || die "The uploaded file is not an OpenVPN or WireGuard profile."
+    [[ -n "$uploaded_type" ]] || die "The uploaded file is not an OpenVPN, WireGuard or AmneziaWG profile."
     case "$uploaded_type" in
         openvpn) validate_ovpn "$temp" ;;
         wireguard) validate_wireguard "$temp" ;;
+        amneziawg) validate_amneziawg "$temp" ;;
     esac
     profile_sha256=$(sha256sum "$temp" | awk '{print $1}')
 
@@ -10182,6 +10301,7 @@ remote_auto_add_profile() {
     case "$type" in
         openvpn) validate_ovpn "$src" ;;
         wireguard) validate_wireguard "$src" ;;
+        amneziawg) validate_amneziawg "$src" ;;
     esac
     alias=$REMOTE_ALIAS
     owner=$REMOTE_OWNER_ID
@@ -10754,8 +10874,8 @@ myip_app_route_path() {
                 printf "app:%s -> %s -> OpenVPN -> Internet\n" "$app" "${route_iface:-tunnel}"
             fi
             ;;
-        wireguard)
-            printf "app:%s -> %s -> WireGuard -> Internet\n" "$app" "${route_iface:-tunnel}"
+        wireguard|amneziawg)
+            printf "app:%s -> %s -> %s -> Internet\n" "$app" "${route_iface:-tunnel}" "$(vpn_type_label "$type")"
             ;;
         inherit)
             printf "app:%s -> %s -> inherited route -> Internet\n" "$app" "${route_iface:-veth}"
@@ -11158,7 +11278,7 @@ status_app() {
         health="STARTING"
         case "$type" in
             openvpn) diagnosis=$(openvpn_status_diagnosis "$vpn_log") ;;
-            wireguard) diagnosis="WireGuard is running, but its interface or full-tunnel route is not ready." ;;
+            wireguard|amneziawg) diagnosis="$(vpn_type_label "$type") is running, but its interface or full-tunnel route is not ready." ;;
             inherit) diagnosis="The inherited upstream data path is not ready." ;;
             *) diagnosis="The network backend is active, but no usable route exists." ;;
         esac
@@ -11173,7 +11293,7 @@ status_app() {
         health="OFFLINE"
         case "$type" in
             openvpn) diagnosis=$(openvpn_status_diagnosis "$vpn_log") ;;
-            wireguard) diagnosis="The WireGuard interface exists, but the Internet data-path probe failed." ;;
+            wireguard|amneziawg) diagnosis="The $(vpn_type_label "$type") interface exists, but the Internet data-path probe failed." ;;
             inherit) diagnosis="The upstream route exists, but the inherited Internet data-path probe failed." ;;
             *) diagnosis="The tunnel exists, but the Internet data-path probe failed." ;;
         esac
@@ -11277,22 +11397,23 @@ status_app() {
         else
             printf 'OpenVPN handshake: not established\n'
         fi
-    elif [[ "$type" == wireguard && -n "$route_iface" ]]; then
-        local latest now age peer_count wg_endpoint rx_bytes tx_bytes
-        latest=$(ip netns exec "$NS_NAME" wg show "$route_iface" latest-handshakes 2>/dev/null |
+    elif [[ ( "$type" == wireguard || "$type" == amneziawg ) && -n "$route_iface" ]]; then
+        local latest now age peer_count wg_endpoint rx_bytes tx_bytes wg_cmd=wg
+        [[ "$type" != amneziawg ]] || wg_cmd=awg
+        latest=$(ip netns exec "$NS_NAME" "$wg_cmd" show "$route_iface" latest-handshakes 2>/dev/null |
             awk '$2 > latest { latest=$2 } END { print latest+0 }')
-        peer_count=$(ip netns exec "$NS_NAME" wg show "$route_iface" peers 2>/dev/null |
+        peer_count=$(ip netns exec "$NS_NAME" "$wg_cmd" show "$route_iface" peers 2>/dev/null |
             awk 'NF { count++ } END { print count+0 }')
-        wg_endpoint=$(ip netns exec "$NS_NAME" wg show "$route_iface" endpoints 2>/dev/null |
+        wg_endpoint=$(ip netns exec "$NS_NAME" "$wg_cmd" show "$route_iface" endpoints 2>/dev/null |
             awk '{$1=""; sub(/^ /, ""); if ($0 != "(none)") print}' |
             paste -sd ', ' -)
         IFS=' ' read -r rx_bytes tx_bytes < <(
-            ip netns exec "$NS_NAME" wg show "$route_iface" transfer 2>/dev/null |
+            ip netns exec "$NS_NAME" "$wg_cmd" show "$route_iface" transfer 2>/dev/null |
             awk '{rx+=$2; tx+=$3} END {print rx+0, tx+0}'
         )
 
-        printf 'WireGuard peers:   %s\n' "${peer_count:-0}"
-        printf 'WireGuard endpoint:%s%s\n' "${wg_endpoint:+ }" "${wg_endpoint:- unavailable}"
+        printf '%s peers:   %s\n' "$(vpn_type_label "$type")" "${peer_count:-0}"
+        printf '%s endpoint:%s%s\n' "$(vpn_type_label "$type")" "${wg_endpoint:+ }" "${wg_endpoint:- unavailable}"
         if [[ "${latest:-0}" -gt 0 ]]; then
             now=$(date +%s)
             age=$((now - latest))
@@ -11319,7 +11440,7 @@ status_app() {
             'error|warning|failed|invalid|no such|stale|endpoint|upstream|ready|iptables|nft|route' 14
         print_status_log_cut \
             "Important VPN log cuts:" "$vpn_log" \
-            'error|warning|failed|fatal|AUTH_FAILED|VERIFY ERROR|TLS:|TLS Error|TCP connection|Attempting to establish|Peer Connection|Initialization Sequence|WireGuard|wg-quick|RTNETLINK|handshake|endpoint|timed out|refused|unreachable' 18
+            'error|warning|failed|fatal|AUTH_FAILED|VERIFY ERROR|TLS:|TLS Error|TCP connection|Attempting to establish|Peer Connection|Initialization Sequence|WireGuard|AmneziaWG|wg-quick|awg-quick|RTNETLINK|handshake|endpoint|timed out|refused|unreachable' 18
     fi
 
     rm -rf "$tmpdir"
@@ -11572,6 +11693,7 @@ list_local_instance_records() {
         case "$vpn_type" in
             openvpn) app_type=vpn-client/ovpn ;;
             wireguard) app_type=vpn-client/wg ;;
+            amneziawg) app_type=vpn-client/awg ;;
             inherit) app_type=vpn-client/inherit ;;
             *) app_type=vpn-client ;;
         esac
@@ -13438,7 +13560,7 @@ main() {
             ;;
         add)
             (( $# >= 3 )) ||
-                die "Usage: nns-app add <app_name> <profile.ovpn|wireguard.conf>|any [country] [--refresh] [--via <upstream-app>|host]"
+                die "Usage: nns-app add <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf>|any [country] [--refresh] [--via <upstream-app>|host]"
             if [[ "$3" == any ]]; then
                 local add_app=$2 add_country="" add_refresh="off" add_via="__default__"
                 shift 3

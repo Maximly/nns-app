@@ -10,6 +10,7 @@ test: build
 	./tests/test-server-reinstall.sh
 	./tests/test-fixed-ip.sh
 	./tests/test-backup.sh
+	./tests/test-amneziawg.sh
 
 clean:
 	rm -f nns-app-install.sh

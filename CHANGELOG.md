@@ -1,3 +1,12 @@
+## 1.3.42 — AmneziaWG client profiles
+
+- Detect AmneziaWG profiles by obfuscation keys and keep them distinct from WireGuard.
+- Validate AWG 1.x/2.x and 3.1 settings without permitting profile-supplied hooks.
+- Use `awg-quick`/`awg` for the dedicated namespace backend, readiness and status.
+- Include AWG in watchdog, app inventory and remote auto-profile deployment.
+- Preserve original AWG keys when preparing managed runtime configs.
+- Require separate installation of the matching AmneziaWG tools/backend.
+
 ## 1.3.41 — Full-state backup and clean-machine restore
 
 - `backup --output /absolute/path/file.tar.gz` captures all managed applications, servers, clients and private keys, remote identities, configurations, and systemd active/enabled states.

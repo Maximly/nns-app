@@ -532,8 +532,8 @@ myip_app_route_path() {
                 printf "app:%s -> %s -> OpenVPN -> Internet\n" "$app" "${route_iface:-tunnel}"
             fi
             ;;
-        wireguard)
-            printf "app:%s -> %s -> WireGuard -> Internet\n" "$app" "${route_iface:-tunnel}"
+        wireguard|amneziawg)
+            printf "app:%s -> %s -> %s -> Internet\n" "$app" "${route_iface:-tunnel}" "$(vpn_type_label "$type")"
             ;;
         inherit)
             printf "app:%s -> %s -> inherited route -> Internet\n" "$app" "${route_iface:-veth}"
@@ -936,7 +936,7 @@ status_app() {
         health="STARTING"
         case "$type" in
             openvpn) diagnosis=$(openvpn_status_diagnosis "$vpn_log") ;;
-            wireguard) diagnosis="WireGuard is running, but its interface or full-tunnel route is not ready." ;;
+            wireguard|amneziawg) diagnosis="$(vpn_type_label "$type") is running, but its interface or full-tunnel route is not ready." ;;
             inherit) diagnosis="The inherited upstream data path is not ready." ;;
             *) diagnosis="The network backend is active, but no usable route exists." ;;
         esac
@@ -951,7 +951,7 @@ status_app() {
         health="OFFLINE"
         case "$type" in
             openvpn) diagnosis=$(openvpn_status_diagnosis "$vpn_log") ;;
-            wireguard) diagnosis="The WireGuard interface exists, but the Internet data-path probe failed." ;;
+            wireguard|amneziawg) diagnosis="The $(vpn_type_label "$type") interface exists, but the Internet data-path probe failed." ;;
             inherit) diagnosis="The upstream route exists, but the inherited Internet data-path probe failed." ;;
             *) diagnosis="The tunnel exists, but the Internet data-path probe failed." ;;
         esac
@@ -1055,22 +1055,23 @@ status_app() {
         else
             printf 'OpenVPN handshake: not established\n'
         fi
-    elif [[ "$type" == wireguard && -n "$route_iface" ]]; then
-        local latest now age peer_count wg_endpoint rx_bytes tx_bytes
-        latest=$(ip netns exec "$NS_NAME" wg show "$route_iface" latest-handshakes 2>/dev/null |
+    elif [[ ( "$type" == wireguard || "$type" == amneziawg ) && -n "$route_iface" ]]; then
+        local latest now age peer_count wg_endpoint rx_bytes tx_bytes wg_cmd=wg
+        [[ "$type" != amneziawg ]] || wg_cmd=awg
+        latest=$(ip netns exec "$NS_NAME" "$wg_cmd" show "$route_iface" latest-handshakes 2>/dev/null |
             awk '$2 > latest { latest=$2 } END { print latest+0 }')
-        peer_count=$(ip netns exec "$NS_NAME" wg show "$route_iface" peers 2>/dev/null |
+        peer_count=$(ip netns exec "$NS_NAME" "$wg_cmd" show "$route_iface" peers 2>/dev/null |
             awk 'NF { count++ } END { print count+0 }')
-        wg_endpoint=$(ip netns exec "$NS_NAME" wg show "$route_iface" endpoints 2>/dev/null |
+        wg_endpoint=$(ip netns exec "$NS_NAME" "$wg_cmd" show "$route_iface" endpoints 2>/dev/null |
             awk '{$1=""; sub(/^ /, ""); if ($0 != "(none)") print}' |
             paste -sd ', ' -)
         IFS=' ' read -r rx_bytes tx_bytes < <(
-            ip netns exec "$NS_NAME" wg show "$route_iface" transfer 2>/dev/null |
+            ip netns exec "$NS_NAME" "$wg_cmd" show "$route_iface" transfer 2>/dev/null |
             awk '{rx+=$2; tx+=$3} END {print rx+0, tx+0}'
         )
 
-        printf 'WireGuard peers:   %s\n' "${peer_count:-0}"
-        printf 'WireGuard endpoint:%s%s\n' "${wg_endpoint:+ }" "${wg_endpoint:- unavailable}"
+        printf '%s peers:   %s\n' "$(vpn_type_label "$type")" "${peer_count:-0}"
+        printf '%s endpoint:%s%s\n' "$(vpn_type_label "$type")" "${wg_endpoint:+ }" "${wg_endpoint:- unavailable}"
         if [[ "${latest:-0}" -gt 0 ]]; then
             now=$(date +%s)
             age=$((now - latest))
@@ -1097,7 +1098,7 @@ status_app() {
             'error|warning|failed|invalid|no such|stale|endpoint|upstream|ready|iptables|nft|route' 14
         print_status_log_cut \
             "Important VPN log cuts:" "$vpn_log" \
-            'error|warning|failed|fatal|AUTH_FAILED|VERIFY ERROR|TLS:|TLS Error|TCP connection|Attempting to establish|Peer Connection|Initialization Sequence|WireGuard|wg-quick|RTNETLINK|handshake|endpoint|timed out|refused|unreachable' 18
+            'error|warning|failed|fatal|AUTH_FAILED|VERIFY ERROR|TLS:|TLS Error|TCP connection|Attempting to establish|Peer Connection|Initialization Sequence|WireGuard|AmneziaWG|wg-quick|awg-quick|RTNETLINK|handshake|endpoint|timed out|refused|unreachable' 18
     fi
 
     rm -rf "$tmpdir"
@@ -1350,6 +1351,7 @@ list_local_instance_records() {
         case "$vpn_type" in
             openvpn) app_type=vpn-client/ovpn ;;
             wireguard) app_type=vpn-client/wg ;;
+            amneziawg) app_type=vpn-client/awg ;;
             inherit) app_type=vpn-client/inherit ;;
             *) app_type=vpn-client ;;
         esac

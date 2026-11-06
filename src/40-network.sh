@@ -28,7 +28,7 @@ profile_endpoints() {
                 }
             ' "$profile"
             ;;
-        wireguard)
+        wireguard|amneziawg)
             python3 - "$profile" <<'PY_WG_ENDPOINTS'
 import re
 import sys
@@ -344,7 +344,7 @@ netns_up() {
     vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
     [[ -n "$vpn_type" ]] || die "Cannot determine VPN backend for '$app'. Re-add its profile or configure inherit."
     case "$vpn_type" in
-        wireguard) tunnel_iface=$(wireguard_iface_name "$app") ;;
+        wireguard|amneziawg) tunnel_iface=$(wireguard_iface_name "$app") ;;
         inherit)
             [[ "$via_app" != host ]] || die "Inherit backend '$app' requires an upstream NNS app."
             tunnel_iface=$VETH_NS

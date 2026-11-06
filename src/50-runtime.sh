@@ -24,30 +24,43 @@ openvpn_exec() {
 }
 
 wireguard_exec() {
-    local app=$1 profile=$2 runtime_config iface wg_quick
+    local app=$1 profile=$2 protocol=${3:-wireguard} runtime_config iface wg_quick wg_cmd cleanup_cmd
     load_cfg "$app"
 
     iface=$(wireguard_iface_name "$app")
     runtime_config=$(wireguard_runtime_config_path "$app")
-    wg_quick=$(command -v wg-quick)
-    [[ -x "$wg_quick" ]] || die "wg-quick is not installed."
+    case "$protocol" in
+        wireguard) wg_cmd=wg; wg_quick=$(command -v wg-quick || true) ;;
+        amneziawg) wg_cmd=awg; wg_quick=$(command -v awg-quick || true) ;;
+        *) die "Unknown WireGuard-family backend '$protocol'." ;;
+    esac
+    [[ -n "$wg_quick" && -x "$wg_quick" ]] ||
+        die "$protocol requires ${wg_cmd} and ${wg_cmd}-quick. Install AmneziaWG tools (and its kernel module or userspace backend) before starting this app."
+    command -v "$wg_cmd" >/dev/null 2>&1 ||
+        die "$protocol requires '$wg_cmd'; install the matching tools before starting this app."
 
     prepare_wireguard_runtime_config \
         "$profile" "$runtime_config" "${DISABLE_IPV6:-on}"
 
     wireguard_cleanup() {
-        if ip netns list 2>/dev/null | awk '{print $1}' | grep -Fxq "$NS_NAME"; then
-            ip netns exec "$NS_NAME" "$wg_quick" down "$runtime_config" \
-                >/dev/null 2>&1 || ip -n "$NS_NAME" link del "$iface" 2>/dev/null || true
+        local ns=$1 quick=$2 runtime=$3 device=$4
+        if ip netns list 2>/dev/null | awk '{print $1}' | grep -Fxq "$ns"; then
+            ip netns exec "$ns" "$quick" down "$runtime" \
+                >/dev/null 2>&1 || ip -n "$ns" link del "$device" 2>/dev/null || true
         fi
-        rm -f "$runtime_config"
+        rm -f "$runtime"
     }
 
+    # EXIT executes after this function's locals go out of scope. Capture
+    # escaped arguments now, otherwise teardown fails with 'unbound variable'
+    # under set -u (affecting existing WireGuard as well as AmneziaWG).
+    printf -v cleanup_cmd 'wireguard_cleanup %q %q %q %q' \
+        "$NS_NAME" "$wg_quick" "$runtime_config" "$iface"
     trap 'exit 0' TERM INT HUP
-    trap wireguard_cleanup EXIT
+    trap "$cleanup_cmd" EXIT
 
     ip netns exec "$NS_NAME" "$wg_quick" up "$runtime_config"
-    log "WireGuard interface '$iface' is active in '$NS_NAME'."
+    log "$(vpn_type_label "$protocol") interface '$iface' is active in '$NS_NAME'."
 
     # Keep the service process alive after wg-quick configures the interface.
     # This lets the backend-neutral compatibility unit own WireGuard teardown
@@ -92,7 +105,7 @@ vpn_exec() {
                 *) die "Unsupported local transport '${TRANSPORT_TYPE}'." ;;
             esac
             ;;
-        wireguard) wireguard_exec "$app" "$profile" ;;
+        wireguard|amneziawg) wireguard_exec "$app" "$profile" "$type" ;;
         inherit)
             trap 'exit 0' TERM INT HUP
             while :; do sleep 3600 & wait $! || true; done
@@ -148,11 +161,11 @@ watchdog_enabled_for_type() {
     case "${mode,,}" in
         off|no|false|0|disabled) return 1 ;;
         auto|on|yes|true|1|enabled)
-            [[ "$type" == openvpn || "$type" == wireguard ]]
+            [[ "$type" == openvpn || "$type" == wireguard || "$type" == amneziawg ]]
             ;;
         *)
             warn "Invalid WATCHDOG_MODE='$mode'; treating it as auto."
-            [[ "$type" == openvpn || "$type" == wireguard ]]
+            [[ "$type" == openvpn || "$type" == wireguard || "$type" == amneziawg ]]
             ;;
     esac
 }
@@ -396,7 +409,7 @@ start_app() {
     if [[ "$vpn_type" == inherit ]]; then
         profile_marker="inherit:${UPSTREAM_APP:-host}"
     else
-        [[ -n "$DEFAULT_PROFILE" ]] || die "No profile configured. Use: nns-app add $app profile.ovpn|wireguard.conf"
+        [[ -n "$DEFAULT_PROFILE" ]] || die "No profile configured. Use: nns-app add $app profile.ovpn|wireguard.conf|amneziawg.conf"
         [[ -f "$(profiles_dir "$app")/$DEFAULT_PROFILE" ]] ||
             die "Configured profile '$DEFAULT_PROFILE' is missing."
         profile_marker=$DEFAULT_PROFILE

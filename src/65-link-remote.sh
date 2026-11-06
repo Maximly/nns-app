@@ -1577,10 +1577,11 @@ remote_auto_deploy_internal() {
     cat >"$temp"
     [[ -s "$temp" ]] || die "The uploaded VPN profile is empty."
     uploaded_type=$(profile_type_from_file "$temp" 2>/dev/null || true)
-    [[ -n "$uploaded_type" ]] || die "The uploaded file is not an OpenVPN or WireGuard profile."
+    [[ -n "$uploaded_type" ]] || die "The uploaded file is not an OpenVPN, WireGuard or AmneziaWG profile."
     case "$uploaded_type" in
         openvpn) validate_ovpn "$temp" ;;
         wireguard) validate_wireguard "$temp" ;;
+        amneziawg) validate_amneziawg "$temp" ;;
     esac
     profile_sha256=$(sha256sum "$temp" | awk '{print $1}')
 
@@ -3067,6 +3068,7 @@ remote_auto_add_profile() {
     case "$type" in
         openvpn) validate_ovpn "$src" ;;
         wireguard) validate_wireguard "$src" ;;
+        amneziawg) validate_amneziawg "$src" ;;
     esac
     alias=$REMOTE_ALIAS
     owner=$REMOTE_OWNER_ID
