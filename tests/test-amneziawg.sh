@@ -118,6 +118,33 @@ reject_change invalid_rekey 'RekeyAfterTime = 100-120' 'RekeyAfterTime = 200-250
 reject_change invalid_cookie 'DisableCookies = on' 'DisableCookies = nonsense'
 reject_change injected_hook 'RandomTrailers = on' 'PostUp = touch /tmp/exploit'
 
+# AWG 2.0/3.1 H1-H4 use unsigned 32-bit values; values above 2^31-1
+# must pass validation, including the high H3/H4 ranges seen in the wild.
+sed -e 's/H3 = 104000-105000/H3 = 2894541602-2894587236/' \
+    -e 's/H4 = 106000-107000/H4 = 3771044036-3771056315/' \
+    "$TMP/a3.conf" >"$TMP/unsigned-high.conf"
+validate_amneziawg "$TMP/unsigned-high.conf" || fail 'valid uint32 AWG header ranges rejected'
+prepare_wireguard_runtime_config "$TMP/unsigned-high.conf" "$TMP/unsigned-runtime.conf" on
+grep -Fxq 'H3 = 2894541602-2894587236' "$TMP/unsigned-runtime.conf" || fail 'uint32 H3 changed at runtime'
+grep -Fxq 'H4 = 3771044036-3771056315' "$TMP/unsigned-runtime.conf" || fail 'uint32 H4 changed at runtime'
+
+sed 's/H4 = 3771044036-3771056315/H4 = 4294967295/' \
+    "$TMP/unsigned-high.conf" >"$TMP/unsigned-max.conf"
+validate_amneziawg "$TMP/unsigned-max.conf" || fail 'uint32 maximum not accepted'
+
+reject_unsigned() {
+    local variant=$1 before=$2 after=$3
+    sed "s#${before}#${after}#" "$TMP/unsigned-high.conf" >"$TMP/$variant.conf"
+    if (validate_amneziawg "$TMP/$variant.conf") >/dev/null 2>&1; then
+        fail "invalid unsigned AWG $variant was accepted"
+    fi
+}
+reject_unsigned overflow 'H3 = 2894541602-2894587236' 'H3 = 2894541602-4294967296'
+reject_unsigned reversed 'H3 = 2894541602-2894587236' 'H3 = 2894587236-2894541602'
+reject_unsigned overlap 'H3 = 2894541602-2894587236' 'H3 = 3771044036-3771050000'
+reject_unsigned zero 'H3 = 2894541602-2894587236' 'H3 = 0-5'
+reject_change timer_overflow 'RekeyTimeout = 4-7' 'RekeyTimeout = 4-65536'
+
 # Verify that status/readiness query AWG rather than standard WireGuard.
 (
     cfg_read_value() { printf 'netns-test\n'; }

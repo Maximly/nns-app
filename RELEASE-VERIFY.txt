@@ -1,4 +1,4 @@
-nns-app v1.3.43 — split-tunnel WireGuard/AmneziaWG support
+nns-app v1.3.44 — AmneziaWG uint32 header validation
 Build: embedded Python compilation and Bash syntax checks passed.
 Tests: static, functions, unified inventory, OpenVPN server reinstall,
 fixed client IP, AmneziaWG, and split-tunnel regression suites passed.
@@ -6,3 +6,5 @@ Backup: core backup/restore checks printed PASS; the backup test process
 subsequently hung during teardown (known intermittent suite issue).
 Live tunnel validation: not performed (no provider/credentials on test host).
 Security: imported profile AllowedIPs preserved; kill switch unchanged.
+
+AmneziaWG uint32 boundary regression: added to test-amneziawg.sh.

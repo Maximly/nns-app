@@ -1862,7 +1862,7 @@ manual_payload=$(remote_command_payload gateway client export \
     remote_auto_register() { fail 'current remote was unnecessarily registered'; }
     log() { printf 'log:%s\n' "$*"; }
     output=$(remote_auto_refresh_configured_app my-app)
-    grep -Fq 'already runs nns-app 1.3.43' <<<"$output" ||
+    grep -Fq 'already runs nns-app 1.3.44' <<<"$output" ||
         fail 'current remote refresh status missing'
 )
 

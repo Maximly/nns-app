@@ -1,3 +1,10 @@
+## 1.3.44 — AmneziaWG uint32 H1–H4 ranges
+
+- Accept unsigned 32-bit H1–H4 header values up to `4294967295`; fix false rejection of provider-generated high-bit header ranges.
+- Keep rejecting out-of-range values, reversed intervals and overlapping H1–H4 ranges.
+- Validate AmneziaWG 3.1 timer/padding intervals against the documented uint16 limit and retain values unchanged in runtime profiles.
+- Add regression coverage for full uint32 boundary, high H3/H4 values, overflow, overlap and reversal.
+
 ## 1.3.43 — IPv4 split-tunnel WireGuard / AmneziaWG
 
 - Accept partial IPv4 `AllowedIPs` rather than demanding an Internet-wide route.

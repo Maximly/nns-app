@@ -61,7 +61,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.43"
+readonly VERSION="1.3.44"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -1600,11 +1600,11 @@ def validate_key(value, line_no, field):
 def validate_awg_value(key, value, line_no):
     # Reject shell metacharacters, malformed intervals, and protocol options
     # that awg-quick cannot interpret. Values are only ever copied as data.
-    def number(low=0, high=2147483647):
+    def number(low=0, high=65535):
         if not re.fullmatch(r"[0-9]+", value) or not low <= int(value) <= high:
             fail(line_no, f"{key} must be an integer in {low}..{high}")
 
-    def interval(low=0, high=2147483647):
+    def interval(low=0, high=65535):
         if not re.fullmatch(r"[0-9]+(?:-[0-9]+)?", value):
             fail(line_no, f"{key} requires a number or numeric range")
         parts = [int(x) for x in value.split("-")]
@@ -1620,7 +1620,9 @@ def validate_awg_value(key, value, line_no):
     elif key in {"s1", "s2", "s3", "s4"}:
         number(0, 65535)
     elif key in {"h1", "h2", "h3", "h4"}:
-        interval(1, 2147483647)
+        # H1-H4 are uint32, not signed int32. Values >= 2**31 are valid.
+        # Reject overflow and reversed ranges before handing them to awg-quick.
+        interval(1, 4294967295)
     elif key in {"i1", "i2", "i3", "i4", "i5"}:
         # Signature-chain segments: no arbitrary text, commands or hooks.
         if len(value) > 4096 or not re.fullmatch(
@@ -1632,7 +1634,8 @@ def validate_awg_value(key, value, line_no):
         validate_key(value, line_no, "HeaderProtectionKey")
     elif key in {"contentpaddingaddition", "rekeyaftertime", "rekeytimeout",
                  "rejectaftertime", "keepalivetimeout", "maxhandshakeattempts"}:
-        interval(0, 2147483647)
+        # AWG 3.1 timing / padding ranges use uint16.
+        interval(0, 65535)
     elif key in {"randomtrailers", "disablecookies"}:
         if value.lower() not in {"on", "off", "yes", "no", "true", "false", "0", "1"}:
             fail(line_no, f"{key} must be on or off")

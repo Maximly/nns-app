@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.43
+**Release:** 1.3.44
 
 **Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
@@ -12,7 +12,16 @@ host's default route or DNS configuration.
 The release includes both the modular source tree and a pre-built,
 single-file installer: `nns-app-install.sh`.
 
-## Split-tunnel WireGuard and AmneziaWG profiles (v1.3.43)
+## AmneziaWG unsigned header ranges (v1.3.44)
+
+`H1`–`H4` accept the full AWG `uint32` range, up to `4294967295`,
+including values above `2147483647`. Invalid, reversed, or overlapping
+ranges are still rejected, and the original numbers are preserved in the
+runtime configuration. AWG 3.1 timer/padding ranges use the specified
+`uint16` limit. This fixes import of provider profiles with high H3/H4 values;
+it does not install the AmneziaWG kernel/userspace runtime.
+
+## Split-tunnel WireGuard and AmneziaWG profiles (v1.3.44)
 
 `nns-app add <app> <profile.conf>` now accepts private and selected-prefix
 `AllowedIPs` (for example `10.30.0.0/16`) for both WireGuard and AmneziaWG.
