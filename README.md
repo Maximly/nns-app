@@ -4,13 +4,35 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.42
+**Release:** 1.3.43
 
 **Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
 
 The release includes both the modular source tree and a pre-built,
 single-file installer: `nns-app-install.sh`.
+
+## Split-tunnel WireGuard and AmneziaWG profiles (v1.3.43)
+
+`nns-app add <app> <profile.conf>` now accepts private and selected-prefix
+`AllowedIPs` (for example `10.30.0.0/16`) for both WireGuard and AmneziaWG.
+The original `AllowedIPs` are not expanded or rewritten. The interface and
+routes come up through `wg-quick`/`awg-quick` inside the namespace. With the
+(default) kill switch enabled, other destinations are blocked rather than
+routed via the host. A split-tunnel app reports `READY` after its routes are
+installed, **not** `ONLINE`: actual peer reachability depends on a host in
+those allowed networks and is not proven by an arbitrary Internet ping.
+
+```bash
+sudo nns-app add edgewall maximawg.conf
+sudo nns-app start edgewall
+nns-app status edgewall
+# Test an actual destination covered by the profile's AllowedIPs:
+nns-app run edgewall ping -c 2 10.30.1.199
+```
+
+When `KILLSWITCH=off`, unmatched routes can egress through the namespace's
+host uplink. IPv6-only profiles are not supported in this IPv4 release.
 
 ## AmneziaWG client profiles (v1.3.42)
 

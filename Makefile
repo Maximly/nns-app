@@ -11,6 +11,7 @@ test: build
 	./tests/test-fixed-ip.sh
 	./tests/test-backup.sh
 	./tests/test-amneziawg.sh
+	./tests/test-split-tunnel.sh
 
 clean:
 	rm -f nns-app-install.sh

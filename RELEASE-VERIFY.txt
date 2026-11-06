@@ -1,5 +1,8 @@
-nns-app release: 1.3.42
-Feature: AmneziaWG client profile import and runtime
-Tests verified individually: static, functions, inventory, server reinstall, backup/restore, fixed-IP, AmneziaWG
-Note: sequential full-suite execution occasionally stalls in legacy fixed-IP/backup tests in this sandbox.
-No kernel/interface connectivity test: requires Linux with operational AmneziaWG tools and compatible kernel/userspace backend.
+nns-app v1.3.43 — split-tunnel WireGuard/AmneziaWG support
+Build: embedded Python compilation and Bash syntax checks passed.
+Tests: static, functions, unified inventory, OpenVPN server reinstall,
+fixed client IP, AmneziaWG, and split-tunnel regression suites passed.
+Backup: core backup/restore checks printed PASS; the backup test process
+subsequently hung during teardown (known intermittent suite issue).
+Live tunnel validation: not performed (no provider/credentials on test host).
+Security: imported profile AllowedIPs preserved; kill switch unchanged.

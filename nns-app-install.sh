@@ -61,7 +61,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.42"
+readonly VERSION="1.3.43"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -1447,8 +1447,8 @@ profile_type_from_file() {
     local file=$1
     [[ -f "$file" && -s "$file" ]] || return 1
 
-    if grep -Eiq '^[[:space:]]*\[Interface\][[:space:]]*(#.*)?$' "$file" &&
-       grep -Eiq '^[[:space:]]*\[Peer\][[:space:]]*(#.*)?$' "$file"; then
+    if grep -Eiq '^[[:space:]]*\[[[:space:]]*Interface[[:space:]]*\][[:space:]]*(#.*)?$' "$file" &&
+       grep -Eiq '^[[:space:]]*\[[[:space:]]*Peer[[:space:]]*\][[:space:]]*(#.*)?$' "$file"; then
         # AWG configs share the standard WireGuard INI shape. Detect their
         # obfuscation directives before falling back to the standard backend.
         # No generic `wg-quick` tool may process these fields.
@@ -1787,16 +1787,11 @@ if peer_count < 1:
 if endpoint_count < 1:
     raise SystemExit("profile must contain at least one IPv4/hostname Endpoint")
 
-full_default = ipaddress.ip_network("0.0.0.0/0") in allowed_networks
-split_default = (
-    ipaddress.ip_network("0.0.0.0/1") in allowed_networks
-    and ipaddress.ip_network("128.0.0.0/1") in allowed_networks
-)
-if not (full_default or split_default):
-    raise SystemExit(
-        "nns-app currently requires a full-tunnel IPv4 WireGuard profile "
-        "(0.0.0.0/0 or both /1 halves in AllowedIPs)"
-    )
+# A VPN namespace may intentionally route only selected private networks.
+# Preserve AllowedIPs verbatim; the namespace kill switch prevents packets to
+# other destinations from escaping through its host-facing veth.
+if not allowed_networks:
+    raise SystemExit("[Peer] AllowedIPs must contain at least one IPv4 network; IPv6-only profiles are not supported")
 PY_WG_VALIDATE
     then
         die "WireGuard profile validation failed."
@@ -1805,6 +1800,79 @@ PY_WG_VALIDATE
 
 validate_amneziawg() {
     validate_wireguard "$1" amneziawg
+}
+
+# Classify the *effective IPv4 coverage*, not just exact /0 or /1 strings.
+# Accept a full route expressed as four /2 networks, etc. This does not edit
+# the provider's AllowedIPs or inject an unapproved default route.
+wireguard_profile_route_mode() {
+    local profile=$1
+    python3 - "$profile" <<'PY_WG_ROUTE_MODE'
+import ipaddress
+import re
+import sys
+from pathlib import Path
+
+networks = []
+section = None
+for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = raw.split("#", 1)[0].strip()
+    if re.fullmatch(r"\[\s*peer\s*\]", line, flags=re.IGNORECASE):
+        section = "peer"
+    elif line.startswith("["):
+        section = None
+    elif section == "peer" and "=" in line:
+        key, value = line.split("=", 1)
+        if key.strip().lower() == "allowedips":
+            for address in value.split(","):
+                network = ipaddress.ip_network(address.strip(), strict=False)
+                if network.version == 4:
+                    networks.append(network)
+
+if not networks:
+    raise SystemExit("WireGuard profile has no IPv4 AllowedIPs")
+collapsed = list(ipaddress.collapse_addresses(networks))
+print("full" if collapsed == [ipaddress.ip_network("0.0.0.0/0")] else "split")
+PY_WG_ROUTE_MODE
+}
+
+# Choose one routable IPv4 sample from the authorised destinations. A probe
+# checks only the Linux route; it does not assume there is a pingable host.
+wireguard_profile_route_sample() {
+    local profile=$1
+    python3 - "$profile" <<'PY_WG_ROUTE_SAMPLE'
+import ipaddress
+import re
+import sys
+from pathlib import Path
+section = None
+for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = raw.split("#", 1)[0].strip()
+    if re.fullmatch(r"\[\s*peer\s*\]", line, flags=re.IGNORECASE):
+        section = "peer"
+    elif line.startswith("["):
+        section = None
+    elif section == "peer" and "=" in line:
+        key, value = line.split("=", 1)
+        if key.strip().lower() == "allowedips":
+            for address in value.split(","):
+                network = ipaddress.ip_network(address.strip(), strict=False)
+                if network.version == 4:
+                    print(network.network_address + int(network.num_addresses > 1))
+                    raise SystemExit(0)
+raise SystemExit("WireGuard profile has no IPv4 AllowedIPs")
+PY_WG_ROUTE_SAMPLE
+}
+
+# Used by readiness, watchdog, status, and inventory. Must not force an
+# arbitrary public IPv4 connectivity probe on a private-network-only tunnel.
+app_split_tunnel() {
+    local app=$1 backend profile
+    backend=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    case "$backend" in wireguard|amneziawg) ;; *) return 1 ;; esac
+    profile=$(cfg_read_value "$app" DEFAULT_PROFILE 2>/dev/null || true)
+    [[ -n "$profile" && -f "$(profiles_dir "$app")/$profile" ]] || return 1
+    [[ "$(wireguard_profile_route_mode "$(profiles_dir "$app")/$profile")" == split ]]
 }
 
 prepare_wireguard_runtime_config() {
@@ -2142,6 +2210,14 @@ add_profile() {
         log "VPN profile DNS setting is ignored at runtime; namespace DNS_SERVERS remains authoritative."
     fi
 
+    if [[ "$type" == wireguard || "$type" == amneziawg ]]; then
+        if [[ "$(wireguard_profile_route_mode "$dest")" == split ]]; then
+            log "Split-tunnel AllowedIPs detected: only listed IPv4 destinations use the VPN."
+            if ! bool_on "${KILLSWITCH:-on}"; then
+                warn "KILLSWITCH is off: traffic outside AllowedIPs may use the host uplink."
+            fi
+        fi
+    fi
     log "Default profile is now '$name' ($(vpn_type_label "$type"))."
     if systemctl is-active --quiet "nns-openvpn@${app}.service"; then
         warn "'$app' is currently running. Stop and start it to switch profiles/backends."
@@ -3511,6 +3587,26 @@ wait_online() {
     local app=$1 timeout=$2 deadline
     load_cfg "$app"
 
+    # In split-tunnel mode a route to 1.1.1.1 is intentionally absent.
+    # Verify the interface and its AllowedIPs route instead. This is a READY
+    # check, not a claim that a remote peer has completed a handshake.
+    if app_split_tunnel "$app"; then
+        local profile probe dev expected
+        profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
+        expected=$(wireguard_iface_name "$app")
+        probe=$(wireguard_profile_route_sample "$profile")
+        deadline=$((SECONDS + timeout))
+        while (( SECONDS < deadline )); do
+            if vpn_route_ready "$app"; then
+                dev=$(ip -n "$NS_NAME" -4 route get "$probe" 2>/dev/null |
+                      awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+                [[ "$dev" != "$expected" ]] || return 0
+            fi
+            sleep 0.2
+        done
+        return 1
+    fi
+
     deadline=$((SECONDS + timeout))
     while (( SECONDS < deadline )); do
         if vpn_route_ready "$app"; then
@@ -3616,6 +3712,7 @@ watchdog_mark_online() {
     WD_FAILURES=0
     WD_LAST_CHECK=$(date +%s)
     WD_LAST_RESULT=online
+    if app_split_tunnel "$app"; then WD_LAST_RESULT=ready-split; fi
     watchdog_state_save "$app"
 }
 
@@ -3698,6 +3795,7 @@ watchdog_check() {
         WD_FAILURES=0
         WD_LAST_CHECK=$now
         WD_LAST_RESULT=online
+        if app_split_tunnel "$app"; then WD_LAST_RESULT=ready-split; fi
         watchdog_state_save "$app"
         release_lock "watchdog-$app"
         return 0
@@ -3878,14 +3976,20 @@ start_app() {
     fi
 
     if wait_online "$app" "$timeout"; then
-        local ext
-        ext=$(ip netns exec "$NS_NAME" curl -4fsS \
-              --connect-timeout 1 --max-time 1 \
-              "$EXTERNAL_IP_URL" 2>/dev/null || true)
+        local ext=""
+        if ! app_split_tunnel "$app"; then
+            ext=$(ip netns exec "$NS_NAME" curl -4fsS \
+                  --connect-timeout 1 --max-time 1 \
+                  "$EXTERNAL_IP_URL" 2>/dev/null || true)
+        fi
         if watchdog_enabled_for_type "$vpn_type"; then
             watchdog_mark_online "$app"
         fi
-        log "Started '$app' with '$profile_marker' ($(vpn_type_label "$vpn_type")) via $desired_via.${ext:+ External IP: $ext}"
+        if app_split_tunnel "$app"; then
+            log "Started '$app' with '$profile_marker' ($(vpn_type_label "$vpn_type")) via $desired_via. Split routes ready; peer reachability not verified."
+        else
+            log "Started '$app' with '$profile_marker' ($(vpn_type_label "$vpn_type")) via $desired_via.${ext:+ External IP: $ext}"
+        fi
         return 0
     fi
 
@@ -10930,7 +11034,9 @@ myip_report_app() {
     elif [[ -e "/run/netns/$NS_NAME" ]] && systemctl is-active --quiet "nns-netns@${app}.service"; then
         state=started
         route=$(myip_route_snapshot_namespace "$NS_NAME" 2>/dev/null || true)
-        external_ip=$(myip_external_namespace "$NS_NAME" "${EXTERNAL_IP_URL:-https://api.ipify.org}" 2>/dev/null || true)
+        if ! app_split_tunnel "$app"; then
+            external_ip=$(myip_external_namespace "$NS_NAME" "${EXTERNAL_IP_URL:-https://api.ipify.org}" 2>/dev/null || true)
+        fi
     fi
 
     IFS='|' read -r dev gateway local_ip <<<"$route"
@@ -10941,6 +11047,9 @@ myip_report_app() {
         path="app:$app -> route not ready"
     else
         path=$(myip_app_route_path "$app" "$dev" "$gateway" "$type" "$runtime_via")
+        if [[ "$mode" != current ]] && app_split_tunnel "$app"; then
+            path="app:$app -> selected AllowedIPs -> $(wireguard_iface_name "$app") -> VPN peer (other destinations blocked by kill switch when enabled)"
+        fi
     fi
 
     printf 'Context:           app\n'
@@ -10952,6 +11061,11 @@ myip_report_app() {
     printf 'Route interface:   %s\n' "${dev:-unavailable}"
     printf 'Default gateway:   %s\n' "${gateway:-direct or unavailable}"
     printf 'Backend:           %s\n' "$type_label"
+    if app_split_tunnel "$app"; then
+        printf 'Routing mode:      split (IPv4 AllowedIPs only)\n'
+        printf 'VPN tunnel:        %s\n' "$(wireguard_iface_name "$app")"
+        printf 'VPN reachability:  not verified by external-IP probe\n'
+    fi
     printf 'Configured via:    %s\n' "$configured_via"
     printf 'Runtime via:       %s\n' "$runtime_via"
 
@@ -11238,7 +11352,7 @@ status_app() {
         route_iface=$(vpn_route_iface "$app" 2>/dev/null || true)
         local_ip=$(vpn_local_ipv4 "$app" 2>/dev/null || true)
 
-        if [[ -n "$route_iface" ]]; then
+        if [[ -n "$route_iface" ]] && ! app_split_tunnel "$app"; then
             external_ip=$(ip netns exec "$NS_NAME" curl -4fsS \
                 --connect-timeout 2 --max-time 4 \
                 "$EXTERNAL_IP_URL" 2>/dev/null || true)
@@ -11278,10 +11392,18 @@ status_app() {
         health="STARTING"
         case "$type" in
             openvpn) diagnosis=$(openvpn_status_diagnosis "$vpn_log") ;;
-            wireguard|amneziawg) diagnosis="$(vpn_type_label "$type") is running, but its interface or full-tunnel route is not ready." ;;
+            wireguard|amneziawg) diagnosis="$(vpn_type_label "$type") is running, but its interface or AllowedIPs routes are not ready." ;;
             inherit) diagnosis="The inherited upstream data path is not ready." ;;
             *) diagnosis="The network backend is active, but no usable route exists." ;;
         esac
+    elif app_split_tunnel "$app"; then
+        if wait_online "$app" 2; then
+            health="READY"
+            diagnosis="Split-tunnel routes are installed; peer connectivity is not verified."
+        else
+            health="STARTING"
+            diagnosis="The split-tunnel interface is up, but the AllowedIPs route is not ready."
+        fi
     elif [[ -n "$external_ip" || "$ping_ok" == yes ]]; then
         health="ONLINE"
         if [[ -n "$external_ip" ]]; then
@@ -11345,6 +11467,9 @@ status_app() {
     fi
     [[ -z "$ns_since" ]] || printf 'Namespace active:  %s\n' "$ns_since"
     [[ -z "$vpn_since" ]] || printf 'VPN active:        %s\n' "$vpn_since"
+    if app_split_tunnel "$app"; then
+        printf 'Routing mode:      split (AllowedIPs only; no Internet probe)\n'
+    fi
     printf 'Kill switch:       %s\n' "${KILLSWITCH:-unknown}"
     printf 'DNS servers:       %s\n' "${DNS_SERVERS:-not configured}"
     if [[ "$dns_proxy_state" == active ]]; then
@@ -11489,7 +11614,9 @@ list_apps() {
             local_ip=$(vpn_local_ipv4 "$app" 2>/dev/null || true)
             [[ -n "$local_ip" ]] || local_ip="-"
             external=""
-            if vpn_route_ready "$app"; then
+            if app_split_tunnel "$app"; then
+                if wait_online "$app" 1; then external="split routes ready"; else external="split route not ready"; fi
+            elif vpn_route_ready "$app"; then
                 local ns
                 ns=$(cfg_read_value "$app" NS_NAME 2>/dev/null || true)
                 external=$(ip netns exec "$ns" curl -4fsS \
@@ -11709,7 +11836,9 @@ list_local_instance_records() {
             local_ip=$(vpn_local_ipv4 "$app" 2>/dev/null || true)
             [[ -n "$local_ip" ]] || local_ip=-
             external=''
-            if vpn_route_ready "$app"; then
+            if app_split_tunnel "$app"; then
+                if wait_online "$app" 1; then external="split routes ready"; else external="split route not ready"; fi
+            elif vpn_route_ready "$app"; then
                 local ns
                 ns=$(cfg_read_value "$app" NS_NAME 2>/dev/null || true)
                 external=$(ip netns exec "$ns" curl -4fsS \

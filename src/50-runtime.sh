@@ -124,6 +124,26 @@ wait_online() {
     local app=$1 timeout=$2 deadline
     load_cfg "$app"
 
+    # In split-tunnel mode a route to 1.1.1.1 is intentionally absent.
+    # Verify the interface and its AllowedIPs route instead. This is a READY
+    # check, not a claim that a remote peer has completed a handshake.
+    if app_split_tunnel "$app"; then
+        local profile probe dev expected
+        profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
+        expected=$(wireguard_iface_name "$app")
+        probe=$(wireguard_profile_route_sample "$profile")
+        deadline=$((SECONDS + timeout))
+        while (( SECONDS < deadline )); do
+            if vpn_route_ready "$app"; then
+                dev=$(ip -n "$NS_NAME" -4 route get "$probe" 2>/dev/null |
+                      awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+                [[ "$dev" != "$expected" ]] || return 0
+            fi
+            sleep 0.2
+        done
+        return 1
+    fi
+
     deadline=$((SECONDS + timeout))
     while (( SECONDS < deadline )); do
         if vpn_route_ready "$app"; then
@@ -229,6 +249,7 @@ watchdog_mark_online() {
     WD_FAILURES=0
     WD_LAST_CHECK=$(date +%s)
     WD_LAST_RESULT=online
+    if app_split_tunnel "$app"; then WD_LAST_RESULT=ready-split; fi
     watchdog_state_save "$app"
 }
 
@@ -311,6 +332,7 @@ watchdog_check() {
         WD_FAILURES=0
         WD_LAST_CHECK=$now
         WD_LAST_RESULT=online
+        if app_split_tunnel "$app"; then WD_LAST_RESULT=ready-split; fi
         watchdog_state_save "$app"
         release_lock "watchdog-$app"
         return 0
@@ -491,14 +513,20 @@ start_app() {
     fi
 
     if wait_online "$app" "$timeout"; then
-        local ext
-        ext=$(ip netns exec "$NS_NAME" curl -4fsS \
-              --connect-timeout 1 --max-time 1 \
-              "$EXTERNAL_IP_URL" 2>/dev/null || true)
+        local ext=""
+        if ! app_split_tunnel "$app"; then
+            ext=$(ip netns exec "$NS_NAME" curl -4fsS \
+                  --connect-timeout 1 --max-time 1 \
+                  "$EXTERNAL_IP_URL" 2>/dev/null || true)
+        fi
         if watchdog_enabled_for_type "$vpn_type"; then
             watchdog_mark_online "$app"
         fi
-        log "Started '$app' with '$profile_marker' ($(vpn_type_label "$vpn_type")) via $desired_via.${ext:+ External IP: $ext}"
+        if app_split_tunnel "$app"; then
+            log "Started '$app' with '$profile_marker' ($(vpn_type_label "$vpn_type")) via $desired_via. Split routes ready; peer reachability not verified."
+        else
+            log "Started '$app' with '$profile_marker' ($(vpn_type_label "$vpn_type")) via $desired_via.${ext:+ External IP: $ext}"
+        fi
         return 0
     fi
 

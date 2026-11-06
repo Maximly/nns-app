@@ -588,7 +588,9 @@ myip_report_app() {
     elif [[ -e "/run/netns/$NS_NAME" ]] && systemctl is-active --quiet "nns-netns@${app}.service"; then
         state=started
         route=$(myip_route_snapshot_namespace "$NS_NAME" 2>/dev/null || true)
-        external_ip=$(myip_external_namespace "$NS_NAME" "${EXTERNAL_IP_URL:-https://api.ipify.org}" 2>/dev/null || true)
+        if ! app_split_tunnel "$app"; then
+            external_ip=$(myip_external_namespace "$NS_NAME" "${EXTERNAL_IP_URL:-https://api.ipify.org}" 2>/dev/null || true)
+        fi
     fi
 
     IFS='|' read -r dev gateway local_ip <<<"$route"
@@ -599,6 +601,9 @@ myip_report_app() {
         path="app:$app -> route not ready"
     else
         path=$(myip_app_route_path "$app" "$dev" "$gateway" "$type" "$runtime_via")
+        if [[ "$mode" != current ]] && app_split_tunnel "$app"; then
+            path="app:$app -> selected AllowedIPs -> $(wireguard_iface_name "$app") -> VPN peer (other destinations blocked by kill switch when enabled)"
+        fi
     fi
 
     printf 'Context:           app\n'
@@ -610,6 +615,11 @@ myip_report_app() {
     printf 'Route interface:   %s\n' "${dev:-unavailable}"
     printf 'Default gateway:   %s\n' "${gateway:-direct or unavailable}"
     printf 'Backend:           %s\n' "$type_label"
+    if app_split_tunnel "$app"; then
+        printf 'Routing mode:      split (IPv4 AllowedIPs only)\n'
+        printf 'VPN tunnel:        %s\n' "$(wireguard_iface_name "$app")"
+        printf 'VPN reachability:  not verified by external-IP probe\n'
+    fi
     printf 'Configured via:    %s\n' "$configured_via"
     printf 'Runtime via:       %s\n' "$runtime_via"
 
@@ -896,7 +906,7 @@ status_app() {
         route_iface=$(vpn_route_iface "$app" 2>/dev/null || true)
         local_ip=$(vpn_local_ipv4 "$app" 2>/dev/null || true)
 
-        if [[ -n "$route_iface" ]]; then
+        if [[ -n "$route_iface" ]] && ! app_split_tunnel "$app"; then
             external_ip=$(ip netns exec "$NS_NAME" curl -4fsS \
                 --connect-timeout 2 --max-time 4 \
                 "$EXTERNAL_IP_URL" 2>/dev/null || true)
@@ -936,10 +946,18 @@ status_app() {
         health="STARTING"
         case "$type" in
             openvpn) diagnosis=$(openvpn_status_diagnosis "$vpn_log") ;;
-            wireguard|amneziawg) diagnosis="$(vpn_type_label "$type") is running, but its interface or full-tunnel route is not ready." ;;
+            wireguard|amneziawg) diagnosis="$(vpn_type_label "$type") is running, but its interface or AllowedIPs routes are not ready." ;;
             inherit) diagnosis="The inherited upstream data path is not ready." ;;
             *) diagnosis="The network backend is active, but no usable route exists." ;;
         esac
+    elif app_split_tunnel "$app"; then
+        if wait_online "$app" 2; then
+            health="READY"
+            diagnosis="Split-tunnel routes are installed; peer connectivity is not verified."
+        else
+            health="STARTING"
+            diagnosis="The split-tunnel interface is up, but the AllowedIPs route is not ready."
+        fi
     elif [[ -n "$external_ip" || "$ping_ok" == yes ]]; then
         health="ONLINE"
         if [[ -n "$external_ip" ]]; then
@@ -1003,6 +1021,9 @@ status_app() {
     fi
     [[ -z "$ns_since" ]] || printf 'Namespace active:  %s\n' "$ns_since"
     [[ -z "$vpn_since" ]] || printf 'VPN active:        %s\n' "$vpn_since"
+    if app_split_tunnel "$app"; then
+        printf 'Routing mode:      split (AllowedIPs only; no Internet probe)\n'
+    fi
     printf 'Kill switch:       %s\n' "${KILLSWITCH:-unknown}"
     printf 'DNS servers:       %s\n' "${DNS_SERVERS:-not configured}"
     if [[ "$dns_proxy_state" == active ]]; then
@@ -1147,7 +1168,9 @@ list_apps() {
             local_ip=$(vpn_local_ipv4 "$app" 2>/dev/null || true)
             [[ -n "$local_ip" ]] || local_ip="-"
             external=""
-            if vpn_route_ready "$app"; then
+            if app_split_tunnel "$app"; then
+                if wait_online "$app" 1; then external="split routes ready"; else external="split route not ready"; fi
+            elif vpn_route_ready "$app"; then
                 local ns
                 ns=$(cfg_read_value "$app" NS_NAME 2>/dev/null || true)
                 external=$(ip netns exec "$ns" curl -4fsS \
@@ -1367,7 +1390,9 @@ list_local_instance_records() {
             local_ip=$(vpn_local_ipv4 "$app" 2>/dev/null || true)
             [[ -n "$local_ip" ]] || local_ip=-
             external=''
-            if vpn_route_ready "$app"; then
+            if app_split_tunnel "$app"; then
+                if wait_online "$app" 1; then external="split routes ready"; else external="split route not ready"; fi
+            elif vpn_route_ready "$app"; then
                 local ns
                 ns=$(cfg_read_value "$app" NS_NAME 2>/dev/null || true)
                 external=$(ip netns exec "$ns" curl -4fsS \

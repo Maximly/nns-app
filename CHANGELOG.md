@@ -1,3 +1,11 @@
+## 1.3.43 — IPv4 split-tunnel WireGuard / AmneziaWG
+
+- Accept partial IPv4 `AllowedIPs` rather than demanding an Internet-wide route.
+- Keep provider cryptographic routing unchanged; preserve namespace kill switch.
+- Verify an authorised split route for readiness; distinguish `READY` from actual tunnel connectivity.
+- Avoid inappropriate public-IP/ping checks in start, run, watchdog, status, inventory and myip when split tunneling.
+- Reject IPv6-only configurations explicitly, and warn if a split tunnel is used with the kill switch disabled.
+
 ## 1.3.42 — AmneziaWG client profiles
 
 - Detect AmneziaWG profiles by obfuscation keys and keep them distinct from WireGuard.

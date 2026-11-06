@@ -3,8 +3,8 @@ profile_type_from_file() {
     local file=$1
     [[ -f "$file" && -s "$file" ]] || return 1
 
-    if grep -Eiq '^[[:space:]]*\[Interface\][[:space:]]*(#.*)?$' "$file" &&
-       grep -Eiq '^[[:space:]]*\[Peer\][[:space:]]*(#.*)?$' "$file"; then
+    if grep -Eiq '^[[:space:]]*\[[[:space:]]*Interface[[:space:]]*\][[:space:]]*(#.*)?$' "$file" &&
+       grep -Eiq '^[[:space:]]*\[[[:space:]]*Peer[[:space:]]*\][[:space:]]*(#.*)?$' "$file"; then
         # AWG configs share the standard WireGuard INI shape. Detect their
         # obfuscation directives before falling back to the standard backend.
         # No generic `wg-quick` tool may process these fields.
@@ -343,16 +343,11 @@ if peer_count < 1:
 if endpoint_count < 1:
     raise SystemExit("profile must contain at least one IPv4/hostname Endpoint")
 
-full_default = ipaddress.ip_network("0.0.0.0/0") in allowed_networks
-split_default = (
-    ipaddress.ip_network("0.0.0.0/1") in allowed_networks
-    and ipaddress.ip_network("128.0.0.0/1") in allowed_networks
-)
-if not (full_default or split_default):
-    raise SystemExit(
-        "nns-app currently requires a full-tunnel IPv4 WireGuard profile "
-        "(0.0.0.0/0 or both /1 halves in AllowedIPs)"
-    )
+# A VPN namespace may intentionally route only selected private networks.
+# Preserve AllowedIPs verbatim; the namespace kill switch prevents packets to
+# other destinations from escaping through its host-facing veth.
+if not allowed_networks:
+    raise SystemExit("[Peer] AllowedIPs must contain at least one IPv4 network; IPv6-only profiles are not supported")
 PY_WG_VALIDATE
     then
         die "WireGuard profile validation failed."
@@ -361,6 +356,79 @@ PY_WG_VALIDATE
 
 validate_amneziawg() {
     validate_wireguard "$1" amneziawg
+}
+
+# Classify the *effective IPv4 coverage*, not just exact /0 or /1 strings.
+# Accept a full route expressed as four /2 networks, etc. This does not edit
+# the provider's AllowedIPs or inject an unapproved default route.
+wireguard_profile_route_mode() {
+    local profile=$1
+    python3 - "$profile" <<'PY_WG_ROUTE_MODE'
+import ipaddress
+import re
+import sys
+from pathlib import Path
+
+networks = []
+section = None
+for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = raw.split("#", 1)[0].strip()
+    if re.fullmatch(r"\[\s*peer\s*\]", line, flags=re.IGNORECASE):
+        section = "peer"
+    elif line.startswith("["):
+        section = None
+    elif section == "peer" and "=" in line:
+        key, value = line.split("=", 1)
+        if key.strip().lower() == "allowedips":
+            for address in value.split(","):
+                network = ipaddress.ip_network(address.strip(), strict=False)
+                if network.version == 4:
+                    networks.append(network)
+
+if not networks:
+    raise SystemExit("WireGuard profile has no IPv4 AllowedIPs")
+collapsed = list(ipaddress.collapse_addresses(networks))
+print("full" if collapsed == [ipaddress.ip_network("0.0.0.0/0")] else "split")
+PY_WG_ROUTE_MODE
+}
+
+# Choose one routable IPv4 sample from the authorised destinations. A probe
+# checks only the Linux route; it does not assume there is a pingable host.
+wireguard_profile_route_sample() {
+    local profile=$1
+    python3 - "$profile" <<'PY_WG_ROUTE_SAMPLE'
+import ipaddress
+import re
+import sys
+from pathlib import Path
+section = None
+for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = raw.split("#", 1)[0].strip()
+    if re.fullmatch(r"\[\s*peer\s*\]", line, flags=re.IGNORECASE):
+        section = "peer"
+    elif line.startswith("["):
+        section = None
+    elif section == "peer" and "=" in line:
+        key, value = line.split("=", 1)
+        if key.strip().lower() == "allowedips":
+            for address in value.split(","):
+                network = ipaddress.ip_network(address.strip(), strict=False)
+                if network.version == 4:
+                    print(network.network_address + int(network.num_addresses > 1))
+                    raise SystemExit(0)
+raise SystemExit("WireGuard profile has no IPv4 AllowedIPs")
+PY_WG_ROUTE_SAMPLE
+}
+
+# Used by readiness, watchdog, status, and inventory. Must not force an
+# arbitrary public IPv4 connectivity probe on a private-network-only tunnel.
+app_split_tunnel() {
+    local app=$1 backend profile
+    backend=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    case "$backend" in wireguard|amneziawg) ;; *) return 1 ;; esac
+    profile=$(cfg_read_value "$app" DEFAULT_PROFILE 2>/dev/null || true)
+    [[ -n "$profile" && -f "$(profiles_dir "$app")/$profile" ]] || return 1
+    [[ "$(wireguard_profile_route_mode "$(profiles_dir "$app")/$profile")" == split ]]
 }
 
 prepare_wireguard_runtime_config() {
@@ -698,6 +766,14 @@ add_profile() {
         log "VPN profile DNS setting is ignored at runtime; namespace DNS_SERVERS remains authoritative."
     fi
 
+    if [[ "$type" == wireguard || "$type" == amneziawg ]]; then
+        if [[ "$(wireguard_profile_route_mode "$dest")" == split ]]; then
+            log "Split-tunnel AllowedIPs detected: only listed IPv4 destinations use the VPN."
+            if ! bool_on "${KILLSWITCH:-on}"; then
+                warn "KILLSWITCH is off: traffic outside AllowedIPs may use the host uplink."
+            fi
+        fi
+    fi
     log "Default profile is now '$name' ($(vpn_type_label "$type"))."
     if systemctl is-active --quiet "nns-openvpn@${app}.service"; then
         warn "'$app' is currently running. Stop and start it to switch profiles/backends."
