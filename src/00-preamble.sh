@@ -28,6 +28,8 @@
 #   install [<app_name> [--backend inherit] [--via <upstream-app>|host]
 #                         [--via-remote <user@host> [--remote-port <port>]]]
 #   remove  <app_name>
+#   backup --output <file.tar.gz>
+#   restore <file.tar.gz> [--no-start]
 #   purge
 #   repair [--local-only]
 #   list [apps|namespaces|gateways|clients|all]
@@ -59,7 +61,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.40"
+readonly VERSION="1.3.41"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -290,6 +292,8 @@ Usage:
   nns-app remove  <app_name> [--local-only]
   nns-app purge [--local-only]
   nns-app repair [--local-only]
+  nns-app backup --output </absolute/path/backup.tar.gz>
+  nns-app restore <backup.tar.gz> [--no-start]
   nns-app list [apps|namespaces|gateways|clients|all]
   nns-app status  <app_name>
   nns-app myip [<app_or_gateway_name>]
@@ -359,6 +363,8 @@ Examples:
   nns-app run my-private-app firefox --no-remote
   sudo nns-app purge
   sudo nns-app repair
+  sudo nns-app backup --output /var/backups/nns-full-backup.tar.gz
+  sudo nns-app restore /var/backups/nns-full-backup.tar.gz
   nns-app list            # all locally managed apps, with Type column
   nns-app list apps       # same unified local app inventory
   nns-app list namespaces # namespace VPN clients only

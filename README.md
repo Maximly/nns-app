@@ -4,13 +4,59 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.40
+**Release:** 1.3.41
 
 **Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
 
 The release includes both the modular source tree and a pre-built,
 single-file installer: `nns-app-install.sh`.
+
+## Full backup and clean-machine restore (v1.3.41)
+
+`sudo nns-app backup --output /var/backups/nns-full-backup.tar.gz` creates a mode-0600
+archive of the complete local nns-app state: all namespace applications,
+OpenVPN servers/gateways, CA and client private keys/certificates, revoked
+clients, fixed-IP mappings, provider profiles, remote/SSH credentials managed
+by nns-app, configuration, service enabled/running state, cached data and the
+installed single-file engine. External SSH identity files referenced by nns-app
+are bundled and relocated under `/etc/nns-app/restored-keys/` on restore.
+
+Copy the archive securely to the replacement Ubuntu/Debian/Fedora machine.
+Use this release's `nns-app-install.sh` (or later) to run directly:
+
+```bash
+sudo bash nns-app-install.sh restore /var/backups/nns-full-backup.tar.gz
+# optionally restore services and boot policy without starting services now
+sudo bash nns-app-install.sh restore /var/backups/nns-full-backup.tar.gz --no-start
+```
+
+The backup is also **self-contained**: if you have only the archive on a
+clean machine, extract the embedded engine and run it directly:
+
+```bash
+tar -xOzf /var/backups/nns-full-backup.tar.gz nns-backup/engine.sh > /tmp/nns-app-restore.sh
+sudo bash /tmp/nns-app-restore.sh restore /var/backups/nns-full-backup.tar.gz
+rm -f /tmp/nns-app-restore.sh
+```
+
+Only do this with a backup you created and trust: the extracted engine runs as root.
+
+Restore requires no pre-existing managed nns-app configuration. It validates
+archive paths, types and SHA-256 hashes before making system changes; installs
+missing packages, recreates missing application users as locked accounts,
+regenerates systemd units and restores the saved enabled/running state.
+The stored archive engine can be recovered in an emergency, but run restore
+from the current trusted installer. Never restore an untrusted archive as root.
+
+**Security:** the archive contains private VPN CA/server/client keys and SSH
+identities. Keep it encrypted when transferred or stored; only root should have
+access. Existing exported `.ovpn` files stored outside nns-app are not collected,
+but every managed client credential is preserved and profiles can be re-exported.
+Existing services may need a new `--public` endpoint or updated host routes when
+moving between machines; public IP addresses, external SSH hosts, cloud security
+groups, OS login passwords, and state on separate remote hosts cannot be cloned
+by a local backup. Back up each managed remote host separately if required.
 
 ## Quick start
 

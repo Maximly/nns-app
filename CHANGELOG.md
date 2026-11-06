@@ -1,3 +1,8 @@
+## 1.3.41 — Full-state backup and clean-machine restore
+
+- `backup --output /absolute/path/file.tar.gz` captures all managed applications, servers, clients and private keys, remote identities, configurations, and systemd active/enabled states.
+- `restore file.tar.gz [--no-start]` validates the archive and deploys it on a clean compatible Linux machine, regenerating systemd/sudoers metadata.
+
 # Changelog
 
 ## 1.3.40

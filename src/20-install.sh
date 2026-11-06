@@ -328,8 +328,10 @@ refresh_managed_unit_metadata() {
         gateway_write_openssl_config "$gateway" "$(gateway_dir "$gateway")"
         gateway_write_server_config "$gateway"
         gateway_write_transport_config "$gateway"
-        systemctl enable --now "nns-gateway-crl-refresh@${gateway}.timer" \
-            >/dev/null 2>&1 || true
+        if [[ "${NNS_RESTORE_IN_PROGRESS:-off}" != on ]]; then
+            systemctl enable --now "nns-gateway-crl-refresh@${gateway}.timer" \
+                >/dev/null 2>&1 || true
+        fi
         if systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
             warn "Gateway '$gateway' is running; restart it to activate refreshed gateway and transport settings."
         fi

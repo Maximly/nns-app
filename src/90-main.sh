@@ -127,6 +127,14 @@ main() {
     reexec_as_root_if_needed "$@"
 
     case "$cmd" in
+        backup)
+            shift
+            nns_backup "$@"
+            ;;
+        restore)
+            shift
+            nns_restore "$@"
+            ;;
         install)
             if (( $# == 1 )); then
                 install_engine on
