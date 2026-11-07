@@ -1862,7 +1862,7 @@ manual_payload=$(remote_command_payload gateway client export \
     remote_auto_register() { fail 'current remote was unnecessarily registered'; }
     log() { printf 'log:%s\n' "$*"; }
     output=$(remote_auto_refresh_configured_app my-app)
-    grep -Fq 'already runs nns-app 1.3.44' <<<"$output" ||
+    grep -Fq 'already runs nns-app 1.3.45' <<<"$output" ||
         fail 'current remote refresh status missing'
 )
 
@@ -1947,7 +1947,7 @@ EOF_REPAIR_STATE
     gateway_remove() { printf 'server-remove:%s\n' "$1"; }
     gateway_status() { printf 'server-status:%s\n' "$1"; }
     gateway_client_revoke() { printf 'server-revoke:%s:%s\n' "$1" "$2"; }
-    server_export_ovpn() { printf 'server-export:%s|%s|%s|%s|%s|%s|%s\n' "$@"; }
+    server_export_ovpn() { printf 'server-export:%s|%s|%s|%s|%s|%s|%s|%s\n' "$@"; }
 
     if server_gateway_exists '../malicious'; then
         fail 'server gateway lookup accepted path traversal'
@@ -1989,13 +1989,32 @@ EOF_REPAIR_STATE
     [[ $(main status office-vpn) == 'server-status:office-vpn' ]] || fail 'server status CLI'
     [[ $(main remove office-vpn) == 'server-remove:office-vpn' ]] || fail 'server remove CLI'
     output=$(main export ovpn office-vpn --client laptop --output /tmp/laptop.ovpn)
-    [[ "$output" == 'server-export:office-vpn|laptop|/tmp/laptop.ovpn|-|auto|modern|off' ]] ||
+    [[ "$output" == 'server-export:office-vpn|laptop|/tmp/laptop.ovpn|-|auto|modern|off|keep' ]] ||
         fail "server export CLI: $output"
     output=$(main export ovpn office-vpn --client laptop --fixed-ip --output /tmp/static.ovpn)
-    [[ "$output" == 'server-export:office-vpn|laptop|/tmp/static.ovpn|-|auto|modern|on' ]] ||
+    [[ "$output" == 'server-export:office-vpn|laptop|/tmp/static.ovpn|-|auto|modern|on|keep' ]] ||
         fail "server --fixed-ip export CLI: $output"
     if ( main export ovpn other-vpn --client laptop --fixed-ip ) >/dev/null 2>&1; then
         fail '--fixed-ip was accepted for a non-managed server'
+    fi
+    output=$(main export ovpn office-vpn --client laptop --fixed-ip --split-tunnel --output /tmp/split.ovpn)
+    [[ "$output" == 'server-export:office-vpn|laptop|/tmp/split.ovpn|-|auto|modern|on|split' ]] ||
+        fail "server split export CLI: $output"
+    output=$(main export ovpn office-vpn --client laptop --full-tunnel --output /tmp/full.ovpn)
+    [[ "$output" == 'server-export:office-vpn|laptop|/tmp/full.ovpn|-|auto|modern|off|full' ]] ||
+        fail "server full export CLI: $output"
+    if ( main export ovpn other-vpn --client laptop --split-tunnel ) >/dev/null 2>&1; then
+        fail '--split-tunnel was accepted for a non-managed server'
+    fi
+    gateway_client_route_mode() { case "$3" in show|split|full) ;; *) return 1 ;; esac; printf 'route:%s|%s|%s\n' "$@"; }
+    [[ $(main route-mode office-vpn laptop) == 'route:office-vpn|laptop|show' ]] ||
+        fail 'route-mode show CLI'
+    [[ $(main route-mode office-vpn laptop split) == 'route:office-vpn|laptop|split' ]] ||
+        fail 'route-mode split CLI'
+    [[ $(main gateway client route-mode office-vpn laptop full) == 'route:office-vpn|laptop|full' ]] ||
+        fail 'gateway client route-mode CLI'
+    if ( main route-mode office-vpn laptop invalid ) >/dev/null 2>&1; then
+        fail 'invalid route-mode accepted'
     fi
     gateway_client_fixed_ip() {
         case "$3" in on|off|show) ;; *) return 1 ;; esac

@@ -352,7 +352,7 @@ main() {
                 die "Usage: nns-app export ovpn <app_name> --client <client_name> [--embedded] [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]"
             [[ "$2" == ovpn ]] ||
                 die "Only 'nns-app export ovpn ...' is currently supported."
-            local export_app=$3 export_client="" export_public="-" export_proto="auto" export_output="-" export_compat="modern" export_fixed_ip="off"
+            local export_app=$3 export_client="" export_public="-" export_proto="auto" export_output="-" export_compat="modern" export_fixed_ip="off" export_route_mode="keep"
             shift 3
             while (( $# > 0 )); do
                 case "$1" in
@@ -365,6 +365,10 @@ main() {
                         export_compat=embedded; shift ;;
                     --fixed-ip)
                         export_fixed_ip=on; shift ;;
+                    --split-tunnel)
+                        export_route_mode=split; shift ;;
+                    --full-tunnel)
+                        export_route_mode=full; shift ;;
                     --public)
                         (( $# >= 2 )) || die "--public requires host:port."
                         export_public=$2; shift 2 ;;
@@ -386,9 +390,9 @@ main() {
             [[ -n "$export_client" ]] || die "export ovpn requires --client <client_name>."
             if server_gateway_exists "$export_app"; then
                 server_export_ovpn "$export_app" "$export_client" \
-                    "$export_output" "$export_public" "$export_proto" "$export_compat" "$export_fixed_ip"
+                    "$export_output" "$export_public" "$export_proto" "$export_compat" "$export_fixed_ip" "$export_route_mode"
             else
-                [[ "$export_fixed_ip" == off ]] || die "--fixed-ip is supported for locally managed OpenVPN servers only."
+                [[ "$export_fixed_ip" == off && "$export_route_mode" == keep ]] || die "--fixed-ip and tunnel routing controls are supported for locally managed OpenVPN servers only."
                 remote_auto_export_public_ovpn "$export_app" "$export_client" \
                     "$export_public" "$export_proto" "$export_output" "$export_compat"
             fi
@@ -487,6 +491,11 @@ main() {
                     ;;
                 *) die "Usage: nns-app stop <app_name> [--local-only]" ;;
             esac
+            ;;
+        route-mode)
+            (( $# >= 3 && $# <= 4 )) ||
+                die "Usage: nns-app route-mode <server_name> <client_name> [split|full]"
+            gateway_client_route_mode "$2" "$3" "${4:-show}"
             ;;
         fixed-ip)
             (( $# >= 3 && $# <= 4 )) ||
@@ -620,6 +629,11 @@ main() {
                                 die "Usage: nns-app gateway client fixed-ip <gateway_name> <client_name> [on|off]"
                             gateway_client_fixed_ip "$4" "$5" "${6:-show}"
                             ;;
+                        route-mode)
+                            (( $# >= 5 && $# <= 6 )) ||
+                                die "Usage: nns-app gateway client route-mode <gateway_name> <client_name> [split|full]"
+                            gateway_client_route_mode "$4" "$5" "${6:-show}"
+                            ;;
                         list)
                             [[ $# -eq 4 ]] ||
                                 die "Usage: nns-app gateway client list <gateway_name>"
@@ -628,7 +642,7 @@ main() {
                         export)
                             (( $# >= 6 )) ||
                                 die "Usage: nns-app gateway client export <gateway_name> <client_name> --output <file.ovpn>"
-                            local export_gateway=$4 export_client=$5 export_output="" export_format="ovpn" export_static="off"
+                            local export_gateway=$4 export_client=$5 export_output="" export_format="ovpn" export_static="off" export_route_mode="keep"
                             shift 5
                             while (( $# > 0 )); do
                                 case "$1" in
@@ -644,6 +658,10 @@ main() {
                                         export_format=${1#--format=}; shift ;;
                                     --fixed-ip)
                                         export_static=on; shift ;;
+                                    --split-tunnel)
+                                        export_route_mode=split; shift ;;
+                                    --full-tunnel)
+                                        export_route_mode=full; shift ;;
                                     *)
                                         die "Unknown gateway client export option '$1'."
                                         ;;
@@ -652,6 +670,9 @@ main() {
                             [[ -n "$export_output" ]] || die "--output is required."
                             if [[ "$export_static" == on ]]; then
                                 gateway_client_fixed_ip "$export_gateway" "$export_client" on >&2
+                            fi
+                            if [[ "$export_route_mode" != keep ]]; then
+                                gateway_client_route_mode "$export_gateway" "$export_client" "$export_route_mode" >&2
                             fi
                             gateway_client_export "$export_gateway" "$export_client" "$export_output" "$export_format"
                             ;;

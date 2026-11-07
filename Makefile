@@ -9,6 +9,7 @@ test: build
 	./tests/test-list.sh
 	./tests/test-server-reinstall.sh
 	./tests/test-fixed-ip.sh
+	./tests/test-client-routing.sh
 	./tests/test-backup.sh
 	./tests/test-amneziawg.sh
 	./tests/test-split-tunnel.sh

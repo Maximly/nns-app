@@ -1,10 +1,11 @@
-nns-app v1.3.44 — AmneziaWG uint32 header validation
-Build: embedded Python compilation and Bash syntax checks passed.
-Tests: static, functions, unified inventory, OpenVPN server reinstall,
-fixed client IP, AmneziaWG, and split-tunnel regression suites passed.
-Backup: core backup/restore checks printed PASS; the backup test process
-subsequently hung during teardown (known intermittent suite issue).
-Live tunnel validation: not performed (no provider/credentials on test host).
-Security: imported profile AllowedIPs preserved; kill switch unchanged.
-
-AmneziaWG uint32 boundary regression: added to test-amneziawg.sh.
+nns-app v1.3.45 — per-client OpenVPN server-side routing policy
+Build: Bash syntax and 27 embedded Python compilation checks passed.
+Tests passing individually: static, functions/CLI dispatch, unified inventory,
+OpenVPN server reinstall, fixed client IPs, new per-client route mode,
+AmneziaWG, and WireGuard split-tunnel.
+Backup/restore suite was not rerun to completion for this release; it has a
+known intermittent teardown hang from previous versions.
+Live OpenVPN client-to-client and route-mode connectivity: not performed.
+Compatibility: existing clients without ROUTE_MODE keep full tunnel.
+Security: only root-owned client metadata may change CCD policy; generated
+client .ovpn profiles contain neither fixed IP nor route-mode settings.

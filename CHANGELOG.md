@@ -1,3 +1,8 @@
+## 1.3.45 — server-side OpenVPN client routing modes
+- Add per-client `split`/`full` routing policy, independent of fixed-IP; configure via `export ovpn ... --split-tunnel|--full-tunnel`, `route-mode <server> <client> [split|full]`, and gateway client equivalents.
+- Split mode removes the `redirect-gateway` and public DNS push for that client only, preserving the VPN pool route and existing `.ovpn` credentials.
+- Generate CCD for routing-only clients as well as fixed-IP clients; ensure changes and rollback preserve both settings; show route mode in client list.
+
 ## 1.3.44 — AmneziaWG uint32 H1–H4 ranges
 
 - Accept unsigned 32-bit H1–H4 header values up to `4294967295`; fix false rejection of provider-generated high-bit header ranges.

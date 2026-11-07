@@ -38,6 +38,7 @@
 #   export  ovpn <app_name> --client <name> [--embedded]
 #                  [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]
 #   fixed-ip <server_name> <client_name> [on|off]
+#   route-mode <server_name> <client_name> [split|full]
 #   revoke  <app_name> <client_name>
 #   add     <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf>
 #   add     <app_name> any [country] [--refresh] [--via <upstream-app>|host]
@@ -53,7 +54,7 @@
 #   remote add|connect|sync|rotate|status ...
 #   link import <app> <bundle.nnslink>
 #   gateway start|stop|status|list|remove ...
-#   gateway client add|fixed-ip|list|export|revoke ...
+#   gateway client add|fixed-ip|route-mode|list|export|revoke ...
 #
 # The script installs itself as /usr/local/sbin/nns_app.sh and creates the
 # convenience symlink /usr/local/bin/nns-app.
@@ -61,7 +62,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.44"
+readonly VERSION="1.3.45"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -207,7 +208,7 @@ reset_gateway_cfg_vars() {
 
 reset_gateway_client_vars() {
     CLIENT_NAME="" STATUS="" CERT_SERIAL="" CREATED_AT="" REVOKED_AT=""
-    GENERATION="" CLOAK_UID="" FIXED_IP=""
+    GENERATION="" CLOAK_UID="" FIXED_IP="" ROUTE_MODE="full"
 }
 
 required_binary() {
@@ -298,9 +299,11 @@ Usage:
   nns-app status  <app_name>
   nns-app myip [<app_or_gateway_name>]
   nns-app export ovpn <app_name> --client <client_name> [--embedded] [--fixed-ip]
+                  [--split-tunnel|--full-tunnel]
                   [--public <host>:<port>] [--proto tcp|udp]
                   [--output <file|->]
   nns-app fixed-ip <server_name> <client_name> [on|off]
+  nns-app route-mode <server_name> <client_name> [split|full]
   nns-app revoke <app_name> <client_name> [--modern|--embedded]
   nns-app add     <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf>
   nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
@@ -324,9 +327,11 @@ Usage:
   nns-app gateway remove <gateway_name>
   nns-app gateway client add    <gateway_name> <client_name> [--fixed-ip]
   nns-app gateway client fixed-ip <gateway_name> <client_name> [on|off]
+  nns-app gateway client route-mode <gateway_name> <client_name> [split|full]
   nns-app gateway client list   <gateway_name>
   nns-app gateway client export <gateway_name> <client_name>
-                  [--fixed-ip] [--format ovpn|nnslink] --output <file|->
+                  [--fixed-ip] [--split-tunnel|--full-tunnel]
+                  [--format ovpn|nnslink] --output <file|->
   nns-app gateway client rotate <gateway_name> <client_name>
   nns-app gateway client revoke <gateway_name> <client_name>
 

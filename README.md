@@ -4,13 +4,43 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.44
+**Release:** 1.3.45
 
 **Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
 
 The release includes both the modular source tree and a pre-built,
 single-file installer: `nns-app-install.sh`.
+
+## Per-client split-tunnel OpenVPN (v1.3.45)
+
+The original OpenVPN servers push `redirect-gateway def1` and public DNS to
+all clients. Version 1.3.45 adds an independent **server-side** routing policy:
+`split` lets the client keep its normal Internet default route and local DNS,
+while the OpenVPN server's own client-pool network remains reachable; `full`
+retains the original gateway/DNS behaviour. Fixed IP addressing and tunnel
+routing are independent and are never embedded in exported `.ovpn` files.
+
+```bash
+# Create or re-export a client with fixed IP and split routing:
+sudo nns-app export ovpn mlvpn --client ml --fixed-ip --split-tunnel --output ~/ml-split.ovpn
+# Change an existing client's routing without re-exporting or rotating keys:
+sudo nns-app route-mode mlvpn ml split
+nns-app route-mode mlvpn ml
+sudo nns-app route-mode mlvpn ml full
+# Existing admin CLI also supports gateway client route-mode / --split-tunnel.
+```
+
+Existing clients stay `full` until explicitly changed, to preserve historical
+behaviour. New clients also default to `full` for compatibility with remote
+full-tunnel gateway clients; explicitly choose `--split-tunnel` for VPN-only
+access. A route-mode change rebuilds a client's CCD file and restarts a running
+OpenVPN service to reconnect clients. It does not alter certificate identity.
+`split` removes the server's `redirect-gateway` and public DNS pushes only for
+that client. The server's VPN subnet route (`10.253.0.0/24` for `mlvpn`)
+continues to work. Access to **other** remote networks requires explicit
+routes (and appropriate routing/firewall configuration), not merely selecting
+split mode.
 
 ## AmneziaWG unsigned header ranges (v1.3.44)
 

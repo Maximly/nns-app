@@ -849,25 +849,72 @@ else:
 PY_NNS_FIXED_ALLOC
 }
 
+# A split-tunnel policy is a server-side CCD push override. It does not
+# change the exported client profile or the static IP allocation.
+gateway_active_split_clients() {
+    local root=$1 file
+    for file in "$root"/clients/*/client.cfg; do
+        [[ -f "$file" ]] || continue
+        (
+            CLIENT_NAME='' STATUS='' ROUTE_MODE='full'
+            # Only read trusted, root-owned managed client metadata.
+            local owner mode
+            owner=$(stat -c '%u' "$file") || exit 1
+            mode=$(stat -c '%a' "$file") || exit 1
+            [[ "$owner" == 0 ]] || exit 1
+            (( (8#$mode & 0022) == 0 )) || exit 1
+            # shellcheck disable=SC1090
+            source "$file"
+            case "${ROUTE_MODE:-full}" in
+                full) ;;
+                split)
+                    [[ "${STATUS:-}" == active ]] || exit 0
+                    validate_gateway_client_name "$CLIENT_NAME"
+                    [[ "$(basename "$(dirname "$file")")" == "$CLIENT_NAME" ]] || exit 1
+                    printf '%s\n' "$CLIENT_NAME"
+                    ;;
+                *) exit 1 ;;
+            esac
+        ) || return 1
+    done
+}
+
 gateway_sync_fixed_ip_ccd() {
-    local root=$1 assignments=${2:-} netmask=$3 group ccd client addr tmp file
-    local -A keep=()
+    local root=$1 assignments=${2:-} netmask=$3 split_clients=${4:-}
+    local group ccd client addr tmp file
+    local -A fixed_ips=() split=() keep=()
     group=$(nns_unprivileged_group)
     ccd="$root/ccd"
     [[ ! -L "$ccd" ]] || { warn "Refusing symlinked CCD directory: $ccd"; return 1; }
     install -d -o root -g "$group" -m 0750 "$ccd" || return 1
-    # Atomically replace individual CN files before removing stale entries,
-    # so reconnecting clients never see a partially written CCD entry.
     while IFS='|' read -r client addr; do
         [[ -n "$client" ]] || continue
         validate_gateway_client_name "$client"
+        fixed_ips[$client]=$addr
         keep[$client]=1
+    done <<<"$assignments"
+    while IFS= read -r client; do
+        [[ -n "$client" ]] || continue
+        validate_gateway_client_name "$client"
+        split[$client]=1
+        keep[$client]=1
+    done <<<"$split_clients"
+    # Replace complete CCD entries atomically, never leave partial directives.
+    for client in "${!keep[@]}"; do
         tmp=$(mktemp "$ccd/.new.XXXXXX") || return 1
-        printf 'ifconfig-push %s %s\n' "$addr" "$netmask" >"$tmp"
+        {
+            if [[ -n "${fixed_ips[$client]:-}" ]]; then
+                printf 'ifconfig-push %s %s\n' "${fixed_ips[$client]}" "$netmask"
+            fi
+            if [[ -n "${split[$client]:-}" ]]; then
+                printf 'push-remove redirect-gateway\n'
+                printf 'push-remove "dhcp-option DNS"\n'
+            fi
+        } >"$tmp" || return 1
         chown "root:$group" "$tmp" || return 1
         chmod 0640 "$tmp" || return 1
         mv -f -- "$tmp" "$ccd/$client" || return 1
-    done <<<"$assignments"
+    done
     for file in "$ccd"/*; do
         [[ -f "$file" && ! -L "$file" ]] || continue
         client=${file##*/}
@@ -879,7 +926,7 @@ gateway_write_server_config() {
     local gateway=$1
     local root=${2:-$(gateway_dir "$gateway")}
     local config output pki proto_option network netmask dns
-    local unpriv_user unpriv_group fixed_assignments fixed_pool dynamic_first dynamic_last fixed_netmask
+    local unpriv_user unpriv_group fixed_assignments fixed_pool dynamic_first dynamic_last fixed_netmask split_clients
 
     if [[ "$root" == "$(gateway_dir "$gateway")" ]]; then
         load_gateway_cfg "$gateway"
@@ -900,19 +947,6 @@ gateway_write_server_config() {
     [[ "$OPENVPN_LISTEN_PROTO" == tcp ]] &&
         proto_option=tcp-server || proto_option=udp
 
-    fixed_assignments=$(gateway_active_fixed_assignments "$root") || return 1
-    fixed_pool=off
-    if [[ -n "$fixed_assignments" ]]; then
-        local plan
-        plan=$(gateway_fixed_ip_plan "$CLIENT_POOL" "$fixed_assignments") || return 1
-        IFS='|' read -r dynamic_first dynamic_last fixed_netmask <<<"$plan"
-        fixed_pool=on
-        gateway_sync_fixed_ip_ccd "$root" "$fixed_assignments" "$fixed_netmask" || return 1
-    else
-        # Drop stale CCD entries after the last assignment was removed.
-        gateway_sync_fixed_ip_ccd "$root" '' '255.255.255.0' || return 1
-    fi
-
     IFS='|' read -r network netmask < <(
         python3 - "$CLIENT_POOL" <<'PY_GATEWAY_POOL'
 import ipaddress
@@ -922,6 +956,16 @@ net = ipaddress.ip_network(sys.argv[1], strict=True)
 print(f'{net.network_address}|{net.netmask}')
 PY_GATEWAY_POOL
     )
+    fixed_assignments=$(gateway_active_fixed_assignments "$root") || return 1
+    split_clients=$(gateway_active_split_clients "$root") || return 1
+    fixed_pool=off
+    if [[ -n "$fixed_assignments" ]]; then
+        local plan
+        plan=$(gateway_fixed_ip_plan "$CLIENT_POOL" "$fixed_assignments") || return 1
+        IFS='|' read -r dynamic_first dynamic_last fixed_netmask <<<"$plan"
+        fixed_pool=on
+    fi
+    gateway_sync_fixed_ip_ccd "$root" "$fixed_assignments" "$netmask" "$split_clients" || return 1
 
     {
         printf '# Generated by nns-app; recreate the gateway instead of editing this file.\n'
@@ -938,9 +982,11 @@ PY_GATEWAY_POOL
         if [[ "$fixed_pool" == on ]]; then
             printf 'server %s %s nopool\n' "$network" "$netmask"
             printf 'ifconfig-pool %s %s %s\n' "$dynamic_first" "$dynamic_last" "$fixed_netmask"
-            printf 'client-config-dir %s\n' "$root/ccd"
         else
             printf 'server %s %s\n' "$network" "$netmask"
+        fi
+        if [[ "$fixed_pool" == on || -n "$split_clients" ]]; then
+            printf 'client-config-dir %s\n' "$root/ccd"
         fi
         # Force userspace routing for this setting: with OpenVPN DCO enabled,
         # client-to-client is ignored and Linux would need separate tun->tun
@@ -1998,6 +2044,7 @@ CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 GENERATION="$generation"
 CLOAK_UID="$cloak_uid"
 FIXED_IP=""
+ROUTE_MODE="full"
 CLIENT_CFG_EOF
     fi
 
@@ -2068,6 +2115,8 @@ gateway_client_load() {
     GENERATION=${GENERATION:-1}
     CLOAK_UID=${CLOAK_UID:-}
     FIXED_IP=${FIXED_IP:-}
+    ROUTE_MODE=${ROUTE_MODE:-full}
+    case "$ROUTE_MODE" in full|split) ;; *) die "Invalid route mode in $file." ;; esac
     [[ "${CLIENT_NAME:-}" == "$client" ]] ||
         die "CLIENT_NAME mismatch in $file."
 }
@@ -2154,6 +2203,71 @@ gateway_client_fixed_ip() {
     else
         log "Client '$client' on '$gateway': fixed IP disabled (dynamic on reconnect)."
     fi
+}
+
+# Only the server stores this setting. Existing profile and key stay intact.
+# A running OpenVPN server is restarted because changing pushed options does
+# not immediately reconfigure an already-connected client.
+gateway_client_route_mode() {
+    require_root
+    local gateway=$1 client=$2 requested=${3:-show} previous cfg tmp backup was_active=off
+    validate_gateway_name "$gateway"
+    validate_gateway_client_name "$client"
+    case "$requested" in show|split|full) ;; *) die "Expected route-mode split or full." ;; esac
+    acquire_lock "gateway-$gateway"
+    load_gateway_cfg "$gateway"
+    gateway_client_load "$gateway" "$client"
+    previous=${ROUTE_MODE:-full}
+    [[ "${STATUS:-}" == active ]] || die "Cannot change revoked client '$client'."
+    if [[ "$requested" == show ]]; then
+        release_lock "gateway-$gateway"
+        printf '%s/%s: route-mode=%s\n' "$gateway" "$client" "$previous"
+        return 0
+    fi
+    if [[ "$requested" == "$previous" ]]; then
+        release_lock "gateway-$gateway"
+        log "Client '$client' on '$gateway' already uses $requested routing."
+        return 0
+    fi
+    cfg="$(gateway_client_dir "$gateway" "$client")/client.cfg"
+    backup=$(mktemp) || return 1
+    cp -p "$cfg" "$backup" || { rm -f "$backup"; return 1; }
+    tmp=$(mktemp "${cfg}.XXXXXX") || { rm -f "$backup"; return 1; }
+    awk -v mode="$requested" '
+        /^ROUTE_MODE=/ { print "ROUTE_MODE=\"" mode "\""; seen=1; next }
+        { print }
+        END { if (!seen) print "ROUTE_MODE=\"" mode "\"" }
+    ' "$cfg" >"$tmp"
+    install -o root -g root -m 0600 "$tmp" "$cfg" || {
+        rm -f -- "$tmp" "$backup"; return 1;
+    }
+    rm -f "$tmp"
+    if ! gateway_write_server_config "$gateway"; then
+        cp -p "$backup" "$cfg" || true
+        gateway_write_server_config "$gateway" || true
+        rm -f "$backup"
+        release_lock "gateway-$gateway"
+        die "Failed updating route mode for '$client'."
+    fi
+    if systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
+        was_active=on
+    fi
+    release_lock "gateway-$gateway"
+    if [[ "$was_active" == on ]]; then
+        if ! systemctl restart "nns-gateway@${gateway}.service"; then
+            warn "Route mode update failed to restart '$gateway'; rolling back."
+            acquire_lock "gateway-$gateway"
+            cp -p "$backup" "$cfg" || warn "Cannot restore client route mode."
+            gateway_write_server_config "$gateway" || warn "Cannot rebuild previous server configuration."
+            release_lock "gateway-$gateway"
+            systemctl restart "nns-gateway@${gateway}.service" ||
+                warn "Could not restart previous configuration for '$gateway'."
+            rm -f "$backup"
+            return 1
+        fi
+    fi
+    rm -f "$backup"
+    log "Client '$client' on '$gateway': $requested tunnel routing (effective on reconnect)."
 }
 
 gateway_client_export() {
@@ -2300,12 +2414,12 @@ gateway_client_revoke() {
 
 gateway_client_list() {
     require_root
-    local gateway=$1 dir client status serial created fixed
+    local gateway=$1 dir client status serial created fixed route_mode
     validate_gateway_name "$gateway"
     acquire_lock "gateway-$gateway" shared
     load_gateway_cfg "$gateway"
-    printf '%-24s %-10s %-16s %-20s %s\n' "Client" "Status" "Fixed IP" "Serial" "Created"
-    printf '%-24s %-10s %-16s %-20s %s\n' "------------------------" "----------" "----------------" "--------------------" "--------------------"
+    printf '%-24s %-10s %-16s %-10s %-20s %s\n' "Client" "Status" "Fixed IP" "Route" "Serial" "Created"
+    printf '%-24s %-10s %-16s %-10s %-20s %s\n' "------------------------" "----------" "----------------" "----------" "--------------------" "--------------------"
     local found=0
     shopt -s nullglob
     for dir in "$(gateway_clients_dir "$gateway")"/*; do
@@ -2316,8 +2430,9 @@ gateway_client_list() {
         serial=${CERT_SERIAL:-unknown}
         created=${CREATED_AT:-unknown}
         fixed=${FIXED_IP:--}
-        [[ "$status" == active ]] || fixed=-
-        printf '%-24s %-10s %-16s %-20s %s\n' "$client" "$status" "$fixed" "$serial" "$created"
+        route_mode=${ROUTE_MODE:-full}
+        [[ "$status" == active ]] || { fixed=-; route_mode=-; }
+        printf '%-24s %-10s %-16s %-10s %-20s %s\n' "$client" "$status" "$fixed" "$route_mode" "$serial" "$created"
         found=1
     done
     (( found )) || log "No clients configured for gateway '$gateway'."
@@ -2967,7 +3082,7 @@ gateway_show_client_to_client() {
 
 server_export_ovpn() {
     require_root
-    local gateway=$1 client=$2 output=$3 public=$4 proto=$5 compat=$6 fixed_ip=${7:-off}
+    local gateway=$1 client=$2 output=$3 public=$4 proto=$5 compat=$6 fixed_ip=${7:-off} route_mode=${8:-keep}
     server_gateway_exists "$gateway" || die "Server '$gateway' does not exist."
     load_gateway_cfg "$gateway"
     [[ "$compat" == modern && "$OPENVPN_COMPAT" == modern ]] ||
@@ -2982,6 +3097,9 @@ server_export_ovpn() {
     fi
     if [[ "$fixed_ip" == on ]]; then
         gateway_client_fixed_ip "$gateway" "$client" on >&2
+    fi
+    if [[ "$route_mode" != keep ]]; then
+        gateway_client_route_mode "$gateway" "$client" "$route_mode" >&2
     fi
     gateway_client_export "$gateway" "$client" "$output" ovpn
 }
