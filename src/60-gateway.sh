@@ -608,6 +608,26 @@ server_choose_listener() {
     die 'No available UDP OpenVPN server port in 1194-1294; specify --listen.'
 }
 
+# Pick an unused public listener in the host network namespace. Both
+# host-exit servers and gateways exiting through another namespace bind on
+# the host, so they must share one collision domain.
+gateway_choose_listener() {
+    local transport=$1 self=${2:-} proto first last port conflict
+    case "$transport" in
+        direct) proto=udp; first=1194; last=1294 ;;
+        cloak|stunnel) proto=tcp; first=443; last=543 ;;
+        ssh) die 'SSH transport requires an explicit private listener.' ;;
+        *) die "Unsupported gateway transport '$transport'." ;;
+    esac
+    for ((port=first; port<=last; port++)); do
+        if ! conflict=$(server_listener_conflict "$proto" "$port" "$self"); then
+            printf '%s:%s\n' "$proto" "$port"
+            return 0
+        fi
+    done
+    die "No free $proto listener in $first-$last; specify --listen."
+}
+
 gateway_write_openssl_config() {
     local gateway=$1
     local root=${2:-$(gateway_dir "$gateway")} pki output
@@ -1170,13 +1190,26 @@ gateway_create() {
     local route_table rule_priority gateway_tun veth_host veth_ns
     local host_fwd host_mangle ns_fwd ns_nat ns_mangle dns_servers
 
+    # Resolve defaults under the creation lock: a concurrent install must
+    # not reserve the same listener between selection and configuration.
+    if [[ -z "$listen" ]]; then
+        listen=$(gateway_choose_listener "$transport" "$gateway")
+        log "Selected available gateway listener: $listen"
+    fi
     IFS='|' read -r listen_proto listen_port \
         <<<"$(parse_gateway_listen "$listen")"
+    if [[ -z "$public" ]]; then
+        public_host=$(server_public_host) ||
+            die "Cannot detect the server's public IPv4 address; specify --public <host>:<port>."
+        public="$public_host:$listen_port"
+        log "Detected gateway public endpoint: $public"
+    fi
     IFS='|' read -r public_host public_port \
         <<<"$(parse_public_endpoint "$public")"
-    # Check under the global creation lock so concurrent managed installs
-    # cannot reserve the same host port between preflight and commit.
-    if [[ "$via_app" == host && "$transport" != ssh ]]; then
+    # Public listeners bind in the host namespace regardless of which
+    # upstream VPN namespace carries the clients' egress traffic.
+    # Check under the global creation lock to avoid port reservation races.
+    if [[ "$transport" != ssh ]]; then
         local conflict_reason
         if conflict_reason=$(server_listener_conflict "$listen_proto" "$listen_port" "$gateway"); then
             release_lock "gateway-$gateway"

@@ -625,8 +625,8 @@ main() {
                                 ;;
                         esac
                     done
-                    [[ -n "$gw_via" && -n "$gw_listen" && -n "$gw_public" ]] ||
-                        die "gateway create requires --via, --listen and --public."
+                    [[ -n "$gw_via" ]] ||
+                        die "gateway create requires --via <app|host>."
                     [[ "$gw_transport" != ssh ]] ||
                         die "Transport 'ssh' is managed internally by install --via-remote."
                     gateway_create "$gw_name" "$gw_via" "$gw_listen" "$gw_public" "$gw_pool" "$gw_dns" "$gw_transport" "$gw_server_name" modern "$gw_c2c"

@@ -6,7 +6,7 @@ chained namespaces, SSH-managed remote exits, and host-based VPN servers.
 The host's default route and DNS configuration remain independent of individual
 application environments.
 
-**Release:** 2.0.1  
+**Release:** 2.0.2  
 **Supported platforms:** Ubuntu and Fedora with systemd (Debian-family package installation is also supported)  
 **VPN backends:** OpenVPN 2.6+, WireGuard, AmneziaWG, and VPN-free inherited namespaces  
 **License:** GPL-3.0-or-later
@@ -274,14 +274,21 @@ nns-app install my-remote-exit
 nns-app add my-remote-exit ~/my-remote-profile.ovpn
 nns-app start my-remote-exit
 
-sudo nns-app gateway create my-relay \
-    --via my-remote-exit --listen udp:1194 \
-    --public vpn.example.net:1194
+sudo nns-app gateway create my-relay --via my-remote-exit
 
 sudo nns-app gateway client add my-relay my-linux-client
 sudo nns-app gateway client export my-relay my-linux-client \
     --output ~/my-linux-client.ovpn
 ```
+
+The gateway automatically selects an unused host UDP listener (starting at
+1194), discovers the host's public IPv4 address, and advertises that port in
+client profiles. Supply `--listen udp:<port>` and `--public <host>:<port>`
+when a specific port, DNS hostname, external NAT mapping, or load balancer
+is required. nns-app manages the local firewall, not the cloud provider's
+security group or an upstream router's port forwarding. Use `--transport cloak`
+or `--transport stunnel` for a TCP gateway; those default to the first
+available host TCP port starting at 443.
 
 Manual remote registration, connection and credential updates use these commands:
 

@@ -2,8 +2,11 @@
 
 Major milestones are grouped by capability. Maintenance-only releases are not listed separately.
 
-## 2.0.1 — Unified VPN and namespace management (2026-11-07)
+## 2.0 — Unified VPN and gateway management (2026-11-07)
 
+- Added automatic listener selection and public IPv4 endpoint discovery for
+  manually created gateways, preserving explicit network overrides.
+- Prevented listener-port conflicts across host-exit and VPN-exit gateways.
 - Unified the local inventory of application namespaces, public VPN servers, managed gateways and exported client identities, with filtered views and detailed health reporting.
 - Added host-based OpenVPN servers with UDP or TCP listeners, per-client certificates, revocation, fixed server-assigned IPv4 addresses, independent split/full routing and optional client-to-client forwarding.
 - Added Cloak-protected OpenVPN server transport, per-client Cloak credentials and paired client configuration exports.

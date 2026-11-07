@@ -8,6 +8,7 @@ test: build
 	./tests/test-functions.sh
 	./tests/test-list.sh
 	./tests/test-server-reinstall.sh
+	./tests/test-gateway-autoconfig.sh
 	./tests/test-remote-downgrade.sh
 	./tests/test-cloak-server.sh
 	./tests/test-fixed-ip.sh

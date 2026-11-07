@@ -9,12 +9,13 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fxq 'nns-app 2.0.1' <<<"$(head -n1 <<<"$version")"
+grep -Fxq 'nns-app 2.0.2' <<<"$(head -n1 <<<"$version")"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
 grep -Fq 'nns-app myip [<app_or_gateway_name>]' <<<"$help"
 grep -Fq 'nns-app gateway create' <<<"$help"
+grep -Fq 'gateway create <name> --via <app> [--listen' <<<"$help"
 grep -Fq 'nns-app gateway client export' <<<"$help"
 grep -Fq 'nns-app remote connect' <<<"$help"
 grep -Fq 'nns-app link import' <<<"$help"
@@ -210,7 +211,7 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 2.0.1' "$ROOT/README.md"
+grep -Fq '**Release:** 2.0.2' "$ROOT/README.md"
 grep -Fq '## Quick start' "$ROOT/README.md"
 grep -Fq '### Run a VPN locally' "$ROOT/README.md"
 grep -Fq 'nns-app install my-private-app' "$ROOT/README.md"
