@@ -64,7 +64,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.47"
+readonly VERSION="2.0.1"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -393,7 +393,7 @@ Examples:
   # The current automatic-remote host and a free OpenVPN port are used by default.
   nns-app export ovpn my-private-app --client my-laptop \
       --output ~/my-laptop.ovpn
-  # Embedded/vendor-router profile (verified with TP-Link Archer AX80):
+  # Profile for OpenVPN clients requiring embedded compatibility:
   nns-app export ovpn my-private-app --client my-router --embedded \
       --output ~/my-router.ovpn
   # Optional override: --public vpn.example.net:443
@@ -921,6 +921,41 @@ restore_selinux_contexts() {
         warn "Could not restore one or more SELinux file contexts."
 }
 
+# Do not allow a remote automatic-bootstrap installer to replace a newer
+# nns-app engine. The engine is shared by *all* managed services on this host,
+# including unrelated OpenVPN / AmneziaWG servers. Downgrading it can remove
+# CLI capabilities and break their generated systemd configurations.
+nns_version_is_newer() {
+    local candidate=$1 baseline=$2
+    [[ "$candidate" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ &&
+       "$baseline" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || return 2
+    [[ "$candidate" != "$baseline" &&
+       "$(printf '%s\n%s\n' "$baseline" "$candidate" | LC_ALL=C sort -V | tail -n1)" == "$candidate" ]]
+}
+
+nns_engine_version_from_output() {
+    local output=$1
+    if [[ "$output" =~ (^|$'\n')nns-app[[:space:]]+([0-9]+\.[0-9]+(\.[0-9]+)?)($|[[:space:]]) ]]; then
+        printf '%s\n' "${BASH_REMATCH[2]}"
+    else
+        return 1
+    fi
+}
+
+nns_guard_engine_downgrade() {
+    local installed_output installed_version
+    [[ -f "$ENGINE_PATH" ]] || return 0
+    # Existing managed engine should expose a parseable version. Reject an
+    # unknown binary rather than silently overwrite an unrelated installation.
+    installed_output=$("$ENGINE_PATH" --version 2>/dev/null) ||
+        die "Cannot determine installed nns-app version at '$ENGINE_PATH'; refusing to overwrite it."
+    installed_version=$(nns_engine_version_from_output "$installed_output") ||
+        die "Cannot parse installed nns-app version at '$ENGINE_PATH'; refusing to overwrite it."
+    if nns_version_is_newer "$installed_version" "$VERSION"; then
+        die "Refusing nns-app downgrade $installed_version -> $VERSION. Update the initiating remote host to nns-app $installed_version or newer; existing servers and clients were not modified."
+    fi
+}
+
 install_engine_files() {
     require_root
 
@@ -1139,6 +1174,7 @@ install_engine() {
         die "Internal install mode must be 'on' or 'off'."
 
     acquire_lock global
+    nns_guard_engine_downgrade
     ensure_dependencies
     install_engine_files
     install -d -o root -g root -m 0755 \
@@ -5087,10 +5123,8 @@ gateway_generate_pki() {
         -out "$pki/server.crt" >/dev/null 2>&1 || return 1
 
     if [[ "$compat" == embedded ]]; then
-        # Embedded/vendor clients such as TP-Link routers interoperate with
-        # the older tls-auth control-channel protection. Keep the historical
-        # filename for seamless upgrades from 1.3.31; the static key format is
-        # identical and only the OpenVPN directive/direction changes.
+        # Some embedded OpenVPN clients require tls-auth instead of
+        # tls-crypt-v2. Retain the compatible static-key filename.
         openvpn --genkey secret "$pki/tls-crypt.key" || return 1
     else
         openvpn --genkey tls-crypt-v2-server \
@@ -7671,11 +7705,11 @@ gateway_remove() {
 awg_server_config() { printf '%s/%s.conf\n' "$(gateway_dir "$1")" "$(gateway_cfg_value "$1" GATEWAY_TUN)"; }
 
 awg_server_require_runtime() {
-    command -v awg >/dev/null 2>&1 || die "AmneziaWG requires awg (3.1-capable tools). Install amneziawg-tools without the broken Ubuntu 26.04 DKMS metapackage."
+    command -v awg >/dev/null 2>&1 || die "AmneziaWG requires awg (3.1-capable tools). Install AmneziaWG 3.1-compatible tools separately."
     command -v awg-quick >/dev/null 2>&1 || die "AmneziaWG requires awg-quick (3.1-capable tools)."
     if ! modprobe -q amneziawg 2>/dev/null &&
        ! command -v amneziawg-go >/dev/null 2>&1; then
-        die "AmneziaWG kernel module unavailable. Install compatible amneziawg-go userspace backend; do not install broken DKMS packages on Ubuntu 26.04."
+        die "AmneziaWG kernel module unavailable. Install a compatible kernel module or amneziawg-go userspace backend."
     fi
     [[ -c /dev/net/tun ]] || modprobe tun 2>/dev/null || true
 }
@@ -10692,6 +10726,25 @@ remote_auto_resolve_ssh() {
     printf '%s|%s|%s\n' "$ssh_user@$host" "$port" "${host#[}"
 }
 
+# Check the installed remote engine before uploading a bootstrap script.
+# Remote auto shares the nns-app executable with unrelated locally managed
+# servers. An older controller must never force-install its engine over them.
+remote_auto_guard_remote_engine() {
+    local user=$1 target=$2 port=$3 control=$4 output installed
+    output=$(remote_auto_user_exec "$user" ssh \
+        -o "ControlPath=$control" -p "$port" "$target" \
+        "if test -e '$ENGINE_PATH'; then '$ENGINE_PATH' --version; else echo nns-app-absent; fi") ||
+        die "Cannot inspect installed nns-app version on '$target'; refusing automatic bootstrap."
+    if [[ "$output" == nns-app-absent ]]; then
+        return 0
+    fi
+    installed=$(nns_engine_version_from_output "$output") ||
+        die "Cannot parse installed nns-app version on '$target'; refusing automatic bootstrap."
+    if nns_version_is_newer "$installed" "$VERSION"; then
+        die "Remote '$target' has nns-app $installed, newer than local $VERSION. Upgrade nns-app on this initiating host before reinstalling the remote; remote servers were not modified."
+    fi
+}
+
 remote_auto_bootstrap() {
     local app=$1 target=$2 port=$3 alias=$4 owner=$5
     local user dir key pub pub_copy remote_tmp remote_pub control_dir control command
@@ -10733,6 +10786,13 @@ remote_auto_bootstrap() {
         -p "$port" "$target"; then
         remote_auto_bootstrap_cleanup
         die "Cannot establish the bootstrap SSH connection to '$target'."
+    fi
+
+    # The destination might run a newer engine for an independent --server.
+    # Run this read-only check before touching remote files or sudoers.
+    if ! ( remote_auto_guard_remote_engine "$user" "$target" "$port" "$control" ); then
+        remote_auto_bootstrap_cleanup
+        die "Remote bootstrap refused for '$target' due to unsafe installed version."
     fi
 
     if ! remote_auto_user_exec "$user" scp \

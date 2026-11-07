@@ -64,7 +64,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.47"
+readonly VERSION="2.0.1"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -393,7 +393,7 @@ Examples:
   # The current automatic-remote host and a free OpenVPN port are used by default.
   nns-app export ovpn my-private-app --client my-laptop \
       --output ~/my-laptop.ovpn
-  # Embedded/vendor-router profile (verified with TP-Link Archer AX80):
+  # Profile for OpenVPN clients requiring embedded compatibility:
   nns-app export ovpn my-private-app --client my-router --embedded \
       --output ~/my-router.ovpn
   # Optional override: --public vpn.example.net:443

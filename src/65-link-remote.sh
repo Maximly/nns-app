@@ -2621,6 +2621,25 @@ remote_auto_resolve_ssh() {
     printf '%s|%s|%s\n' "$ssh_user@$host" "$port" "${host#[}"
 }
 
+# Check the installed remote engine before uploading a bootstrap script.
+# Remote auto shares the nns-app executable with unrelated locally managed
+# servers. An older controller must never force-install its engine over them.
+remote_auto_guard_remote_engine() {
+    local user=$1 target=$2 port=$3 control=$4 output installed
+    output=$(remote_auto_user_exec "$user" ssh \
+        -o "ControlPath=$control" -p "$port" "$target" \
+        "if test -e '$ENGINE_PATH'; then '$ENGINE_PATH' --version; else echo nns-app-absent; fi") ||
+        die "Cannot inspect installed nns-app version on '$target'; refusing automatic bootstrap."
+    if [[ "$output" == nns-app-absent ]]; then
+        return 0
+    fi
+    installed=$(nns_engine_version_from_output "$output") ||
+        die "Cannot parse installed nns-app version on '$target'; refusing automatic bootstrap."
+    if nns_version_is_newer "$installed" "$VERSION"; then
+        die "Remote '$target' has nns-app $installed, newer than local $VERSION. Upgrade nns-app on this initiating host before reinstalling the remote; remote servers were not modified."
+    fi
+}
+
 remote_auto_bootstrap() {
     local app=$1 target=$2 port=$3 alias=$4 owner=$5
     local user dir key pub pub_copy remote_tmp remote_pub control_dir control command
@@ -2662,6 +2681,13 @@ remote_auto_bootstrap() {
         -p "$port" "$target"; then
         remote_auto_bootstrap_cleanup
         die "Cannot establish the bootstrap SSH connection to '$target'."
+    fi
+
+    # The destination might run a newer engine for an independent --server.
+    # Run this read-only check before touching remote files or sudoers.
+    if ! ( remote_auto_guard_remote_engine "$user" "$target" "$port" "$control" ); then
+        remote_auto_bootstrap_cleanup
+        die "Remote bootstrap refused for '$target' due to unsafe installed version."
     fi
 
     if ! remote_auto_user_exec "$user" scp \

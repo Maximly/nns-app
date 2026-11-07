@@ -9,7 +9,7 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fq 'nns-app 1.3.47' <<<"$version"
+grep -Fxq 'nns-app 2.0.1' <<<"$(head -n1 <<<"$version")"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -210,7 +210,7 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 1.3.47' "$ROOT/README.md"
+grep -Fq '**Release:** 2.0.1' "$ROOT/README.md"
 grep -Fq '## Quick start' "$ROOT/README.md"
 grep -Fq '### Run a VPN locally' "$ROOT/README.md"
 grep -Fq 'nns-app install my-private-app' "$ROOT/README.md"
@@ -261,7 +261,7 @@ grep -Fq 'ufw delete allow "$port/$proto" comment "$marker"' "$INSTALLER"
 grep -Fq -- '--add-port="$port/$proto"' "$INSTALLER"
 grep -Fq -- '--remove-port="$port/$proto"' "$INSTALLER"
 grep -Fq 'tagged iptables INPUT rule' "$ROOT/README.md"
-grep -Fq 'Pre-existing administrator firewall rules are' "$ROOT/README.md"
+grep -Fq 'administrator firewall rules are not removed or globally flushed.' "$ROOT/README.md"
 grep -Fq 'restore_selinux_contexts' "$INSTALLER"
 if grep -Fq '/usr/sbin/openvpn' "$INSTALLER"; then
     echo 'hard-coded Ubuntu OpenVPN path remains in installer' >&2
@@ -356,7 +356,7 @@ if grep -Fq '"Peer Connection Initiated" in log_text' "$INSTALLER"; then
     echo 'VPN Gate probe still accepts TLS-only peer connection' >&2
     exit 1
 fi
-grep -Fq 'documented public OpenVPN credentials (`vpn` / `vpn`)' "$ROOT/README.md"
+grep -Fq 'credentials (`vpn` / `vpn`)' "$ROOT/README.md"
 
 grep -Fq 'nns-app list [apps|namespaces|gateways|clients|all]' "$INSTALLER" || {
     echo 'extended list usage is missing' >&2

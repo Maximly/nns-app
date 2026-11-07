@@ -4,11 +4,11 @@
 awg_server_config() { printf '%s/%s.conf\n' "$(gateway_dir "$1")" "$(gateway_cfg_value "$1" GATEWAY_TUN)"; }
 
 awg_server_require_runtime() {
-    command -v awg >/dev/null 2>&1 || die "AmneziaWG requires awg (3.1-capable tools). Install amneziawg-tools without the broken Ubuntu 26.04 DKMS metapackage."
+    command -v awg >/dev/null 2>&1 || die "AmneziaWG requires awg (3.1-capable tools). Install AmneziaWG 3.1-compatible tools separately."
     command -v awg-quick >/dev/null 2>&1 || die "AmneziaWG requires awg-quick (3.1-capable tools)."
     if ! modprobe -q amneziawg 2>/dev/null &&
        ! command -v amneziawg-go >/dev/null 2>&1; then
-        die "AmneziaWG kernel module unavailable. Install compatible amneziawg-go userspace backend; do not install broken DKMS packages on Ubuntu 26.04."
+        die "AmneziaWG kernel module unavailable. Install a compatible kernel module or amneziawg-go userspace backend."
     fi
     [[ -c /dev/net/tun ]] || modprobe tun 2>/dev/null || true
 }

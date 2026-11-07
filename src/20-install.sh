@@ -134,6 +134,41 @@ restore_selinux_contexts() {
         warn "Could not restore one or more SELinux file contexts."
 }
 
+# Do not allow a remote automatic-bootstrap installer to replace a newer
+# nns-app engine. The engine is shared by *all* managed services on this host,
+# including unrelated OpenVPN / AmneziaWG servers. Downgrading it can remove
+# CLI capabilities and break their generated systemd configurations.
+nns_version_is_newer() {
+    local candidate=$1 baseline=$2
+    [[ "$candidate" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ &&
+       "$baseline" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || return 2
+    [[ "$candidate" != "$baseline" &&
+       "$(printf '%s\n%s\n' "$baseline" "$candidate" | LC_ALL=C sort -V | tail -n1)" == "$candidate" ]]
+}
+
+nns_engine_version_from_output() {
+    local output=$1
+    if [[ "$output" =~ (^|$'\n')nns-app[[:space:]]+([0-9]+\.[0-9]+(\.[0-9]+)?)($|[[:space:]]) ]]; then
+        printf '%s\n' "${BASH_REMATCH[2]}"
+    else
+        return 1
+    fi
+}
+
+nns_guard_engine_downgrade() {
+    local installed_output installed_version
+    [[ -f "$ENGINE_PATH" ]] || return 0
+    # Existing managed engine should expose a parseable version. Reject an
+    # unknown binary rather than silently overwrite an unrelated installation.
+    installed_output=$("$ENGINE_PATH" --version 2>/dev/null) ||
+        die "Cannot determine installed nns-app version at '$ENGINE_PATH'; refusing to overwrite it."
+    installed_version=$(nns_engine_version_from_output "$installed_output") ||
+        die "Cannot parse installed nns-app version at '$ENGINE_PATH'; refusing to overwrite it."
+    if nns_version_is_newer "$installed_version" "$VERSION"; then
+        die "Refusing nns-app downgrade $installed_version -> $VERSION. Update the initiating remote host to nns-app $installed_version or newer; existing servers and clients were not modified."
+    fi
+}
+
 install_engine_files() {
     require_root
 
@@ -352,6 +387,7 @@ install_engine() {
         die "Internal install mode must be 'on' or 'off'."
 
     acquire_lock global
+    nns_guard_engine_downgrade
     ensure_dependencies
     install_engine_files
     install -d -o root -g root -m 0755 \

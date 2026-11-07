@@ -1,8 +1,0 @@
-nns-app 1.3.46: Cloak server transport.
-Generated: 2026-11-07.
-Verified: source syntax, embedded Python blocks, CLI help/version,
-static tests, server reinstall, Cloak lifecycle/export/rollback,
-client routing tests. Other legacy suites are not certified; test-functions
-is environment-sensitive and fixed-IP/split tests have timed out.
-Live Cloak binaries, cloud listener, and macOS Tunnelblick end-to-end are
-not available in this sandbox and remain unverified.

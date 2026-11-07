@@ -758,10 +758,8 @@ gateway_generate_pki() {
         -out "$pki/server.crt" >/dev/null 2>&1 || return 1
 
     if [[ "$compat" == embedded ]]; then
-        # Embedded/vendor clients such as TP-Link routers interoperate with
-        # the older tls-auth control-channel protection. Keep the historical
-        # filename for seamless upgrades from 1.3.31; the static key format is
-        # identical and only the OpenVPN directive/direction changes.
+        # Some embedded OpenVPN clients require tls-auth instead of
+        # tls-crypt-v2. Retain the compatible static-key filename.
         openvpn --genkey secret "$pki/tls-crypt.key" || return 1
     else
         openvpn --genkey tls-crypt-v2-server \
