@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.45
+**Release:** 1.3.46
 
 **Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
@@ -644,6 +644,53 @@ sudo nns-app start office-vpn
 sudo nns-app revoke office-vpn phone
 sudo nns-app remove office-vpn
 ```
+
+### Cloak-protected OpenVPN server (`install --server --transport cloak`)
+
+Cloak wraps OpenVPN's **loopback-only TCP** listener behind a public Cloak
+TCP port. Unlike direct `.ovpn` clients, Cloak clients must run `ck-client`
+locally before starting Tunnelblick. Install the trusted `ck-server` binary
+on the Linux host and `ck-client` on macOS separately. nns-app does not download
+or silently install these third-party binaries.
+
+```bash
+# Existing testtcp holds TCP 443? Stop/remove it or use a different free port.
+sudo nns-app install private-vpn --server \
+    --transport cloak --listen tcp:8443 \
+    --public 157.22.151.94:8443 \
+    --server-name www.bing.com --client-to-client
+
+# Reinstall an existing server in place, preserving its CA and client certs:
+sudo nns-app install myvpn --server --transport cloak \
+    --listen tcp:8443 --server-name www.bing.com
+
+# Export a Tunnelblick profile AND matching Cloak client JSON:
+nns-app export ovpn private-vpn --client mac \
+    --fixed-ip --split-tunnel --output ~/private-vpn-mac.ovpn
+```
+
+The export creates `private-vpn-mac.ovpn` and `private-vpn-mac.cloak.json`.
+Copy both files to macOS. On macOS, start `ck-client` before connecting
+Tunnelblick with the `.ovpn` file:
+
+```bash
+ck-client -c ~/private-vpn-mac.cloak.json -s 157.22.151.94 -p 8443 -l 11940
+# In Tunnelblick, import and connect private-vpn-mac.ovpn
+```
+
+The `.ovpn` file connects to `127.0.0.1:11940/tcp`, never directly to
+Cloak's public port. The JSON contains the Cloak UID, server public key,
+and decoy hostname; the private Cloak key stays on the Linux server.
+In full-tunnel mode, the generated `.ovpn` preserves an underlying-network
+route to the Cloak endpoint to avoid recursive tunnel routing.
+
+`--transport cloak` defaults to TCP 443 for new servers. An occupied port is
+reported, not taken over; specify a free `--listen tcp:<port>`. nns-app
+opens an owned host-firewall rule only for the public Cloak TCP listener.
+Cloud security groups and upstream NAT still require separate configuration.
+Changing the transport of an existing server requires exporting fresh client
+files; existing `.ovpn` alone cannot talk to Cloak. If server reconfiguration
+fails to start, nns-app attempts to restore its previous configuration.
 
 ### Server-assigned fixed client IPs
 

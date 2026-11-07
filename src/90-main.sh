@@ -147,6 +147,7 @@ main() {
                 local install_remote="" install_remote_port=22 install_remote_port_set=off
                 local install_server=off install_listen="" install_public=""
                 local install_pool="" install_dns="" install_c2c=""
+                local install_transport="" install_server_name=""
                 shift 2
                 while (( $# > 0 )); do
                     case "$1" in
@@ -176,6 +177,16 @@ main() {
                             install_public=$2; shift 2 ;;
                         --public=*)
                             install_public=${1#--public=}; shift ;;
+                        --transport)
+                            (( $# >= 2 )) || die "--transport requires direct or cloak."
+                            install_transport=$2; shift 2 ;;
+                        --transport=*)
+                            install_transport=${1#--transport=}; shift ;;
+                        --server-name)
+                            (( $# >= 2 )) || die "--server-name requires a Cloak decoy hostname."
+                            install_server_name=$2; shift 2 ;;
+                        --server-name=*)
+                            install_server_name=${1#--server-name=}; shift ;;
                         --pool)
                             (( $# >= 2 )) || die "--pool requires an IPv4 CIDR."
                             install_pool=$2; shift 2 ;;
@@ -251,10 +262,11 @@ main() {
                        "$install_via" == __default__ && "$install_backend" == __default__ ]] ||
                         die "--server cannot be combined with --via, --remote, or --backend."
                     install_openvpn_server "$install_app_name" \
-                        "$install_listen" "$install_public" "$install_pool" "$install_dns" "$install_c2c"
+                        "$install_listen" "$install_public" "$install_pool" "$install_dns" "$install_c2c" \
+                        "$install_transport" "$install_server_name"
                 else
-                    [[ -z "$install_listen$install_public$install_pool$install_dns$install_c2c" ]] ||
-                        die "--listen, --public, --pool, --dns and --client-to-client require --server."
+                    [[ -z "$install_listen$install_public$install_pool$install_dns$install_c2c$install_transport$install_server_name" ]] ||
+                        die "--listen, --public, --pool, --dns, --transport, --server-name and --client-to-client require --server."
                     if [[ -n "$install_remote" ]]; then
                         [[ "$install_via" == __default__ && "$install_backend" == __default__ ]] ||
                             die "--via-remote cannot be combined with --via or --backend."

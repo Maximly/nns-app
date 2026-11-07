@@ -728,7 +728,8 @@ remote_status() {
 }
 
 gateway_transport_dir() {
-    local gateway=$1 root=${2:-$(gateway_dir "$gateway")}
+    local gateway=$1 root
+    root=${2:-$(gateway_dir "$gateway")}
     printf '%s/transport\n' "$root"
 }
 
@@ -837,7 +838,8 @@ PY_CLOAK_KEYS
 }
 
 gateway_cloak_active_uids_json() {
-    local gateway=$1 root=${2:-$(gateway_dir "$gateway")} dir cfg uid status first=1
+    local gateway=$1 root dir cfg uid status first=1
+    root=${2:-$(gateway_dir "$gateway")}
     printf '['
     shopt -s nullglob
     for dir in "$root/clients"/*; do
@@ -854,7 +856,8 @@ gateway_cloak_active_uids_json() {
 }
 
 gateway_write_transport_config() {
-    local gateway=$1 root=${2:-$(gateway_dir "$gateway")} tdir output private_key public_key uids
+    local gateway=$1 root tdir output private_key public_key uids
+    root=${2:-$(gateway_dir "$gateway")}
     if [[ "$root" == "$(gateway_dir "$gateway")" ]]; then
         load_gateway_cfg "$gateway"
     else
@@ -888,7 +891,7 @@ STUNNEL_SERVER_EOF
             public_key=$(<"$tdir/public.key")
             uids=$(gateway_cloak_active_uids_json "$gateway" "$root")
             python3 - "$tdir/server.json" "$LISTEN_PORT" "$OPENVPN_LISTEN_PORT" \
-                "$PUBLIC_HOST" "$private_key" "$uids" <<'PY_CLOAK_SERVER'
+                "$TRANSPORT_SERVER_NAME" "$private_key" "$uids" <<'PY_CLOAK_SERVER'
 import json,sys
 path, public_port, backend_port, server_name, private_key, uids = sys.argv[1:]
 config = {
@@ -960,6 +963,106 @@ if len(raw) != 16:
     raise SystemExit(1)
 print(value)
 PY_CLOAK_UID
+}
+
+# Assign a Cloak authorization UID to every active pre-existing OpenVPN client
+# when switching an existing direct server to Cloak. No certificate is rotated.
+# The caller holds the gateway lock and snapshots client.cfg before invoking.
+gateway_cloak_ensure_client_uids() {
+    local gateway=$1 root dir cfg uid status tmp
+    root=${2:-$(gateway_dir "$gateway")}
+    shopt -s nullglob
+    for dir in "$root/clients"/*; do
+        cfg="$dir/client.cfg"
+        [[ -f "$cfg" ]] || continue
+        status=$(awk -F= '/^STATUS=/{gsub(/^"|"$/, "", $2); print $2; exit}' "$cfg")
+        [[ "$status" == active ]] || continue
+        uid=$(awk -F= '/^CLOAK_UID=/{gsub(/^"|"$/, "", $2); print $2; exit}' "$cfg")
+        [[ -z "$uid" ]] || continue
+        uid=$(gateway_cloak_new_uid) || return 1
+        tmp=$(mktemp "${cfg}.XXXXXX") || return 1
+        awk -v uid="$uid" '
+          /^CLOAK_UID=/ {print "CLOAK_UID=\"" uid "\""; found=1; next}
+          {print}
+          END {if (!found) print "CLOAK_UID=\"" uid "\""}
+        ' "$cfg" >"$tmp" || { rm -f "$tmp"; return 1; }
+        install -o root -g root -m 0600 "$tmp" "$cfg" || {
+            rm -f "$tmp"; return 1;
+        }
+        rm -f "$tmp"
+    done
+}
+
+# The exported OpenVPN profile is intentionally local-only. Cloak is a
+# separate process; Tunnelblick alone cannot establish a Cloak connection.
+gateway_cloak_export_client_pair() {
+    local gateway=$1 client=$2 output=$3 jsonfile tmp owner group public_host public_port
+    [[ "$output" != - ]] || die "Cloak requires two files: pass --output <file.ovpn> rather than stdout."
+    load_gateway_cfg "$gateway"
+    [[ "$TRANSPORT" == cloak ]] || die "'$gateway' does not use Cloak."
+    output=$(readlink -m "$output")
+    [[ "$output" == *.ovpn ]] || die "Cloak client output must end with .ovpn."
+    jsonfile="${output%.ovpn}.cloak.json"
+    [[ -d "$(dirname "$output")" ]] || die "Output directory does not exist: $(dirname "$output")"
+    [[ ! -e "$output" && ! -e "$jsonfile" ]] || die "Output exists: $output or $jsonfile"
+    tmp=$(mktemp -d) || return 1
+    gateway_write_client_profile_file "$gateway" "$client" "$tmp/client.ovpn" local || {
+        rm -rf "$tmp"; return 1;
+    }
+    # Preserve a physical route to the public Cloak endpoint even when
+    # full-tunnel routing is enabled. Do not route the Cloak socket into itself.
+    printf 'route %s 255.255.255.255 net_gateway\n' "$PUBLIC_HOST" >>"$tmp/client.ovpn"
+    gateway_write_cloak_client_config "$gateway" "$client" "$tmp/client.cloak.json" || {
+        rm -rf "$tmp"; return 1;
+    }
+    public_host=$PUBLIC_HOST
+    public_port=$PUBLIC_PORT
+    owner=${SUDO_USER:-root}
+    if [[ "$owner" != root ]] && id "$owner" >/dev/null 2>&1; then
+        group=$(id -gn "$owner")
+    else
+        owner=root
+        group=root
+    fi
+    install -o "$owner" -g "$group" -m 0600 "$tmp/client.ovpn" "$output" || {
+        rm -rf "$tmp"; return 1;
+    }
+    if ! install -o "$owner" -g "$group" -m 0600 "$tmp/client.cloak.json" "$jsonfile"; then
+        rm -f "$output"
+        rm -rf "$tmp"
+        return 1
+    fi
+    rm -rf "$tmp"
+    log "Exported Cloak client '$client' from '$gateway':"
+    log "  OpenVPN profile: $output"
+    log "  Cloak config:    $jsonfile"
+    log "After copying both files to macOS, from their directory run:"
+    log "  ck-client -c './$(basename "$jsonfile")' -s '$public_host' -p '$public_port' -l 11940"
+    log "Then connect Tunnelblick using '$(basename "$output")'. Both files are required."
+}
+
+gateway_write_cloak_client_config() {
+    local gateway=$1 client=$2 output=$3 uid public_key
+    load_gateway_cfg "$gateway"
+    gateway_client_load "$gateway" "$client"
+    [[ "$TRANSPORT" == cloak ]] || return 1
+    uid=${CLOAK_UID:-}
+    [[ -n "$uid" ]] || die "Cloak client '$client' has no UID; reinstall the server to provision existing clients."
+    public_key=$(<"$(gateway_transport_dir "$gateway")/public.key")
+    python3 - "$output" "$uid" "$public_key" "$TRANSPORT_SERVER_NAME" <<'PY_CLOAK_CLIENT_EXPORT'
+import json, sys
+path, uid, public_key, server_name = sys.argv[1:]
+config = {
+    "Transport": "direct", "ProxyMethod": "openvpn",
+    "EncryptionMethod": "chacha20-poly1305",
+    "UID": uid, "PublicKey": public_key, "ServerName": server_name,
+    "NumConn": 4, "BrowserSig": "chrome", "StreamTimeout": 300,
+}
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(config, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+PY_CLOAK_CLIENT_EXPORT
+    chmod 0600 "$output"
 }
 
 gateway_write_client_profile_file() {
@@ -1043,26 +1146,7 @@ gateway_write_nnslink_bundle() {
         cloak)
             [[ -n "$CLOAK_UID" ]] || die "Cloak client '$client' has no UID; rotate it before export."
             public_key=$(<"$tdir/public.key")
-            python3 - "$temp/cloak-client.json" "$CLOAK_UID" "$public_key" \
-                "$TRANSPORT_SERVER_NAME" <<'PY_CLOAK_CLIENT'
-import json,sys
-path, uid, public_key, server_name = sys.argv[1:]
-config = {
-    "Transport": "direct",
-    "ProxyMethod": "openvpn",
-    "EncryptionMethod": "chacha20-poly1305",
-    "UID": uid,
-    "PublicKey": public_key,
-    "ServerName": server_name,
-    "NumConn": 4,
-    "BrowserSig": "chrome",
-    "StreamTimeout": 300,
-}
-with open(path, "w", encoding="utf-8") as fh:
-    json.dump(config, fh, indent=2, sort_keys=True)
-    fh.write("\n")
-PY_CLOAK_CLIENT
-            chmod 0600 "$temp/cloak-client.json"
+            gateway_write_cloak_client_config "$gateway" "$client" "$temp/cloak-client.json"
             ;;
     esac
 

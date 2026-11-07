@@ -22,7 +22,8 @@
 #
 # Public commands:
 #   install [--local-only]
-#   install <name> --server [--listen udp:1194] [--public host:port]
+#   install <name> --server [--listen udp:1194|tcp:443] [--public host:port]
+#                         [--transport direct|cloak] [--server-name <decoy-host>]
 #                         [--pool CIDR] [--dns "IPv4 IPv4"]
 #                         [--client-to-client[=on|off]]
 #   install [<app_name> [--backend inherit] [--via <upstream-app>|host]
@@ -62,7 +63,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.45"
+readonly VERSION="1.3.46"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -285,7 +286,8 @@ usage() {
     cat <<'USAGE'
 Usage:
   nns-app install [--local-only]
-  nns-app install <name> --server [--listen udp:1194] [--public host:port]
+  nns-app install <name> --server [--listen udp:1194|tcp:443] [--public host:port]
+                  [--transport direct|cloak] [--server-name <cloak-decoy-host>]
                   [--pool IPv4-CIDR] [--dns "IPv4 IPv4"]
                   [--client-to-client[=on|off] | --no-client-to-client]
   nns-app install <app_name> [--backend inherit] [--via <upstream-app>|host]
@@ -5473,7 +5475,7 @@ gateway_create() {
         <<<"$(parse_public_endpoint "$public")"
     # Check under the global creation lock so concurrent managed installs
     # cannot reserve the same host port between preflight and commit.
-    if [[ "$via_app" == host && "$transport" == direct ]]; then
+    if [[ "$via_app" == host && "$transport" != ssh ]]; then
         local conflict_reason
         if conflict_reason=$(server_listener_conflict "$listen_proto" "$listen_port" "$gateway"); then
             release_lock "gateway-$gateway"
@@ -7187,21 +7189,54 @@ server_gateway_exists() {
 # Idempotent install also reconciles an existing OpenVPN server. In-place
 # updates retain its CA, all client keys/certificates, and its tunnel identity.
 # A failed update restores the previous settings and (if running) service.
+# Restore all mutable state affected by a server transport conversion. The
+# private CA, issued certificates and client keys are never modified.
+server_restore_reinstall_snapshot() {
+    local name=$1 snapshot=$2 root cfg client_file client
+    root=$(gateway_dir "$name")
+    cp -p "$snapshot/gateway.cfg" "$root/gateway.cfg" || return 1
+    if [[ -f "$snapshot/server.conf" ]]; then
+        cp -p "$snapshot/server.conf" "$root/server.conf" || return 1
+    else
+        rm -f "$root/server.conf"
+    fi
+    if [[ -e "$snapshot/transport" ]]; then
+        rm -rf "$root/transport"
+        cp -a "$snapshot/transport" "$root/transport" || return 1
+    else
+        rm -rf "$root/transport"
+    fi
+    shopt -s nullglob
+    for cfg in "$snapshot/client-configs"/*.cfg; do
+        client_file=${cfg##*/}
+        client=${client_file%.cfg}
+        cp -p "$cfg" "$root/clients/$client/client.cfg" || return 1
+    done
+}
+
+# Idempotent installation/reconciliation of direct and Cloak host OpenVPN
+# servers. Preserve PKI, issued identities, fixed IP and per-client routing.
 install_openvpn_server() {
     require_root
     local name=$1 listen=${2:-} public=${3:-} pool=${4:-} dns=${5:-}
-    local client_to_client=${6:-}
+    local client_to_client=${6:-} requested_transport=${7:-} requested_decoy=${8:-}
     local protocol port public_host current_proto current_port current_public_port old_public_host
-    local previous_cfg backup_dir changed=off was_active=off conflict_reason
+    local backup_dir="" changed=off was_active=off conflict_reason=""
     local new_proto new_port new_host new_public_port new_pool new_dns new_c2c
+    local old_transport new_transport new_decoy new_backend_port public_proto
+    local old_endpoint="" old_listener="" root cfg client client_dir
     validate_gateway_name "$name"
     [[ -z "$client_to_client" ]] || validate_client_to_client "$client_to_client"
+    case "$requested_transport" in ''|direct|cloak) ;; *) die "--transport must be direct or cloak." ;; esac
+    if [[ -n "$requested_decoy" ]]; then
+        validate_transport_server_name "$requested_decoy"
+        [[ "$requested_transport" == cloak || -z "$requested_transport" ]] ||
+            die "--server-name requires --transport cloak."
+    fi
     [[ ! -f "$(cfg_file "$name")" ]] ||
         die "'$name' is an existing namespace app (type vpn-client); remove it before replacing its type."
 
     acquire_lock global
-    # Install prerequisite files even when the server exists: this is a
-    # re-install/repair operation, not a no-op for existing instances.
     ensure_dependencies
     install_engine_files
 
@@ -7209,12 +7244,26 @@ install_openvpn_server() {
         server_gateway_exists "$name" ||
             die "'$name' is an existing gateway with a non-host exit; use 'gateway' commands."
         load_gateway_cfg "$name"
-        [[ "$TRANSPORT" == direct ]] ||
-            die "'$name' uses $TRANSPORT; --server supports direct transport only."
+        case "$TRANSPORT" in direct|cloak) ;;
+          *) die "'$name' uses $TRANSPORT, which cannot be reinstalled with --server." ;;
+        esac
+        old_transport=$TRANSPORT
+        new_transport=${requested_transport:-$TRANSPORT}
+        new_decoy=${TRANSPORT_SERVER_NAME:-$PUBLIC_HOST}
+        if [[ "$new_transport" == cloak ]]; then
+            new_decoy=${requested_decoy:-$([[ "$old_transport" == cloak ]] && printf %s "$TRANSPORT_SERVER_NAME" || printf %s www.bing.com)}
+            validate_transport_server_name "$new_decoy"
+            [[ -n "$(gateway_transport_binary cloak || true)" ]] ||
+                die "Cloak requires ck-server on the server (install the trusted Cloak binary before --transport cloak)."
+        else
+            [[ -z "$requested_decoy" ]] || die "--server-name requires --transport cloak."
+        fi
         current_proto=$LISTEN_PROTO
         current_port=$LISTEN_PORT
         current_public_port=$PUBLIC_PORT
         old_public_host=$PUBLIC_HOST
+        old_endpoint="$PUBLIC_HOST:$PUBLIC_PORT"
+        old_listener="$LISTEN_PROTO:$LISTEN_PORT"
         new_proto=$LISTEN_PROTO
         new_port=$LISTEN_PORT
         new_host=$PUBLIC_HOST
@@ -7222,22 +7271,31 @@ install_openvpn_server() {
         new_pool=$CLIENT_POOL
         new_dns=$DNS_SERVERS
         new_c2c=$CLIENT_TO_CLIENT
+        new_backend_port=${OPENVPN_LISTEN_PORT:-$LISTEN_PORT}
         if systemctl is-active --quiet "nns-gateway@${name}.service"; then
             was_active=on
         fi
 
         if [[ -n "$listen" ]]; then
             IFS='|' read -r new_proto new_port <<<"$(parse_gateway_listen "$listen")"
+        elif [[ "$old_transport" == direct && "$new_transport" == cloak &&
+                "$current_proto" == udp ]]; then
+            # Cloak exposes a public TCP listener, and its OpenVPN backend is
+            # always private TCP regardless of the original UDP server.
+            new_proto=tcp
+            new_port=443
         fi
-        if conflict_reason=$(server_listener_conflict "$new_proto" "$new_port" "$name"                                 "$([[ "$was_active" == on && "$new_proto:$new_port" == "$current_proto:$current_port" ]] && echo on || echo off)"); then
-            if [[ -n "$listen" ]]; then
-                die "Cannot reinstall '$name': $conflict_reason. Select a free --listen port."
+        [[ "$new_transport" != cloak || "$new_proto" == tcp ]] ||
+            die "Cloak requires a TCP listener. Use --listen tcp:443 (or another TCP port)."
+
+        if conflict_reason=$(server_listener_conflict "$new_proto" "$new_port" "$name" \
+            "$([[ "$was_active" == on && "$new_proto:$new_port" == "$old_listener" ]] && echo on || echo off)"); then
+            if [[ -n "$listen" || "$new_transport" == cloak ]]; then
+                die "Cannot reinstall '$name': $conflict_reason. Select a free --listen tcp:<port>."
             fi
-            # The old unit may have failed to start because another server
-            # already owns its port. Repair it without destroying credentials.
             listen=$(server_choose_listener "$name")
             IFS='|' read -r new_proto new_port <<<"$(parse_gateway_listen "$listen")"
-            warn "Server '$name' cannot use $current_proto:$current_port ($conflict_reason); switching to $listen."
+            warn "Server '$name' cannot use $old_listener ($conflict_reason); switching to $listen."
         fi
         if [[ -z "$public" && "$new_port" != "$current_port" &&
               "$current_public_port" == "$current_port" ]]; then
@@ -7246,11 +7304,20 @@ install_openvpn_server() {
         if [[ -n "$public" ]]; then
             IFS='|' read -r new_host new_public_port <<<"$(parse_public_endpoint "$public")"
         fi
+        if [[ "$new_transport" == cloak ]]; then
+            [[ "$new_decoy" != "$new_host" ]] ||
+                die "Cloak --server-name must differ from --public to avoid a redirect loop."
+            if [[ "$old_transport" != cloak ]]; then
+                new_backend_port=$(gateway_allocate_backend_port "$name")
+            fi
+        else
+            new_decoy=$new_host
+            new_backend_port=$new_port
+        fi
         if [[ -n "$pool" && "$pool" != "$CLIENT_POOL" ]]; then
-            # The allocator checks overlap with all saved and live networks.
-            # Do not regenerate the transit or gateway PKI when changing pool.
             local allocated unused_transit unused_a unused_b
-            IFS='|' read -r allocated unused_transit unused_a unused_b                 <<<"$(allocate_gateway_networks "$pool")"
+            IFS='|' read -r allocated unused_transit unused_a unused_b \
+                <<<"$(allocate_gateway_networks "$pool")"
             [[ "$allocated" == "$pool" ]] || die "Invalid requested client pool '$pool'."
             new_pool=$pool
         fi
@@ -7268,30 +7335,55 @@ install_openvpn_server() {
         if [[ "$new_proto" != "$LISTEN_PROTO" || "$new_port" != "$LISTEN_PORT" ||
               "$new_host" != "$PUBLIC_HOST" || "$new_public_port" != "$PUBLIC_PORT" ||
               "$new_pool" != "$CLIENT_POOL" || "$new_dns" != "$DNS_SERVERS" ||
-              "$new_c2c" != "$CLIENT_TO_CLIENT" ]]; then
+              "$new_c2c" != "$CLIENT_TO_CLIENT" || "$new_transport" != "$old_transport" ||
+              "$new_decoy" != "${TRANSPORT_SERVER_NAME:-$PUBLIC_HOST}" ]]; then
             changed=on
         fi
         if [[ "$changed" == on ]]; then
-            # Stop under the *old* configuration to remove old-port firewall
-            # entries and NAT rules before changing the config file.
             gateway_stop "$name"
             acquire_lock "gateway-$name"
-            backup_dir=$(mktemp -d "$(gateway_dir "$name")/.reinstall.XXXXXX")
-            cp -p "$(gateway_cfg_file "$name")" "$backup_dir/gateway.cfg"
-            if [[ -f "$(gateway_server_config "$name")" ]]; then
-                cp -p "$(gateway_server_config "$name")" "$backup_dir/server.conf"
-            fi
+            root=$(gateway_dir "$name")
+            backup_dir=$(mktemp -d "$root/.reinstall.XXXXXX")
+            cp -p "$root/gateway.cfg" "$backup_dir/gateway.cfg"
+            [[ ! -f "$root/server.conf" ]] || cp -p "$root/server.conf" "$backup_dir/server.conf"
+            [[ ! -d "$root/transport" ]] || cp -a "$root/transport" "$backup_dir/transport"
+            mkdir -p "$backup_dir/client-configs"
+            shopt -s nullglob
+            for client_dir in "$root/clients"/*; do
+                cfg="$client_dir/client.cfg"
+                [[ ! -f "$cfg" ]] || cp -p "$cfg" "$backup_dir/client-configs/${client_dir##*/}.cfg"
+            done
+            gateway_cfg_set "$name" TRANSPORT "$new_transport"
             gateway_cfg_set "$name" LISTEN_PROTO "$new_proto"
             gateway_cfg_set "$name" LISTEN_PORT "$new_port"
-            gateway_cfg_set "$name" OPENVPN_LISTEN_PROTO "$new_proto"
-            gateway_cfg_set "$name" OPENVPN_LISTEN_PORT "$new_port"
+            gateway_cfg_set "$name" OPENVPN_LISTEN_PROTO "$([[ "$new_transport" == cloak ]] && echo tcp || echo "$new_proto")"
+            gateway_cfg_set "$name" OPENVPN_LISTEN_PORT "$new_backend_port"
             gateway_cfg_set "$name" PUBLIC_HOST "$new_host"
             gateway_cfg_set "$name" PUBLIC_PORT "$new_public_port"
-            gateway_cfg_set "$name" TRANSPORT_SERVER_NAME "$new_host"
+            gateway_cfg_set "$name" TRANSPORT_SERVER_NAME "$new_decoy"
             gateway_cfg_set "$name" CLIENT_POOL "$new_pool"
             gateway_cfg_set "$name" DNS_SERVERS "$new_dns"
             gateway_cfg_set "$name" CLIENT_TO_CLIENT "$new_c2c"
+            local prep_ok=on
+            if [[ "$new_transport" == cloak ]]; then
+                if [[ ! -s "$root/transport/private.key" || ! -s "$root/transport/public.key" ]]; then
+                    ( gateway_prepare_transport "$name" "$root" cloak ) || prep_ok=off
+                fi
+                if [[ "$prep_ok" == on ]]; then
+                    ( gateway_cloak_ensure_client_uids "$name" "$root" ) || prep_ok=off
+                fi
+            fi
             release_lock "gateway-$name"
+            if [[ "$prep_ok" != on ]]; then
+                acquire_lock "gateway-$name"
+                server_restore_reinstall_snapshot "$name" "$backup_dir" ||
+                    warn "Could not fully restore '$name' after transport preparation failure."
+                release_lock "gateway-$name"
+                rm -rf "$backup_dir"
+                [[ "$was_active" != on ]] || gateway_start "$name" || true
+                release_lock global
+                die "Failed to prepare '$name' Cloak configuration; previous settings restored."
+            fi
         fi
         write_gateway_unit_dropin "$name"
         systemctl daemon-reload
@@ -7300,42 +7392,58 @@ install_openvpn_server() {
             if [[ "$changed" == on ]]; then
                 gateway_stop "$name" >/dev/null 2>&1 || true
                 acquire_lock "gateway-$name"
-                cp -p "$backup_dir/gateway.cfg" "$(gateway_cfg_file "$name")"
-                if [[ -f "$backup_dir/server.conf" ]]; then
-                    cp -p "$backup_dir/server.conf" "$(gateway_server_config "$name")"
-                fi
-                rm -rf "$backup_dir"
+                server_restore_reinstall_snapshot "$name" "$backup_dir" ||
+                    warn "Could not fully restore '$name' after failed start."
                 release_lock "gateway-$name"
                 if [[ "$was_active" == on ]]; then
                     gateway_start "$name" ||
-                        warn "Rollback restored '$name' settings, but the previous service failed to restart."
+                        warn "Rollback restored '$name' but the previous service failed to restart."
                 fi
             fi
+            [[ -z "$backup_dir" ]] || rm -rf "$backup_dir"
             release_lock global
             die "Server '$name' could not start. Previous settings were restored if reconfigured."
         fi
         [[ -z "$backup_dir" ]] || rm -rf "$backup_dir"
-        log "Reinstalled OpenVPN server '$name' (existing CA and client certificates preserved)."
-        if [[ "$new_host:$new_public_port" != "$old_public_host:$current_public_port" ||
-              "$new_proto:$new_port" != "$current_proto:$current_port" ]]; then
-            warn "Re-export existing client profiles: the server endpoint/listener changed."
+        log "Reinstalled OpenVPN server '$name' with '$new_transport' transport (CA and client certificates preserved)."
+        if [[ "$new_host:$new_public_port" != "$old_endpoint" ||
+              "$new_proto:$new_port" != "$old_listener" || "$new_transport" != "$old_transport" ]]; then
+            warn "Re-export client profiles: public endpoint or transport changed."
         fi
     else
-        if [[ -z "$listen" ]]; then
-            listen=$(server_choose_listener "$name")
+        new_transport=${requested_transport:-direct}
+        if [[ "$new_transport" == cloak ]]; then
+            [[ -n "$(gateway_transport_binary cloak || true)" ]] ||
+                die "Cloak requires ck-server on the server (install Cloak first)."
+            listen=${listen:-tcp:443}
+            new_decoy=${requested_decoy:-www.bing.com}
+            validate_transport_server_name "$new_decoy"
         else
-            IFS='|' read -r protocol port <<<"$(parse_gateway_listen "$listen")"
-            if conflict_reason=$(server_listener_conflict "$protocol" "$port" "$name"); then
-                die "Cannot install '$name': $conflict_reason. Use another --listen port."
-            fi
+            [[ -z "$requested_decoy" ]] || die "--server-name requires --transport cloak."
+            listen=${listen:-$(server_choose_listener "$name")}
+            new_decoy=""
         fi
         IFS='|' read -r protocol port <<<"$(parse_gateway_listen "$listen")"
+        [[ "$new_transport" != cloak || "$protocol" == tcp ]] ||
+            die "Cloak requires --listen tcp:<port>, for example tcp:443."
+        if conflict_reason=$(server_listener_conflict "$protocol" "$port" "$name"); then
+            die "Cannot install '$name': $conflict_reason. Use a different --listen port."
+        fi
         if [[ -z "$public" ]]; then
             public_host=$(server_public_host) ||
                 die "Cannot discover host IPv4. Pass --public <host>:<port>."
             public="$public_host:$port"
         fi
-        gateway_create "$name" host "$listen" "$public" "$pool"             "${dns:-1.1.1.1 9.9.9.9}" direct "" modern "${client_to_client:-off}"
+        if [[ "$new_transport" == cloak ]]; then
+            IFS='|' read -r public_host public_proto <<<"$(parse_public_endpoint "$public")"
+            [[ "$new_decoy" != "$public_host" ]] ||
+                die "Cloak --server-name must differ from --public to avoid a redirect loop."
+        fi
+        gateway_create "$name" host "$listen" "$public" "$pool" \
+            "${dns:-1.1.1.1 9.9.9.9}" "$new_transport" "$new_decoy" modern "${client_to_client:-off}"
+        load_gateway_cfg "$name"
+        new_host=$PUBLIC_HOST
+        new_public_port=$PUBLIC_PORT
         systemctl enable "nns-gateway@${name}.service" >/dev/null
         if ! gateway_start "$name"; then
             release_lock global
@@ -7344,7 +7452,13 @@ install_openvpn_server() {
     fi
     release_lock global
     log "OpenVPN server '$name' is enabled at boot."
-    log "Create client:  nns-app export ovpn $name --client laptop --output laptop.ovpn"
+    if [[ "$new_transport" == cloak ]]; then
+        log "Cloak listener: $new_host:$new_public_port/tcp (private OpenVPN backend)."
+        log "Create client: nns-app export ovpn $name --client laptop --split-tunnel --output laptop.ovpn"
+        log "Cloak client requires ck-client on macOS in addition to Tunnelblick."
+    else
+        log "Create client: nns-app export ovpn $name --client laptop --output laptop.ovpn"
+    fi
     log "Check status:   nns-app status $name"
 }
 
@@ -7403,6 +7517,9 @@ server_export_ovpn() {
         die "Server public endpoint is $PUBLIC_HOST:$PUBLIC_PORT; export override is not supported."
     [[ "$proto" == auto || "$proto" == "$LISTEN_PROTO" ]] ||
         die "Server listener uses $LISTEN_PROTO, not $proto."
+    if [[ "$TRANSPORT" == cloak && "$output" == - ]]; then
+        die "Cloak needs a .ovpn and a .cloak.json file; pass --output <name>.ovpn."
+    fi
     if [[ ! -e "$(gateway_client_dir "$gateway" "$client")" ]]; then
         # Keep stdout pure so --output - can safely be redirected to an .ovpn.
         gateway_client_add "$gateway" "$client" >&2
@@ -7413,7 +7530,11 @@ server_export_ovpn() {
     if [[ "$route_mode" != keep ]]; then
         gateway_client_route_mode "$gateway" "$client" "$route_mode" >&2
     fi
-    gateway_client_export "$gateway" "$client" "$output" ovpn
+    if [[ "$TRANSPORT" == cloak ]]; then
+        gateway_cloak_export_client_pair "$gateway" "$client" "$output"
+    else
+        gateway_client_export "$gateway" "$client" "$output" ovpn
+    fi
 }
 
 gateway_remove() {
@@ -8191,7 +8312,8 @@ remote_status() {
 }
 
 gateway_transport_dir() {
-    local gateway=$1 root=${2:-$(gateway_dir "$gateway")}
+    local gateway=$1 root
+    root=${2:-$(gateway_dir "$gateway")}
     printf '%s/transport\n' "$root"
 }
 
@@ -8300,7 +8422,8 @@ PY_CLOAK_KEYS
 }
 
 gateway_cloak_active_uids_json() {
-    local gateway=$1 root=${2:-$(gateway_dir "$gateway")} dir cfg uid status first=1
+    local gateway=$1 root dir cfg uid status first=1
+    root=${2:-$(gateway_dir "$gateway")}
     printf '['
     shopt -s nullglob
     for dir in "$root/clients"/*; do
@@ -8317,7 +8440,8 @@ gateway_cloak_active_uids_json() {
 }
 
 gateway_write_transport_config() {
-    local gateway=$1 root=${2:-$(gateway_dir "$gateway")} tdir output private_key public_key uids
+    local gateway=$1 root tdir output private_key public_key uids
+    root=${2:-$(gateway_dir "$gateway")}
     if [[ "$root" == "$(gateway_dir "$gateway")" ]]; then
         load_gateway_cfg "$gateway"
     else
@@ -8351,7 +8475,7 @@ STUNNEL_SERVER_EOF
             public_key=$(<"$tdir/public.key")
             uids=$(gateway_cloak_active_uids_json "$gateway" "$root")
             python3 - "$tdir/server.json" "$LISTEN_PORT" "$OPENVPN_LISTEN_PORT" \
-                "$PUBLIC_HOST" "$private_key" "$uids" <<'PY_CLOAK_SERVER'
+                "$TRANSPORT_SERVER_NAME" "$private_key" "$uids" <<'PY_CLOAK_SERVER'
 import json,sys
 path, public_port, backend_port, server_name, private_key, uids = sys.argv[1:]
 config = {
@@ -8423,6 +8547,106 @@ if len(raw) != 16:
     raise SystemExit(1)
 print(value)
 PY_CLOAK_UID
+}
+
+# Assign a Cloak authorization UID to every active pre-existing OpenVPN client
+# when switching an existing direct server to Cloak. No certificate is rotated.
+# The caller holds the gateway lock and snapshots client.cfg before invoking.
+gateway_cloak_ensure_client_uids() {
+    local gateway=$1 root dir cfg uid status tmp
+    root=${2:-$(gateway_dir "$gateway")}
+    shopt -s nullglob
+    for dir in "$root/clients"/*; do
+        cfg="$dir/client.cfg"
+        [[ -f "$cfg" ]] || continue
+        status=$(awk -F= '/^STATUS=/{gsub(/^"|"$/, "", $2); print $2; exit}' "$cfg")
+        [[ "$status" == active ]] || continue
+        uid=$(awk -F= '/^CLOAK_UID=/{gsub(/^"|"$/, "", $2); print $2; exit}' "$cfg")
+        [[ -z "$uid" ]] || continue
+        uid=$(gateway_cloak_new_uid) || return 1
+        tmp=$(mktemp "${cfg}.XXXXXX") || return 1
+        awk -v uid="$uid" '
+          /^CLOAK_UID=/ {print "CLOAK_UID=\"" uid "\""; found=1; next}
+          {print}
+          END {if (!found) print "CLOAK_UID=\"" uid "\""}
+        ' "$cfg" >"$tmp" || { rm -f "$tmp"; return 1; }
+        install -o root -g root -m 0600 "$tmp" "$cfg" || {
+            rm -f "$tmp"; return 1;
+        }
+        rm -f "$tmp"
+    done
+}
+
+# The exported OpenVPN profile is intentionally local-only. Cloak is a
+# separate process; Tunnelblick alone cannot establish a Cloak connection.
+gateway_cloak_export_client_pair() {
+    local gateway=$1 client=$2 output=$3 jsonfile tmp owner group public_host public_port
+    [[ "$output" != - ]] || die "Cloak requires two files: pass --output <file.ovpn> rather than stdout."
+    load_gateway_cfg "$gateway"
+    [[ "$TRANSPORT" == cloak ]] || die "'$gateway' does not use Cloak."
+    output=$(readlink -m "$output")
+    [[ "$output" == *.ovpn ]] || die "Cloak client output must end with .ovpn."
+    jsonfile="${output%.ovpn}.cloak.json"
+    [[ -d "$(dirname "$output")" ]] || die "Output directory does not exist: $(dirname "$output")"
+    [[ ! -e "$output" && ! -e "$jsonfile" ]] || die "Output exists: $output or $jsonfile"
+    tmp=$(mktemp -d) || return 1
+    gateway_write_client_profile_file "$gateway" "$client" "$tmp/client.ovpn" local || {
+        rm -rf "$tmp"; return 1;
+    }
+    # Preserve a physical route to the public Cloak endpoint even when
+    # full-tunnel routing is enabled. Do not route the Cloak socket into itself.
+    printf 'route %s 255.255.255.255 net_gateway\n' "$PUBLIC_HOST" >>"$tmp/client.ovpn"
+    gateway_write_cloak_client_config "$gateway" "$client" "$tmp/client.cloak.json" || {
+        rm -rf "$tmp"; return 1;
+    }
+    public_host=$PUBLIC_HOST
+    public_port=$PUBLIC_PORT
+    owner=${SUDO_USER:-root}
+    if [[ "$owner" != root ]] && id "$owner" >/dev/null 2>&1; then
+        group=$(id -gn "$owner")
+    else
+        owner=root
+        group=root
+    fi
+    install -o "$owner" -g "$group" -m 0600 "$tmp/client.ovpn" "$output" || {
+        rm -rf "$tmp"; return 1;
+    }
+    if ! install -o "$owner" -g "$group" -m 0600 "$tmp/client.cloak.json" "$jsonfile"; then
+        rm -f "$output"
+        rm -rf "$tmp"
+        return 1
+    fi
+    rm -rf "$tmp"
+    log "Exported Cloak client '$client' from '$gateway':"
+    log "  OpenVPN profile: $output"
+    log "  Cloak config:    $jsonfile"
+    log "After copying both files to macOS, from their directory run:"
+    log "  ck-client -c './$(basename "$jsonfile")' -s '$public_host' -p '$public_port' -l 11940"
+    log "Then connect Tunnelblick using '$(basename "$output")'. Both files are required."
+}
+
+gateway_write_cloak_client_config() {
+    local gateway=$1 client=$2 output=$3 uid public_key
+    load_gateway_cfg "$gateway"
+    gateway_client_load "$gateway" "$client"
+    [[ "$TRANSPORT" == cloak ]] || return 1
+    uid=${CLOAK_UID:-}
+    [[ -n "$uid" ]] || die "Cloak client '$client' has no UID; reinstall the server to provision existing clients."
+    public_key=$(<"$(gateway_transport_dir "$gateway")/public.key")
+    python3 - "$output" "$uid" "$public_key" "$TRANSPORT_SERVER_NAME" <<'PY_CLOAK_CLIENT_EXPORT'
+import json, sys
+path, uid, public_key, server_name = sys.argv[1:]
+config = {
+    "Transport": "direct", "ProxyMethod": "openvpn",
+    "EncryptionMethod": "chacha20-poly1305",
+    "UID": uid, "PublicKey": public_key, "ServerName": server_name,
+    "NumConn": 4, "BrowserSig": "chrome", "StreamTimeout": 300,
+}
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(config, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+PY_CLOAK_CLIENT_EXPORT
+    chmod 0600 "$output"
 }
 
 gateway_write_client_profile_file() {
@@ -8506,26 +8730,7 @@ gateway_write_nnslink_bundle() {
         cloak)
             [[ -n "$CLOAK_UID" ]] || die "Cloak client '$client' has no UID; rotate it before export."
             public_key=$(<"$tdir/public.key")
-            python3 - "$temp/cloak-client.json" "$CLOAK_UID" "$public_key" \
-                "$TRANSPORT_SERVER_NAME" <<'PY_CLOAK_CLIENT'
-import json,sys
-path, uid, public_key, server_name = sys.argv[1:]
-config = {
-    "Transport": "direct",
-    "ProxyMethod": "openvpn",
-    "EncryptionMethod": "chacha20-poly1305",
-    "UID": uid,
-    "PublicKey": public_key,
-    "ServerName": server_name,
-    "NumConn": 4,
-    "BrowserSig": "chrome",
-    "StreamTimeout": 300,
-}
-with open(path, "w", encoding="utf-8") as fh:
-    json.dump(config, fh, indent=2, sort_keys=True)
-    fh.write("\n")
-PY_CLOAK_CLIENT
-            chmod 0600 "$temp/cloak-client.json"
+            gateway_write_cloak_client_config "$gateway" "$client" "$temp/cloak-client.json"
             ;;
     esac
 
@@ -13548,6 +13753,7 @@ main() {
                 local install_remote="" install_remote_port=22 install_remote_port_set=off
                 local install_server=off install_listen="" install_public=""
                 local install_pool="" install_dns="" install_c2c=""
+                local install_transport="" install_server_name=""
                 shift 2
                 while (( $# > 0 )); do
                     case "$1" in
@@ -13577,6 +13783,16 @@ main() {
                             install_public=$2; shift 2 ;;
                         --public=*)
                             install_public=${1#--public=}; shift ;;
+                        --transport)
+                            (( $# >= 2 )) || die "--transport requires direct or cloak."
+                            install_transport=$2; shift 2 ;;
+                        --transport=*)
+                            install_transport=${1#--transport=}; shift ;;
+                        --server-name)
+                            (( $# >= 2 )) || die "--server-name requires a Cloak decoy hostname."
+                            install_server_name=$2; shift 2 ;;
+                        --server-name=*)
+                            install_server_name=${1#--server-name=}; shift ;;
                         --pool)
                             (( $# >= 2 )) || die "--pool requires an IPv4 CIDR."
                             install_pool=$2; shift 2 ;;
@@ -13652,10 +13868,11 @@ main() {
                        "$install_via" == __default__ && "$install_backend" == __default__ ]] ||
                         die "--server cannot be combined with --via, --remote, or --backend."
                     install_openvpn_server "$install_app_name" \
-                        "$install_listen" "$install_public" "$install_pool" "$install_dns" "$install_c2c"
+                        "$install_listen" "$install_public" "$install_pool" "$install_dns" "$install_c2c" \
+                        "$install_transport" "$install_server_name"
                 else
-                    [[ -z "$install_listen$install_public$install_pool$install_dns$install_c2c" ]] ||
-                        die "--listen, --public, --pool, --dns and --client-to-client require --server."
+                    [[ -z "$install_listen$install_public$install_pool$install_dns$install_c2c$install_transport$install_server_name" ]] ||
+                        die "--listen, --public, --pool, --dns, --transport, --server-name and --client-to-client require --server."
                     if [[ -n "$install_remote" ]]; then
                         [[ "$install_via" == __default__ && "$install_backend" == __default__ ]] ||
                             die "--via-remote cannot be combined with --via or --backend."

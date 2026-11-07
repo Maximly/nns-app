@@ -22,7 +22,8 @@
 #
 # Public commands:
 #   install [--local-only]
-#   install <name> --server [--listen udp:1194] [--public host:port]
+#   install <name> --server [--listen udp:1194|tcp:443] [--public host:port]
+#                         [--transport direct|cloak] [--server-name <decoy-host>]
 #                         [--pool CIDR] [--dns "IPv4 IPv4"]
 #                         [--client-to-client[=on|off]]
 #   install [<app_name> [--backend inherit] [--via <upstream-app>|host]
@@ -62,7 +63,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.45"
+readonly VERSION="1.3.46"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -285,7 +286,8 @@ usage() {
     cat <<'USAGE'
 Usage:
   nns-app install [--local-only]
-  nns-app install <name> --server [--listen udp:1194] [--public host:port]
+  nns-app install <name> --server [--listen udp:1194|tcp:443] [--public host:port]
+                  [--transport direct|cloak] [--server-name <cloak-decoy-host>]
                   [--pool IPv4-CIDR] [--dns "IPv4 IPv4"]
                   [--client-to-client[=on|off] | --no-client-to-client]
   nns-app install <app_name> [--backend inherit] [--via <upstream-app>|host]

@@ -1,3 +1,10 @@
+## v1.3.46 (2026-11-07)
+- Support `install <name> --server --transport cloak [--listen tcp:443] [--server-name <decoy>]`, reusing the managed gateway Cloak wrapper and OpenVPN loopback backend.
+- Reinstall existing host servers with Cloak without regenerating CA/client certificates, assign Cloak UIDs to existing active clients, preserve existing fixed-IP and routing policies, and roll back on failed start.
+- `export ovpn <server> --client <name> --output <name>.ovpn` for Cloak exports two files: local Tunnelblick profile and separate `*.cloak.json`, with instructions to run `ck-client` on macOS.
+- Reject public listener collisions for Cloak servers; preserve a physical route to the Cloak endpoint in full-tunnel client profiles.
+- Correct Cloak decoy redirect target to use `TRANSPORT_SERVER_NAME`, not the server public host.
+
 ## 1.3.45 — server-side OpenVPN client routing modes
 - Add per-client `split`/`full` routing policy, independent of fixed-IP; configure via `export ovpn ... --split-tunnel|--full-tunnel`, `route-mode <server> <client> [split|full]`, and gateway client equivalents.
 - Split mode removes the `redirect-gateway` and public DNS push for that client only, preserving the VPN pool route and existing `.ovpn` credentials.
