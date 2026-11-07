@@ -312,6 +312,13 @@ repair_gateway_one() {
     fi
     acquire_lock "gateway-$gateway"
     load_gateway_cfg "$gateway"
+    if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
+        write_gateway_unit_dropin "$gateway"
+        awg_server_write_config "$gateway"
+        release_lock "gateway-$gateway"
+        repair_fixed "Refreshed AmneziaWG server '$gateway' managed configuration"
+        return 0
+    fi
     root_mode=$(stat -c '%a' "$(gateway_dir "$gateway")" 2>/dev/null || true)
     if [[ "$root_mode" != 711 ]]; then
         if gateway_ensure_runtime_access "$gateway"; then

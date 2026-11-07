@@ -48,14 +48,27 @@ load_gateway_cfg() {
 
     [[ "${GATEWAY_NAME:-}" == "$gateway" ]] ||
         die "GATEWAY_NAME mismatch in $file."
-    [[ "${GATEWAY_BACKEND:-}" == openvpn ]] ||
-        die "Unsupported gateway backend '${GATEWAY_BACKEND:-}'."
+    GATEWAY_BACKEND=${GATEWAY_BACKEND:-openvpn}
+    case "$GATEWAY_BACKEND" in
+        openvpn|amneziawg) ;;
+        *) die "Unsupported gateway backend '${GATEWAY_BACKEND:-}'." ;;
+    esac
     TRANSPORT=${TRANSPORT:-direct}
     OPENVPN_COMPAT=${OPENVPN_COMPAT:-modern}
     case "$OPENVPN_COMPAT" in
         modern|embedded) ;;
         *) die "Unsupported OpenVPN compatibility mode '$OPENVPN_COMPAT'." ;;
     esac
+    if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
+        [[ "$LISTEN_PROTO" == udp ]] || die "AmneziaWG servers require UDP."
+        AWG_JC=${AWG_JC:-5}
+        AWG_JMIN=${AWG_JMIN:-50}
+        AWG_JMAX=${AWG_JMAX:-200}
+        AWG_S1=${AWG_S1:-88}
+        AWG_S2=${AWG_S2:-47}
+        AWG_S3=${AWG_S3:-29}
+        AWG_S4=${AWG_S4:-17}
+    fi
     OPENVPN_LISTEN_PROTO=${OPENVPN_LISTEN_PROTO:-$LISTEN_PROTO}
     OPENVPN_LISTEN_PORT=${OPENVPN_LISTEN_PORT:-$LISTEN_PORT}
     CLIENT_TO_CLIENT=${CLIENT_TO_CLIENT:-off}
@@ -936,6 +949,10 @@ gateway_write_server_config() {
         source "$root/gateway.cfg"
     fi
 
+    if [[ "${GATEWAY_BACKEND:-}" == amneziawg ]]; then
+        awg_server_write_config "$gateway"
+        return $?
+    fi
     config="$root/server.conf"
     output="$config"
     if [[ "$root" == "$(gateway_dir "$gateway")" ]]; then
@@ -1427,6 +1444,11 @@ gateway_host_exit_rules_up() {
     gateway_host_exit_rules_down
 
     iptables_chain_ensure filter "$HOST_FWD_CHAIN"
+    if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
+        iptables -w -t filter -A "$HOST_FWD_CHAIN" \
+            -i "$GATEWAY_TUN" -o "$GATEWAY_TUN" -s "$CLIENT_POOL" -d "$CLIENT_POOL" \
+            -j "$([[ "$CLIENT_TO_CLIENT" == on ]] && echo ACCEPT || echo DROP)"
+    fi
     iptables -w -t filter -A "$HOST_FWD_CHAIN" \
         -i "$GATEWAY_TUN" -s "$CLIENT_POOL" -o "$wan" -j ACCEPT
     iptables -w -t filter -A "$HOST_FWD_CHAIN" \
@@ -1784,6 +1806,10 @@ gateway_start() {
     validate_gateway_name "$gateway"
     acquire_lock "gateway-$gateway"
     load_gateway_cfg "$gateway"
+    if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
+        awg_server_start "$gateway"
+        return $?
+    fi
     gateway_ensure_runtime_access "$gateway" || {
         release_lock "gateway-$gateway"
         die "Could not normalize runtime access for gateway '$gateway'."
@@ -1976,6 +2002,11 @@ gateway_client_add() {
     acquire_lock "gateway-$gateway"
     load_gateway_cfg "$gateway"
 
+    if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
+        release_lock "gateway-$gateway"
+        awg_server_client_add "$gateway" "$client"
+        return $?
+    fi
     pki=$(gateway_pki_dir "$gateway")
     final=$(gateway_client_dir "$gateway" "$client")
     if [[ -e "$final" ]]; then
@@ -2127,6 +2158,15 @@ gateway_client_fixed_ip() {
     local cfg tmp backup was_active=off
     validate_gateway_name "$gateway"
     validate_gateway_client_name "$client"
+    if [[ "$(gateway_cfg_value "$gateway" GATEWAY_BACKEND)" == amneziawg ]]; then
+        gateway_client_load "$gateway" "$client"
+        case "$requested" in
+            show|on) printf '%s/%s: fixed-ip=%s (required by AmneziaWG)\n' "$gateway" "$client" "$FIXED_IP" ;;
+            off) die "AmneziaWG peers require server-assigned stable IPs; cannot disable." ;;
+            *) die "Expected fixed-ip on or off." ;;
+        esac
+        return 0
+    fi
     case "$requested" in show|on|off) ;; *) die "Expected fixed-ip on or off." ;; esac
     acquire_lock "gateway-$gateway"
     load_gateway_cfg "$gateway"
@@ -2217,6 +2257,18 @@ gateway_client_route_mode() {
     acquire_lock "gateway-$gateway"
     load_gateway_cfg "$gateway"
     gateway_client_load "$gateway" "$client"
+    if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
+        previous=${ROUTE_MODE:-split}
+        if [[ "$requested" == show ]]; then
+            release_lock "gateway-$gateway"
+            printf '%s/%s: route-mode=%s (re-export needed after change)\n' "$gateway" "$client" "$previous"
+            return 0
+        fi
+        sed -i -E "s/^ROUTE_MODE=.*/ROUTE_MODE=\"$requested\"/" "$(gateway_client_dir "$gateway" "$client")/client.cfg"
+        release_lock "gateway-$gateway"
+        log "Updated AmneziaWG client route mode; re-export its .conf profile to apply."
+        return 0
+    fi
     previous=${ROUTE_MODE:-full}
     [[ "${STATUS:-}" == active ]] || die "Cannot change revoked client '$client'."
     if [[ "$requested" == show ]]; then
@@ -2279,6 +2331,7 @@ gateway_client_export() {
     case "$format" in ovpn|nnslink) ;; *) die "Unsupported export format '$format'." ;; esac
     acquire_lock "gateway-$gateway" shared
     load_gateway_cfg "$gateway"
+    [[ "${GATEWAY_BACKEND:-openvpn}" != amneziawg ]] || die "Use: nns-app export awg $gateway --client $client --output client.conf"
     gateway_client_load "$gateway" "$client"
     [[ "${STATUS:-}" == active ]] ||
         die "Client '$client' is revoked and cannot be exported."
@@ -2344,6 +2397,11 @@ gateway_client_revoke() {
     [[ "${STATUS:-}" == active ]] ||
         die "Client '$client' is already revoked."
 
+    if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
+        release_lock "gateway-$gateway"
+        awg_server_client_revoke "$gateway" "$client"
+        return $?
+    fi
     cdir=$(gateway_client_dir "$gateway" "$client")
     pki=$(gateway_pki_dir "$gateway")
     backup=$(mktemp -d "$(gateway_dir "$gateway")/.ca-db.XXXXXX")
@@ -2528,6 +2586,10 @@ gateway_external_client_records() {
 
 gateway_connected_clients() {
     local gateway=$1 status_file
+    if [[ "$(gateway_cfg_value "$gateway" GATEWAY_BACKEND)" == amneziawg ]]; then
+        awg_server_connected_clients "$gateway"
+        return $?
+    fi
     status_file=$(gateway_status_file "$gateway")
     [[ -s "$status_file" ]] || return 0
     python3 - "$status_file" <<'PY_GATEWAY_STATUS'
@@ -2672,6 +2734,10 @@ gateway_status() {
     validate_gateway_name "$gateway"
     acquire_lock "gateway-$gateway" shared
     load_gateway_cfg "$gateway"
+    if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
+        awg_server_status "$gateway"
+        return $?
+    fi
     unit="nns-gateway@${gateway}.service"
     state=$(systemctl is-active "$unit" 2>/dev/null || true)
     sub=$(systemctl show "$unit" -p SubState --value 2>/dev/null || true)
@@ -2929,6 +2995,8 @@ install_openvpn_server() {
     if [[ -f "$(gateway_cfg_file "$name")" ]]; then
         server_gateway_exists "$name" ||
             die "'$name' is an existing gateway with a non-host exit; use 'gateway' commands."
+        [[ "$(gateway_cfg_value "$name" GATEWAY_BACKEND)" != amneziawg ]] ||
+            die "'$name' is an existing AmneziaWG server; reinstall with --server --amnezia."
         load_gateway_cfg "$name"
         case "$TRANSPORT" in direct|cloak) ;;
           *) die "'$name' uses $TRANSPORT, which cannot be reinstalled with --server." ;;
@@ -3264,6 +3332,6 @@ gateway_remove() {
 
     release_lock "gateway-$gateway"
     release_lock global
-    log "Removed gateway '$gateway', including its CA and all client private keys."
+    log "Removed managed server '$gateway', including all managed client private keys."
 }
 

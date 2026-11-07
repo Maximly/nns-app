@@ -1,3 +1,11 @@
+## 1.3.47 (2026-11-07)
+
+- Added `install <name> --server --amnezia` for native AmneziaWG 3.1 host servers.
+- Added `export awg <name> --client <peer> --output file.conf` with split/full routing.
+- Managed per-peer static IP, certificate-free key rotation by revoke/new peer, server host NAT, firewall, and systemd startup.
+- Retained AmneziaWG server and peer secrets in managed full backup/restore state.
+- Does not auto-install kernel modules or upstream repositories; requires compatible AWG tools and module/userspace backend.
+
 ## v1.3.46 (2026-11-07)
 - Support `install <name> --server --transport cloak [--listen tcp:443] [--server-name <decoy>]`, reusing the managed gateway Cloak wrapper and OpenVPN loopback backend.
 - Reinstall existing host servers with Cloak without regenerating CA/client certificates, assign Cloak UIDs to existing active clients, preserve existing fixed-IP and routing policies, and roll back on failed start.

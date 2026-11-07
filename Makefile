@@ -13,6 +13,7 @@ test: build
 	./tests/test-client-routing.sh
 	./tests/test-backup.sh
 	./tests/test-amneziawg.sh
+	./tests/test-awg-server.sh
 	./tests/test-split-tunnel.sh
 
 clean:

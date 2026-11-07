@@ -4,7 +4,7 @@
 connects each namespace through OpenVPN or WireGuard without replacing the
 host's default route or DNS configuration.
 
-**Release:** 1.3.46
+**Release:** 1.3.47
 
 **Supported platforms:** Ubuntu and Fedora with systemd  
 **VPN backends:** OpenVPN 2.6+, WireGuard, and inherit-only child namespaces
@@ -1512,3 +1512,30 @@ before committing source or generated-installer changes.
 ## License
 
 GPL-3.0-or-later. See `LICENSE`.
+
+
+## AmneziaWG 3.1 server (v1.3.47)
+
+Requires `awg`, `awg-quick`, and either a compatible AmneziaWG kernel module
+or `amneziawg-go` (userspace). On Ubuntu 26.04 avoid installing a broken
+DKMS metapackage; use compatible userspace tools if no module is available.
+The server does not add third-party APT repositories automatically.
+
+```bash
+sudo nns-app install testawg --server --amnezia --listen udp:51821 \
+    --public vpn.example.com:51821
+nns-app export awg testawg --client mac --split-tunnel --output ~/mac.conf
+nns-app status testawg
+```
+
+Import `mac.conf` in an AmneziaWG 3.1-compatible client (not Tunnelblick).
+By default, split mode only routes the server's VPN subnet through the tunnel;
+`--full-tunnel` changes the exported `AllowedIPs` to `0.0.0.0/0`.
+Every peer receives a dedicated fixed VPN address on the server.
+All keys and profiles are kept under `/etc/nns-app/gateways/<name>` and are
+included in a full `nns-app backup`.
+
+Install is idempotent for an existing AmneziaWG server and retains its
+server/client keys. Existing port/pool changes are rejected rather than
+invalidating client profiles. The implementation has been statically and
+unit-tested but requires a live AmneziaWG 3.1 integration test.

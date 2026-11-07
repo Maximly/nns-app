@@ -325,10 +325,15 @@ refresh_managed_unit_metadata() {
         gateway=$(basename "$dir")
         acquire_lock "gateway-$gateway"
         write_gateway_unit_dropin "$gateway"
-        gateway_write_openssl_config "$gateway" "$(gateway_dir "$gateway")"
-        gateway_write_server_config "$gateway"
-        gateway_write_transport_config "$gateway"
-        if [[ "${NNS_RESTORE_IN_PROGRESS:-off}" != on ]]; then
+        if [[ "$(gateway_cfg_value "$gateway" GATEWAY_BACKEND)" == amneziawg ]]; then
+            awg_server_write_config "$gateway"
+        else
+            gateway_write_openssl_config "$gateway" "$(gateway_dir "$gateway")"
+            gateway_write_server_config "$gateway"
+            gateway_write_transport_config "$gateway"
+        fi
+        if [[ "$(gateway_cfg_value "$gateway" GATEWAY_BACKEND)" != amneziawg &&
+              "${NNS_RESTORE_IN_PROGRESS:-off}" != on ]]; then
             systemctl enable --now "nns-gateway-crl-refresh@${gateway}.timer" \
                 >/dev/null 2>&1 || true
         fi
@@ -460,6 +465,10 @@ write_gateway_unit_dropin() {
     via=$VIA_APP
     dir=$(gateway_dropin_dir "$gateway")
     rm -rf "$dir"
+    if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
+        awg_server_enable_dropin "$gateway"
+        return 0
+    fi
     # Host-egress OpenVPN servers have no nns-online@ upstream dependency.
     [[ "$via" != host ]] || return 0
     install -d -o root -g root -m 0755 "$dir"

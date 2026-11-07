@@ -1862,7 +1862,7 @@ manual_payload=$(remote_command_payload gateway client export \
     remote_auto_register() { fail 'current remote was unnecessarily registered'; }
     log() { printf 'log:%s\n' "$*"; }
     output=$(remote_auto_refresh_configured_app my-app)
-    grep -Fq 'already runs nns-app 1.3.45' <<<"$output" ||
+    grep -Fq 'already runs nns-app 1.3.47' <<<"$output" ||
         fail 'current remote refresh status missing'
 )
 
@@ -1941,7 +1941,7 @@ EOF_REPAIR_STATE
 (
     reexec_as_root_if_needed() { :; }
     server_gateway_exists() { [[ "$1" == office-vpn ]]; }
-    install_openvpn_server() { printf 'server-install:%s|%s|%s|%s|%s|%s\n' "$@"; }
+    install_openvpn_server() { printf 'server-install:%s|%s|%s|%s|%s|%s\n' "${@:1:6}"; }
     gateway_start() { printf 'server-start:%s\n' "$1"; }
     gateway_stop() { printf 'server-stop:%s\n' "$1"; }
     gateway_remove() { printf 'server-remove:%s\n' "$1"; }

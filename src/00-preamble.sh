@@ -22,7 +22,7 @@
 #
 # Public commands:
 #   install [--local-only]
-#   install <name> --server [--listen udp:1194|tcp:443] [--public host:port]
+#   install <name> --server [--amnezia] [--listen udp:1194|tcp:443] [--public host:port]
 #                         [--transport direct|cloak] [--server-name <decoy-host>]
 #                         [--pool CIDR] [--dns "IPv4 IPv4"]
 #                         [--client-to-client[=on|off]]
@@ -36,6 +36,7 @@
 #   list [apps|namespaces|gateways|clients|all]
 #   status  <app_name>
 #   myip    [<app_or_gateway_name>]
+#   export  awg <amnezia_server> --client <name> --output <client.conf> [--split-tunnel|--full-tunnel]
 #   export  ovpn <app_name> --client <name> [--embedded]
 #                  [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]
 #   fixed-ip <server_name> <client_name> [on|off]
@@ -63,7 +64,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.46"
+readonly VERSION="1.3.47"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -205,6 +206,7 @@ reset_gateway_cfg_vars() {
     RULE_PRIORITY="" SERVER_CN="" HOST_FWD_CHAIN=""
     HOST_MANGLE_CHAIN="" NS_FWD_CHAIN="" NS_NAT_CHAIN=""
     NS_MANGLE_CHAIN="" REMOTE_MANAGED_OWNER_ID=""
+    AWG_JC="" AWG_JMIN="" AWG_JMAX="" AWG_S1="" AWG_S2="" AWG_S3="" AWG_S4=""
 }
 
 reset_gateway_client_vars() {
@@ -286,7 +288,7 @@ usage() {
     cat <<'USAGE'
 Usage:
   nns-app install [--local-only]
-  nns-app install <name> --server [--listen udp:1194|tcp:443] [--public host:port]
+  nns-app install <name> --server [--amnezia] [--listen udp:1194|tcp:443] [--public host:port]
                   [--transport direct|cloak] [--server-name <cloak-decoy-host>]
                   [--pool IPv4-CIDR] [--dns "IPv4 IPv4"]
                   [--client-to-client[=on|off] | --no-client-to-client]
@@ -300,6 +302,8 @@ Usage:
   nns-app list [apps|namespaces|gateways|clients|all]
   nns-app status  <app_name>
   nns-app myip [<app_or_gateway_name>]
+  nns-app export awg <server_name> --client <client_name> --output <file.conf>
+                  [--split-tunnel|--full-tunnel] [--fixed-ip]
   nns-app export ovpn <app_name> --client <client_name> [--embedded] [--fixed-ip]
                   [--split-tunnel|--full-tunnel]
                   [--public <host>:<port>] [--proto tcp|udp]
@@ -354,6 +358,8 @@ Examples:
   sudo ./nns-app.sh install --local-only
   sudo nns-app install my-upstream-vpn
   sudo nns-app install office-vpn --server
+  sudo nns-app install amn-test --server --amnezia --listen udp:51821
+  nns-app export awg amn-test --client mac --split-tunnel --output ~/mac.conf
   nns-app export ovpn office-vpn --client laptop --output ~/laptop.ovpn
   nns-app install my-private-app via --remote user@remote-host
   nns-app add my-private-app ~/my-base-profile.ovpn

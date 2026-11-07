@@ -62,6 +62,18 @@ main() {
             dns_proxy_exec "$2"
             exit
             ;;
+        _amnezia-up)
+            require_root
+            [[ $# -eq 2 ]] || die "_amnezia-up requires server_name."
+            awg_server_up "$2"
+            exit
+            ;;
+        _amnezia-down)
+            require_root
+            [[ $# -eq 2 ]] || die "_amnezia-down requires server_name."
+            awg_server_down "$2"
+            exit
+            ;;
         _gateway-up)
             require_root
             [[ $# -eq 2 ]] || die "_gateway-up requires gateway_name."
@@ -93,6 +105,7 @@ main() {
         _gateway-crl-refresh)
             require_root
             [[ $# -eq 2 ]] || die "_gateway-crl-refresh requires gateway_name."
+            [[ "$(gateway_cfg_value "$2" GATEWAY_BACKEND)" != amneziawg ]] || exit 0
             gateway_crl_refresh "$2"
             exit
             ;;
@@ -145,7 +158,7 @@ main() {
                 [[ -n "$install_app_name" && "$install_app_name" != --* ]] ||
                     die "Usage: nns-app install <name> --server"
                 local install_remote="" install_remote_port=22 install_remote_port_set=off
-                local install_server=off install_listen="" install_public=""
+                local install_server=off install_amnezia=off install_listen="" install_public=""
                 local install_pool="" install_dns="" install_c2c=""
                 local install_transport="" install_server_name=""
                 shift 2
@@ -153,6 +166,10 @@ main() {
                     case "$1" in
                         --server)
                             install_server=on
+                            shift
+                            ;;
+                        --amnezia)
+                            install_amnezia=on
                             shift
                             ;;
                         --client-to-client)
@@ -261,10 +278,18 @@ main() {
                     [[ -z "$install_remote" && "$install_remote_port_set" == off &&
                        "$install_via" == __default__ && "$install_backend" == __default__ ]] ||
                         die "--server cannot be combined with --via, --remote, or --backend."
-                    install_openvpn_server "$install_app_name" \
-                        "$install_listen" "$install_public" "$install_pool" "$install_dns" "$install_c2c" \
-                        "$install_transport" "$install_server_name"
+                    if [[ "$install_amnezia" == on ]]; then
+                        [[ -z "$install_transport$install_server_name" ]] ||
+                            die "--amnezia cannot be combined with --transport or --server-name."
+                        awg_server_install "$install_app_name" "$install_listen" "$install_public" \
+                            "$install_pool" "$install_dns" "$install_c2c"
+                    else
+                        install_openvpn_server "$install_app_name" \
+                            "$install_listen" "$install_public" "$install_pool" "$install_dns" "$install_c2c" \
+                            "$install_transport" "$install_server_name"
+                    fi
                 else
+                    [[ "$install_amnezia" != on ]] || die "--amnezia requires --server."
                     [[ -z "$install_listen$install_public$install_pool$install_dns$install_c2c$install_transport$install_server_name" ]] ||
                         die "--listen, --public, --pool, --dns, --transport, --server-name and --client-to-client require --server."
                     if [[ -n "$install_remote" ]]; then
@@ -362,9 +387,9 @@ main() {
         export)
             (( $# >= 4 )) ||
                 die "Usage: nns-app export ovpn <app_name> --client <client_name> [--embedded] [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]"
-            [[ "$2" == ovpn ]] ||
-                die "Only 'nns-app export ovpn ...' is currently supported."
-            local export_app=$3 export_client="" export_public="-" export_proto="auto" export_output="-" export_compat="modern" export_fixed_ip="off" export_route_mode="keep"
+            [[ "$2" == ovpn || "$2" == awg ]] ||
+                die "Supported export formats: ovpn and awg."
+            local export_kind=$2 export_app=$3 export_client="" export_public="-" export_proto="auto" export_output="-" export_compat="modern" export_fixed_ip="off" export_route_mode="keep"
             shift 3
             while (( $# > 0 )); do
                 case "$1" in
@@ -400,7 +425,12 @@ main() {
                 esac
             done
             [[ -n "$export_client" ]] || die "export ovpn requires --client <client_name>."
-            if server_gateway_exists "$export_app"; then
+            if [[ "$export_kind" == awg ]]; then
+                server_gateway_exists "$export_app" || die "AmneziaWG export requires a locally managed server."
+                [[ "$export_public" == - && "$export_proto" == auto && "$export_compat" == modern ]] ||
+                    die "--public, --proto and --embedded are not valid for AmneziaWG client export."
+                awg_server_client_export "$export_app" "$export_client" "$export_output" "$export_route_mode"
+            elif server_gateway_exists "$export_app"; then
                 server_export_ovpn "$export_app" "$export_client" \
                     "$export_output" "$export_public" "$export_proto" "$export_compat" "$export_fixed_ip" "$export_route_mode"
             else
@@ -423,7 +453,11 @@ main() {
             if server_gateway_exists "$2"; then
                 [[ "$revoke_scope" != embedded ]] ||
                     die "--embedded is not supported for a modern OpenVPN server."
-                gateway_client_revoke "$2" "$3"
+                if [[ "$(gateway_cfg_value "$2" GATEWAY_BACKEND)" == amneziawg ]]; then
+                    awg_server_client_revoke "$2" "$3"
+                else
+                    gateway_client_revoke "$2" "$3"
+                fi
             else
                 remote_auto_revoke_public_ovpn "$2" "$3" "$revoke_scope"
             fi

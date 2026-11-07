@@ -690,7 +690,11 @@ myip_report_gateway() {
     printf 'Context:           gateway\n'
     printf 'Gateway:           %s\n' "$name"
     printf 'State:             %s\n' "$state"
-    printf 'Backend:           OpenVPN server\n'
+    if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
+        printf 'Backend:           AmneziaWG 3.1 server\n'
+    else
+        printf 'Backend:           OpenVPN server\n'
+    fi
     printf 'Public endpoint:   %s\n' "$endpoint"
     printf 'Client pool:       %s\n' "$CLIENT_POOL"
     printf 'Server tunnel:     %s\n' "$GATEWAY_TUN"
@@ -1408,7 +1412,9 @@ list_local_instance_records() {
         gateway=${dir##*/}
         record=$(gateway_inventory_record "$gateway" local)
         IFS='|' read -r _ gateway kind state via endpoint active revoked connected source <<<"$record"
-        if [[ "$via" == host ]]; then
+        if [[ "$(gateway_cfg_value "$gateway" GATEWAY_BACKEND)" == amneziawg ]]; then
+            app_type=amneziawg-server
+        elif [[ "$via" == host ]]; then
             app_type=openvpn-server
         else
             app_type=openvpn-gateway

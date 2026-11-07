@@ -22,7 +22,7 @@
 #
 # Public commands:
 #   install [--local-only]
-#   install <name> --server [--listen udp:1194|tcp:443] [--public host:port]
+#   install <name> --server [--amnezia] [--listen udp:1194|tcp:443] [--public host:port]
 #                         [--transport direct|cloak] [--server-name <decoy-host>]
 #                         [--pool CIDR] [--dns "IPv4 IPv4"]
 #                         [--client-to-client[=on|off]]
@@ -36,6 +36,7 @@
 #   list [apps|namespaces|gateways|clients|all]
 #   status  <app_name>
 #   myip    [<app_or_gateway_name>]
+#   export  awg <amnezia_server> --client <name> --output <client.conf> [--split-tunnel|--full-tunnel]
 #   export  ovpn <app_name> --client <name> [--embedded]
 #                  [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]
 #   fixed-ip <server_name> <client_name> [on|off]
@@ -63,7 +64,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.3.46"
+readonly VERSION="1.3.47"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -205,6 +206,7 @@ reset_gateway_cfg_vars() {
     RULE_PRIORITY="" SERVER_CN="" HOST_FWD_CHAIN=""
     HOST_MANGLE_CHAIN="" NS_FWD_CHAIN="" NS_NAT_CHAIN=""
     NS_MANGLE_CHAIN="" REMOTE_MANAGED_OWNER_ID=""
+    AWG_JC="" AWG_JMIN="" AWG_JMAX="" AWG_S1="" AWG_S2="" AWG_S3="" AWG_S4=""
 }
 
 reset_gateway_client_vars() {
@@ -286,7 +288,7 @@ usage() {
     cat <<'USAGE'
 Usage:
   nns-app install [--local-only]
-  nns-app install <name> --server [--listen udp:1194|tcp:443] [--public host:port]
+  nns-app install <name> --server [--amnezia] [--listen udp:1194|tcp:443] [--public host:port]
                   [--transport direct|cloak] [--server-name <cloak-decoy-host>]
                   [--pool IPv4-CIDR] [--dns "IPv4 IPv4"]
                   [--client-to-client[=on|off] | --no-client-to-client]
@@ -300,6 +302,8 @@ Usage:
   nns-app list [apps|namespaces|gateways|clients|all]
   nns-app status  <app_name>
   nns-app myip [<app_or_gateway_name>]
+  nns-app export awg <server_name> --client <client_name> --output <file.conf>
+                  [--split-tunnel|--full-tunnel] [--fixed-ip]
   nns-app export ovpn <app_name> --client <client_name> [--embedded] [--fixed-ip]
                   [--split-tunnel|--full-tunnel]
                   [--public <host>:<port>] [--proto tcp|udp]
@@ -354,6 +358,8 @@ Examples:
   sudo ./nns-app.sh install --local-only
   sudo nns-app install my-upstream-vpn
   sudo nns-app install office-vpn --server
+  sudo nns-app install amn-test --server --amnezia --listen udp:51821
+  nns-app export awg amn-test --client mac --split-tunnel --output ~/mac.conf
   nns-app export ovpn office-vpn --client laptop --output ~/laptop.ovpn
   nns-app install my-private-app via --remote user@remote-host
   nns-app add my-private-app ~/my-base-profile.ovpn
@@ -449,7 +455,7 @@ reexec_as_root_if_needed() {
         list|status|myip|start|stop|run)
             sudo_args+=( -n )
             ;;
-        install|remove|add|purge|repair|backup|restore|gateway|remote|link|export|revoke|fixed-ip)
+        install|remove|add|purge|repair|backup|restore|gateway|remote|link|export|revoke|fixed-ip|route-mode|client-to-client)
             ;;
         *)
             die "Unknown command '$cmd'."
@@ -1106,10 +1112,15 @@ refresh_managed_unit_metadata() {
         gateway=$(basename "$dir")
         acquire_lock "gateway-$gateway"
         write_gateway_unit_dropin "$gateway"
-        gateway_write_openssl_config "$gateway" "$(gateway_dir "$gateway")"
-        gateway_write_server_config "$gateway"
-        gateway_write_transport_config "$gateway"
-        if [[ "${NNS_RESTORE_IN_PROGRESS:-off}" != on ]]; then
+        if [[ "$(gateway_cfg_value "$gateway" GATEWAY_BACKEND)" == amneziawg ]]; then
+            awg_server_write_config "$gateway"
+        else
+            gateway_write_openssl_config "$gateway" "$(gateway_dir "$gateway")"
+            gateway_write_server_config "$gateway"
+            gateway_write_transport_config "$gateway"
+        fi
+        if [[ "$(gateway_cfg_value "$gateway" GATEWAY_BACKEND)" != amneziawg &&
+              "${NNS_RESTORE_IN_PROGRESS:-off}" != on ]]; then
             systemctl enable --now "nns-gateway-crl-refresh@${gateway}.timer" \
                 >/dev/null 2>&1 || true
         fi
@@ -1241,6 +1252,10 @@ write_gateway_unit_dropin() {
     via=$VIA_APP
     dir=$(gateway_dropin_dir "$gateway")
     rm -rf "$dir"
+    if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
+        awg_server_enable_dropin "$gateway"
+        return 0
+    fi
     # Host-egress OpenVPN servers have no nns-online@ upstream dependency.
     [[ "$via" != host ]] || return 0
     install -d -o root -g root -m 0755 "$dir"
@@ -4362,14 +4377,27 @@ load_gateway_cfg() {
 
     [[ "${GATEWAY_NAME:-}" == "$gateway" ]] ||
         die "GATEWAY_NAME mismatch in $file."
-    [[ "${GATEWAY_BACKEND:-}" == openvpn ]] ||
-        die "Unsupported gateway backend '${GATEWAY_BACKEND:-}'."
+    GATEWAY_BACKEND=${GATEWAY_BACKEND:-openvpn}
+    case "$GATEWAY_BACKEND" in
+        openvpn|amneziawg) ;;
+        *) die "Unsupported gateway backend '${GATEWAY_BACKEND:-}'." ;;
+    esac
     TRANSPORT=${TRANSPORT:-direct}
     OPENVPN_COMPAT=${OPENVPN_COMPAT:-modern}
     case "$OPENVPN_COMPAT" in
         modern|embedded) ;;
         *) die "Unsupported OpenVPN compatibility mode '$OPENVPN_COMPAT'." ;;
     esac
+    if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
+        [[ "$LISTEN_PROTO" == udp ]] || die "AmneziaWG servers require UDP."
+        AWG_JC=${AWG_JC:-5}
+        AWG_JMIN=${AWG_JMIN:-50}
+        AWG_JMAX=${AWG_JMAX:-200}
+        AWG_S1=${AWG_S1:-88}
+        AWG_S2=${AWG_S2:-47}
+        AWG_S3=${AWG_S3:-29}
+        AWG_S4=${AWG_S4:-17}
+    fi
     OPENVPN_LISTEN_PROTO=${OPENVPN_LISTEN_PROTO:-$LISTEN_PROTO}
     OPENVPN_LISTEN_PORT=${OPENVPN_LISTEN_PORT:-$LISTEN_PORT}
     CLIENT_TO_CLIENT=${CLIENT_TO_CLIENT:-off}
@@ -5250,6 +5278,10 @@ gateway_write_server_config() {
         source "$root/gateway.cfg"
     fi
 
+    if [[ "${GATEWAY_BACKEND:-}" == amneziawg ]]; then
+        awg_server_write_config "$gateway"
+        return $?
+    fi
     config="$root/server.conf"
     output="$config"
     if [[ "$root" == "$(gateway_dir "$gateway")" ]]; then
@@ -5741,6 +5773,11 @@ gateway_host_exit_rules_up() {
     gateway_host_exit_rules_down
 
     iptables_chain_ensure filter "$HOST_FWD_CHAIN"
+    if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
+        iptables -w -t filter -A "$HOST_FWD_CHAIN" \
+            -i "$GATEWAY_TUN" -o "$GATEWAY_TUN" -s "$CLIENT_POOL" -d "$CLIENT_POOL" \
+            -j "$([[ "$CLIENT_TO_CLIENT" == on ]] && echo ACCEPT || echo DROP)"
+    fi
     iptables -w -t filter -A "$HOST_FWD_CHAIN" \
         -i "$GATEWAY_TUN" -s "$CLIENT_POOL" -o "$wan" -j ACCEPT
     iptables -w -t filter -A "$HOST_FWD_CHAIN" \
@@ -6098,6 +6135,10 @@ gateway_start() {
     validate_gateway_name "$gateway"
     acquire_lock "gateway-$gateway"
     load_gateway_cfg "$gateway"
+    if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
+        awg_server_start "$gateway"
+        return $?
+    fi
     gateway_ensure_runtime_access "$gateway" || {
         release_lock "gateway-$gateway"
         die "Could not normalize runtime access for gateway '$gateway'."
@@ -6290,6 +6331,11 @@ gateway_client_add() {
     acquire_lock "gateway-$gateway"
     load_gateway_cfg "$gateway"
 
+    if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
+        release_lock "gateway-$gateway"
+        awg_server_client_add "$gateway" "$client"
+        return $?
+    fi
     pki=$(gateway_pki_dir "$gateway")
     final=$(gateway_client_dir "$gateway" "$client")
     if [[ -e "$final" ]]; then
@@ -6441,6 +6487,15 @@ gateway_client_fixed_ip() {
     local cfg tmp backup was_active=off
     validate_gateway_name "$gateway"
     validate_gateway_client_name "$client"
+    if [[ "$(gateway_cfg_value "$gateway" GATEWAY_BACKEND)" == amneziawg ]]; then
+        gateway_client_load "$gateway" "$client"
+        case "$requested" in
+            show|on) printf '%s/%s: fixed-ip=%s (required by AmneziaWG)\n' "$gateway" "$client" "$FIXED_IP" ;;
+            off) die "AmneziaWG peers require server-assigned stable IPs; cannot disable." ;;
+            *) die "Expected fixed-ip on or off." ;;
+        esac
+        return 0
+    fi
     case "$requested" in show|on|off) ;; *) die "Expected fixed-ip on or off." ;; esac
     acquire_lock "gateway-$gateway"
     load_gateway_cfg "$gateway"
@@ -6531,6 +6586,18 @@ gateway_client_route_mode() {
     acquire_lock "gateway-$gateway"
     load_gateway_cfg "$gateway"
     gateway_client_load "$gateway" "$client"
+    if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
+        previous=${ROUTE_MODE:-split}
+        if [[ "$requested" == show ]]; then
+            release_lock "gateway-$gateway"
+            printf '%s/%s: route-mode=%s (re-export needed after change)\n' "$gateway" "$client" "$previous"
+            return 0
+        fi
+        sed -i -E "s/^ROUTE_MODE=.*/ROUTE_MODE=\"$requested\"/" "$(gateway_client_dir "$gateway" "$client")/client.cfg"
+        release_lock "gateway-$gateway"
+        log "Updated AmneziaWG client route mode; re-export its .conf profile to apply."
+        return 0
+    fi
     previous=${ROUTE_MODE:-full}
     [[ "${STATUS:-}" == active ]] || die "Cannot change revoked client '$client'."
     if [[ "$requested" == show ]]; then
@@ -6593,6 +6660,7 @@ gateway_client_export() {
     case "$format" in ovpn|nnslink) ;; *) die "Unsupported export format '$format'." ;; esac
     acquire_lock "gateway-$gateway" shared
     load_gateway_cfg "$gateway"
+    [[ "${GATEWAY_BACKEND:-openvpn}" != amneziawg ]] || die "Use: nns-app export awg $gateway --client $client --output client.conf"
     gateway_client_load "$gateway" "$client"
     [[ "${STATUS:-}" == active ]] ||
         die "Client '$client' is revoked and cannot be exported."
@@ -6658,6 +6726,11 @@ gateway_client_revoke() {
     [[ "${STATUS:-}" == active ]] ||
         die "Client '$client' is already revoked."
 
+    if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
+        release_lock "gateway-$gateway"
+        awg_server_client_revoke "$gateway" "$client"
+        return $?
+    fi
     cdir=$(gateway_client_dir "$gateway" "$client")
     pki=$(gateway_pki_dir "$gateway")
     backup=$(mktemp -d "$(gateway_dir "$gateway")/.ca-db.XXXXXX")
@@ -6842,6 +6915,10 @@ gateway_external_client_records() {
 
 gateway_connected_clients() {
     local gateway=$1 status_file
+    if [[ "$(gateway_cfg_value "$gateway" GATEWAY_BACKEND)" == amneziawg ]]; then
+        awg_server_connected_clients "$gateway"
+        return $?
+    fi
     status_file=$(gateway_status_file "$gateway")
     [[ -s "$status_file" ]] || return 0
     python3 - "$status_file" <<'PY_GATEWAY_STATUS'
@@ -6986,6 +7063,10 @@ gateway_status() {
     validate_gateway_name "$gateway"
     acquire_lock "gateway-$gateway" shared
     load_gateway_cfg "$gateway"
+    if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
+        awg_server_status "$gateway"
+        return $?
+    fi
     unit="nns-gateway@${gateway}.service"
     state=$(systemctl is-active "$unit" 2>/dev/null || true)
     sub=$(systemctl show "$unit" -p SubState --value 2>/dev/null || true)
@@ -7243,6 +7324,8 @@ install_openvpn_server() {
     if [[ -f "$(gateway_cfg_file "$name")" ]]; then
         server_gateway_exists "$name" ||
             die "'$name' is an existing gateway with a non-host exit; use 'gateway' commands."
+        [[ "$(gateway_cfg_value "$name" GATEWAY_BACKEND)" != amneziawg ]] ||
+            die "'$name' is an existing AmneziaWG server; reinstall with --server --amnezia."
         load_gateway_cfg "$name"
         case "$TRANSPORT" in direct|cloak) ;;
           *) die "'$name' uses $TRANSPORT, which cannot be reinstalled with --server." ;;
@@ -7578,9 +7661,413 @@ gateway_remove() {
 
     release_lock "gateway-$gateway"
     release_lock global
-    log "Removed gateway '$gateway', including its CA and all client private keys."
+    log "Removed managed server '$gateway', including all managed client private keys."
 }
 
+
+# nns-app AmneziaWG 3.1 host server. Persistent state lives in the managed
+# gateway tree so existing backups include both server and client private keys.
+
+awg_server_config() { printf '%s/%s.conf\n' "$(gateway_dir "$1")" "$(gateway_cfg_value "$1" GATEWAY_TUN)"; }
+
+awg_server_require_runtime() {
+    command -v awg >/dev/null 2>&1 || die "AmneziaWG requires awg (3.1-capable tools). Install amneziawg-tools without the broken Ubuntu 26.04 DKMS metapackage."
+    command -v awg-quick >/dev/null 2>&1 || die "AmneziaWG requires awg-quick (3.1-capable tools)."
+    if ! modprobe -q amneziawg 2>/dev/null &&
+       ! command -v amneziawg-go >/dev/null 2>&1; then
+        die "AmneziaWG kernel module unavailable. Install compatible amneziawg-go userspace backend; do not install broken DKMS packages on Ubuntu 26.04."
+    fi
+    [[ -c /dev/net/tun ]] || modprobe tun 2>/dev/null || true
+}
+
+awg_server_key() {
+    local key=$1 value
+    value=$(awg genkey) || return 1
+    [[ "$value" =~ ^[A-Za-z0-9+/]{43}=$ ]] || return 1
+    printf '%s\n' "$value" >"$key"
+    chmod 0600 "$key"
+}
+
+awg_server_client_ip() {
+    local root=$1 client=$2 pool=$3
+    python3 - "$root" "$client" "$pool" <<'PY_AWG_ALLOC'
+from pathlib import Path
+import ipaddress, sys
+root, client, network = Path(sys.argv[1]), sys.argv[2], ipaddress.ip_network(sys.argv[3], strict=True)
+used = {network.network_address + 1}
+for cfg in (root/'clients').glob('*/client.cfg'):
+    if cfg.parent.name == client: continue
+    for line in cfg.read_text().splitlines():
+        if line.startswith('FIXED_IP='):
+            try: used.add(ipaddress.ip_address(line.split('=',1)[1].strip('"\'')))
+            except ValueError: raise SystemExit('Invalid existing AmneziaWG fixed IP')
+for candidate in network.hosts():
+    if candidate not in used:
+        print(candidate)
+        break
+else:
+    raise SystemExit('No free AmneziaWG client IPs')
+PY_AWG_ALLOC
+}
+
+awg_server_write_config() {
+    local gateway=$1 root="$(gateway_dir "$1")" config tmp server_ip client_dir cfg status key ip
+    load_gateway_cfg "$gateway"
+    [[ "$GATEWAY_BACKEND" == amneziawg ]] || die "Not an AmneziaWG server: $gateway"
+    server_ip=$(python3 - "$CLIENT_POOL" <<'PY_AWG_HOST'
+import ipaddress,sys
+net=ipaddress.ip_network(sys.argv[1], strict=True)
+print(next(net.hosts()))
+PY_AWG_HOST
+    ) || return 1
+    config="$root/$GATEWAY_TUN.conf"
+    tmp=$(mktemp "$root/.amnezia-conf.XXXXXX") || return 1
+    {
+        printf '[Interface]\n'
+        printf 'PrivateKey = %s\n' "$(cat "$root/server.key")"
+        printf 'Address = %s/%s\n' "$server_ip" "${CLIENT_POOL#*/}"
+        printf 'ListenPort = %s\nMTU = 1280\n' "$LISTEN_PORT"
+        printf 'Jc = %s\nJmin = %s\nJmax = %s\n' "$AWG_JC" "$AWG_JMIN" "$AWG_JMAX"
+        printf 'S1 = %s\nS2 = %s\nS3 = %s\nS4 = %s\n' "$AWG_S1" "$AWG_S2" "$AWG_S3" "$AWG_S4"
+        printf 'H1 = 1\nH2 = 2\nH3 = 3\nH4 = 4\n'
+        printf 'HeaderProtectionKey = %s\n' "$(cat "$root/header.key")"
+        printf 'ContentPaddingAddition = 32-128\n'
+        printf 'PostUp = /usr/local/sbin/nns_app.sh _gateway-tun-up %s\n' "$gateway"
+        shopt -s nullglob
+        for client_dir in "$root/clients"/*; do
+            cfg="$client_dir/client.cfg"
+            [[ -f "$cfg" ]] || continue
+            status=$(sed -n 's/^STATUS=//p' "$cfg" | head -n 1 | tr -d '"')
+            [[ "$status" == active ]] || continue
+            key=$(cat "$client_dir/public.key") || return 1
+            ip=$(sed -n 's/^FIXED_IP=//p' "$cfg" | head -n 1 | tr -d '"')
+            [[ -n "$ip" ]] || die "Missing fixed IP for AmneziaWG peer '${client_dir##*/}'."
+            printf '\n[Peer]\n# Client: %s\nPublicKey = %s\nAllowedIPs = %s/32\n' \
+                "${client_dir##*/}" "$key" "$ip"
+        done
+        shopt -u nullglob
+    } >"$tmp" || { rm -f "$tmp"; return 1; }
+    chmod 0600 "$tmp"
+    mv -f "$tmp" "$config"
+}
+
+awg_server_enable_dropin() {
+    local gateway=$1 dir
+    dir=$(gateway_dropin_dir "$gateway")
+    install -d -o root -g root -m 0755 "$dir"
+    cat >"$dir/20-amnezia.conf" <<'UNIT'
+[Unit]
+Description=NNS managed AmneziaWG server %i
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=
+ExecStart=/usr/local/sbin/nns_app.sh _amnezia-up %i
+ExecStop=/usr/local/sbin/nns_app.sh _amnezia-down %i
+Restart=no
+UNIT
+    chmod 0644 "$dir/20-amnezia.conf"
+}
+
+awg_server_up() {
+    require_root
+    local gateway=$1
+    load_gateway_cfg "$gateway"
+    [[ "$GATEWAY_BACKEND" == amneziawg ]] || die "Not an AmneziaWG server."
+    awg_server_require_runtime
+    awg-quick up "$(awg_server_config "$gateway")"
+}
+
+awg_server_down() {
+    require_root
+    local gateway=$1
+    load_gateway_cfg "$gateway"
+    [[ "$GATEWAY_BACKEND" == amneziawg ]] || die "Not an AmneziaWG server."
+    awg-quick down "$(awg_server_config "$gateway")" || true
+}
+
+awg_server_start() {
+    require_root
+    local gateway=$1
+    load_gateway_cfg "$gateway"
+    awg_server_require_runtime
+    write_gateway_unit_dropin "$gateway"
+    awg_server_write_config "$gateway"
+    systemctl daemon-reload
+    if systemctl is-active --quiet "nns-gateway@$gateway.service"; then
+        systemctl restart "nns-gateway@$gateway.service" || return 1
+    else
+        systemctl start "nns-gateway@$gateway.service" || return 1
+    fi
+    ip link show "$GATEWAY_TUN" up >/dev/null 2>&1 || die "AmneziaWG interface '$GATEWAY_TUN' not created. Check journalctl -u nns-gateway@$gateway."
+    log "AmneziaWG server '$gateway' active at $PUBLIC_HOST:$PUBLIC_PORT/udp."
+}
+
+awg_server_install() {
+    require_root
+    local name=$1 listen=${2:-} public=${3:-} pool=${4:-} dns=${5:-} c2c=${6:-}
+    local proto port host public_port root staging tun host_fwd host_mangle ns_fwd ns_nat ns_mangle
+    local veth_host veth_ns conflict existing=no backup_cfg="" previously_active=off
+    validate_gateway_name "$name"
+    [[ ! -f "$(cfg_file "$name")" ]] || die "'$name' is an existing namespace app."
+    if [[ -f "$(gateway_cfg_file "$name")" ]]; then
+        [[ "$(gateway_cfg_value "$name" GATEWAY_BACKEND)" == amneziawg ]] ||
+            die "'$name' already exists as an OpenVPN server; use a different name."
+        existing=yes
+    fi
+    [[ -z "$c2c" || "$c2c" == off || "$c2c" == on ]] || die "Expected --client-to-client=on|off."
+    awg_server_require_runtime
+    [[ -z "$dns" ]] || dns=$(validate_gateway_dns "$dns")
+    acquire_lock global
+    if [[ "$existing" == yes ]]; then
+        load_gateway_cfg "$name"
+        root=$(gateway_dir "$name")
+        backup_cfg=$(mktemp "$root/.reinstall-cfg.XXXXXX") || die "Cannot snapshot AmneziaWG server."
+        cp -p "$(gateway_cfg_file "$name")" "$backup_cfg" || die "Cannot snapshot AmneziaWG configuration."
+        systemctl is-active --quiet "nns-gateway@$name.service" && previously_active=on || true
+        [[ -z "$listen" ]] || [[ "$listen" == "$LISTEN_PROTO:$LISTEN_PORT" ]] ||
+            die "Changing an existing AmneziaWG listener requires migration; keys and peers preserved, use the same --listen."
+        [[ -z "$pool" || "$pool" == "$CLIENT_POOL" ]] || die "Cannot change a pool with existing peers."
+        [[ -z "$public" ]] || {
+            IFS='|' read -r host public_port <<<"$(parse_public_endpoint "$public")"
+            gateway_cfg_set "$name" PUBLIC_HOST "$host"
+            gateway_cfg_set "$name" PUBLIC_PORT "$public_port"
+        }
+        [[ -z "$dns" ]] || gateway_cfg_set "$name" DNS_SERVERS "$(validate_gateway_dns "$dns")"
+        [[ -z "$c2c" ]] || gateway_cfg_set "$name" CLIENT_TO_CLIENT "$c2c"
+        # Reconfiguration never regenerates server or client private keys.
+    else
+        listen=${listen:-$(server_choose_listener "$name")}
+        IFS='|' read -r proto port <<<"$(parse_gateway_listen "$listen")"
+        [[ "$proto" == udp ]] || die "AmneziaWG uses UDP; use --listen udp:<port>."
+        if conflict=$(server_listener_conflict udp "$port" "$name"); then die "$conflict"; fi
+        if [[ -z "$public" ]]; then
+            host=$(server_public_host) || die "Cannot discover public host; pass --public host:port."
+            public="$host:$port"
+        fi
+        IFS='|' read -r host public_port <<<"$(parse_public_endpoint "$public")"
+        IFS='|' read -r pool _ _ _ <<<"$(allocate_gateway_networks "$pool")"
+        IFS='|' read -r tun veth_host veth_ns host_fwd host_mangle ns_fwd ns_nat ns_mangle <<<"$(make_gateway_names "$name")"
+        root=$(gateway_dir "$name")
+        install -d -m 0755 "$(dirname "$root")"
+        staging=$(mktemp -d "$(dirname "$root")/.${name}.awg.XXXXXX") || die "Cannot stage AmneziaWG server."
+        mkdir -m 0700 "$staging/clients"
+        awg_server_key "$staging/server.key" || die "Cannot generate AmneziaWG server key."
+        awg pubkey <"$staging/server.key" >"$staging/server.pub" || die "Cannot derive AmneziaWG public key."
+        awg_server_key "$staging/header.key" || die "Cannot generate header-protection key."
+        local params awg_jc awg_jmin awg_jmax awg_s1 awg_s2 awg_s3 awg_s4
+        params=$(python3 - <<'PY_AWG_PARAMS'
+import secrets
+rng = secrets.SystemRandom()
+print('|'.join(map(str, (
+    rng.randint(3, 6), rng.randint(45, 75), rng.randint(190, 250),
+    rng.randint(40, 100), rng.randint(16, 39),
+    rng.randint(16, 70), rng.randint(16, 70)
+))))
+PY_AWG_PARAMS
+        ) || die "Cannot generate AmneziaWG obfuscation parameters."
+        IFS='|' read -r awg_jc awg_jmin awg_jmax awg_s1 awg_s2 awg_s3 awg_s4 <<<"$params"
+        cat >"$staging/gateway.cfg" <<EOF_CFG
+GATEWAY_NAME="$name"
+GATEWAY_BACKEND="amneziawg"
+VIA_APP="host"
+TRANSPORT="direct"
+LISTEN_PROTO="udp"
+LISTEN_PORT="$port"
+PUBLIC_HOST="$host"
+PUBLIC_PORT="$public_port"
+TRANSPORT_SERVER_NAME="$host"
+CLIENT_POOL="$pool"
+DNS_SERVERS="${dns:-1.1.1.1 9.9.9.9}"
+CLIENT_TO_CLIENT="${c2c:-off}"
+AWG_JC="$awg_jc"
+AWG_JMIN="$awg_jmin"
+AWG_JMAX="$awg_jmax"
+AWG_S1="$awg_s1"
+AWG_S2="$awg_s2"
+AWG_S3="$awg_s3"
+AWG_S4="$awg_s4"
+GATEWAY_TUN="$tun"
+GATEWAY_VETH_HOST="$veth_host"
+GATEWAY_VETH_NS="$veth_ns"
+HOST_FWD_CHAIN="$host_fwd"
+HOST_MANGLE_CHAIN="$host_mangle"
+NS_FWD_CHAIN="$ns_fwd"
+NS_NAT_CHAIN="$ns_nat"
+NS_MANGLE_CHAIN="$ns_mangle"
+ROUTE_TABLE="0"
+RULE_PRIORITY="0"
+EOF_CFG
+        chmod 0644 "$staging/gateway.cfg"
+        chmod 0711 "$staging"
+        mv "$staging" "$root"
+    fi
+    write_gateway_unit_dropin "$name"
+    systemctl daemon-reload
+    systemctl enable "nns-gateway@$name.service" >/dev/null || true
+    release_lock global
+    if ! awg_server_start "$name"; then
+        if [[ "$existing" == yes && -s "$backup_cfg" ]]; then
+            cp -p "$backup_cfg" "$(gateway_cfg_file "$name")"
+            awg_server_write_config "$name" || true
+            if [[ "$previously_active" == on ]]; then
+                systemctl restart "nns-gateway@$name.service" ||
+                    warn "Could not restart '$name' after restoring its previous configuration."
+            fi
+        fi
+        [[ -z "$backup_cfg" ]] || rm -f "$backup_cfg"
+        die "AmneziaWG server '$name' failed to start; existing config restored if this was a reinstall."
+    fi
+    [[ -z "$backup_cfg" ]] || rm -f "$backup_cfg"
+    log "Export client: nns-app export awg $name --client mac --split-tunnel --output mac.conf"
+}
+
+awg_server_client_add() {
+    require_root
+    local gateway=$1 client=$2 route_mode=${3:-split} root dir staging ip created
+    validate_gateway_client_name "$client"
+    [[ "$route_mode" == split || "$route_mode" == full ]] || die "Expected split or full routing."
+    load_gateway_cfg "$gateway"
+    [[ "$GATEWAY_BACKEND" == amneziawg ]] || die "Not an AmneziaWG server."
+    root=$(gateway_dir "$gateway")
+    dir=$(gateway_client_dir "$gateway" "$client")
+    [[ ! -e "$dir" ]] || die "Client '$client' already exists."
+    acquire_lock "gateway-$gateway"
+    staging=$(mktemp -d "$root/clients/.${client}.XXXXXX") || die "Cannot stage client."
+    awg_server_key "$staging/private.key" || die "Cannot generate peer key."
+    awg pubkey <"$staging/private.key" >"$staging/public.key" || die "Cannot derive peer public key."
+    ip=$(awg_server_client_ip "$root" "$client" "$CLIENT_POOL") || die "No free peer IP."
+    created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    printf 'CLIENT_NAME="%s"\nSTATUS="active"\nFIXED_IP="%s"\nROUTE_MODE="%s"\nCREATED_AT="%s"\n' \
+        "$client" "$ip" "$route_mode" "$created" >"$staging/client.cfg"
+    chmod 0600 "$staging/client.cfg" "$staging/private.key" "$staging/public.key"
+    mv "$staging" "$dir"
+    awg_server_write_config "$gateway"
+    release_lock "gateway-$gateway"
+    if systemctl is-active --quiet "nns-gateway@$gateway.service"; then
+        # Apply peer without bouncing established peers; `syncconf` handles
+        # config changes and preserves existing handshakes.
+        awg syncconf "$GATEWAY_TUN" <(awg-quick strip "$(awg_server_config "$gateway")") ||
+            die "Peer created but could not be applied; restart server manually."
+    fi
+    log "Created AmneziaWG peer '$client': $ip"
+}
+
+awg_server_client_export() {
+    require_root
+    local gateway=$1 client=$2 output=$3 route=${4:-keep} root dir ip mode dns item tmp owner group
+    validate_gateway_name "$gateway"
+    validate_gateway_client_name "$client"
+    [[ -n "$output" && "$output" != - ]] || die "AmneziaWG export requires --output <client.conf> (cannot print private keys to stdout)."
+    load_gateway_cfg "$gateway"
+    [[ "$GATEWAY_BACKEND" == amneziawg ]] || die "Not an AmneziaWG server."
+    root=$(gateway_dir "$gateway")
+    dir=$(gateway_client_dir "$gateway" "$client")
+    [[ -f "$dir/client.cfg" ]] || awg_server_client_add "$gateway" "$client" "${route/keep/split}"
+    [[ -f "$dir/client.cfg" ]] || die "Could not create AmneziaWG peer."
+    [[ "$(sed -n 's/^STATUS=//p' "$dir/client.cfg" | tr -d '"')" == active ]] || die "Peer revoked."
+    if [[ "$route" == split || "$route" == full ]]; then
+        sed -i -E "s/^ROUTE_MODE=.*/ROUTE_MODE=\"$route\"/" "$dir/client.cfg"
+    fi
+    mode=$(sed -n 's/^ROUTE_MODE=//p' "$dir/client.cfg" | tr -d '"')
+    ip=$(sed -n 's/^FIXED_IP=//p' "$dir/client.cfg" | tr -d '"')
+    output=$(readlink -m "$output")
+    [[ ! -e "$output" ]] || die "Export file exists: $output"
+    [[ -d "$(dirname "$output")" ]] || die "Output directory missing: $output"
+    tmp=$(mktemp) || return 1
+    {
+        printf '[Interface]\nPrivateKey = %s\nAddress = %s/32\nMTU = 1280\n' "$(cat "$dir/private.key")" "$ip"
+        if [[ "$mode" == full ]]; then
+            printf 'DNS = %s\n' "${DNS_SERVERS// /, }"
+        fi
+        printf 'Jc = %s\nJmin = %s\nJmax = %s\n' "$AWG_JC" "$AWG_JMIN" "$AWG_JMAX"
+        printf 'S1 = %s\nS2 = %s\nS3 = %s\nS4 = %s\n' "$AWG_S1" "$AWG_S2" "$AWG_S3" "$AWG_S4"
+        printf 'H1 = 1\nH2 = 2\nH3 = 3\nH4 = 4\n'
+        printf 'HeaderProtectionKey = %s\n' "$(cat "$root/header.key")"
+        printf 'ContentPaddingAddition = 32-128\n'
+        printf '\n[Peer]\nPublicKey = %s\nEndpoint = %s:%s\n' "$(cat "$root/server.pub")" "$PUBLIC_HOST" "$PUBLIC_PORT"
+        if [[ "$mode" == full ]]; then
+            printf 'AllowedIPs = 0.0.0.0/0\n'
+        else
+            printf 'AllowedIPs = %s\n' "$CLIENT_POOL"
+        fi
+        printf 'PersistentKeepalive = 25\n'
+    } >"$tmp" || { rm -f "$tmp"; return 1; }
+    owner=${SUDO_USER:-root}
+    if [[ "$owner" != root ]] && id "$owner" >/dev/null 2>&1; then
+        group=$(id -gn "$owner")
+    else
+        owner=root; group=root
+    fi
+    install -m 0600 -o "$owner" -g "$group" "$tmp" "$output" || return 1
+    rm -f "$tmp"
+    log "Exported AmneziaWG client '$client' to $output ($mode, fixed $ip)."
+}
+
+awg_server_client_revoke() {
+    require_root
+    local gateway=$1 client=$2 dir
+    load_gateway_cfg "$gateway"
+    [[ "$GATEWAY_BACKEND" == amneziawg ]] || die "Not an AmneziaWG server."
+    dir=$(gateway_client_dir "$gateway" "$client")
+    [[ -f "$dir/client.cfg" ]] || die "Client '$client' does not exist."
+    sed -i -E 's/^STATUS=.*/STATUS="revoked"/' "$dir/client.cfg"
+    awg_server_write_config "$gateway"
+    if systemctl is-active --quiet "nns-gateway@$gateway.service"; then
+        awg syncconf "$GATEWAY_TUN" <(awg-quick strip "$(awg_server_config "$gateway")") ||
+            die "Client marked revoked but server sync failed; restart server."
+    fi
+    log "Revoked AmneziaWG peer '$client'."
+}
+
+awg_server_connected_clients() {
+    local gateway=$1 root dir key handshake now ip rx tx
+    load_gateway_cfg "$gateway"
+    root=$(gateway_dir "$gateway")
+    now=$(date +%s)
+    shopt -s nullglob
+    for dir in "$root/clients"/*; do
+        [[ -f "$dir/client.cfg" ]] || continue
+        [[ "$(sed -n 's/^STATUS=//p' "$dir/client.cfg" | tr -d '"')" == active ]] || continue
+        key=$(cat "$dir/public.key")
+        handshake=$(awg show "$GATEWAY_TUN" latest-handshakes 2>/dev/null | awk -v k="$key" '$1==k {print $2}')
+        [[ "$handshake" =~ ^[0-9]+$ ]] || continue
+        (( handshake > 0 && now - handshake < 180 )) || continue
+        ip=$(sed -n 's/^FIXED_IP=//p' "$dir/client.cfg" | tr -d '"')
+        IFS=$'\t' read -r rx tx < <(awg show "$GATEWAY_TUN" transfer 2>/dev/null | awk -v k="$key" '$1==k {printf "%s\t%s\n",$2,$3}') || true
+        printf '%s|%s|%s|%s|%s|%s\n' "${dir##*/}" "handshake" "$ip" "${rx:-0}" "${tx:-0}" "$(date -u -d "@$handshake" +%F\ %T)"
+    done
+    shopt -u nullglob
+}
+
+awg_server_status() {
+    local gateway=$1 unit state iface=no fw=no listen=no connected
+    load_gateway_cfg "$gateway"
+    unit="nns-gateway@$gateway.service"
+    state=$(systemctl is-active "$unit" 2>/dev/null || true)
+    ip link show "$GATEWAY_TUN" up >/dev/null 2>&1 && iface=yes
+    [[ "$(awg show "$GATEWAY_TUN" listen-port 2>/dev/null || true)" == "$LISTEN_PORT" ]] && listen=yes
+    local wan
+    wan=$(detect_wan_iface auto 2>/dev/null || true)
+    if [[ -n "$wan" ]]; then
+        gateway_firewall_ready "$gateway" '' "$wan" && fw=yes || true
+    fi
+    connected=$(awg_server_connected_clients "$gateway" | grep -c . || true)
+    local health=STOPPED
+    if [[ "$state" == active ]]; then
+        health=DEGRADED
+        [[ "$iface" == yes && "$listen" == yes && "$fw" == yes ]] && health=READY
+    elif [[ "$state" == failed ]]; then
+        health=FAILED
+    fi
+    printf 'App:               %s\nType:              amneziawg-server\nHealth:            %s\n' \
+        "$gateway" "$health"
+    printf 'Service:           %s\nPublic endpoint:   %s:%s/udp\nClient pool:       %s\n' \
+        "${state:-stopped}" "$PUBLIC_HOST" "$PUBLIC_PORT" "$CLIENT_POOL"
+    printf 'Tunnel:            %s (%s)\nListener:          %s\nFirewall:          %s\n' \
+        "$GATEWAY_TUN" "$iface" "$listen" "$fw"
+    printf 'Client-to-client:  %s\nConnected peers:   %s (handshake within 180s)\n' "$CLIENT_TO_CLIENT" "$connected"
+}
 
 # nns-app source module: inherit-only application environments, transport
 # bundles and SSH-based remote gateway management.
@@ -11467,7 +11954,11 @@ myip_report_gateway() {
     printf 'Context:           gateway\n'
     printf 'Gateway:           %s\n' "$name"
     printf 'State:             %s\n' "$state"
-    printf 'Backend:           OpenVPN server\n'
+    if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
+        printf 'Backend:           AmneziaWG 3.1 server\n'
+    else
+        printf 'Backend:           OpenVPN server\n'
+    fi
     printf 'Public endpoint:   %s\n' "$endpoint"
     printf 'Client pool:       %s\n' "$CLIENT_POOL"
     printf 'Server tunnel:     %s\n' "$GATEWAY_TUN"
@@ -12185,7 +12676,9 @@ list_local_instance_records() {
         gateway=${dir##*/}
         record=$(gateway_inventory_record "$gateway" local)
         IFS='|' read -r _ gateway kind state via endpoint active revoked connected source <<<"$record"
-        if [[ "$via" == host ]]; then
+        if [[ "$(gateway_cfg_value "$gateway" GATEWAY_BACKEND)" == amneziawg ]]; then
+            app_type=amneziawg-server
+        elif [[ "$via" == host ]]; then
             app_type=openvpn-server
         else
             app_type=openvpn-gateway
@@ -12563,6 +13056,13 @@ repair_gateway_one() {
     fi
     acquire_lock "gateway-$gateway"
     load_gateway_cfg "$gateway"
+    if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
+        write_gateway_unit_dropin "$gateway"
+        awg_server_write_config "$gateway"
+        release_lock "gateway-$gateway"
+        repair_fixed "Refreshed AmneziaWG server '$gateway' managed configuration"
+        return 0
+    fi
     root_mode=$(stat -c '%a' "$(gateway_dir "$gateway")" 2>/dev/null || true)
     if [[ "$root_mode" != 711 ]]; then
         if gateway_ensure_runtime_access "$gateway"; then
@@ -13668,6 +14168,18 @@ main() {
             dns_proxy_exec "$2"
             exit
             ;;
+        _amnezia-up)
+            require_root
+            [[ $# -eq 2 ]] || die "_amnezia-up requires server_name."
+            awg_server_up "$2"
+            exit
+            ;;
+        _amnezia-down)
+            require_root
+            [[ $# -eq 2 ]] || die "_amnezia-down requires server_name."
+            awg_server_down "$2"
+            exit
+            ;;
         _gateway-up)
             require_root
             [[ $# -eq 2 ]] || die "_gateway-up requires gateway_name."
@@ -13699,6 +14211,7 @@ main() {
         _gateway-crl-refresh)
             require_root
             [[ $# -eq 2 ]] || die "_gateway-crl-refresh requires gateway_name."
+            [[ "$(gateway_cfg_value "$2" GATEWAY_BACKEND)" != amneziawg ]] || exit 0
             gateway_crl_refresh "$2"
             exit
             ;;
@@ -13751,7 +14264,7 @@ main() {
                 [[ -n "$install_app_name" && "$install_app_name" != --* ]] ||
                     die "Usage: nns-app install <name> --server"
                 local install_remote="" install_remote_port=22 install_remote_port_set=off
-                local install_server=off install_listen="" install_public=""
+                local install_server=off install_amnezia=off install_listen="" install_public=""
                 local install_pool="" install_dns="" install_c2c=""
                 local install_transport="" install_server_name=""
                 shift 2
@@ -13759,6 +14272,10 @@ main() {
                     case "$1" in
                         --server)
                             install_server=on
+                            shift
+                            ;;
+                        --amnezia)
+                            install_amnezia=on
                             shift
                             ;;
                         --client-to-client)
@@ -13867,10 +14384,18 @@ main() {
                     [[ -z "$install_remote" && "$install_remote_port_set" == off &&
                        "$install_via" == __default__ && "$install_backend" == __default__ ]] ||
                         die "--server cannot be combined with --via, --remote, or --backend."
-                    install_openvpn_server "$install_app_name" \
-                        "$install_listen" "$install_public" "$install_pool" "$install_dns" "$install_c2c" \
-                        "$install_transport" "$install_server_name"
+                    if [[ "$install_amnezia" == on ]]; then
+                        [[ -z "$install_transport$install_server_name" ]] ||
+                            die "--amnezia cannot be combined with --transport or --server-name."
+                        awg_server_install "$install_app_name" "$install_listen" "$install_public" \
+                            "$install_pool" "$install_dns" "$install_c2c"
+                    else
+                        install_openvpn_server "$install_app_name" \
+                            "$install_listen" "$install_public" "$install_pool" "$install_dns" "$install_c2c" \
+                            "$install_transport" "$install_server_name"
+                    fi
                 else
+                    [[ "$install_amnezia" != on ]] || die "--amnezia requires --server."
                     [[ -z "$install_listen$install_public$install_pool$install_dns$install_c2c$install_transport$install_server_name" ]] ||
                         die "--listen, --public, --pool, --dns, --transport, --server-name and --client-to-client require --server."
                     if [[ -n "$install_remote" ]]; then
@@ -13968,9 +14493,9 @@ main() {
         export)
             (( $# >= 4 )) ||
                 die "Usage: nns-app export ovpn <app_name> --client <client_name> [--embedded] [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]"
-            [[ "$2" == ovpn ]] ||
-                die "Only 'nns-app export ovpn ...' is currently supported."
-            local export_app=$3 export_client="" export_public="-" export_proto="auto" export_output="-" export_compat="modern" export_fixed_ip="off" export_route_mode="keep"
+            [[ "$2" == ovpn || "$2" == awg ]] ||
+                die "Supported export formats: ovpn and awg."
+            local export_kind=$2 export_app=$3 export_client="" export_public="-" export_proto="auto" export_output="-" export_compat="modern" export_fixed_ip="off" export_route_mode="keep"
             shift 3
             while (( $# > 0 )); do
                 case "$1" in
@@ -14006,7 +14531,12 @@ main() {
                 esac
             done
             [[ -n "$export_client" ]] || die "export ovpn requires --client <client_name>."
-            if server_gateway_exists "$export_app"; then
+            if [[ "$export_kind" == awg ]]; then
+                server_gateway_exists "$export_app" || die "AmneziaWG export requires a locally managed server."
+                [[ "$export_public" == - && "$export_proto" == auto && "$export_compat" == modern ]] ||
+                    die "--public, --proto and --embedded are not valid for AmneziaWG client export."
+                awg_server_client_export "$export_app" "$export_client" "$export_output" "$export_route_mode"
+            elif server_gateway_exists "$export_app"; then
                 server_export_ovpn "$export_app" "$export_client" \
                     "$export_output" "$export_public" "$export_proto" "$export_compat" "$export_fixed_ip" "$export_route_mode"
             else
@@ -14029,7 +14559,11 @@ main() {
             if server_gateway_exists "$2"; then
                 [[ "$revoke_scope" != embedded ]] ||
                     die "--embedded is not supported for a modern OpenVPN server."
-                gateway_client_revoke "$2" "$3"
+                if [[ "$(gateway_cfg_value "$2" GATEWAY_BACKEND)" == amneziawg ]]; then
+                    awg_server_client_revoke "$2" "$3"
+                else
+                    gateway_client_revoke "$2" "$3"
+                fi
             else
                 remote_auto_revoke_public_ovpn "$2" "$3" "$revoke_scope"
             fi
