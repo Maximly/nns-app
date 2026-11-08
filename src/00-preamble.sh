@@ -36,6 +36,7 @@
 #   list [apps|namespaces|gateways|clients|all]
 #   status  <app_name>
 #   myip    [<app_or_gateway_name>]
+#   myloc   [<app_or_gateway_name>] [--json]
 #   export  awg <amnezia_server> --client <name> --output <client.conf> [--split-tunnel|--full-tunnel]
 #   export  ovpn <app_name> --client <name> [--embedded]
 #                  [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]
@@ -66,7 +67,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.0.9"
+readonly VERSION="2.0.10"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -307,6 +308,7 @@ Usage:
   nns-app list [apps|namespaces|gateways|clients|all]
   nns-app status  <app_name>
   nns-app myip [<app_or_gateway_name>]
+  nns-app myloc [<app_or_gateway_name>] [--json]
   nns-app export awg <server_name> --client <client_name> --output <file.conf>
                   [--split-tunnel|--full-tunnel] [--fixed-ip]
   nns-app export ovpn <app_name> --client <client_name> [--embedded] [--fixed-ip]
@@ -401,6 +403,8 @@ Examples:
   nns-app myip
   nns-app myip my-private-app
   nns-app myip office-vpn   # managed OpenVPN server
+  nns-app myloc my-private-app
+  nns-app myloc office-vpn --json
 
   # Export a standard OpenVPN profile for a client that does not run nns-app.
   # The current automatic-remote host and a free OpenVPN port are used by default.

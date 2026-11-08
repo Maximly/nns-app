@@ -6,7 +6,7 @@ chained namespaces, SSH-managed remote exits, and host-based VPN servers.
 The host's default route and DNS configuration remain independent of individual
 application environments.
 
-**Release:** 2.0.9  
+**Release:** 2.0.10  
 **Supported platforms:** Ubuntu and Fedora with systemd (Debian-family package installation is also supported)  
 **VPN backends:** OpenVPN 2.6+, WireGuard, AmneziaWG, and VPN-free inherited namespaces  
 **License:** GPL-3.0-or-later
@@ -404,9 +404,17 @@ nns-app list all         # local and remote apps + exported clients
 nns-app status office-vpn
 nns-app myip my-private-app
 nns-app myip office-vpn
+nns-app myloc my-private-app   # geolocation of its Internet exit
+nns-app myloc office-vpn     # geolocation of the gateway upstream exit
+nns-app myloc --json         # machine-readable JSON for the current context
 sudo nns-app repair
 sudo nns-app repair --local-only
 ```
+
+`myloc` queries the public exit through the selected app namespace or gateway
+upstream. Its free ip-api.com endpoint uses unencrypted HTTP, is limited to
+45 requests/minute per exit address and permits non-commercial use only.
+Geolocation is approximate; a query failure never falls back to the host network.
 
 `status` reports runtime readiness; a locally healthy listener does not
 establish public reachability. Check host/firewall rules, router forwarding,

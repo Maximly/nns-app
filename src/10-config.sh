@@ -25,20 +25,26 @@ reexec_as_root_if_needed() {
     target=$(readlink -f "$0")
     [[ -x "$target" ]] || die "Cannot execute script: $target"
 
-    # Context-only `myip` needs no privilege escalation. For an explicit
+    # Context-only IP/geolocation inspection needs no privilege escalation. For an explicit
     # host-egress OpenVPN gateway the public listener and host exit are also
     # readable without sudo. App and upstream-namespace inspection still
     # needs root to enter the target namespace.
-    if [[ "$cmd" == myip && $# -eq 1 ]]; then
+    if [[ ( "$cmd" == myip || "$cmd" == myloc ) && $# -eq 1 ]]; then
         return 0
     fi
-    if [[ "$cmd" == myip && $# -eq 2 ]] && myip_host_gateway_readable "$2"; then
+    if [[ ( "$cmd" == myip || "$cmd" == myloc ) && $# -ge 2 ]] &&
+       [[ "$2" != --json ]] && myip_host_gateway_readable "$2"; then
         return 0
+    fi
+
+    # Sudoers rules for app inspections use the canonical app-first form.
+    if [[ "$cmd" == myloc && $# -eq 3 && "$2" == --json ]]; then
+        set -- "$1" "$3" --json
     fi
 
     local sudo_args=(/usr/bin/sudo)
     case "$cmd" in
-        list|status|myip|start|stop|run)
+        list|status|myip|myloc|start|stop|run)
             sudo_args+=( -n )
             ;;
         install|remove|add|purge|repair|backup|restore|gateway|remote|link|export|client|revoke|fixed-ip|route-mode|client-to-client|set-via)
@@ -51,7 +57,7 @@ reexec_as_root_if_needed() {
     # Gateways don't have a per-user namespace sudoers entry. Use regular sudo
     # for gateway lifecycle commands so existing host sudo policy can prompt
     # instead of failing under -n. Namespace apps keep their NOPASSWD rules.
-    if [[ "$cmd" == status || "$cmd" == stop || "$cmd" == run ]] &&
+    if [[ "$cmd" == status || "$cmd" == stop || "$cmd" == run || "$cmd" == myloc ]] &&
        (( $# >= 2 )) && managed_gateway_exists "$2"; then
         sudo_args=(/usr/bin/sudo)
     fi

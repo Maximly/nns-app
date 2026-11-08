@@ -9,7 +9,7 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fxq 'nns-app 2.0.9' <<<"$(head -n1 <<<"$version")"
+grep -Fxq 'nns-app 2.0.10' <<<"$(head -n1 <<<"$version")"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -108,11 +108,19 @@ for desktop_var in \
 done
 
 
+grep -Fq '$ENGINE_PATH myloc $app' "$INSTALLER" || {
+    echo 'per-app sudoers does not allow explicit myloc inspection' >&2
+    exit 1
+}
+grep -Fq 'nns-app myloc [<app_or_gateway_name>] [--json]' <<<"$help" || {
+    echo 'myloc help missing' >&2
+    exit 1
+}
 grep -Fq '$ENGINE_PATH myip $app' "$INSTALLER" || {
     echo 'per-app sudoers does not allow explicit myip inspection' >&2
     exit 1
 }
-grep -Fq 'if [[ "$cmd" == myip && $# -eq 1 ]]' "$INSTALLER" || {
+grep -Fq 'if [[ ( "$cmd" == myip || "$cmd" == myloc ) && $# -eq 1 ]]' "$INSTALLER" || {
     echo 'context-only myip still requires sudo' >&2
     exit 1
 }
@@ -213,7 +221,7 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 2.0.9' "$ROOT/README.md"
+grep -Fq '**Release:** 2.0.10' "$ROOT/README.md"
 grep -Fq '## Quick start' "$ROOT/README.md"
 grep -Fq '### Run a VPN locally' "$ROOT/README.md"
 grep -Fq 'nns-app install my-private-app' "$ROOT/README.md"

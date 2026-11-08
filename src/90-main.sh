@@ -598,6 +598,10 @@ main() {
             (( $# <= 2 )) || die "Usage: nns-app myip [<app_or_gateway_name>]"
             myip_command "${2:-}"
             ;;
+        myloc)
+            shift
+            myloc_command "$@"
+            ;;
         export)
             (( $# >= 4 )) ||
                 die "Usage: nns-app export ovpn <app_name> --client <client_name> [--embedded] [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]"

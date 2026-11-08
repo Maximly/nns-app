@@ -36,6 +36,7 @@
 #   list [apps|namespaces|gateways|clients|all]
 #   status  <app_name>
 #   myip    [<app_or_gateway_name>]
+#   myloc   [<app_or_gateway_name>] [--json]
 #   export  awg <amnezia_server> --client <name> --output <client.conf> [--split-tunnel|--full-tunnel]
 #   export  ovpn <app_name> --client <name> [--embedded]
 #                  [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]
@@ -66,7 +67,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.0.9"
+readonly VERSION="2.0.10"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -307,6 +308,7 @@ Usage:
   nns-app list [apps|namespaces|gateways|clients|all]
   nns-app status  <app_name>
   nns-app myip [<app_or_gateway_name>]
+  nns-app myloc [<app_or_gateway_name>] [--json]
   nns-app export awg <server_name> --client <client_name> --output <file.conf>
                   [--split-tunnel|--full-tunnel] [--fixed-ip]
   nns-app export ovpn <app_name> --client <client_name> [--embedded] [--fixed-ip]
@@ -401,6 +403,8 @@ Examples:
   nns-app myip
   nns-app myip my-private-app
   nns-app myip office-vpn   # managed OpenVPN server
+  nns-app myloc my-private-app
+  nns-app myloc office-vpn --json
 
   # Export a standard OpenVPN profile for a client that does not run nns-app.
   # The current automatic-remote host and a free OpenVPN port are used by default.
@@ -452,20 +456,26 @@ reexec_as_root_if_needed() {
     target=$(readlink -f "$0")
     [[ -x "$target" ]] || die "Cannot execute script: $target"
 
-    # Context-only `myip` needs no privilege escalation. For an explicit
+    # Context-only IP/geolocation inspection needs no privilege escalation. For an explicit
     # host-egress OpenVPN gateway the public listener and host exit are also
     # readable without sudo. App and upstream-namespace inspection still
     # needs root to enter the target namespace.
-    if [[ "$cmd" == myip && $# -eq 1 ]]; then
+    if [[ ( "$cmd" == myip || "$cmd" == myloc ) && $# -eq 1 ]]; then
         return 0
     fi
-    if [[ "$cmd" == myip && $# -eq 2 ]] && myip_host_gateway_readable "$2"; then
+    if [[ ( "$cmd" == myip || "$cmd" == myloc ) && $# -ge 2 ]] &&
+       [[ "$2" != --json ]] && myip_host_gateway_readable "$2"; then
         return 0
+    fi
+
+    # Sudoers rules for app inspections use the canonical app-first form.
+    if [[ "$cmd" == myloc && $# -eq 3 && "$2" == --json ]]; then
+        set -- "$1" "$3" --json
     fi
 
     local sudo_args=(/usr/bin/sudo)
     case "$cmd" in
-        list|status|myip|start|stop|run)
+        list|status|myip|myloc|start|stop|run)
             sudo_args+=( -n )
             ;;
         install|remove|add|purge|repair|backup|restore|gateway|remote|link|export|client|revoke|fixed-ip|route-mode|client-to-client|set-via)
@@ -478,7 +488,7 @@ reexec_as_root_if_needed() {
     # Gateways don't have a per-user namespace sudoers entry. Use regular sudo
     # for gateway lifecycle commands so existing host sudo policy can prompt
     # instead of failing under -n. Namespace apps keep their NOPASSWD rules.
-    if [[ "$cmd" == status || "$cmd" == stop || "$cmd" == run ]] &&
+    if [[ "$cmd" == status || "$cmd" == stop || "$cmd" == run || "$cmd" == myloc ]] &&
        (( $# >= 2 )) && managed_gateway_exists "$2"; then
         sudo_args=(/usr/bin/sudo)
     fi
@@ -1373,7 +1383,9 @@ Cmnd_Alias $alias = \\
     $ENGINE_PATH list client, \\
     $ENGINE_PATH list clients, \\
     $ENGINE_PATH status $app, \\
-    $ENGINE_PATH myip $app, \\
+    $ENGINE_PATH myip $app, \
+    $ENGINE_PATH myloc $app, \
+    $ENGINE_PATH myloc $app --json, \\
     $ENGINE_PATH start $app, \\
     $ENGINE_PATH start -i $app, \\
     $ENGINE_PATH start --ignore-start-error $app, \\
@@ -13382,6 +13394,117 @@ list_inventory_objects() {
 list_managed_objects() { list_inventory_objects managed; }
 list_all_objects() { list_inventory_objects all; }
 
+# External IP geolocation for the current network or a managed app's egress.
+# ip-api.com's free API is HTTP-only, rate-limited, non-commercial. Only a
+# single request is made; a failed namespace lookup never falls back to host.
+readonly MYLOC_URL='http://ip-api.com/json/?fields=status,message,query,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,org,as'
+
+myloc_query() {
+    local ns=${1:-} json
+    local -a cmd=(/usr/bin/curl -4fsS --noproxy '*' --connect-timeout 3 --max-time 10 "$MYLOC_URL")
+    if [[ -n "$ns" ]]; then
+        json=$("$(ip_binary)" netns exec "$ns" "${cmd[@]}") || return 1
+    else
+        json=$("${cmd[@]}") || return 1
+    fi
+    [[ -n "$json" ]] || return 1
+    printf '%s\n' "$json"
+}
+
+myloc_namespace_ready() {
+    [[ -e "/run/netns/$1" ]]
+}
+
+myloc_format() {
+    local format=$1 context=$2
+    python3 -c '
+import json
+import sys
+try:
+    data = json.load(sys.stdin)
+except (ValueError, UnicodeError):
+    sys.exit("ERROR: Invalid geolocation response.")
+if not isinstance(data, dict):
+    sys.exit("ERROR: Invalid geolocation response type.")
+if data.get("status") != "success":
+    sys.exit("ERROR: IP geolocation query failed: " + str(data.get("message", "unknown")))
+if not isinstance(data.get("query"), str) or not data["query"]:
+    sys.exit("ERROR: Geolocation response lacks public IP.")
+if sys.argv[1] == "json":
+    print(json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2))
+    sys.exit(0)
+print("Context:           " + sys.argv[2])
+fields = [
+    ("query", "Public IPv4"), ("country", "Country"),
+    ("countryCode", "Country code"), ("regionName", "Region"),
+    ("city", "City"), ("zip", "Postal code"),
+    ("timezone", "Timezone"), ("isp", "ISP"),
+    ("org", "Organization"), ("as", "ASN"),
+]
+for key, label in fields:
+    value = data.get(key)
+    if value is not None and value != "":
+        print(f"{label + chr(58):<19}{value}")
+if data.get("lat") is not None and data.get("lon") is not None:
+    print("Coordinates:       {}, {}".format(data["lat"], data["lon"]))
+print("Provider:          ip-api.com (approximate location; HTTP)")
+' "$format" "$context"
+}
+
+myloc_command() {
+    local requested="" format=pretty context="host" ns="" via="" json=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --json) format=json ;;
+            --*) die "Unknown myloc option '$1'." ;;
+            *)
+                [[ -z "$requested" ]] || die 'Usage: nns-app myloc [<app_or_gateway_name>] [--json]'
+                requested=$1 ;;
+        esac
+        shift
+    done
+
+    if [[ -n "$requested" ]]; then
+        validate_app_name "$requested"
+        if managed_gateway_exists "$requested"; then
+            load_gateway_cfg "$requested"
+            via=$VIA_APP
+            systemctl is-active --quiet "nns-gateway@${requested}.service" ||
+                die "Gateway '$requested' is stopped."
+            if [[ "$via" == host ]]; then
+                myip_host_namespace || die "Cannot inspect host-exit gateway '$requested' from another network namespace."
+                context="gateway:$requested via host"
+            else
+                require_root
+                load_cfg "$via"
+                myloc_namespace_ready "$NS_NAME" || die "Gateway upstream '$via' has no active namespace."
+                ns=$NS_NAME
+                context="gateway:$requested via $via"
+            fi
+        else
+            require_root
+            load_cfg "$requested"
+            myloc_namespace_ready "$NS_NAME" || die "App '$requested' has no active namespace."
+            ns=$NS_NAME
+            context="app:$requested"
+        fi
+    else
+        local detected
+        detected=$(current_nns_app 2>/dev/null || true)
+        if [[ -z "$detected" && -n "${NNS_APP_CONTEXT:-}" ]] && ! myip_host_namespace; then
+            detected=$NNS_APP_CONTEXT
+        fi
+        if [[ -n "$detected" ]]; then
+            context="app:$detected (current namespace)"
+        elif ! myip_host_namespace; then
+            context='current network namespace'
+        fi
+    fi
+
+    json=$(myloc_query "$ns") || die "IP geolocation unavailable from '$context' (DNS, network, API, or rate limit)."
+    printf '%s\n' "$json" | myloc_format "$format" "$context"
+}
+
 # nns-app source module: conservative state and lifecycle reconciliation.
 #
 # `nns-app repair` fixes only resources whose nns-app ownership can be proven.
@@ -15348,6 +15471,10 @@ main() {
         myip)
             (( $# <= 2 )) || die "Usage: nns-app myip [<app_or_gateway_name>]"
             myip_command "${2:-}"
+            ;;
+        myloc)
+            shift
+            myloc_command "$@"
             ;;
         export)
             (( $# >= 4 )) ||
