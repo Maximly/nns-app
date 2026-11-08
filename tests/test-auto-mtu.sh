@@ -10,10 +10,13 @@ load_cfg() { NS_NAME=nns-test; AUTO_MTU=${TEST_AUTO_MTU:-on}; }
 vpn_type_for_app() { printf '%s\n' "${TEST_TYPE:-openvpn}"; }
 app_split_tunnel() { [[ "${TEST_SPLIT:-off}" == on ]]; }
 vpn_route_iface() { echo tun0; }
-SAVED_MTU=""
+RUN_DIR=$(mktemp -d)
+trap 'rm -rf "$RUN_DIR"' EXIT
+SAVED_MTU=''
 MTU=1500
-TRIES=""
+TRIES=''
 SAVE_COUNT=0
+
 ip() {
     if [[ "$1" == -n && "$3" == -o ]]; then
         echo "2: tun0: <UP> mtu $MTU qdisc fq_codel"
@@ -24,49 +27,85 @@ ip() {
         TRIES+="$MTU "
         return 0
     fi
+    if [[ "$1" == netns && "$2" == exec && "$4" == curl ]]; then
+        local url=${!#} mode=${TEST_MODE:-healthy} fail_probe=0
+        case "$mode" in
+            healthy) ;;
+            dnsfailed) echo 'curl: (6) Could not resolve host' >&2; return 6 ;;
+            tcpfailed) echo 'curl: (28) Connection timed out' >&2; return 28 ;;
+            stuck) fail_probe=1 ;;
+            rescued1400) (( MTU <= 1400 )) || fail_probe=1 ;;
+            rescued1280) (( MTU <= 1280 )) || fail_probe=1 ;;
+            mixed)
+                if [[ "$url" == *speed.cloudflare.com* ]]; then
+                    echo 'curl: (6) Could not resolve host' >&2
+                    return 6
+                fi
+                (( MTU <= 1400 )) || fail_probe=1
+                ;;
+            onehealthy)
+                if [[ "$url" == *api.ipify.org* ]] && (( MTU > 1400 )); then
+                    fail_probe=1
+                fi
+                ;;
+            servererror) echo 'curl: (22) The requested URL returned error: 503' >&2; return 22 ;;
+            shortreply)
+                printf 'NNS_MTU_METRICS:0.032|0.150|1|200\n'
+                return 0
+                ;;
+        esac
+        if (( fail_probe )); then
+            # Curl 8.11+ may return zero time_connect on TLS timeout.
+            echo '* TLSv1.3 (OUT), TLS handshake, Client hello (1):' >&2
+            printf 'NNS_MTU_METRICS:0.000000|0.000000|0|000\n'
+            return 28
+        fi
+        local bytes=14
+        [[ "$url" == *'/__down?bytes=32768' ]] && bytes=32768
+        printf 'NNS_MTU_METRICS:0.032|0.150|%d|200\n' "$bytes"
+        return 0
+    fi
     echo "unexpected mock ip args: $*" >&2
     return 1
 }
-cfg_set() { [[ "$2" == TUN_MTU ]] || fail 'wrong cfg var'; SAVED_MTU=$3; SAVE_COUNT=$((SAVE_COUNT + 1)); }
-# Confirm the real curl-metrics classifier works with the project's IFS.
-(
-    ip() { printf '0.032 0.000\n'; return 28; }
-    if mtu_https_probe test https://example.org/; then fail 'TLS timeout was healthy';
-    else [[ $? == 10 ]] || fail 'TLS timeout classification'; fi
-)
-(
-    ip() { printf '0.000 0.000\n'; return 6; }
-    if mtu_https_probe test https://example.org/; then fail 'DNS error was healthy';
-    else [[ $? == 20 ]] || fail 'DNS error classification'; fi
-)
-(
-    ip() { printf '0.034 0.212\n'; return 22; }
-    mtu_https_probe test https://example.org/ || fail 'completed TLS incorrectly treated as MTU issue'
-)
-# Use a simpler response for the tuner itself, with two independent targets.
-mtu_https_probe() {
-    local ns=$1 url=$2
-    case "${TEST_MODE:-healthy}" in
-        healthy) return 0;;
-        dnsfailed) return 20;;
-        stuck) return 10;;
-        rescued1400) if (( MTU <= 1400 )); then return 0; else return 10; fi;;
-        rescued1280) if (( MTU <= 1280 )); then return 0; else return 10; fi;;
-        intermittent) if (( MTU <= 1400 )); then
-             if [[ "$url" == *cloudflare* ]]; then return 0; else return 10; fi
-          fi
-          return 10;;
-    esac
+cfg_set() {
+    [[ "$2" == TUN_MTU ]] || fail 'wrong cfg variable'
+    SAVED_MTU=$3
+    SAVE_COUNT=$((SAVE_COUNT + 1))
 }
+
+# Real classifier (not stubbed): avoids curl's time_connect=0 TLS regression.
+TEST_MODE=stuck
+if mtu_https_probe test https://api.ipify.org/; then fail 'TLS stall classified as healthy';
+else [[ $? == 10 ]] || fail 'TLS stall not classified by ClientHello'; fi
+TEST_MODE=dnsfailed
+if mtu_https_probe test https://api.ipify.org/; then fail 'DNS failure classified as healthy';
+else [[ $? == 20 ]] || fail 'DNS failure incorrectly triggers tuning'; fi
+TEST_MODE=tcpfailed
+if mtu_https_probe test https://api.ipify.org/; then fail 'TCP timeout classified as healthy';
+else [[ $? == 20 ]] || fail 'TCP timeout incorrectly triggers tuning'; fi
+TEST_MODE=shortreply
+if mtu_https_probe test 'https://speed.cloudflare.com/__down?bytes=32768'; then
+    fail '1-byte download classified as healthy'
+else [[ $? == 20 ]] || fail 'short download classified as MTU stall'; fi
+
 TEST_MODE=healthy
 mtu_auto_repair test
 [[ $MTU == 1500 && $SAVE_COUNT == 0 ]] || fail 'healthy tunnel modified'
+grep -Fq 'healthy:MTU=1500' "$RUN_DIR/test.mtu-check" || fail 'healthy probe status not saved'
 TEST_MODE=dnsfailed
 mtu_auto_repair test
-[[ $MTU == 1500 && $SAVE_COUNT == 0 ]] || fail 'non-TLS outage triggered tuning'
-TEST_MODE=rescued1400
+[[ $MTU == 1500 && $SAVE_COUNT == 0 ]] || fail 'DNS failure triggered tuning'
+TEST_MODE=onehealthy
 mtu_auto_repair test
-[[ $MTU == 1400 && $SAVED_MTU == 1400 && $SAVE_COUNT == 1 ]] || fail 'MTU recovery not saved'
+[[ $MTU == 1400 && $SAVED_MTU == 1400 && $SAVE_COUNT == 1 ]] ||
+    fail 'healthy first target hid a stalled second target'
+grep -Fq 'recovered:MTU=1400' "$RUN_DIR/test.mtu-check" || fail 'MTU recovery not reflected in state'
+TRIES='' MTU=1500 SAVED_MTU='' SAVE_COUNT=0
+TEST_MODE=mixed
+mtu_auto_repair test
+[[ $MTU == 1400 && $SAVED_MTU == 1400 && $SAVE_COUNT == 1 ]] ||
+    fail 'unavailable optional target suppressed recoverable TLS stall'
 TRIES='' MTU=1500 SAVED_MTU='' SAVE_COUNT=0
 TEST_MODE=rescued1280
 mtu_auto_repair test
@@ -76,7 +115,6 @@ TRIES='' MTU=1500 SAVED_MTU='' SAVE_COUNT=0
 TEST_MODE=stuck
 mtu_auto_repair test
 [[ $MTU == 1500 && $SAVE_COUNT == 0 ]] || fail 'failed tuning not rolled back'
-TRIES='' MTU=1500 SAVED_MTU='' SAVE_COUNT=0
 TEST_MODE=rescued1400 TEST_AUTO_MTU=off
 mtu_auto_repair test
 [[ $MTU == 1500 && $SAVE_COUNT == 0 ]] || fail 'disabled tuning changed MTU'
@@ -87,8 +125,7 @@ TEST_SPLIT=off TEST_TYPE=wireguard
 mtu_auto_repair test
 [[ $MTU == 1500 && $SAVE_COUNT == 0 ]] || fail 'wireguard unexpectedly tuned'
 TEST_TYPE=openvpn
-# Ensure the startup paths call the repair hook and the OpenVPN exec path
-# persists learned values across backend reconnections.
+# Both startup paths must call the repair hook, saved values must be reused.
 grep -Fq 'mtu_auto_repair "$app"' "$ROOT/src/50-runtime.sh" || fail 'interactive start missing repair'
 grep -Fq 'mtu_auto_repair "$2"' "$ROOT/src/90-main.sh" || fail 'boot-time online unit missing repair'
 grep -Fq 'args+=(--tun-mtu "$TUN_MTU")' "$ROOT/src/50-runtime.sh" || fail 'OpenVPN reconnect missing saved MTU'

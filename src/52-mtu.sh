@@ -1,47 +1,71 @@
-# Conditional HTTPS/MTU validation for OpenVPN namespace clients.
-# The small IP probe in wait_online() verifies basic routing, not TLS-sized
-# packets. Only attempt an MTU reduction after both independent HTTPS probes
-# establish TCP but fail to complete TLS.
+# Verify substantial HTTPS transfers through a full-tunnel OpenVPN namespace.
+# Only change the interface MTU if a previously failing transfer recovers at
+# the new size. IP reachability alone is not proof that TCP/TLS works.
 
+mtu_probe_state() {
+    local app=$1 state=$2
+    [[ -n "${RUN_DIR:-}" ]] || return 0
+    install -d -o root -g root -m 0755 "$RUN_DIR" 2>/dev/null || return 0
+    printf '%s\n' "$state" >"$RUN_DIR/${app}.mtu-check" 2>/dev/null || true
+}
+
+# Returns: 0 = transfer completed, 10 = stalled after TLS was sent,
+#          20 = target unavailable / DNS / TCP connect / certificate error.
+# Always check the full response. A successful TCP connect or 204 response
+# cannot establish that the path carries packets of normal application size.
 mtu_https_probe() {
-    local ns=$1 url=$2 metrics rc=0 connected tls_done
-    if metrics=$(ip netns exec "$ns" curl -4 -sS -o /dev/null \
-            --noproxy '*' --connect-timeout 3 --max-time 7 \
-            --write-out '%{time_connect} %{time_appconnect}' \
-            "$url" 2>/dev/null); then
-        return 0
+    local ns=$1 url=$2 capture rc=0 metrics tcp tls bytes http_code
+    local min_bytes=7
+    [[ "$url" == *'/__down?bytes=32768' ]] && min_bytes=32768
+    if capture=$(ip netns exec "$ns" curl -4 -v -f -sS \
+            --noproxy '*' --connect-timeout 4 --max-time 6 \
+            -o /dev/null \
+            --write-out $'\nNNS_MTU_METRICS:%{time_connect}|%{time_appconnect}|%{size_download}|%{http_code}\n' \
+            "$url" 2>&1); then
+        rc=0
     else
         rc=$?
     fi
-    # A completed TLS handshake also counts when the HTTP endpoint later
-    # declines the request. Never mistake DNS/TCP/certificate failure for PMTU.
-    local IFS=' '
-    read -r connected tls_done <<<"$metrics"
-    if [[ -n "$tls_done" ]] &&
-       awk -v t="$tls_done" 'BEGIN { exit !(t > 0) }'; then
+
+    if (( rc == 0 )); then
+        [[ "$capture" == *'NNS_MTU_METRICS:'* ]] || return 20
+        metrics=${capture##*NNS_MTU_METRICS:}
+        metrics=${metrics%%$'\n'*}
+        local IFS='|'
+        read -r tcp tls bytes http_code <<< "$metrics"
+        # Require the expected response length, not merely a successful TLS
+        # handshake. The diagnostic download is a fixed 32-KiB payload.
+        [[ "$bytes" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 20
+        awk -v got="$bytes" -v minimum="$min_bytes" \
+            'BEGIN { exit !(got >= minimum) }' || return 20
         return 0
     fi
-    if [[ -n "$connected" ]] &&
-       awk -v t="$connected" 'BEGIN { exit !(t > 0) }' &&
-       [[ "$rc" == 28 || "$rc" == 35 || "$rc" == 56 ]]; then
+
+    # Recent curl versions can reset time_connect to zero when a TLS
+    # handshake times out. Its verbose ClientHello log still proves TCP
+    # connected and that TLS traffic was sent. DNS/TCP/certificate errors
+    # must not be misclassified as path-MTU failures.
+    if (( rc == 28 || rc == 18 )) &&
+       [[ "$capture" == *'TLS handshake, Client hello'* ]]; then
         return 10
     fi
     return 20
 }
 
 mtu_auto_repair() {
-    local app=$1 kind ns dev original candidate result url good suspect=0
-    local deadline
+    local app=$1 kind ns dev original candidate result url
+    local deadline suspect=0 unavailable=0 good
     local -a urls=(
-        'https://www.cloudflare.com/cdn-cgi/trace'
-        'https://www.google.com/generate_204'
+        'https://speed.cloudflare.com/__down?bytes=32768'
+        'https://api.ipify.org/'
     )
+    local -a failed_urls=() healthy_urls=()
 
     load_cfg "$app"
-    [[ "${AUTO_MTU:-on}" != off ]] || return 0
+    [[ "${AUTO_MTU:-on}" != off ]] || { mtu_probe_state "$app" disabled; return 0; }
     kind=$(vpn_type_for_app "$app" 2>/dev/null || true)
     [[ "$kind" == openvpn ]] || return 0
-    app_split_tunnel "$app" && return 0
+    app_split_tunnel "$app" && { mtu_probe_state "$app" split-tunnel-skipped; return 0; }
     ns=$NS_NAME
     dev=$(vpn_route_iface "$app" 2>/dev/null || true)
     [[ "$dev" == tun* ]] || return 0
@@ -49,41 +73,65 @@ mtu_auto_repair() {
         awk '{for (i=1;i<=NF;i++) if ($i=="mtu") {print $(i+1); exit}}')
     [[ "$original" =~ ^[0-9]+$ ]] || return 0
 
-    # Any working HTTPS target is sufficient proof that TLS-size traffic passes.
-    # If a target fails DNS/TCP or certificate validation, do not touch MTU.
+    # End-to-end budget includes baseline probes. Avoid holding the startup
+    # service indefinitely when the connection is broken.
+    deadline=$((SECONDS + 38))
     for url in "${urls[@]}"; do
         if mtu_https_probe "$ns" "$url"; then
-            return 0
+            healthy_urls+=("$url")
+            continue
         else
             result=$?
         fi
-        [[ "$result" == 10 ]] || return 0
-        suspect=$((suspect + 1))
+        if (( result == 10 )); then
+            failed_urls+=("$url")
+            suspect=$((suspect + 1))
+        else
+            unavailable=$((unavailable + 1))
+        fi
     done
-    (( suspect == ${#urls[@]} )) || return 0
 
-    warn "'$app': IP connectivity works but HTTPS TLS is stalled; checking tunnel MTU."
-    deadline=$((SECONDS + 35))
-    # A known conservative starting point avoids expensive wide-range sweeps.
-    # The probe is the authority: no MTU value is committed before TLS succeeds.
+    if (( suspect == 0 )); then
+        if (( unavailable == 0 )); then
+            mtu_probe_state "$app" "healthy:MTU=$original"
+        else
+            mtu_probe_state "$app" "inconclusive:unavailable=$unavailable:MTU=$original"
+            warn "'$app': an HTTPS probe was unavailable; MTU remains $original (no size-related stall detected)."
+        fi
+        return 0
+    fi
+    # A DNS/TCP failure at one optional target must not mask a genuine TLS
+    # stall at another. Only the stalled target can authorize a saved MTU,
+    # after it recovers at the new setting on two independent connections.
+    if (( unavailable != 0 )); then
+        warn "'$app': $unavailable HTTPS target(s) unavailable; checking MTU only against the $suspect confirmed TLS stall(s)."
+    fi
+    warn "'$app': $suspect HTTPS transfer(s) stalled after TCP/TLS; testing smaller $dev MTUs."
     for candidate in 1400 1360 1320 1280 1200; do
         (( SECONDS < deadline )) || break
         (( candidate < original )) || continue
         if ! ip -n "$ns" link set dev "$dev" mtu "$candidate"; then
-            warn "'$app': could not set $dev MTU $candidate; restoring prior setting."
+            warn "'$app': could not set $dev MTU $candidate."
             break
         fi
-        good=off
-        for url in "${urls[@]}"; do
-            (( SECONDS < deadline )) || break
-            if mtu_https_probe "$ns" "$url" &&
-               mtu_https_probe "$ns" "$url"; then
-                good=on
-                break
-            fi
+        good=on
+        # Every previously failed target must recover. A different working
+        # URL is not evidence that the original failure is fixed.
+        for url in "${failed_urls[@]}"; do
+            (( SECONDS < deadline )) || { good=off; break; }
+            if ! mtu_https_probe "$ns" "$url"; then good=off; break; fi
         done
         if [[ "$good" == on ]]; then
+            # Retest all targets known to have worked or stalled. Ignore
+            # independent DNS/TCP failures unrelated to packet size.
+            for url in "${healthy_urls[@]}" "${failed_urls[@]}"; do
+                (( SECONDS < deadline )) || { good=off; break; }
+                if ! mtu_https_probe "$ns" "$url"; then good=off; break; fi
+            done
+        fi
+        if [[ "$good" == on ]]; then
             if cfg_set "$app" TUN_MTU "$candidate"; then
+                mtu_probe_state "$app" "recovered:MTU=$candidate:previous=$original"
                 log "'$app': HTTPS recovered at $dev MTU $candidate (previous $original); saved for OpenVPN reconnects."
                 return 0
             fi
@@ -92,6 +140,7 @@ mtu_auto_repair() {
         fi
     done
     ip -n "$ns" link set dev "$dev" mtu "$original" 2>/dev/null || true
-    warn "'$app': HTTPS did not recover with reduced MTU; keeping $original."
+    mtu_probe_state "$app" "unresolved:MTU=$original"
+    warn "'$app': HTTPS did not reliably recover with reduced MTU; keeping $original."
     return 0
 }

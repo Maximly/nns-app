@@ -6,7 +6,7 @@ chained namespaces, SSH-managed remote exits, and host-based VPN servers.
 The host's default route and DNS configuration remain independent of individual
 application environments.
 
-**Release:** 2.0.6  
+**Release:** 2.0.7  
 **Supported platforms:** Ubuntu and Fedora with systemd (Debian-family package installation is also supported)  
 **VPN backends:** OpenVPN 2.6+, WireGuard, AmneziaWG, and VPN-free inherited namespaces  
 **License:** GPL-3.0-or-later
@@ -59,21 +59,22 @@ WireGuard and AmneziaWG accept IPv4 split-tunnel `AllowedIPs` such as
 reachability to an actual remote service. The kill switch blocks unmatched
 traffic by default.
 
-**Automatic OpenVPN MTU recovery:** When a full-tunnel OpenVPN app starts,
-nns-app first verifies basic IP reachability and then makes short HTTPS
-connectivity checks against Cloudflare's trace endpoint and Google's
-`generate_204` endpoint. A successful HTTPS probe keeps the current MTU.
-Only when *both* probes establish TCP but stall during TLS does nns-app try
-smaller TUN MTUs (1400, 1360, 1320, 1280, 1200), verifying recovery before
-saving the result. The working MTU persists across OpenVPN reconnects without
-changing the imported profile; a failed sweep restores the original value.
-DNS failures, TCP failures and private/split-tunnel profiles are not used to
-infer an MTU problem. To disable automatic checks in an app, set
-`AUTO_MTU="off"` in its root-owned app configuration. `TUN_MTU` holds the
-last learned OpenVPN MTU (empty by default); clear it to return to profile
-settings on the next VPN restart. The checks run both on interactive start
-and during boot-time online activation. Probe endpoints are external services
-and may not be reachable on every network.
+**Automatic OpenVPN MTU recovery:** On startup, a full-tunnel OpenVPN app
+first checks IP reachability, then verifies completed HTTPS transfers using
+Cloudflare's 32-KiB speed-test download and the ipify IPv4 endpoint. If both
+succeed, the interface MTU is unchanged. If a transfer stalls *after* TLS
+ClientHello, nns-app temporarily tests smaller TUN MTUs (1400, 1360, 1320,
+1280, 1200). It saves the first setting at which every previously failing
+transfer recovers twice and every initially healthy probe remains working;
+otherwise it restores the original MTU. Unavailable targets do not prevent
+recovery of an independently confirmed TLS stall. DNS failures, TCP connection
+failures, certificate errors, and split-tunnel apps cannot by themselves
+trigger tuning. Probes are budget-limited, and the
+last result is displayed in `nns-app status`. Set `AUTO_MTU="off"` in the
+app configuration to disable checks; `TUN_MTU` holds the last measured value
+and is reapplied on OpenVPN reconnects. Clearing `TUN_MTU` returns to the
+profile's MTU on the next restart. External probe hosts are not guaranteed to
+be available on every network.
 
 For free VPN Gate OpenVPN relay selection:
 

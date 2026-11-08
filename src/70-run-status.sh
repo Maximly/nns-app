@@ -1081,6 +1081,11 @@ status_app() {
         fi
         printf 'Tunnel MTU:        %s (auto-check %s; saved %s)\n' \
             "${current_tun_mtu:-not available}" "${AUTO_MTU:-on}" "${TUN_MTU:-none}"
+        local mtu_check_state=""
+        if [[ -f "$RUN_DIR/${app}.mtu-check" ]]; then
+            mtu_check_state=$(head -n 1 "$RUN_DIR/${app}.mtu-check" 2>/dev/null || true)
+        fi
+        [[ -z "$mtu_check_state" ]] || printf 'Auto MTU result:   %s\n' "$mtu_check_state"
     fi
     printf 'Tunnel IPv4:       %s\n' "${local_ip:-not assigned}"
     printf 'External IPv4:     %s\n' "${external_ip:-unavailable}"
