@@ -1073,6 +1073,15 @@ status_app() {
         printf 'Snap DNS proxy:    inactive; starts on demand\n'
     fi
     printf 'Tunnel interface:  %s\n' "${route_iface:-not ready}"
+    if [[ "$type" == openvpn ]]; then
+        local current_tun_mtu=""
+        if [[ -n "$route_iface" && "$namespace_exists" == yes ]]; then
+            current_tun_mtu=$(ip -n "$NS_NAME" -o link show dev "$route_iface" 2>/dev/null |
+                awk '{for (i=1;i<=NF;i++) if ($i=="mtu") {print $(i+1); exit}}')
+        fi
+        printf 'Tunnel MTU:        %s (auto-check %s; saved %s)\n' \
+            "${current_tun_mtu:-not available}" "${AUTO_MTU:-on}" "${TUN_MTU:-none}"
+    fi
     printf 'Tunnel IPv4:       %s\n' "${local_ip:-not assigned}"
     printf 'External IPv4:     %s\n' "${external_ip:-unavailable}"
     printf 'Ping data path:    %s\n' "$ping_ok"

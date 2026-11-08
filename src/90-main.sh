@@ -320,6 +320,7 @@ main() {
             [[ $# -eq 3 ]] || die "_wait-online requires app_name and timeout."
             wait_online "$2" "$3" ||
                 die "NNS app '$2' did not become online within $3 seconds."
+            mtu_auto_repair "$2"
             exit
             ;;
         _remote-auto-authorize)

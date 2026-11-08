@@ -6,7 +6,7 @@ chained namespaces, SSH-managed remote exits, and host-based VPN servers.
 The host's default route and DNS configuration remain independent of individual
 application environments.
 
-**Release:** 2.0.5  
+**Release:** 2.0.6  
 **Supported platforms:** Ubuntu and Fedora with systemd (Debian-family package installation is also supported)  
 **VPN backends:** OpenVPN 2.6+, WireGuard, AmneziaWG, and VPN-free inherited namespaces  
 **License:** GPL-3.0-or-later
@@ -58,6 +58,22 @@ WireGuard and AmneziaWG accept IPv4 split-tunnel `AllowedIPs` such as
 `10.30.0.0/16`; a split-route configuration can be `READY` without confirming
 reachability to an actual remote service. The kill switch blocks unmatched
 traffic by default.
+
+**Automatic OpenVPN MTU recovery:** When a full-tunnel OpenVPN app starts,
+nns-app first verifies basic IP reachability and then makes short HTTPS
+connectivity checks against Cloudflare's trace endpoint and Google's
+`generate_204` endpoint. A successful HTTPS probe keeps the current MTU.
+Only when *both* probes establish TCP but stall during TLS does nns-app try
+smaller TUN MTUs (1400, 1360, 1320, 1280, 1200), verifying recovery before
+saving the result. The working MTU persists across OpenVPN reconnects without
+changing the imported profile; a failed sweep restores the original value.
+DNS failures, TCP failures and private/split-tunnel profiles are not used to
+infer an MTU problem. To disable automatic checks in an app, set
+`AUTO_MTU="off"` in its root-owned app configuration. `TUN_MTU` holds the
+last learned OpenVPN MTU (empty by default); clear it to return to profile
+settings on the next VPN restart. The checks run both on interactive start
+and during boot-time online activation. Probe endpoints are external services
+and may not be reachable on every network.
 
 For free VPN Gate OpenVPN relay selection:
 

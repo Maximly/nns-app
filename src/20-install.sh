@@ -233,7 +233,7 @@ BindsTo=nns-openvpn@%i.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/nns_app.sh _wait-online %i 60
-TimeoutStartSec=70s
+TimeoutStartSec=120s
 
 [Install]
 WantedBy=multi-user.target
@@ -647,6 +647,11 @@ DISABLE_DCO="off"
 PROFILE_FIXUPS="on"
 READY_TIMEOUT="5"
 EXTERNAL_IP_URL="https://api.ipify.org"
+# Check HTTPS on start; tune OpenVPN MTU only when basic IP connectivity is
+# healthy but both independent TLS probes stall. off disables this behavior.
+AUTO_MTU="on"
+# Last tested working OpenVPN tunnel MTU; empty means provider default.
+TUN_MTU=""
 
 # auto: monitor OpenVPN/WireGuard only while this environment is running.
 # on:   same monitoring policy, explicitly enabled.

@@ -66,7 +66,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.0.5"
+readonly VERSION="2.0.6"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -185,6 +185,7 @@ reset_app_cfg_vars() {
     KILLSWITCH="" AUTOSTART="" UPSTREAM_APP="" WAN_IFACE=""
     DNS_SERVERS="" DISABLE_IPV6="" DISABLE_DCO="" PROFILE_FIXUPS=""
     READY_TIMEOUT="" EXTERNAL_IP_URL="" WATCHDOG_MODE=""
+    AUTO_MTU="" TUN_MTU=""
     WATCHDOG_FAILURES="" WATCHDOG_COOLDOWN="" NS_NAME="" NS_CIDR=""
     HOST_ADDR="" NS_ADDR="" VETH_HOST="" VETH_NS=""
     TRANSPORT_TYPE="" TRANSPORT_REMOTE_HOST="" TRANSPORT_REMOTE_PORT=""

@@ -19,6 +19,12 @@ openvpn_exec() {
     if bool_on "$DISABLE_DCO"; then
         args+=(--disable-dco)
     fi
+    # A previously measured safe MTU survives OpenVPN reconnects and service
+    # restarts. The source profile is never modified by automatic tuning.
+    if [[ "${TUN_MTU:-}" =~ ^[0-9]+$ ]] &&
+       (( TUN_MTU >= 576 && TUN_MTU <= 1500 )); then
+        args+=(--tun-mtu "$TUN_MTU")
+    fi
 
     exec "$ip_bin" netns exec "$NS_NAME" "${args[@]}"
 }
@@ -454,6 +460,9 @@ start_app() {
     fi
     if app_is_started "$app" && [[ "$current" == "$profile_marker" && "$current_via" == "$desired_via" ]]; then
         sync_watchdog_timer "$app"
+        if [[ "$ignore_start_error" == off ]] && wait_online "$app" 2; then
+            mtu_auto_repair "$app"
+        fi
         log "'$app' is already started with '$profile_marker' via $desired_via."
         return 0
     fi
@@ -513,6 +522,9 @@ start_app() {
     fi
 
     if wait_online "$app" "$timeout"; then
+        if [[ "$ignore_start_error" == off ]]; then
+            mtu_auto_repair "$app"
+        fi
         local ext=""
         if ! app_split_tunnel "$app"; then
             ext=$(ip netns exec "$NS_NAME" curl -4fsS \
