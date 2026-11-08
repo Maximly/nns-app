@@ -25,6 +25,10 @@ openvpn_exec() {
        (( TUN_MTU >= 576 && TUN_MTU <= 1500 )); then
         args+=(--tun-mtu "$TUN_MTU")
     fi
+    # Run inside OpenVPN's own network namespace after it has created the TUN,
+    # including internal SIGUSR1/ping-restart reconnects. Unlike a periodic
+    # watchdog this does not wait for connectivity or DNS.
+    args+=(--script-security 2 --up "$ENGINE_PATH _mtu-up $app" --up-restart)
 
     exec "$ip_bin" netns exec "$NS_NAME" "${args[@]}"
 }
@@ -263,6 +267,30 @@ watchdog_namespace_exists() {
     [[ -e "/run/netns/$NS_NAME" ]]
 }
 
+# The MTU timer is separate from the data-path watchdog, which can block on
+# routing or network probes. Only run it for a client with a saved OpenVPN MTU.
+sync_mtu_timer() {
+    local app=$1 kind
+    load_cfg "$app"
+    kind=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    if [[ "$kind" == openvpn && "${TUN_MTU:-}" =~ ^[0-9]+$ ]] &&
+       (( TUN_MTU >= 576 && TUN_MTU <= 1500 )); then
+        if bool_on "${AUTOSTART:-off}"; then
+            systemctl enable "nns-mtu@${app}.timer" >/dev/null 2>&1 || true
+        else
+            systemctl disable "nns-mtu@${app}.timer" >/dev/null 2>&1 || true
+        fi
+        if app_is_started "$app"; then
+            systemctl start "nns-mtu@${app}.timer" >/dev/null 2>&1 ||
+                warn "Could not start the MTU reconciliation timer for '$app'."
+        else
+            systemctl stop "nns-mtu@${app}.timer" >/dev/null 2>&1 || true
+        fi
+    else
+        systemctl disable --now "nns-mtu@${app}.timer" >/dev/null 2>&1 || true
+    fi
+}
+
 sync_watchdog_timer() {
     local app=$1 type
     validate_app_name "$app"
@@ -288,6 +316,7 @@ sync_watchdog_timer() {
         systemctl stop "nns-watchdog@${app}.service" >/dev/null 2>&1 || true
         rm -f "$(watchdog_state_file "$app")"
     fi
+    sync_mtu_timer "$app"
 }
 
 watchdog_check() {
@@ -310,10 +339,8 @@ watchdog_check() {
         return 0
     fi
 
-    # Reconcile a saved MTU after an OpenVPN-internal reconnect. This needs
-    # no HTTPS probes and cannot trigger a fresh MTU search.
-    mtu_apply_saved "$app" || true
-
+    # MTU is reconciled by OpenVPN's --up callback and the independent
+    # nns-mtu timer, never by network-dependent watchdog probes.
     watchdog_state_load "$app"
     if (( WD_ARMED == 0 )) &&
        systemctl is-active --quiet "nns-online@${app}.service"; then
@@ -595,12 +622,15 @@ stop_app_internal() {
     stop_dependents "$app"
     systemctl stop "nns-watchdog@${app}.timer" 2>/dev/null || true
     systemctl stop "nns-watchdog@${app}.service" 2>/dev/null || true
+    systemctl stop "nns-mtu@${app}.timer" 2>/dev/null || true
+    systemctl stop "nns-mtu@${app}.service" 2>/dev/null || true
     systemctl stop "nns-online@${app}.service" 2>/dev/null || true
     systemctl stop "nns-dns@${app}.service" 2>/dev/null || true
     systemctl stop "nns-openvpn@${app}.service" 2>/dev/null || true
     systemctl stop "nns-netns@${app}.service" 2>/dev/null || true
     systemctl reset-failed \
         "nns-watchdog@${app}.service" \
+        "nns-mtu@${app}.service" \
         "nns-online@${app}.service" \
         "nns-dns@${app}.service" \
         "nns-openvpn@${app}.service" \
@@ -680,7 +710,7 @@ remove_app() {
     stop_app "$app"
     load_cfg "$app"
     firewalld_interface_remove "$VETH_HOST"
-    systemctl disable --now "nns-watchdog@${app}.timer" \
+    systemctl disable --now "nns-watchdog@${app}.timer" "nns-mtu@${app}.timer" \
         >/dev/null 2>&1 || true
     systemctl disable \
         "nns-online@${app}.service" \
@@ -759,6 +789,8 @@ purge_engine() {
     for app in "${apps[@]}"; do
         systemctl stop "nns-watchdog@${app}.timer" 2>/dev/null || true
         systemctl stop "nns-watchdog@${app}.service" 2>/dev/null || true
+        systemctl stop "nns-mtu@${app}.timer" 2>/dev/null || true
+        systemctl stop "nns-mtu@${app}.service" 2>/dev/null || true
         systemctl stop "nns-online@${app}.service" 2>/dev/null || true
         systemctl stop "nns-dns@${app}.service" 2>/dev/null || true
         systemctl stop "nns-openvpn@${app}.service" 2>/dev/null || true
@@ -815,6 +847,8 @@ purge_engine() {
            -o -name 'nns-dns@*.service' \
            -o -name 'nns-watchdog@*.service' \
            -o -name 'nns-watchdog@*.timer' \
+           -o -name 'nns-mtu@*.service' \
+           -o -name 'nns-mtu@*.timer' \
            -o -name 'nns-gateway@*.service' \
            -o -name 'nns-gateway-crl-refresh@*.service' \
            -o -name 'nns-gateway-crl-refresh@*.timer' \) \
@@ -825,6 +859,8 @@ purge_engine() {
            -o -name 'nns-online@*.service.d' \
            -o -name 'nns-watchdog@*.service.d' \
            -o -name 'nns-watchdog@*.timer.d' \
+           -o -name 'nns-mtu@*.service.d' \
+           -o -name 'nns-mtu@*.timer.d' \
            -o -name 'nns-gateway@*.service.d' \) \
         -exec rm -rf {} + 2>/dev/null || true
 
@@ -834,10 +870,12 @@ purge_engine() {
         /etc/systemd/system/nns-online@.service.d \
         /etc/systemd/system/nns-watchdog@.service.d \
         /etc/systemd/system/nns-watchdog@.timer.d \
+        /etc/systemd/system/nns-mtu@.service.d \
+        /etc/systemd/system/nns-mtu@.timer.d \
         /etc/systemd/system/nns-gateway@.service.d
     rm -f -- \
         "$VPN_UNIT" "$NETNS_UNIT" "$ONLINE_UNIT" "$DNS_PROXY_UNIT" \
-        "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$GATEWAY_UNIT" \
+        "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$MTU_SERVICE" "$MTU_TIMER" "$GATEWAY_UNIT" \
         "$GATEWAY_CRL_SERVICE" "$GATEWAY_CRL_TIMER"
 
     systemctl daemon-reload

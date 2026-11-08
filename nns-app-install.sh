@@ -66,7 +66,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.0.8"
+readonly VERSION="2.0.9"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -81,6 +81,8 @@ readonly ONLINE_UNIT="/etc/systemd/system/nns-online@.service"
 readonly DNS_PROXY_UNIT="/etc/systemd/system/nns-dns@.service"
 readonly WATCHDOG_SERVICE="/etc/systemd/system/nns-watchdog@.service"
 readonly WATCHDOG_TIMER="/etc/systemd/system/nns-watchdog@.timer"
+readonly MTU_SERVICE="/etc/systemd/system/nns-mtu@.service"
+readonly MTU_TIMER="/etc/systemd/system/nns-mtu@.timer"
 readonly GATEWAY_CRL_SERVICE="/etc/systemd/system/nns-gateway-crl-refresh@.service"
 readonly GATEWAY_CRL_TIMER="/etc/systemd/system/nns-gateway-crl-refresh@.timer"
 readonly FIREWALLD_ZONE="nns-app"
@@ -1091,6 +1093,32 @@ Unit=nns-watchdog@%i.service
 WantedBy=timers.target
 WATCHDOG_TIMER_EOF
 
+    cat >"$MTU_SERVICE" <<'MTU_SERVICE_EOF'
+[Unit]
+Description=Local-only MTU reconciliation for NNS app %i
+ConditionPathExists=/etc/nns-app/%i/%i.cfg
+After=nns-openvpn@%i.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nns_app.sh _mtu-reconcile %i
+TimeoutStartSec=8s
+MTU_SERVICE_EOF
+
+    cat >"$MTU_TIMER" <<'MTU_TIMER_EOF'
+[Unit]
+Description=Fast local-only MTU reconciliation for NNS app %i
+
+[Timer]
+OnActiveSec=10s
+OnUnitActiveSec=10s
+AccuracySec=1s
+Unit=nns-mtu@%i.service
+
+[Install]
+WantedBy=timers.target
+MTU_TIMER_EOF
+
     cat >"$GATEWAY_UNIT" <<'GATEWAY_UNIT_EOF'
 [Unit]
 Description=NNS managed OpenVPN gateway %i
@@ -1137,12 +1165,12 @@ WantedBy=timers.target
 CRL_TIMER_EOF
 
     chmod 0644 "$NETNS_UNIT" "$VPN_UNIT" "$ONLINE_UNIT" "$DNS_PROXY_UNIT" \
-        "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$GATEWAY_UNIT" \
+        "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$MTU_SERVICE" "$MTU_TIMER" "$GATEWAY_UNIT" \
         "$GATEWAY_CRL_SERVICE" "$GATEWAY_CRL_TIMER"
     restore_selinux_contexts \
         "$ENGINE_PATH" "$USER_PATH" \
         "$NETNS_UNIT" "$VPN_UNIT" "$ONLINE_UNIT" "$DNS_PROXY_UNIT" \
-        "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$GATEWAY_UNIT" \
+        "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$MTU_SERVICE" "$MTU_TIMER" "$GATEWAY_UNIT" \
         "$GATEWAY_CRL_SERVICE" "$GATEWAY_CRL_TIMER"
     systemctl daemon-reload
 }
@@ -3576,6 +3604,10 @@ openvpn_exec() {
        (( TUN_MTU >= 576 && TUN_MTU <= 1500 )); then
         args+=(--tun-mtu "$TUN_MTU")
     fi
+    # Run inside OpenVPN's own network namespace after it has created the TUN,
+    # including internal SIGUSR1/ping-restart reconnects. Unlike a periodic
+    # watchdog this does not wait for connectivity or DNS.
+    args+=(--script-security 2 --up "$ENGINE_PATH _mtu-up $app" --up-restart)
 
     exec "$ip_bin" netns exec "$NS_NAME" "${args[@]}"
 }
@@ -3814,6 +3846,30 @@ watchdog_namespace_exists() {
     [[ -e "/run/netns/$NS_NAME" ]]
 }
 
+# The MTU timer is separate from the data-path watchdog, which can block on
+# routing or network probes. Only run it for a client with a saved OpenVPN MTU.
+sync_mtu_timer() {
+    local app=$1 kind
+    load_cfg "$app"
+    kind=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    if [[ "$kind" == openvpn && "${TUN_MTU:-}" =~ ^[0-9]+$ ]] &&
+       (( TUN_MTU >= 576 && TUN_MTU <= 1500 )); then
+        if bool_on "${AUTOSTART:-off}"; then
+            systemctl enable "nns-mtu@${app}.timer" >/dev/null 2>&1 || true
+        else
+            systemctl disable "nns-mtu@${app}.timer" >/dev/null 2>&1 || true
+        fi
+        if app_is_started "$app"; then
+            systemctl start "nns-mtu@${app}.timer" >/dev/null 2>&1 ||
+                warn "Could not start the MTU reconciliation timer for '$app'."
+        else
+            systemctl stop "nns-mtu@${app}.timer" >/dev/null 2>&1 || true
+        fi
+    else
+        systemctl disable --now "nns-mtu@${app}.timer" >/dev/null 2>&1 || true
+    fi
+}
+
 sync_watchdog_timer() {
     local app=$1 type
     validate_app_name "$app"
@@ -3839,6 +3895,7 @@ sync_watchdog_timer() {
         systemctl stop "nns-watchdog@${app}.service" >/dev/null 2>&1 || true
         rm -f "$(watchdog_state_file "$app")"
     fi
+    sync_mtu_timer "$app"
 }
 
 watchdog_check() {
@@ -3861,10 +3918,8 @@ watchdog_check() {
         return 0
     fi
 
-    # Reconcile a saved MTU after an OpenVPN-internal reconnect. This needs
-    # no HTTPS probes and cannot trigger a fresh MTU search.
-    mtu_apply_saved "$app" || true
-
+    # MTU is reconciled by OpenVPN's --up callback and the independent
+    # nns-mtu timer, never by network-dependent watchdog probes.
     watchdog_state_load "$app"
     if (( WD_ARMED == 0 )) &&
        systemctl is-active --quiet "nns-online@${app}.service"; then
@@ -4146,12 +4201,15 @@ stop_app_internal() {
     stop_dependents "$app"
     systemctl stop "nns-watchdog@${app}.timer" 2>/dev/null || true
     systemctl stop "nns-watchdog@${app}.service" 2>/dev/null || true
+    systemctl stop "nns-mtu@${app}.timer" 2>/dev/null || true
+    systemctl stop "nns-mtu@${app}.service" 2>/dev/null || true
     systemctl stop "nns-online@${app}.service" 2>/dev/null || true
     systemctl stop "nns-dns@${app}.service" 2>/dev/null || true
     systemctl stop "nns-openvpn@${app}.service" 2>/dev/null || true
     systemctl stop "nns-netns@${app}.service" 2>/dev/null || true
     systemctl reset-failed \
         "nns-watchdog@${app}.service" \
+        "nns-mtu@${app}.service" \
         "nns-online@${app}.service" \
         "nns-dns@${app}.service" \
         "nns-openvpn@${app}.service" \
@@ -4231,7 +4289,7 @@ remove_app() {
     stop_app "$app"
     load_cfg "$app"
     firewalld_interface_remove "$VETH_HOST"
-    systemctl disable --now "nns-watchdog@${app}.timer" \
+    systemctl disable --now "nns-watchdog@${app}.timer" "nns-mtu@${app}.timer" \
         >/dev/null 2>&1 || true
     systemctl disable \
         "nns-online@${app}.service" \
@@ -4310,6 +4368,8 @@ purge_engine() {
     for app in "${apps[@]}"; do
         systemctl stop "nns-watchdog@${app}.timer" 2>/dev/null || true
         systemctl stop "nns-watchdog@${app}.service" 2>/dev/null || true
+        systemctl stop "nns-mtu@${app}.timer" 2>/dev/null || true
+        systemctl stop "nns-mtu@${app}.service" 2>/dev/null || true
         systemctl stop "nns-online@${app}.service" 2>/dev/null || true
         systemctl stop "nns-dns@${app}.service" 2>/dev/null || true
         systemctl stop "nns-openvpn@${app}.service" 2>/dev/null || true
@@ -4366,6 +4426,8 @@ purge_engine() {
            -o -name 'nns-dns@*.service' \
            -o -name 'nns-watchdog@*.service' \
            -o -name 'nns-watchdog@*.timer' \
+           -o -name 'nns-mtu@*.service' \
+           -o -name 'nns-mtu@*.timer' \
            -o -name 'nns-gateway@*.service' \
            -o -name 'nns-gateway-crl-refresh@*.service' \
            -o -name 'nns-gateway-crl-refresh@*.timer' \) \
@@ -4376,6 +4438,8 @@ purge_engine() {
            -o -name 'nns-online@*.service.d' \
            -o -name 'nns-watchdog@*.service.d' \
            -o -name 'nns-watchdog@*.timer.d' \
+           -o -name 'nns-mtu@*.service.d' \
+           -o -name 'nns-mtu@*.timer.d' \
            -o -name 'nns-gateway@*.service.d' \) \
         -exec rm -rf {} + 2>/dev/null || true
 
@@ -4385,10 +4449,12 @@ purge_engine() {
         /etc/systemd/system/nns-online@.service.d \
         /etc/systemd/system/nns-watchdog@.service.d \
         /etc/systemd/system/nns-watchdog@.timer.d \
+        /etc/systemd/system/nns-mtu@.service.d \
+        /etc/systemd/system/nns-mtu@.timer.d \
         /etc/systemd/system/nns-gateway@.service.d
     rm -f -- \
         "$VPN_UNIT" "$NETNS_UNIT" "$ONLINE_UNIT" "$DNS_PROXY_UNIT" \
-        "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$GATEWAY_UNIT" \
+        "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$MTU_SERVICE" "$MTU_TIMER" "$GATEWAY_UNIT" \
         "$GATEWAY_CRL_SERVICE" "$GATEWAY_CRL_TIMER"
 
     systemctl daemon-reload
@@ -4460,6 +4526,62 @@ mtu_https_probe() {
     return 20
 }
 
+# OpenVPN invokes this hook *inside* the client namespace, immediately after
+# opening the TUN and again with --up-restart. Unlike vpn_route_iface, the
+# device argument is available before OpenVPN installs its default route.
+mtu_openvpn_up() {
+    local app=$1 dev=$2 actual current_ns named_ns
+    validate_app_name "$app"
+    load_cfg "$app"
+    [[ "${TUN_MTU:-}" =~ ^[0-9]+$ ]] || return 0
+    (( TUN_MTU >= 576 && TUN_MTU <= 1500 )) || return 0
+    [[ "$dev" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || {
+        warn "OpenVPN MTU callback received an invalid interface name."
+        return 1
+    }
+    # Prevent an unexpected callback from changing the host interface.
+    current_ns=$(stat -Lc '%d:%i' /proc/self/ns/net 2>/dev/null || true)
+    named_ns=$(stat -Lc '%d:%i' "/run/netns/$NS_NAME" 2>/dev/null || true)
+    [[ -n "$current_ns" && "$current_ns" == "$named_ns" ]] || {
+        warn "'$app': MTU hook is not in the expected network namespace; leaving MTU unchanged."
+        return 0
+    }
+    # OpenVPN supplies the just-created device. Checking it through `ip`
+    # avoids relying on a netns-aware sysfs mount in ip netns exec.
+    actual=$(ip -o link show dev "$dev" 2>/dev/null |
+        awk '{for (i=1;i<=NF;i++) if ($i=="mtu") {print $(i+1); exit}}')
+    [[ "$actual" =~ ^[0-9]+$ ]] || return 1
+    [[ "$actual" == "$TUN_MTU" ]] && return 0
+    if ! ip link set dev "$dev" mtu "$TUN_MTU"; then
+        # Do not fail an otherwise usable OpenVPN connection when a profile
+        # drops CAP_NET_ADMIN during a restart; the root-owned local timer
+        # provides a second opportunity to reconcile the TUN.
+        warn "'$app': OpenVPN MTU up hook could not set $dev to $TUN_MTU; local timer will retry."
+        return 0
+    fi
+    log "'$app': OpenVPN up hook applied MTU $TUN_MTU to $dev."
+}
+
+# A lightweight independent systemd timer invokes this without any DNS,
+# network probes, OpenVPN restart, or data-path watchdog lock. Skip a tick
+# rather than interfere with the MTU discovery sweep.
+mtu_reconcile_local() {
+    local app=$1 fd rc=0
+    validate_app_name "$app"
+    load_cfg "$app"
+    [[ "${TUN_MTU:-}" =~ ^[0-9]+$ ]] || return 0
+    [[ -e "/run/netns/$NS_NAME" ]] || return 0
+    install -d -m 0755 "$RUN_DIR"
+    exec {fd}>"$RUN_DIR/$app.mtu-guard"
+    if flock -n "$fd"; then
+        load_cfg "$app"
+        mtu_apply_saved "$app" || rc=$?
+        flock -u "$fd"
+    fi
+    eval "exec ${fd}>&-"
+    return "$rc"
+}
+
 # An MTU selected by a successful earlier probe is a runtime requirement,
 # even if OpenVPN was already active when the value was saved. OpenVPN may
 # also recreate its TUN interface after an internal reconnect; the watchdog
@@ -4495,6 +4617,18 @@ mtu_apply_saved() {
 }
 
 mtu_auto_repair() {
+    local app=$1 fd rc=0
+    validate_app_name "$app"
+    install -d -m 0755 "$RUN_DIR"
+    exec {fd}>"$RUN_DIR/$app.mtu-guard"
+    flock -x "$fd"
+    mtu_auto_repair_locked "$app" || rc=$?
+    flock -u "$fd"
+    eval "exec ${fd}>&-"
+    return "$rc"
+}
+
+mtu_auto_repair_locked() {
     local app=$1 kind ns dev original candidate result url
     local deadline suspect=0 unavailable=0 good
     local -a urls=(
@@ -4576,6 +4710,11 @@ mtu_auto_repair() {
             if cfg_set "$app" TUN_MTU "$candidate"; then
                 mtu_probe_state "$app" "recovered:MTU=$candidate:previous=$original"
                 log "'$app': HTTPS recovered at $dev MTU $candidate (previous $original); saved for OpenVPN reconnects."
+                # Start fast, network-free reconciliation only after there is
+                # a validated MTU to enforce; no timer for default MTUs.
+                if declare -F sync_mtu_timer >/dev/null; then
+                    sync_mtu_timer "$app"
+                fi
                 return 0
             fi
             warn "'$app': could not persist the working MTU; restoring $original."
@@ -13761,6 +13900,8 @@ repair_dangling_systemd_units() {
     done < <(systemctl list-units --all --plain --no-legend \
         'nns-netns@*.service' 'nns-openvpn@*.service' 'nns-online@*.service' \
         'nns-dns@*.service' 'nns-watchdog@*.service' 'nns-watchdog@*.timer' \
+        'nns-mtu@*.service' 'nns-mtu@*.timer' \
+\
         'nns-gateway@*.service' 'nns-gateway-crl-refresh@*.service' \
         'nns-gateway-crl-refresh@*.timer' 2>/dev/null || true)
     while read -r unit _; do
@@ -13769,12 +13910,14 @@ repair_dangling_systemd_units() {
     done < <(systemctl list-unit-files --no-legend \
         'nns-netns@*.service' 'nns-openvpn@*.service' 'nns-online@*.service' \
         'nns-dns@*.service' 'nns-watchdog@*.service' 'nns-watchdog@*.timer' \
+        'nns-mtu@*.service' 'nns-mtu@*.timer' \
+\
         'nns-gateway@*.service' 'nns-gateway-crl-refresh@*.service' \
         'nns-gateway-crl-refresh@*.timer' 2>/dev/null || true)
 
     for unit in "${!seen[@]}"; do
         case "$unit" in
-            nns-netns@*.service|nns-openvpn@*.service|nns-online@*.service|nns-dns@*.service|nns-watchdog@*.service|nns-watchdog@*.timer)
+            nns-netns@*.service|nns-openvpn@*.service|nns-online@*.service|nns-dns@*.service|nns-watchdog@*.service|nns-watchdog@*.timer|nns-mtu@*.service|nns-mtu@*.timer)
                 name=${unit#*@}; name=${name%.service}; name=${name%.timer}
                 [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]] || continue
                 [[ -f "$(cfg_file "$name")" ]] && continue
@@ -14164,7 +14307,8 @@ def service_states():
     result = []
     configs = [('/etc/nns-app', re.compile(r'^([A-Za-z0-9][A-Za-z0-9._-]{0,31})$'),
                 ['nns-netns@{}.service', 'nns-openvpn@{}.service',
-                 'nns-online@{}.service', 'nns-watchdog@{}.timer']),
+                 'nns-online@{}.service', 'nns-watchdog@{}.timer',
+                 'nns-mtu@{}.timer']),
                ('/etc/nns-app/gateways', re.compile(r'^([A-Za-z0-9][A-Za-z0-9._-]{0,31})$'),
                 ['nns-gateway@{}.service', 'nns-gateway-crl-refresh@{}.timer'])]
     for base, matcher, units in configs:
@@ -14196,7 +14340,7 @@ def service_states():
 
 def allowed_unit(unit):
     return bool(re.fullmatch(
-        r'nns-(?:netns|openvpn|online|watchdog|gateway|gateway-crl-refresh)@'
+        r'nns-(?:netns|openvpn|online|watchdog|mtu|gateway|gateway-crl-refresh)@'
         r'[A-Za-z0-9][A-Za-z0-9._-]{0,31}\.(?:service|timer)', unit))
 
 
@@ -14941,6 +15085,19 @@ main() {
             (( $# >= 2 )) || die "_remote-auto requires an operation."
             shift
             remote_auto_dispatch "$@"
+            exit
+            ;;
+        _mtu-up)
+            require_root
+            # OpenVPN appends: dev tun_mtu 0 local_ip remote_ip [init|restart].
+            (( $# >= 3 )) || die "_mtu-up requires app_name and tunnel device."
+            mtu_openvpn_up "$2" "$3"
+            exit
+            ;;
+        _mtu-reconcile)
+            require_root
+            [[ $# -eq 2 ]] || die "_mtu-reconcile requires app_name."
+            mtu_reconcile_local "$2"
             exit
             ;;
         _watchdog)

@@ -7,6 +7,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 log() { :; }
 warn() { :; }
 load_cfg() { NS_NAME=nns-test; AUTO_MTU=${TEST_AUTO_MTU:-on}; TUN_MTU=${TEST_TUN_MTU:-}; }
+validate_app_name() { :; }
 vpn_type_for_app() { printf '%s\n' "${TEST_TYPE:-openvpn}"; }
 app_split_tunnel() { [[ "${TEST_SPLIT:-off}" == on ]]; }
 vpn_route_iface() { echo tun0; }
@@ -137,8 +138,10 @@ load_cfg test
 mtu_apply_saved test
 [[ "$MTU" == 1400 ]] || fail 'saved MTU was not restored after a reconnect'
 grep -Fq 'restored:MTU=1400:previous=1500' "$RUN_DIR/test.mtu-check" || fail 'MTU restoration not reported'
-# Watchdog must reconcile OpenVPN reconnects without running the HTTP probes.
-grep -Fq 'mtu_apply_saved "$app" || true' "$ROOT/src/50-runtime.sh" || fail 'watchdog does not reapply saved MTU'
+# MTU reconciliation runs outside the slow network-dependent watchdog.
+grep -Fq 'mtu_apply_saved "$app" || rc=$?' "$ROOT/src/52-mtu.sh" || fail 'local MTU reconciliation missing'
+grep -Fq 'ExecStart=/usr/local/sbin/nns_app.sh _mtu-reconcile %i' "$ROOT/src/20-install.sh" || fail 'independent MTU unit missing'
+grep -Fq 'args+=(--script-security 2 --up "$ENGINE_PATH _mtu-up $app" --up-restart)' "$ROOT/src/50-runtime.sh" || fail 'OpenVPN callback missing'
 # Both startup paths must call the repair hook, saved values must be reused.
 grep -Fq 'mtu_auto_repair "$app"' "$ROOT/src/50-runtime.sh" || fail 'interactive start missing repair'
 grep -Fq 'mtu_auto_repair "$2"' "$ROOT/src/90-main.sh" || fail 'boot-time online unit missing repair'

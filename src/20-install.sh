@@ -282,6 +282,32 @@ Unit=nns-watchdog@%i.service
 WantedBy=timers.target
 WATCHDOG_TIMER_EOF
 
+    cat >"$MTU_SERVICE" <<'MTU_SERVICE_EOF'
+[Unit]
+Description=Local-only MTU reconciliation for NNS app %i
+ConditionPathExists=/etc/nns-app/%i/%i.cfg
+After=nns-openvpn@%i.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nns_app.sh _mtu-reconcile %i
+TimeoutStartSec=8s
+MTU_SERVICE_EOF
+
+    cat >"$MTU_TIMER" <<'MTU_TIMER_EOF'
+[Unit]
+Description=Fast local-only MTU reconciliation for NNS app %i
+
+[Timer]
+OnActiveSec=10s
+OnUnitActiveSec=10s
+AccuracySec=1s
+Unit=nns-mtu@%i.service
+
+[Install]
+WantedBy=timers.target
+MTU_TIMER_EOF
+
     cat >"$GATEWAY_UNIT" <<'GATEWAY_UNIT_EOF'
 [Unit]
 Description=NNS managed OpenVPN gateway %i
@@ -328,12 +354,12 @@ WantedBy=timers.target
 CRL_TIMER_EOF
 
     chmod 0644 "$NETNS_UNIT" "$VPN_UNIT" "$ONLINE_UNIT" "$DNS_PROXY_UNIT" \
-        "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$GATEWAY_UNIT" \
+        "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$MTU_SERVICE" "$MTU_TIMER" "$GATEWAY_UNIT" \
         "$GATEWAY_CRL_SERVICE" "$GATEWAY_CRL_TIMER"
     restore_selinux_contexts \
         "$ENGINE_PATH" "$USER_PATH" \
         "$NETNS_UNIT" "$VPN_UNIT" "$ONLINE_UNIT" "$DNS_PROXY_UNIT" \
-        "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$GATEWAY_UNIT" \
+        "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$MTU_SERVICE" "$MTU_TIMER" "$GATEWAY_UNIT" \
         "$GATEWAY_CRL_SERVICE" "$GATEWAY_CRL_TIMER"
     systemctl daemon-reload
 }

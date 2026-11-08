@@ -336,6 +336,19 @@ main() {
             remote_auto_dispatch "$@"
             exit
             ;;
+        _mtu-up)
+            require_root
+            # OpenVPN appends: dev tun_mtu 0 local_ip remote_ip [init|restart].
+            (( $# >= 3 )) || die "_mtu-up requires app_name and tunnel device."
+            mtu_openvpn_up "$2" "$3"
+            exit
+            ;;
+        _mtu-reconcile)
+            require_root
+            [[ $# -eq 2 ]] || die "_mtu-reconcile requires app_name."
+            mtu_reconcile_local "$2"
+            exit
+            ;;
         _watchdog)
             require_root
             [[ $# -eq 2 ]] || die "_watchdog requires app_name."

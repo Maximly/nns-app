@@ -136,7 +136,8 @@ def service_states():
     result = []
     configs = [('/etc/nns-app', re.compile(r'^([A-Za-z0-9][A-Za-z0-9._-]{0,31})$'),
                 ['nns-netns@{}.service', 'nns-openvpn@{}.service',
-                 'nns-online@{}.service', 'nns-watchdog@{}.timer']),
+                 'nns-online@{}.service', 'nns-watchdog@{}.timer',
+                 'nns-mtu@{}.timer']),
                ('/etc/nns-app/gateways', re.compile(r'^([A-Za-z0-9][A-Za-z0-9._-]{0,31})$'),
                 ['nns-gateway@{}.service', 'nns-gateway-crl-refresh@{}.timer'])]
     for base, matcher, units in configs:
@@ -168,7 +169,7 @@ def service_states():
 
 def allowed_unit(unit):
     return bool(re.fullmatch(
-        r'nns-(?:netns|openvpn|online|watchdog|gateway|gateway-crl-refresh)@'
+        r'nns-(?:netns|openvpn|online|watchdog|mtu|gateway|gateway-crl-refresh)@'
         r'[A-Za-z0-9][A-Za-z0-9._-]{0,31}\.(?:service|timer)', unit))
 
 

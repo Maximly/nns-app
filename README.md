@@ -6,7 +6,7 @@ chained namespaces, SSH-managed remote exits, and host-based VPN servers.
 The host's default route and DNS configuration remain independent of individual
 application environments.
 
-**Release:** 2.0.8  
+**Release:** 2.0.9  
 **Supported platforms:** Ubuntu and Fedora with systemd (Debian-family package installation is also supported)  
 **VPN backends:** OpenVPN 2.6+, WireGuard, AmneziaWG, and VPN-free inherited namespaces  
 **License:** GPL-3.0-or-later
@@ -73,8 +73,10 @@ failures, certificate errors, and split-tunnel apps cannot by themselves
 trigger tuning. Probes are budget-limited, and the
 last result is displayed in `nns-app status`. Set `AUTO_MTU="off"` in the
 app configuration to disable checks; `TUN_MTU` holds the last measured value
-and is reapplied on startup and checked by the watchdog after reconnects. Clearing `TUN_MTU` returns to the
-profile's MTU on the next restart. External probe hosts are not guaranteed to
+and is reapplied at TUN creation/reconnect by OpenVPN's `--up` callback.
+An independent, network-free 10-second timer reconciles later MTU drift;
+its check is not delayed by the connectivity watchdog. Clearing `TUN_MTU`
+returns to the profile's MTU on the next restart. External probe hosts are not guaranteed to
 be available on every network.
 
 For free VPN Gate OpenVPN relay selection:

@@ -52,6 +52,62 @@ mtu_https_probe() {
     return 20
 }
 
+# OpenVPN invokes this hook *inside* the client namespace, immediately after
+# opening the TUN and again with --up-restart. Unlike vpn_route_iface, the
+# device argument is available before OpenVPN installs its default route.
+mtu_openvpn_up() {
+    local app=$1 dev=$2 actual current_ns named_ns
+    validate_app_name "$app"
+    load_cfg "$app"
+    [[ "${TUN_MTU:-}" =~ ^[0-9]+$ ]] || return 0
+    (( TUN_MTU >= 576 && TUN_MTU <= 1500 )) || return 0
+    [[ "$dev" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || {
+        warn "OpenVPN MTU callback received an invalid interface name."
+        return 1
+    }
+    # Prevent an unexpected callback from changing the host interface.
+    current_ns=$(stat -Lc '%d:%i' /proc/self/ns/net 2>/dev/null || true)
+    named_ns=$(stat -Lc '%d:%i' "/run/netns/$NS_NAME" 2>/dev/null || true)
+    [[ -n "$current_ns" && "$current_ns" == "$named_ns" ]] || {
+        warn "'$app': MTU hook is not in the expected network namespace; leaving MTU unchanged."
+        return 0
+    }
+    # OpenVPN supplies the just-created device. Checking it through `ip`
+    # avoids relying on a netns-aware sysfs mount in ip netns exec.
+    actual=$(ip -o link show dev "$dev" 2>/dev/null |
+        awk '{for (i=1;i<=NF;i++) if ($i=="mtu") {print $(i+1); exit}}')
+    [[ "$actual" =~ ^[0-9]+$ ]] || return 1
+    [[ "$actual" == "$TUN_MTU" ]] && return 0
+    if ! ip link set dev "$dev" mtu "$TUN_MTU"; then
+        # Do not fail an otherwise usable OpenVPN connection when a profile
+        # drops CAP_NET_ADMIN during a restart; the root-owned local timer
+        # provides a second opportunity to reconcile the TUN.
+        warn "'$app': OpenVPN MTU up hook could not set $dev to $TUN_MTU; local timer will retry."
+        return 0
+    fi
+    log "'$app': OpenVPN up hook applied MTU $TUN_MTU to $dev."
+}
+
+# A lightweight independent systemd timer invokes this without any DNS,
+# network probes, OpenVPN restart, or data-path watchdog lock. Skip a tick
+# rather than interfere with the MTU discovery sweep.
+mtu_reconcile_local() {
+    local app=$1 fd rc=0
+    validate_app_name "$app"
+    load_cfg "$app"
+    [[ "${TUN_MTU:-}" =~ ^[0-9]+$ ]] || return 0
+    [[ -e "/run/netns/$NS_NAME" ]] || return 0
+    install -d -m 0755 "$RUN_DIR"
+    exec {fd}>"$RUN_DIR/$app.mtu-guard"
+    if flock -n "$fd"; then
+        load_cfg "$app"
+        mtu_apply_saved "$app" || rc=$?
+        flock -u "$fd"
+    fi
+    eval "exec ${fd}>&-"
+    return "$rc"
+}
+
 # An MTU selected by a successful earlier probe is a runtime requirement,
 # even if OpenVPN was already active when the value was saved. OpenVPN may
 # also recreate its TUN interface after an internal reconnect; the watchdog
@@ -87,6 +143,18 @@ mtu_apply_saved() {
 }
 
 mtu_auto_repair() {
+    local app=$1 fd rc=0
+    validate_app_name "$app"
+    install -d -m 0755 "$RUN_DIR"
+    exec {fd}>"$RUN_DIR/$app.mtu-guard"
+    flock -x "$fd"
+    mtu_auto_repair_locked "$app" || rc=$?
+    flock -u "$fd"
+    eval "exec ${fd}>&-"
+    return "$rc"
+}
+
+mtu_auto_repair_locked() {
     local app=$1 kind ns dev original candidate result url
     local deadline suspect=0 unavailable=0 good
     local -a urls=(
@@ -168,6 +236,11 @@ mtu_auto_repair() {
             if cfg_set "$app" TUN_MTU "$candidate"; then
                 mtu_probe_state "$app" "recovered:MTU=$candidate:previous=$original"
                 log "'$app': HTTPS recovered at $dev MTU $candidate (previous $original); saved for OpenVPN reconnects."
+                # Start fast, network-free reconciliation only after there is
+                # a validated MTU to enforce; no timer for default MTUs.
+                if declare -F sync_mtu_timer >/dev/null; then
+                    sync_mtu_timer "$app"
+                fi
                 return 0
             fi
             warn "'$app': could not persist the working MTU; restoring $original."

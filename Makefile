@@ -6,6 +6,7 @@ build:
 test: build
 	./tests/test-static.sh
 	./tests/test-auto-mtu.sh
+	./tests/test-mtu-hook.sh
 	./tests/test-functions.sh
 	./tests/test-list.sh
 	./tests/test-unified-commands.sh

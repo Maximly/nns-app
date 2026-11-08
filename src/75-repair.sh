@@ -516,6 +516,8 @@ repair_dangling_systemd_units() {
     done < <(systemctl list-units --all --plain --no-legend \
         'nns-netns@*.service' 'nns-openvpn@*.service' 'nns-online@*.service' \
         'nns-dns@*.service' 'nns-watchdog@*.service' 'nns-watchdog@*.timer' \
+        'nns-mtu@*.service' 'nns-mtu@*.timer' \
+\
         'nns-gateway@*.service' 'nns-gateway-crl-refresh@*.service' \
         'nns-gateway-crl-refresh@*.timer' 2>/dev/null || true)
     while read -r unit _; do
@@ -524,12 +526,14 @@ repair_dangling_systemd_units() {
     done < <(systemctl list-unit-files --no-legend \
         'nns-netns@*.service' 'nns-openvpn@*.service' 'nns-online@*.service' \
         'nns-dns@*.service' 'nns-watchdog@*.service' 'nns-watchdog@*.timer' \
+        'nns-mtu@*.service' 'nns-mtu@*.timer' \
+\
         'nns-gateway@*.service' 'nns-gateway-crl-refresh@*.service' \
         'nns-gateway-crl-refresh@*.timer' 2>/dev/null || true)
 
     for unit in "${!seen[@]}"; do
         case "$unit" in
-            nns-netns@*.service|nns-openvpn@*.service|nns-online@*.service|nns-dns@*.service|nns-watchdog@*.service|nns-watchdog@*.timer)
+            nns-netns@*.service|nns-openvpn@*.service|nns-online@*.service|nns-dns@*.service|nns-watchdog@*.service|nns-watchdog@*.timer|nns-mtu@*.service|nns-mtu@*.timer)
                 name=${unit#*@}; name=${name%.service}; name=${name%.timer}
                 [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]] || continue
                 [[ -f "$(cfg_file "$name")" ]] && continue

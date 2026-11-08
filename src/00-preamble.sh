@@ -66,7 +66,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.0.8"
+readonly VERSION="2.0.9"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -81,6 +81,8 @@ readonly ONLINE_UNIT="/etc/systemd/system/nns-online@.service"
 readonly DNS_PROXY_UNIT="/etc/systemd/system/nns-dns@.service"
 readonly WATCHDOG_SERVICE="/etc/systemd/system/nns-watchdog@.service"
 readonly WATCHDOG_TIMER="/etc/systemd/system/nns-watchdog@.timer"
+readonly MTU_SERVICE="/etc/systemd/system/nns-mtu@.service"
+readonly MTU_TIMER="/etc/systemd/system/nns-mtu@.timer"
 readonly GATEWAY_CRL_SERVICE="/etc/systemd/system/nns-gateway-crl-refresh@.service"
 readonly GATEWAY_CRL_TIMER="/etc/systemd/system/nns-gateway-crl-refresh@.timer"
 readonly FIREWALLD_ZONE="nns-app"
