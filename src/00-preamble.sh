@@ -41,6 +41,8 @@
 #                  [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]
 #   fixed-ip <server_name> <client_name> [on|off]
 #   route-mode <server_name> <client_name> [split|full]
+#   client  export <app_name> <client_name> --output <file>
+#   client  remove <app_name> <client_name>
 #   revoke  <app_name> <client_name>
 #   add     <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf>
 #   add     <app_name> any [country] [--refresh] [--via <upstream-app>|host]
@@ -56,7 +58,7 @@
 #   remote add|connect|sync|rotate|status ...
 #   link import <app> <bundle.nnslink>
 #   gateway start|stop|status|list|remove ...
-#   gateway client add|fixed-ip|route-mode|list|export|revoke ...
+#   gateway client add|fixed-ip|route-mode|list|export|revoke|remove ...
 #
 # The script installs itself as /usr/local/sbin/nns_app.sh and creates the
 # convenience symlink /usr/local/bin/nns-app.
@@ -64,7 +66,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.0.3"
+readonly VERSION="2.0.4"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -310,6 +312,13 @@ Usage:
                   [--output <file|->]
   nns-app fixed-ip <server_name> <client_name> [on|off]
   nns-app route-mode <server_name> <client_name> [split|full]
+  nns-app client export <app_name> <client_name> --output <file>
+                  [--format ovpn|awg|nnslink] [--fixed-ip]
+                  [--split-tunnel|--full-tunnel]
+  nns-app client remove <app_name> <client_name>
+  nns-app client add <app_name> <client_name> [--fixed-ip]
+  nns-app client revoke <app_name> <client_name>
+  nns-app client list <app_name>
   nns-app revoke <app_name> <client_name> [--modern|--embedded]
   nns-app add     <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf>
   nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
@@ -339,6 +348,7 @@ Usage:
                   [--format ovpn|nnslink] --output <file|->
   nns-app gateway client rotate <gateway_name> <client_name>
   nns-app gateway client revoke <gateway_name> <client_name>
+  nns-app gateway client remove <gateway_name> <client_name>
 
   nns-app link import <app_name> <bundle.nnslink>
   nns-app remote add <alias> --ssh <user@host> [--port <port>] [--identity <file>]

@@ -41,6 +41,8 @@
 #                  [--public <host>:<port>] [--proto tcp|udp] [--output <file|->]
 #   fixed-ip <server_name> <client_name> [on|off]
 #   route-mode <server_name> <client_name> [split|full]
+#   client  export <app_name> <client_name> --output <file>
+#   client  remove <app_name> <client_name>
 #   revoke  <app_name> <client_name>
 #   add     <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf>
 #   add     <app_name> any [country] [--refresh] [--via <upstream-app>|host]
@@ -56,7 +58,7 @@
 #   remote add|connect|sync|rotate|status ...
 #   link import <app> <bundle.nnslink>
 #   gateway start|stop|status|list|remove ...
-#   gateway client add|fixed-ip|route-mode|list|export|revoke ...
+#   gateway client add|fixed-ip|route-mode|list|export|revoke|remove ...
 #
 # The script installs itself as /usr/local/sbin/nns_app.sh and creates the
 # convenience symlink /usr/local/bin/nns-app.
@@ -64,7 +66,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.0.3"
+readonly VERSION="2.0.4"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -310,6 +312,13 @@ Usage:
                   [--output <file|->]
   nns-app fixed-ip <server_name> <client_name> [on|off]
   nns-app route-mode <server_name> <client_name> [split|full]
+  nns-app client export <app_name> <client_name> --output <file>
+                  [--format ovpn|awg|nnslink] [--fixed-ip]
+                  [--split-tunnel|--full-tunnel]
+  nns-app client remove <app_name> <client_name>
+  nns-app client add <app_name> <client_name> [--fixed-ip]
+  nns-app client revoke <app_name> <client_name>
+  nns-app client list <app_name>
   nns-app revoke <app_name> <client_name> [--modern|--embedded]
   nns-app add     <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf>
   nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
@@ -339,6 +348,7 @@ Usage:
                   [--format ovpn|nnslink] --output <file|->
   nns-app gateway client rotate <gateway_name> <client_name>
   nns-app gateway client revoke <gateway_name> <client_name>
+  nns-app gateway client remove <gateway_name> <client_name>
 
   nns-app link import <app_name> <bundle.nnslink>
   nns-app remote add <alias> --ssh <user@host> [--port <port>] [--identity <file>]
@@ -454,7 +464,7 @@ reexec_as_root_if_needed() {
         list|status|myip|start|stop|run)
             sudo_args+=( -n )
             ;;
-        install|remove|add|purge|repair|backup|restore|gateway|remote|link|export|revoke|fixed-ip|route-mode|client-to-client)
+        install|remove|add|purge|repair|backup|restore|gateway|remote|link|export|client|revoke|fixed-ip|route-mode|client-to-client)
             ;;
         *)
             die "Unknown command '$cmd'."
@@ -14330,6 +14340,135 @@ managed_app_run() {
     fi
 }
 
+# A managed public gateway is an app, regardless of the backend or its exit.
+# The public client CLI handles credentials for these apps independently from
+# the namespace VPN profiles configured with `nns-app add`.
+managed_client_export() {
+    local app=$1 client=$2 output=$3 format=${4:-auto}
+    local fixed_ip=${5:-off} route_mode=${6:-keep} backend transport cdir sidecar
+    require_root
+    validate_gateway_name "$app"
+    validate_gateway_client_name "$client"
+    managed_gateway_exists "$app" ||
+        die "App '$app' is not a managed VPN server/gateway."
+    load_gateway_cfg "$app"
+    backend=${GATEWAY_BACKEND:-openvpn}
+    transport=${TRANSPORT:-direct}
+    case "$format" in auto|ovpn|awg|nnslink) ;; *) die "Unsupported client export format '$format'." ;; esac
+    if [[ "$format" == auto ]]; then
+        if [[ "$backend" == amneziawg ]]; then
+            format=awg
+        elif [[ "$transport" == direct || "$transport" == cloak ]]; then
+            format=ovpn
+        else
+            format=nnslink
+        fi
+    fi
+    case "$backend:$format" in
+        amneziawg:awg)
+            [[ "$fixed_ip" == off || "$fixed_ip" == on ]] || die "Invalid fixed IP option."
+            ;;
+        openvpn:ovpn)
+            [[ "$transport" == direct || "$transport" == cloak ]] ||
+                die "Transport '$transport' requires --format nnslink."
+            ;;
+        openvpn:nnslink) ;;
+        *) die "Format '$format' is incompatible with server '$app' ($backend)." ;;
+    esac
+    [[ "$route_mode" == keep || "$route_mode" == full || "$route_mode" == split ]] ||
+        die "Invalid tunnel route mode '$route_mode'."
+    [[ -n "$output" ]] || die "--output is required."
+    if [[ "$backend" == amneziawg ]]; then
+        [[ "$output" != - ]] || die "AmneziaWG private profiles require a file output."
+    fi
+    if [[ "$transport" == cloak && "$format" == ovpn ]]; then
+        [[ "$output" != - && "$output" == *.ovpn ]] ||
+            die "Cloak export requires an .ovpn output path."
+    fi
+    # Fail on invalid/conflicting output BEFORE issuing a persistent credential.
+    if [[ "$output" != - ]]; then
+        output=$(readlink -m -- "$output")
+        [[ -d "$(dirname -- "$output")" ]] || die "Output directory does not exist: $(dirname -- "$output")"
+        [[ ! -e "$output" && ! -L "$output" ]] || die "Output already exists: $output"
+        if [[ "$transport" == cloak && "$format" == ovpn ]]; then
+            sidecar="${output%.ovpn}.cloak.json"
+            [[ ! -e "$sidecar" && ! -L "$sidecar" ]] || die "Output already exists: $sidecar"
+        fi
+    fi
+    cdir=$(gateway_client_dir "$app" "$client")
+    if [[ "$backend" == amneziawg ]]; then
+        awg_server_client_export "$app" "$client" "$output" "$route_mode"
+    elif [[ "$format" == ovpn ]]; then
+        server_export_ovpn "$app" "$client" "$output" - auto modern "$fixed_ip" "$route_mode"
+    else
+        if [[ ! -e "$cdir" ]]; then
+            gateway_client_add "$app" "$client" >&2
+        fi
+        if [[ "$fixed_ip" == on ]]; then
+            gateway_client_fixed_ip "$app" "$client" on >&2
+        fi
+        if [[ "$route_mode" != keep ]]; then
+            gateway_client_route_mode "$app" "$client" "$route_mode" >&2
+        fi
+        gateway_client_export "$app" "$client" "$output" nnslink
+    fi
+}
+
+# Revoke first, then destroy the local client identity. OpenVPN's CA database
+# and CRL are deliberately retained: deleting them would reauthorize a removed
+# certificate. For AWG, the peer is removed from the live server before its
+# private/public keys and metadata are destroyed.
+managed_client_remove() {
+    local app=$1 client=$2 dir backend state
+    require_root
+    validate_gateway_name "$app"
+    validate_gateway_client_name "$client"
+    managed_gateway_exists "$app" || die "App '$app' is not a managed VPN server/gateway."
+    dir=$(gateway_client_dir "$app" "$client")
+    [[ -d "$dir" && ! -L "$dir" ]] || die "Client '$client' does not exist on '$app'."
+    acquire_lock "gateway-$app" shared
+    load_gateway_cfg "$app"
+    backend=${GATEWAY_BACKEND:-openvpn}
+    gateway_client_load "$app" "$client"
+    state=${STATUS:-}
+    release_lock "gateway-$app"
+    [[ "$state" == active || "$state" == revoked ]] ||
+        die "Cannot remove client '$client': unknown status '$state'."
+    if [[ "$backend" == amneziawg ]]; then
+        # Retry the live peer synchronization even for an already-revoked
+        # record: the previous syncconf might have failed after updating its
+        # metadata, leaving the old peer authorized in the running interface.
+        awg_server_client_revoke "$app" "$client" || return 1
+    elif [[ "$state" == active ]]; then
+        gateway_client_revoke "$app" "$client" || return 1
+    elif systemctl is-active --quiet "nns-gateway@${app}.service"; then
+        # A previous revoke may have persisted the CRL but failed to restart
+        # the daemon. Do not destroy the last client record until a running
+        # OpenVPN process has reloaded its CRL and dropped the old session.
+        systemctl restart "nns-gateway@${app}.service" || return 1
+    fi
+    acquire_lock "gateway-$app"
+    load_gateway_cfg "$app"
+    gateway_client_load "$app" "$client"
+    if [[ "${STATUS:-}" != revoked || -L "$dir" ]]; then
+        release_lock "gateway-$app"
+        die "Client '$client' was not safely revoked; files preserved."
+    fi
+    # Only the validated, root-controlled client directory is removed. Never
+    # remove gateway CA/CRL material or any other client record.
+    rm -rf -- "$dir" || { release_lock "gateway-$app"; die "Failed deleting client '$client'."; }
+    if [[ "$backend" == amneziawg ]]; then
+        awg_server_write_config "$app" || { release_lock "gateway-$app"; die "Failed regenerating AmneziaWG peer configuration."; }
+    else
+        gateway_write_server_config "$app" || { release_lock "gateway-$app"; die "Failed rebuilding OpenVPN client configuration."; }
+        if [[ "${TRANSPORT:-direct}" == cloak ]]; then
+            gateway_write_transport_config "$app" || { release_lock "gateway-$app"; die "Failed rebuilding Cloak client authorization."; }
+        fi
+    fi
+    release_lock "gateway-$app"
+    log "Revoked and removed client '$client' from '$app'."
+}
+
 main() {
     local cmd=${1:-}
     if [[ -z "$cmd" ]]; then
@@ -14764,6 +14903,57 @@ main() {
                     "$export_public" "$export_proto" "$export_output" "$export_compat"
             fi
             ;;
+        client)
+            (( $# >= 3 )) || die "Usage: nns-app client <export|remove|add|list|revoke> <app> [client] ..."
+            case "$2" in
+                export)
+                    (( $# >= 5 )) || die "Usage: nns-app client export <app> <client> --output <file> [--format ovpn|awg|nnslink] [--full-tunnel|--split-tunnel] [--fixed-ip]"
+                    local app=$3 name=$4 output="" format=auto fixed=off route=keep
+                    shift 4
+                    while (( $# > 0 )); do
+                        case "$1" in
+                            --output)
+                                (( $# >= 2 )) || die "--output requires a path."
+                                output=$2; shift 2 ;;
+                            --output=*) output=${1#--output=}; shift ;;
+                            --format)
+                                (( $# >= 2 )) || die "--format requires ovpn, awg or nnslink."
+                                format=$2; shift 2 ;;
+                            --format=*) format=${1#--format=}; shift ;;
+                            --fixed-ip) fixed=on; shift ;;
+                            --full-tunnel) route=full; shift ;;
+                            --split-tunnel) route=split; shift ;;
+                            *) die "Unknown client export option '$1'." ;;
+                        esac
+                    done
+                    [[ -n "$output" ]] || die "--output is required."
+                    managed_client_export "$app" "$name" "$output" "$format" "$fixed" "$route"
+                    ;;
+                remove)
+                    [[ $# -eq 4 ]] || die "Usage: nns-app client remove <app> <client>"
+                    managed_client_remove "$3" "$4"
+                    ;;
+                add)
+                    [[ $# -eq 4 || ( $# -eq 5 && "$5" == --fixed-ip ) ]] ||
+                        die "Usage: nns-app client add <app> <client> [--fixed-ip]"
+                    gateway_client_add "$3" "$4"
+                    [[ $# -ne 5 ]] || gateway_client_fixed_ip "$3" "$4" on
+                    ;;
+                revoke)
+                    [[ $# -eq 4 ]] || die "Usage: nns-app client revoke <app> <client>"
+                    if [[ "$(gateway_cfg_value "$3" GATEWAY_BACKEND)" == amneziawg ]]; then
+                        awg_server_client_revoke "$3" "$4"
+                    else
+                        gateway_client_revoke "$3" "$4"
+                    fi
+                    ;;
+                list)
+                    [[ $# -eq 3 ]] || die "Usage: nns-app client list <app>"
+                    gateway_client_list "$3"
+                    ;;
+                *) die "Unknown client command '$2'." ;;
+            esac
+            ;;
         revoke)
             (( $# >= 3 && $# <= 4 )) ||
                 die "Usage: nns-app revoke <app_name> <client_name> [--modern|--embedded]"
@@ -15027,13 +15217,7 @@ main() {
                                 esac
                             done
                             [[ -n "$export_output" ]] || die "--output is required."
-                            if [[ "$export_static" == on ]]; then
-                                gateway_client_fixed_ip "$export_gateway" "$export_client" on >&2
-                            fi
-                            if [[ "$export_route_mode" != keep ]]; then
-                                gateway_client_route_mode "$export_gateway" "$export_client" "$export_route_mode" >&2
-                            fi
-                            gateway_client_export "$export_gateway" "$export_client" "$export_output" "$export_format"
+                            managed_client_export "$export_gateway" "$export_client" "$export_output" "$export_format" "$export_static" "$export_route_mode"
                             ;;
                         rotate)
                             [[ $# -eq 5 ]] ||
@@ -15044,6 +15228,11 @@ main() {
                             [[ $# -eq 5 ]] ||
                                 die "Usage: nns-app gateway client revoke <gateway_name> <client_name>"
                             gateway_client_revoke "$4" "$5"
+                            ;;
+                        remove)
+                            [[ $# -eq 5 ]] ||
+                                die "Usage: nns-app gateway client remove <gateway_name> <client_name>"
+                            managed_client_remove "$4" "$5"
                             ;;
                         *)
                             die "Unknown gateway client command '$3'."

@@ -4,12 +4,12 @@ Major milestones are grouped by capability. Maintenance-only releases are not li
 
 ## 2.0 — Unified VPN and gateway management (2026-11-07)
 
-- Unified app lifecycle and run commands for namespace clients, host-exit servers and upstream-backed gateways; gateway `run` follows the configured egress.
+- Unified app lifecycle, run and client-management commands for namespace clients, host-exit servers and upstream-backed gateways; gateway `run` follows the configured egress.
 - Added automatic listener selection and public IPv4 endpoint discovery for
   manually created gateways, preserving explicit network overrides.
 - Prevented listener-port conflicts across host-exit and VPN-exit gateways.
 - Unified the local inventory of application namespaces, public VPN servers, managed gateways and exported client identities, with filtered views and detailed health reporting.
-- Added host-based OpenVPN servers with UDP or TCP listeners, per-client certificates, revocation, fixed server-assigned IPv4 addresses, independent split/full routing and optional client-to-client forwarding.
+- Added host-based OpenVPN servers with UDP or TCP listeners, automatic client enrollment on export, revocation and full client removal, fixed server-assigned IPv4 addresses, independent split/full routing and optional client-to-client forwarding.
 - Added Cloak-protected OpenVPN server transport, per-client Cloak credentials and paired client configuration exports.
 - Added AmneziaWG 3.1 host servers, randomized obfuscation parameters, fixed peer allocations, native split/full client exports and peer revocation.
 - Extended WireGuard and AmneziaWG client import to preserve IPv4 split-tunnel routes and AmneziaWG 3.1 header-protection settings.

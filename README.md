@@ -6,7 +6,7 @@ chained namespaces, SSH-managed remote exits, and host-based VPN servers.
 The host's default route and DNS configuration remain independent of individual
 application environments.
 
-**Release:** 2.0.3  
+**Release:** 2.0.4  
 **Supported platforms:** Ubuntu and Fedora with systemd (Debian-family package installation is also supported)  
 **VPN backends:** OpenVPN 2.6+, WireGuard, AmneziaWG, and VPN-free inherited namespaces  
 **License:** GPL-3.0-or-later
@@ -291,15 +291,27 @@ active server and disables OpenVPN DCO so OpenVPN can forward between clients.
 nns-app list clients
 nns-app list gateways
 nns-app gateway client list office-vpn
-nns-app revoke office-vpn laptop
-nns-app revoke my-awg mac
+# Export creates missing client identities; repeat export reuses existing keys.
+sudo nns-app client export office-vpn laptop --full-tunnel --output ~/laptop.ovpn
+sudo nns-app client export my-awg mac --full-tunnel --output ~/mac.conf
+
+# Revoke without deleting the record, or revoke and completely remove it.
+sudo nns-app client revoke office-vpn laptop
+sudo nns-app client remove office-vpn laptop
+sudo nns-app client remove my-awg mac
 sudo nns-app stop office-vpn
 sudo nns-app start office-vpn
 sudo nns-app remove office-vpn
 ```
 
 Removing a server permanently deletes its CA, private keys and managed client
-records. Back up first. Client revocation preserves the server identity.
+records. Back up first. Client removal first revokes access, then deletes that client's credentials,
+keys and metadata from the server. For OpenVPN, the CA database and CRL keep
+the revoked certificate serial so deleted clients cannot reconnect. For
+AmneziaWG, the peer is removed from the running server and its keys are deleted.
+Previously exported profiles remain on client devices but cannot authenticate.
+Re-exporting an existing active client preserves its credentials. Output files
+are never overwritten; choose a new path to export again.
 
 ## Managed remote gateways
 

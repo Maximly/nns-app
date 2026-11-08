@@ -8,6 +8,7 @@ test: build
 	./tests/test-functions.sh
 	./tests/test-list.sh
 	./tests/test-unified-commands.sh
+	./tests/test-managed-clients.sh
 	./tests/test-server-reinstall.sh
 	./tests/test-gateway-autoconfig.sh
 	./tests/test-remote-downgrade.sh
