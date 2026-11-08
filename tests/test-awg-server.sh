@@ -82,7 +82,7 @@ echo 'AmneziaWG server create/reinstall/peer/export/revoke tests passed.'
     [[ "$got" == 'awg-install:demo|udp:51821|vpn.example.net:51821|||' ]] || fail "--amnezia CLI dispatch: $got"
     if ( main install demo --amnezia ) >/dev/null 2>&1; then fail '--amnezia accepted without --server'; fi
     if ( main install demo --server --amnezia --transport cloak ) >/dev/null 2>&1; then fail 'Cloak unexpectedly combined with AmneziaWG'; fi
-    server_gateway_exists() { :; }
+    managed_gateway_exists() { :; }
     awg_server_client_export() { printf 'awg-export:%s|%s|%s|%s\n' "$@"; }
     got=$(main export awg demo --client mac --split-tunnel --output mac.conf)
     [[ "$got" == 'awg-export:demo|mac|mac.conf|split' ]] || fail "AWG client CLI export dispatch: $got"

@@ -1278,6 +1278,7 @@ grep -Fq 'return 0' <<<"$app_enum_definition" ||
 # use ownership-scoped remote cleanup by default.
 (
     reexec_as_root_if_needed() { :; }
+    managed_app_kind() { printf 'namespace\n'; }
     remove_app() { printf 'remove:%s:%s\n' "$1" "${2:-remote}"; }
     purge_engine() { printf 'purge:%s\n' "${1:-remote}"; }
     output=$(main remove my-app)
@@ -1444,6 +1445,7 @@ manual_payload=$(remote_command_payload gateway client export \
 
 # CLI stop parsing must select symmetric or local-only semantics explicitly.
 (
+    managed_app_kind() { printf 'namespace\n'; }
     stop_app_cli() { printf 'stop-cli:%s:%s\n' "$1" "$2"; }
     output=$(main stop my-app)
     grep -Fq 'stop-cli:my-app:remote' <<<"$output" ||
@@ -1862,7 +1864,7 @@ manual_payload=$(remote_command_payload gateway client export \
     remote_auto_register() { fail 'current remote was unnecessarily registered'; }
     log() { printf 'log:%s\n' "$*"; }
     output=$(remote_auto_refresh_configured_app my-app)
-    grep -Fq 'already runs nns-app 2.0.2' <<<"$output" ||
+    grep -Fq 'already runs nns-app 2.0.3' <<<"$output" ||
         fail 'current remote refresh status missing'
 )
 
@@ -1941,6 +1943,8 @@ EOF_REPAIR_STATE
 (
     reexec_as_root_if_needed() { :; }
     server_gateway_exists() { [[ "$1" == office-vpn ]]; }
+    managed_gateway_exists() { [[ "$1" == office-vpn ]]; }
+    managed_app_kind() { [[ "$1" == office-vpn ]] && printf 'gateway\n' || printf 'namespace\n'; }
     install_openvpn_server() { printf 'server-install:%s|%s|%s|%s|%s|%s\n' "${@:1:6}"; }
     gateway_start() { printf 'server-start:%s\n' "$1"; }
     gateway_stop() { printf 'server-stop:%s\n' "$1"; }

@@ -1,4 +1,81 @@
 # nns-app source module: CLI parser and source-only guard.
+# A VPN namespace and a VPN server/gateway are both managed apps. Their
+# persistent state remains in its respective backend directory; CLI lifecycle
+# operations resolve by installed object, never by the gateway's VIA_APP.
+managed_app_kind() {
+    local app=${1:-} namespace=off gateway=off
+    validate_app_name "$app"
+    [[ ! -f "$(cfg_file "$app")" ]] || namespace=on
+    if managed_gateway_exists "$app"; then gateway=on; fi
+    if [[ "$namespace" == on && "$gateway" == on ]]; then
+        die "Conflicting namespace and gateway configurations for app '$app'. Resolve the duplicate before proceeding."
+    elif [[ "$gateway" == on ]]; then
+        printf 'gateway\n'
+    elif [[ "$namespace" == on ]]; then
+        printf 'namespace\n'
+    else
+        die "NNS app '$app' is not installed."
+    fi
+}
+
+managed_app_start() {
+    local app=$1 ignore=${2:-off} via=${3:-__default__} kind
+    kind=$(managed_app_kind "$app") || return 1
+    if [[ "$kind" == gateway ]]; then
+        [[ "$via" == __default__ ]] ||
+            die "Gateway '$app' has a configured exit; change its configuration rather than overriding --via at start."
+        [[ "$ignore" == off ]] ||
+            die "--ignore-start-error is supported only for VPN namespace apps."
+        gateway_start "$app"
+    else
+        start_app "$app" "$ignore" "$via"
+    fi
+}
+
+managed_app_stop() {
+    local app=$1 mode=${2:-remote} kind
+    kind=$(managed_app_kind "$app") || return 1
+    if [[ "$kind" == gateway ]]; then
+        # --local-only is already the natural operation for a local server.
+        gateway_stop "$app"
+    else
+        stop_app_cli "$app" "$mode"
+    fi
+}
+
+managed_app_status() {
+    local app=$1 kind
+    kind=$(managed_app_kind "$app") || return 1
+    if [[ "$kind" == gateway ]]; then
+        gateway_status "$app"
+    else
+        status_app "$app"
+    fi
+}
+
+managed_app_remove() {
+    local app=$1 mode=${2:-remote} kind
+    kind=$(managed_app_kind "$app") || return 1
+    if [[ "$kind" == gateway ]]; then
+        gateway_remove "$app"
+    elif [[ "$mode" == local-only ]]; then
+        remove_app "$app" local-only
+    else
+        remove_app "$app"
+    fi
+}
+
+managed_app_run() {
+    local app=$1 kind
+    shift
+    kind=$(managed_app_kind "$app") || return 1
+    if [[ "$kind" == gateway ]]; then
+        run_in_gateway "$app" "$@"
+    else
+        run_in_app "$app" "$@"
+    fi
+}
+
 main() {
     local cmd=${1:-}
     if [[ -z "$cmd" ]]; then
@@ -313,12 +390,10 @@ main() {
             fi
             ;;
         remove)
-            if [[ $# -eq 2 ]] && server_gateway_exists "$2"; then
-                gateway_remove "$2"
-            elif [[ $# -eq 2 ]]; then
-                remove_app "$2"
+            if [[ $# -eq 2 ]]; then
+                managed_app_remove "$2"
             elif [[ $# -eq 3 && "$3" == --local-only ]]; then
-                remove_app "$2" local-only
+                managed_app_remove "$2" local-only
             else
                 die "Usage: nns-app remove <app_name> [--local-only]"
             fi
@@ -374,11 +449,7 @@ main() {
             ;;
         status)
             [[ $# -eq 2 ]] || die "Usage: nns-app status <app_name>"
-            if server_gateway_exists "$2"; then
-                gateway_status "$2"
-            else
-                status_app "$2"
-            fi
+            managed_app_status "$2"
             ;;
         myip)
             (( $# <= 2 )) || die "Usage: nns-app myip [<app_or_gateway_name>]"
@@ -426,11 +497,11 @@ main() {
             done
             [[ -n "$export_client" ]] || die "export ovpn requires --client <client_name>."
             if [[ "$export_kind" == awg ]]; then
-                server_gateway_exists "$export_app" || die "AmneziaWG export requires a locally managed server."
+                managed_gateway_exists "$export_app" || die "AmneziaWG export requires a locally managed server."
                 [[ "$export_public" == - && "$export_proto" == auto && "$export_compat" == modern ]] ||
                     die "--public, --proto and --embedded are not valid for AmneziaWG client export."
                 awg_server_client_export "$export_app" "$export_client" "$export_output" "$export_route_mode"
-            elif server_gateway_exists "$export_app"; then
+            elif managed_gateway_exists "$export_app"; then
                 server_export_ovpn "$export_app" "$export_client" \
                     "$export_output" "$export_public" "$export_proto" "$export_compat" "$export_fixed_ip" "$export_route_mode"
             else
@@ -450,7 +521,7 @@ main() {
                     *) die "Usage: nns-app revoke <app_name> <client_name> [--modern|--embedded]" ;;
                 esac
             fi
-            if server_gateway_exists "$2"; then
+            if managed_gateway_exists "$2"; then
                 [[ "$revoke_scope" != embedded ]] ||
                     die "--embedded is not supported for a modern OpenVPN server."
                 if [[ "$(gateway_cfg_value "$2" GATEWAY_BACKEND)" == amneziawg ]]; then
@@ -513,27 +584,15 @@ main() {
         start)
             shift
             parse_start_cli "$@"
-            if server_gateway_exists "$START_APP_NAME"; then
-                [[ "$START_VIA" == __default__ && "$START_IGNORE" == off ]] ||
-                    die "An OpenVPN server cannot use --via or --ignore-start-error."
-                gateway_start "$START_APP_NAME"
-            else
-                start_app "$START_APP_NAME" "$START_IGNORE" "$START_VIA"
-            fi
+            managed_app_start "$START_APP_NAME" "$START_IGNORE" "$START_VIA"
             ;;
         stop)
             case $# in
-                2)
-                    if server_gateway_exists "$2"; then
-                        gateway_stop "$2"
-                    else
-                        stop_app_cli "$2" remote
-                    fi
-                    ;;
+                2) managed_app_stop "$2" ;;
                 3)
                     [[ "$3" == --local-only ]] ||
                         die "Usage: nns-app stop <app_name> [--local-only]"
-                    stop_app_cli "$2" local-only
+                    managed_app_stop "$2" local-only
                     ;;
                 *) die "Usage: nns-app stop <app_name> [--local-only]" ;;
             esac
@@ -555,8 +614,8 @@ main() {
         client-to-client)
             (( $# == 2 || $# == 3 )) ||
                 die "Usage: nns-app client-to-client <server_name> [on|off]"
-            server_gateway_exists "$2" ||
-                die "'$2' is not an installed host OpenVPN server."
+            managed_gateway_exists "$2" ||
+                die "'$2' is not an installed OpenVPN gateway."
             if (( $# == 2 )); then
                 gateway_show_client_to_client "$2"
             else
@@ -816,7 +875,7 @@ main() {
             (( $# >= 3 )) || die "Usage: nns-app run <app_name> <command> [arguments...]"
             local app=$2
             shift 2
-            run_in_app "$app" "$@"
+            managed_app_run "$app" "$@"
             ;;
         *)
             usage

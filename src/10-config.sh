@@ -48,11 +48,22 @@ reexec_as_root_if_needed() {
             ;;
     esac
 
+    # Gateways don't have a per-user namespace sudoers entry. Use regular sudo
+    # for gateway lifecycle commands so existing host sudo policy can prompt
+    # instead of failing under -n. Namespace apps keep their NOPASSWD rules.
+    if [[ "$cmd" == status || "$cmd" == stop || "$cmd" == run ]] &&
+       (( $# >= 2 )) && managed_gateway_exists "$2"; then
+        sudo_args=(/usr/bin/sudo)
+    fi
+
     # Canonicalize flexible start-option ordering before sudo. This lets the
     # per-app sudoers entry remain narrow while accepting --via in any position.
     if [[ "$cmd" == start ]]; then
         shift
         parse_start_cli "$@"
+        if managed_gateway_exists "$START_APP_NAME"; then
+            sudo_args=(/usr/bin/sudo)
+        fi
         local -a canonical=(start)
         bool_on "$START_IGNORE" && canonical+=(-i)
         canonical+=("$START_APP_NAME")

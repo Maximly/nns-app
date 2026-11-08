@@ -2960,12 +2960,18 @@ PY_SERVER_PUBLIC_IP
     printf '%s\n' "$value"
 }
 
-server_gateway_exists() {
-    local name=$1
-    # This lookup happens before normal app/gateway validation in the CLI.
-    # Never construct or source a config path from a path traversal or flag.
+# Every configured gateway is a managed app, whether its exit is the host
+# or another VPN namespace. Keep the host-only predicate for the legacy
+# --server *installation/reconciliation* path, not for lifecycle dispatch.
+managed_gateway_exists() {
+    local name=${1:-}
     [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]] || return 1
-    [[ -f "$(gateway_cfg_file "$name")" ]] || return 1
+    [[ -f "$(gateway_cfg_file "$name")" ]]
+}
+
+server_gateway_exists() {
+    local name=${1:-}
+    managed_gateway_exists "$name" || return 1
     [[ "$(gateway_cfg_value "$name" VIA_APP 2>/dev/null || true)" == host ]]
 }
 
@@ -3294,8 +3300,10 @@ gateway_show_client_to_client() {
 server_export_ovpn() {
     require_root
     local gateway=$1 client=$2 output=$3 public=$4 proto=$5 compat=$6 fixed_ip=${7:-off} route_mode=${8:-keep}
-    server_gateway_exists "$gateway" || die "Server '$gateway' does not exist."
+    managed_gateway_exists "$gateway" || die "VPN server/gateway '$gateway' does not exist."
     load_gateway_cfg "$gateway"
+    [[ "$GATEWAY_BACKEND" == openvpn ]] ||
+        die "App '$gateway' is an AmneziaWG server; export an AWG profile using 'nns-app export awg'."
     [[ "$compat" == modern && "$OPENVPN_COMPAT" == modern ]] ||
         die "This server uses modern OpenVPN profiles; --embedded is not supported."
     [[ "$public" == - || "$public" == "$PUBLIC_HOST:$PUBLIC_PORT" ]] ||

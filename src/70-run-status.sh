@@ -306,6 +306,56 @@ compose_user_run_path() {
     fi
 }
 
+# Shared minimal environment and non-root execution for namespace apps and
+# host-exit gateways. Never run a caller-supplied command as root.
+exec_run_as_user() {
+    local app=$1 user=$2
+    shift 2
+    [[ -n "$user" && "$user" != root ]] ||
+        die "Cannot identify an unprivileged run user. Invoke nns-app as your user, or set NNS_APP_USER when running directly as root."
+    id "$user" >/dev/null 2>&1 || die "Run user '$user' does not exist."
+    (( $(id -u "$user") != 0 )) || die "Refusing to run '$app' command as root."
+    local uid gid home shell run_path
+    uid=$(id -u "$user")
+    gid=$(id -g "$user")
+    home=$(getent passwd "$user" | cut -d: -f6)
+    shell=$(getent passwd "$user" | cut -d: -f7)
+    [[ -n "$shell" ]] || shell=/bin/bash
+    run_path=$(compose_user_run_path "${NNS_APP_RUN_PATH:-}")
+
+    local env_args=(
+        "HOME=$home"
+        "USER=$user"
+        "LOGNAME=$user"
+        "SHELL=$shell"
+        "PATH=$run_path"
+        "XDG_RUNTIME_DIR=/run/user/$uid"
+        "NNS_APP_CONTEXT=$app"
+    )
+    local name value
+    # Preserve the desktop-session identity and D-Bus environment needed by
+    # Electron/Chromium safeStorage to select GNOME Keyring or KWallet.  The
+    # command still receives a clean allow-listed environment; no loader or
+    # shell-startup variables are carried across the root boundary.
+    for name in DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS \
+                XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE \
+                DESKTOP_SESSION GDMSESSION GNOME_DESKTOP_SESSION_ID \
+                GNOME_KEYRING_CONTROL KDE_FULL_SESSION KDE_SESSION_VERSION \
+                XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME \
+                XDG_CONFIG_DIRS XDG_DATA_DIRS \
+                LANG LANGUAGE LC_ALL TERM COLORTERM SSH_AUTH_SOCK; do
+        value=${!name-}
+        [[ -z "$value" ]] || env_args+=("$name=$value")
+    done
+
+    exec /usr/bin/setpriv \
+        --reuid="$uid" \
+        --regid="$gid" \
+        --init-groups \
+        -- \
+        /usr/bin/env -i "${env_args[@]}" "$@"
+}
+
 run_user_exec() {
     require_root
     local app=$1
@@ -335,45 +385,7 @@ run_user_exec() {
         prepare_namespaced_snap_mounts
     fi
 
-    local uid gid home shell run_path
-    uid=$(id -u "$APP_USER")
-    gid=$(id -g "$APP_USER")
-    home=$(getent passwd "$APP_USER" | cut -d: -f6)
-    shell=$(getent passwd "$APP_USER" | cut -d: -f7)
-    [[ -n "$shell" ]] || shell=/bin/bash
-    run_path=$(compose_user_run_path "${NNS_APP_RUN_PATH:-}")
-
-    local env_args=(
-        "HOME=$home"
-        "USER=$APP_USER"
-        "LOGNAME=$APP_USER"
-        "SHELL=$shell"
-        "PATH=$run_path"
-        "XDG_RUNTIME_DIR=/run/user/$uid"
-        "NNS_APP_CONTEXT=$app"
-    )
-    local name value
-    # Preserve the desktop-session identity and D-Bus environment needed by
-    # Electron/Chromium safeStorage to select GNOME Keyring or KWallet.  The
-    # command still receives a clean allow-listed environment; no loader or
-    # shell-startup variables are carried across the root boundary.
-    for name in DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS \
-                XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE \
-                DESKTOP_SESSION GDMSESSION GNOME_DESKTOP_SESSION_ID \
-                GNOME_KEYRING_CONTROL KDE_FULL_SESSION KDE_SESSION_VERSION \
-                XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME \
-                XDG_CONFIG_DIRS XDG_DATA_DIRS \
-                LANG LANGUAGE LC_ALL TERM COLORTERM SSH_AUTH_SOCK; do
-        value=${!name-}
-        [[ -z "$value" ]] || env_args+=("$name=$value")
-    done
-
-    exec /usr/bin/setpriv \
-        --reuid="$uid" \
-        --regid="$gid" \
-        --init-groups \
-        -- \
-        /usr/bin/env -i "${env_args[@]}" "$@"
+    exec_run_as_user "$app" "$APP_USER" "$@"
 }
 
 run_in_app() {
@@ -420,6 +432,31 @@ run_in_app() {
     # APP_USER without shell re-parsing or eval.
     exec "$(ip_binary)" netns exec "$NS_NAME" \
         "$ENGINE_PATH" _run-user "$app" "$@"
+}
+
+
+# A gateway's data egress is its configured VIA_APP. The gateway itself lives
+# in the host network namespace: it does not provide an ip-netns target.
+# Host-exit servers execute commands in the host context (unprivileged);
+# VPN-exit gateways execute in their upstream app namespace with its kill switch.
+run_in_gateway() {
+    require_root
+    local gateway=$1 caller via
+    shift
+    (( $# > 0 )) || die "run requires a command line."
+    validate_gateway_name "$gateway"
+    load_gateway_cfg "$gateway"
+    via=$VIA_APP
+    systemctl is-active --quiet "nns-gateway@${gateway}.service" ||
+        die "Gateway app '$gateway' is stopped. Start it first."
+    if [[ "$via" != host ]]; then
+        # `run_in_app` checks the upstream VPN state, namespace, kill switch
+        # and DNS/Snap integration before dropping privileges.
+        run_in_app "$via" "$@"
+    else
+        caller=${NNS_APP_USER:-${SUDO_USER:-}}
+        exec_run_as_user "$gateway" "$caller" "$@"
+    fi
 }
 
 

@@ -6,7 +6,7 @@ chained namespaces, SSH-managed remote exits, and host-based VPN servers.
 The host's default route and DNS configuration remain independent of individual
 application environments.
 
-**Release:** 2.0.2  
+**Release:** 2.0.3  
 **Supported platforms:** Ubuntu and Fedora with systemd (Debian-family package installation is also supported)  
 **VPN backends:** OpenVPN 2.6+, WireGuard, AmneziaWG, and VPN-free inherited namespaces  
 **License:** GPL-3.0-or-later
@@ -102,6 +102,28 @@ public gateway endpoint.
 
 ## Application environments
 
+### Unified app lifecycle
+
+Every name shown by `nns-app list` is a managed app. The same `start`, `stop`,
+`status`, `remove` and `run` commands accept VPN clients, OpenVPN servers,
+AmneziaWG servers and upstream-backed gateways. The `gateway` subcommands
+remain available for managing gateway-specific settings and client identities.
+
+For gateway apps, `run` executes through the gateway's configured **exit**, not
+inside its OpenVPN listener: a `via host` server uses the host network and a
+`via <vpn-app>` gateway runs in the upstream VPN namespace. Commands run with
+non-root user privileges; gateways must be started before `run`.
+
+```bash
+nns-app start office-vpn
+nns-app status office-vpn
+nns-app run office-vpn ping -c 4 ya.ru   # host-exit server: host network
+nns-app stop office-vpn
+
+nns-app start hidemy-mob
+nns-app run hidemy-mob curl -4 https://api.ipify.org  # via hidemy
+```
+
 ### Namespace lifecycle
 
 ```bash
@@ -149,6 +171,21 @@ restarting a child while its upstream is offline and applies a cooldown.
 Use `nns-app status <app>` to inspect readiness, routes, DNS and recovery state.
 
 ## VPN servers
+
+### OpenVPN gateway with a VPN upstream
+
+```bash
+sudo nns-app gateway create hidemy-mob --via hidemy
+nns-app start hidemy-mob
+nns-app status hidemy-mob
+nns-app run hidemy-mob curl -4 https://api.ipify.org
+nns-app export ovpn hidemy-mob --client phone --full-tunnel \
+    --output ~/hidemy-phone.ovpn
+```
+
+The gateway accepts incoming OpenVPN connections on the host, while client
+Internet traffic exits through the `hidemy` VPN namespace. `--listen` and
+`--public` override automatically discovered listener and public endpoint.
 
 ### OpenVPN server — direct UDP or TCP
 

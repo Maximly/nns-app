@@ -64,7 +64,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.0.2"
+readonly VERSION="2.0.3"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -317,9 +317,8 @@ Usage:
   nns-app stop    <app_name> [--local-only]
   nns-app run     <app_name> <command> [arguments...]
 
-  nns-app gateway create <gateway_name> --via <app_name>
-                  --listen <tcp|udp>:<port>
-                  --public <host>:<port>
+  nns-app gateway create <name> --via <app> [--listen <tcp|udp>:<port>]
+                  [--public <host>:<port>]
                   [--pool <IPv4-CIDR>] [--dns "<IPv4> ..."]
                   [--transport direct|stunnel|cloak]
                   [--server-name <cloak-decoy-host>]
@@ -462,11 +461,22 @@ reexec_as_root_if_needed() {
             ;;
     esac
 
+    # Gateways don't have a per-user namespace sudoers entry. Use regular sudo
+    # for gateway lifecycle commands so existing host sudo policy can prompt
+    # instead of failing under -n. Namespace apps keep their NOPASSWD rules.
+    if [[ "$cmd" == status || "$cmd" == stop || "$cmd" == run ]] &&
+       (( $# >= 2 )) && managed_gateway_exists "$2"; then
+        sudo_args=(/usr/bin/sudo)
+    fi
+
     # Canonicalize flexible start-option ordering before sudo. This lets the
     # per-app sudoers entry remain narrow while accepting --via in any position.
     if [[ "$cmd" == start ]]; then
         shift
         parse_start_cli "$@"
+        if managed_gateway_exists "$START_APP_NAME"; then
+            sudo_args=(/usr/bin/sudo)
+        fi
         local -a canonical=(start)
         bool_on "$START_IGNORE" && canonical+=(-i)
         canonical+=("$START_APP_NAME")
@@ -7325,12 +7335,18 @@ PY_SERVER_PUBLIC_IP
     printf '%s\n' "$value"
 }
 
-server_gateway_exists() {
-    local name=$1
-    # This lookup happens before normal app/gateway validation in the CLI.
-    # Never construct or source a config path from a path traversal or flag.
+# Every configured gateway is a managed app, whether its exit is the host
+# or another VPN namespace. Keep the host-only predicate for the legacy
+# --server *installation/reconciliation* path, not for lifecycle dispatch.
+managed_gateway_exists() {
+    local name=${1:-}
     [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]] || return 1
-    [[ -f "$(gateway_cfg_file "$name")" ]] || return 1
+    [[ -f "$(gateway_cfg_file "$name")" ]]
+}
+
+server_gateway_exists() {
+    local name=${1:-}
+    managed_gateway_exists "$name" || return 1
     [[ "$(gateway_cfg_value "$name" VIA_APP 2>/dev/null || true)" == host ]]
 }
 
@@ -7659,8 +7675,10 @@ gateway_show_client_to_client() {
 server_export_ovpn() {
     require_root
     local gateway=$1 client=$2 output=$3 public=$4 proto=$5 compat=$6 fixed_ip=${7:-off} route_mode=${8:-keep}
-    server_gateway_exists "$gateway" || die "Server '$gateway' does not exist."
+    managed_gateway_exists "$gateway" || die "VPN server/gateway '$gateway' does not exist."
     load_gateway_cfg "$gateway"
+    [[ "$GATEWAY_BACKEND" == openvpn ]] ||
+        die "App '$gateway' is an AmneziaWG server; export an AWG profile using 'nns-app export awg'."
     [[ "$compat" == modern && "$OPENVPN_COMPAT" == modern ]] ||
         die "This server uses modern OpenVPN profiles; --embedded is not supported."
     [[ "$public" == - || "$public" == "$PUBLIC_HOST:$PUBLIC_PORT" ]] ||
@@ -11663,6 +11681,56 @@ compose_user_run_path() {
     fi
 }
 
+# Shared minimal environment and non-root execution for namespace apps and
+# host-exit gateways. Never run a caller-supplied command as root.
+exec_run_as_user() {
+    local app=$1 user=$2
+    shift 2
+    [[ -n "$user" && "$user" != root ]] ||
+        die "Cannot identify an unprivileged run user. Invoke nns-app as your user, or set NNS_APP_USER when running directly as root."
+    id "$user" >/dev/null 2>&1 || die "Run user '$user' does not exist."
+    (( $(id -u "$user") != 0 )) || die "Refusing to run '$app' command as root."
+    local uid gid home shell run_path
+    uid=$(id -u "$user")
+    gid=$(id -g "$user")
+    home=$(getent passwd "$user" | cut -d: -f6)
+    shell=$(getent passwd "$user" | cut -d: -f7)
+    [[ -n "$shell" ]] || shell=/bin/bash
+    run_path=$(compose_user_run_path "${NNS_APP_RUN_PATH:-}")
+
+    local env_args=(
+        "HOME=$home"
+        "USER=$user"
+        "LOGNAME=$user"
+        "SHELL=$shell"
+        "PATH=$run_path"
+        "XDG_RUNTIME_DIR=/run/user/$uid"
+        "NNS_APP_CONTEXT=$app"
+    )
+    local name value
+    # Preserve the desktop-session identity and D-Bus environment needed by
+    # Electron/Chromium safeStorage to select GNOME Keyring or KWallet.  The
+    # command still receives a clean allow-listed environment; no loader or
+    # shell-startup variables are carried across the root boundary.
+    for name in DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS \
+                XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE \
+                DESKTOP_SESSION GDMSESSION GNOME_DESKTOP_SESSION_ID \
+                GNOME_KEYRING_CONTROL KDE_FULL_SESSION KDE_SESSION_VERSION \
+                XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME \
+                XDG_CONFIG_DIRS XDG_DATA_DIRS \
+                LANG LANGUAGE LC_ALL TERM COLORTERM SSH_AUTH_SOCK; do
+        value=${!name-}
+        [[ -z "$value" ]] || env_args+=("$name=$value")
+    done
+
+    exec /usr/bin/setpriv \
+        --reuid="$uid" \
+        --regid="$gid" \
+        --init-groups \
+        -- \
+        /usr/bin/env -i "${env_args[@]}" "$@"
+}
+
 run_user_exec() {
     require_root
     local app=$1
@@ -11692,45 +11760,7 @@ run_user_exec() {
         prepare_namespaced_snap_mounts
     fi
 
-    local uid gid home shell run_path
-    uid=$(id -u "$APP_USER")
-    gid=$(id -g "$APP_USER")
-    home=$(getent passwd "$APP_USER" | cut -d: -f6)
-    shell=$(getent passwd "$APP_USER" | cut -d: -f7)
-    [[ -n "$shell" ]] || shell=/bin/bash
-    run_path=$(compose_user_run_path "${NNS_APP_RUN_PATH:-}")
-
-    local env_args=(
-        "HOME=$home"
-        "USER=$APP_USER"
-        "LOGNAME=$APP_USER"
-        "SHELL=$shell"
-        "PATH=$run_path"
-        "XDG_RUNTIME_DIR=/run/user/$uid"
-        "NNS_APP_CONTEXT=$app"
-    )
-    local name value
-    # Preserve the desktop-session identity and D-Bus environment needed by
-    # Electron/Chromium safeStorage to select GNOME Keyring or KWallet.  The
-    # command still receives a clean allow-listed environment; no loader or
-    # shell-startup variables are carried across the root boundary.
-    for name in DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS \
-                XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE \
-                DESKTOP_SESSION GDMSESSION GNOME_DESKTOP_SESSION_ID \
-                GNOME_KEYRING_CONTROL KDE_FULL_SESSION KDE_SESSION_VERSION \
-                XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME \
-                XDG_CONFIG_DIRS XDG_DATA_DIRS \
-                LANG LANGUAGE LC_ALL TERM COLORTERM SSH_AUTH_SOCK; do
-        value=${!name-}
-        [[ -z "$value" ]] || env_args+=("$name=$value")
-    done
-
-    exec /usr/bin/setpriv \
-        --reuid="$uid" \
-        --regid="$gid" \
-        --init-groups \
-        -- \
-        /usr/bin/env -i "${env_args[@]}" "$@"
+    exec_run_as_user "$app" "$APP_USER" "$@"
 }
 
 run_in_app() {
@@ -11777,6 +11807,31 @@ run_in_app() {
     # APP_USER without shell re-parsing or eval.
     exec "$(ip_binary)" netns exec "$NS_NAME" \
         "$ENGINE_PATH" _run-user "$app" "$@"
+}
+
+
+# A gateway's data egress is its configured VIA_APP. The gateway itself lives
+# in the host network namespace: it does not provide an ip-netns target.
+# Host-exit servers execute commands in the host context (unprivileged);
+# VPN-exit gateways execute in their upstream app namespace with its kill switch.
+run_in_gateway() {
+    require_root
+    local gateway=$1 caller via
+    shift
+    (( $# > 0 )) || die "run requires a command line."
+    validate_gateway_name "$gateway"
+    load_gateway_cfg "$gateway"
+    via=$VIA_APP
+    systemctl is-active --quiet "nns-gateway@${gateway}.service" ||
+        die "Gateway app '$gateway' is stopped. Start it first."
+    if [[ "$via" != host ]]; then
+        # `run_in_app` checks the upstream VPN state, namespace, kill switch
+        # and DNS/Snap integration before dropping privileges.
+        run_in_app "$via" "$@"
+    else
+        caller=${NNS_APP_USER:-${SUDO_USER:-}}
+        exec_run_as_user "$gateway" "$caller" "$@"
+    fi
 }
 
 
@@ -14198,6 +14253,83 @@ nns_restore() {
 }
 
 # nns-app source module: CLI parser and source-only guard.
+# A VPN namespace and a VPN server/gateway are both managed apps. Their
+# persistent state remains in its respective backend directory; CLI lifecycle
+# operations resolve by installed object, never by the gateway's VIA_APP.
+managed_app_kind() {
+    local app=${1:-} namespace=off gateway=off
+    validate_app_name "$app"
+    [[ ! -f "$(cfg_file "$app")" ]] || namespace=on
+    if managed_gateway_exists "$app"; then gateway=on; fi
+    if [[ "$namespace" == on && "$gateway" == on ]]; then
+        die "Conflicting namespace and gateway configurations for app '$app'. Resolve the duplicate before proceeding."
+    elif [[ "$gateway" == on ]]; then
+        printf 'gateway\n'
+    elif [[ "$namespace" == on ]]; then
+        printf 'namespace\n'
+    else
+        die "NNS app '$app' is not installed."
+    fi
+}
+
+managed_app_start() {
+    local app=$1 ignore=${2:-off} via=${3:-__default__} kind
+    kind=$(managed_app_kind "$app") || return 1
+    if [[ "$kind" == gateway ]]; then
+        [[ "$via" == __default__ ]] ||
+            die "Gateway '$app' has a configured exit; change its configuration rather than overriding --via at start."
+        [[ "$ignore" == off ]] ||
+            die "--ignore-start-error is supported only for VPN namespace apps."
+        gateway_start "$app"
+    else
+        start_app "$app" "$ignore" "$via"
+    fi
+}
+
+managed_app_stop() {
+    local app=$1 mode=${2:-remote} kind
+    kind=$(managed_app_kind "$app") || return 1
+    if [[ "$kind" == gateway ]]; then
+        # --local-only is already the natural operation for a local server.
+        gateway_stop "$app"
+    else
+        stop_app_cli "$app" "$mode"
+    fi
+}
+
+managed_app_status() {
+    local app=$1 kind
+    kind=$(managed_app_kind "$app") || return 1
+    if [[ "$kind" == gateway ]]; then
+        gateway_status "$app"
+    else
+        status_app "$app"
+    fi
+}
+
+managed_app_remove() {
+    local app=$1 mode=${2:-remote} kind
+    kind=$(managed_app_kind "$app") || return 1
+    if [[ "$kind" == gateway ]]; then
+        gateway_remove "$app"
+    elif [[ "$mode" == local-only ]]; then
+        remove_app "$app" local-only
+    else
+        remove_app "$app"
+    fi
+}
+
+managed_app_run() {
+    local app=$1 kind
+    shift
+    kind=$(managed_app_kind "$app") || return 1
+    if [[ "$kind" == gateway ]]; then
+        run_in_gateway "$app" "$@"
+    else
+        run_in_app "$app" "$@"
+    fi
+}
+
 main() {
     local cmd=${1:-}
     if [[ -z "$cmd" ]]; then
@@ -14512,12 +14644,10 @@ main() {
             fi
             ;;
         remove)
-            if [[ $# -eq 2 ]] && server_gateway_exists "$2"; then
-                gateway_remove "$2"
-            elif [[ $# -eq 2 ]]; then
-                remove_app "$2"
+            if [[ $# -eq 2 ]]; then
+                managed_app_remove "$2"
             elif [[ $# -eq 3 && "$3" == --local-only ]]; then
-                remove_app "$2" local-only
+                managed_app_remove "$2" local-only
             else
                 die "Usage: nns-app remove <app_name> [--local-only]"
             fi
@@ -14573,11 +14703,7 @@ main() {
             ;;
         status)
             [[ $# -eq 2 ]] || die "Usage: nns-app status <app_name>"
-            if server_gateway_exists "$2"; then
-                gateway_status "$2"
-            else
-                status_app "$2"
-            fi
+            managed_app_status "$2"
             ;;
         myip)
             (( $# <= 2 )) || die "Usage: nns-app myip [<app_or_gateway_name>]"
@@ -14625,11 +14751,11 @@ main() {
             done
             [[ -n "$export_client" ]] || die "export ovpn requires --client <client_name>."
             if [[ "$export_kind" == awg ]]; then
-                server_gateway_exists "$export_app" || die "AmneziaWG export requires a locally managed server."
+                managed_gateway_exists "$export_app" || die "AmneziaWG export requires a locally managed server."
                 [[ "$export_public" == - && "$export_proto" == auto && "$export_compat" == modern ]] ||
                     die "--public, --proto and --embedded are not valid for AmneziaWG client export."
                 awg_server_client_export "$export_app" "$export_client" "$export_output" "$export_route_mode"
-            elif server_gateway_exists "$export_app"; then
+            elif managed_gateway_exists "$export_app"; then
                 server_export_ovpn "$export_app" "$export_client" \
                     "$export_output" "$export_public" "$export_proto" "$export_compat" "$export_fixed_ip" "$export_route_mode"
             else
@@ -14649,7 +14775,7 @@ main() {
                     *) die "Usage: nns-app revoke <app_name> <client_name> [--modern|--embedded]" ;;
                 esac
             fi
-            if server_gateway_exists "$2"; then
+            if managed_gateway_exists "$2"; then
                 [[ "$revoke_scope" != embedded ]] ||
                     die "--embedded is not supported for a modern OpenVPN server."
                 if [[ "$(gateway_cfg_value "$2" GATEWAY_BACKEND)" == amneziawg ]]; then
@@ -14712,27 +14838,15 @@ main() {
         start)
             shift
             parse_start_cli "$@"
-            if server_gateway_exists "$START_APP_NAME"; then
-                [[ "$START_VIA" == __default__ && "$START_IGNORE" == off ]] ||
-                    die "An OpenVPN server cannot use --via or --ignore-start-error."
-                gateway_start "$START_APP_NAME"
-            else
-                start_app "$START_APP_NAME" "$START_IGNORE" "$START_VIA"
-            fi
+            managed_app_start "$START_APP_NAME" "$START_IGNORE" "$START_VIA"
             ;;
         stop)
             case $# in
-                2)
-                    if server_gateway_exists "$2"; then
-                        gateway_stop "$2"
-                    else
-                        stop_app_cli "$2" remote
-                    fi
-                    ;;
+                2) managed_app_stop "$2" ;;
                 3)
                     [[ "$3" == --local-only ]] ||
                         die "Usage: nns-app stop <app_name> [--local-only]"
-                    stop_app_cli "$2" local-only
+                    managed_app_stop "$2" local-only
                     ;;
                 *) die "Usage: nns-app stop <app_name> [--local-only]" ;;
             esac
@@ -14754,8 +14868,8 @@ main() {
         client-to-client)
             (( $# == 2 || $# == 3 )) ||
                 die "Usage: nns-app client-to-client <server_name> [on|off]"
-            server_gateway_exists "$2" ||
-                die "'$2' is not an installed host OpenVPN server."
+            managed_gateway_exists "$2" ||
+                die "'$2' is not an installed OpenVPN gateway."
             if (( $# == 2 )); then
                 gateway_show_client_to_client "$2"
             else
@@ -15015,7 +15129,7 @@ main() {
             (( $# >= 3 )) || die "Usage: nns-app run <app_name> <command> [arguments...]"
             local app=$2
             shift 2
-            run_in_app "$app" "$@"
+            managed_app_run "$app" "$@"
             ;;
         *)
             usage
