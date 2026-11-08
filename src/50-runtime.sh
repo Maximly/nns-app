@@ -310,6 +310,10 @@ watchdog_check() {
         return 0
     fi
 
+    # Reconcile a saved MTU after an OpenVPN-internal reconnect. This needs
+    # no HTTPS probes and cannot trigger a fresh MTU search.
+    mtu_apply_saved "$app" || true
+
     watchdog_state_load "$app"
     if (( WD_ARMED == 0 )) &&
        systemctl is-active --quiet "nns-online@${app}.service"; then

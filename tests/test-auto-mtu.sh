@@ -6,7 +6,7 @@ source "$ROOT/src/52-mtu.sh"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 log() { :; }
 warn() { :; }
-load_cfg() { NS_NAME=nns-test; AUTO_MTU=${TEST_AUTO_MTU:-on}; }
+load_cfg() { NS_NAME=nns-test; AUTO_MTU=${TEST_AUTO_MTU:-on}; TUN_MTU=${TEST_TUN_MTU:-}; }
 vpn_type_for_app() { printf '%s\n' "${TEST_TYPE:-openvpn}"; }
 app_split_tunnel() { [[ "${TEST_SPLIT:-off}" == on ]]; }
 vpn_route_iface() { echo tun0; }
@@ -125,6 +125,20 @@ TEST_SPLIT=off TEST_TYPE=wireguard
 mtu_auto_repair test
 [[ $MTU == 1500 && $SAVE_COUNT == 0 ]] || fail 'wireguard unexpectedly tuned'
 TEST_TYPE=openvpn
+# An MTU saved during an earlier repair must be enforced even when the VPN
+# backend is already running (no new OpenVPN process was launched).
+MTU=1500 TEST_TUN_MTU=1400 TEST_MODE=healthy
+mtu_auto_repair test
+[[ "$MTU" == 1400 ]] || fail 'saved MTU was not applied to an already-running tunnel'
+grep -Fq 'healthy:MTU=1400' "$RUN_DIR/test.mtu-check" || fail 'healthy probe did not use the saved MTU'
+# Simulate OpenVPN recreating tun0 after a silent in-process reconnect.
+MTU=1500 TEST_MODE=stuck
+load_cfg test
+mtu_apply_saved test
+[[ "$MTU" == 1400 ]] || fail 'saved MTU was not restored after a reconnect'
+grep -Fq 'restored:MTU=1400:previous=1500' "$RUN_DIR/test.mtu-check" || fail 'MTU restoration not reported'
+# Watchdog must reconcile OpenVPN reconnects without running the HTTP probes.
+grep -Fq 'mtu_apply_saved "$app" || true' "$ROOT/src/50-runtime.sh" || fail 'watchdog does not reapply saved MTU'
 # Both startup paths must call the repair hook, saved values must be reused.
 grep -Fq 'mtu_auto_repair "$app"' "$ROOT/src/50-runtime.sh" || fail 'interactive start missing repair'
 grep -Fq 'mtu_auto_repair "$2"' "$ROOT/src/90-main.sh" || fail 'boot-time online unit missing repair'

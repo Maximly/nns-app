@@ -6,7 +6,7 @@ chained namespaces, SSH-managed remote exits, and host-based VPN servers.
 The host's default route and DNS configuration remain independent of individual
 application environments.
 
-**Release:** 2.0.7  
+**Release:** 2.0.8  
 **Supported platforms:** Ubuntu and Fedora with systemd (Debian-family package installation is also supported)  
 **VPN backends:** OpenVPN 2.6+, WireGuard, AmneziaWG, and VPN-free inherited namespaces  
 **License:** GPL-3.0-or-later
@@ -62,7 +62,8 @@ traffic by default.
 **Automatic OpenVPN MTU recovery:** On startup, a full-tunnel OpenVPN app
 first checks IP reachability, then verifies completed HTTPS transfers using
 Cloudflare's 32-KiB speed-test download and the ipify IPv4 endpoint. If both
-succeed, the interface MTU is unchanged. If a transfer stalls *after* TLS
+succeed, the interface MTU is unchanged unless a previously saved value
+needs reapplication. If a transfer stalls *after* TLS
 ClientHello, nns-app temporarily tests smaller TUN MTUs (1400, 1360, 1320,
 1280, 1200). It saves the first setting at which every previously failing
 transfer recovers twice and every initially healthy probe remains working;
@@ -72,7 +73,7 @@ failures, certificate errors, and split-tunnel apps cannot by themselves
 trigger tuning. Probes are budget-limited, and the
 last result is displayed in `nns-app status`. Set `AUTO_MTU="off"` in the
 app configuration to disable checks; `TUN_MTU` holds the last measured value
-and is reapplied on OpenVPN reconnects. Clearing `TUN_MTU` returns to the
+and is reapplied on startup and checked by the watchdog after reconnects. Clearing `TUN_MTU` returns to the
 profile's MTU on the next restart. External probe hosts are not guaranteed to
 be available on every network.
 

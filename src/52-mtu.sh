@@ -52,6 +52,40 @@ mtu_https_probe() {
     return 20
 }
 
+# An MTU selected by a successful earlier probe is a runtime requirement,
+# even if OpenVPN was already active when the value was saved. OpenVPN may
+# also recreate its TUN interface after an internal reconnect; the watchdog
+# reconciles that interface without restarting the user's processes.
+mtu_apply_saved() {
+    local app=$1 type dev actual previous
+    [[ "${TUN_MTU:-}" =~ ^[0-9]+$ ]] || return 0
+    (( TUN_MTU >= 576 && TUN_MTU <= 1500 )) || {
+        warn "'$app': ignoring invalid saved TUN_MTU '$TUN_MTU'."
+        return 1
+    }
+    type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    [[ "$type" == openvpn ]] || return 0
+    dev=$(vpn_route_iface "$app" 2>/dev/null || true)
+    [[ "$dev" == tun* ]] || return 0
+    actual=$(ip -n "$NS_NAME" -o link show dev "$dev" 2>/dev/null |
+        awk '{for (i=1;i<=NF;i++) if ($i=="mtu") {print $(i+1); exit}}')
+    [[ "$actual" =~ ^[0-9]+$ ]] || return 0
+    [[ "$actual" != "$TUN_MTU" ]] || return 0
+    previous=$actual
+    if ! ip -n "$NS_NAME" link set dev "$dev" mtu "$TUN_MTU"; then
+        warn "'$app': failed to apply saved MTU $TUN_MTU to $dev."
+        return 1
+    fi
+    actual=$(ip -n "$NS_NAME" -o link show dev "$dev" 2>/dev/null |
+        awk '{for (i=1;i<=NF;i++) if ($i=="mtu") {print $(i+1); exit}}')
+    if [[ "$actual" != "$TUN_MTU" ]]; then
+        warn "'$app': saved MTU $TUN_MTU did not take effect on $dev (actual ${actual:-unknown})."
+        return 1
+    fi
+    mtu_probe_state "$app" "restored:MTU=$TUN_MTU:previous=$previous"
+    log "'$app': applied saved MTU $TUN_MTU to $dev."
+}
+
 mtu_auto_repair() {
     local app=$1 kind ns dev original candidate result url
     local deadline suspect=0 unavailable=0 good
@@ -62,6 +96,7 @@ mtu_auto_repair() {
     local -a failed_urls=() healthy_urls=()
 
     load_cfg "$app"
+    mtu_apply_saved "$app" || true
     [[ "${AUTO_MTU:-on}" != off ]] || { mtu_probe_state "$app" disabled; return 0; }
     kind=$(vpn_type_for_app "$app" 2>/dev/null || true)
     [[ "$kind" == openvpn ]] || return 0
