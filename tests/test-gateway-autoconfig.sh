@@ -5,7 +5,7 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 TEST_TMP=$(mktemp -d)
 trap 'rm -rf "$TEST_TMP"' EXIT
 GATEWAY_BASE_DIR="$TEST_TMP/gateways"
-mkdir -p "$GATEWAY_BASE_DIR"/{mlhome,other-exit,secured}
+mkdir -p "$GATEWAY_BASE_DIR"/{office-server,other-exit,secured}
 source "$ROOT/src/60-gateway.sh"
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -15,7 +15,7 @@ ss() {
         -ltn) printf 'LISTEN 0 128 0.0.0.0:444 0.0.0.0:*\n' ;;
     esac
 }
-cat >"$GATEWAY_BASE_DIR/mlhome/gateway.cfg" <<'CFG'
+cat >"$GATEWAY_BASE_DIR/office-server/gateway.cfg" <<'CFG'
 VIA_APP=host
 TRANSPORT=direct
 LISTEN_PROTO=udp
@@ -24,7 +24,7 @@ OPENVPN_LISTEN_PROTO=udp
 OPENVPN_LISTEN_PORT=1194
 CFG
 cat >"$GATEWAY_BASE_DIR/other-exit/gateway.cfg" <<'CFG'
-VIA_APP=hidemy
+VIA_APP=upstream-vpn
 TRANSPORT=direct
 LISTEN_PROTO=udp
 LISTEN_PORT=1195
@@ -39,7 +39,7 @@ LISTEN_PORT=443
 OPENVPN_LISTEN_PROTO=tcp
 OPENVPN_LISTEN_PORT=12345
 CFG
-[[ $(gateway_choose_listener direct hidemy-phone) == udp:1197 ]] ||
+[[ $(gateway_choose_listener direct relay-phone) == udp:1197 ]] ||
     fail 'default UDP listener did not skip managed and unmanaged host ports'
 [[ $(gateway_choose_listener cloak secure-phone-new) == tcp:445 ]] ||
     fail 'default TCP Cloak listener did not skip managed and unmanaged host ports'

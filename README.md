@@ -120,16 +120,16 @@ nns-app status office-vpn
 nns-app run office-vpn ping -c 4 ya.ru   # host-exit server: host network
 nns-app stop office-vpn
 
-nns-app start hidemy-mob
-nns-app run hidemy-mob curl -4 https://api.ipify.org  # via hidemy
+nns-app start relay-gateway
+nns-app run relay-gateway curl -4 https://api.ipify.org  # via upstream-vpn
 ```
 
 ### Change a gateway's upstream
 
 ```bash
-sudo nns-app set-via hidemy-cursor mlhomeuz
-nns-app status hidemy-cursor
-nns-app run hidemy-cursor curl -4 https://api.ipify.org
+sudo nns-app set-via relay-gateway secondary-vpn
+nns-app status relay-gateway
+nns-app run relay-gateway curl -4 https://api.ipify.org
 ```
 
 `set-via <gateway-app> <upstream-app|host>` changes the egress of an existing
@@ -192,16 +192,16 @@ Use `nns-app status <app>` to inspect readiness, routes, DNS and recovery state.
 ### OpenVPN gateway with a VPN upstream
 
 ```bash
-sudo nns-app gateway create hidemy-mob --via hidemy
-nns-app start hidemy-mob
-nns-app status hidemy-mob
-nns-app run hidemy-mob curl -4 https://api.ipify.org
-nns-app export ovpn hidemy-mob --client phone --full-tunnel \
-    --output ~/hidemy-phone.ovpn
+sudo nns-app gateway create relay-gateway --via upstream-vpn
+nns-app start relay-gateway
+nns-app status relay-gateway
+nns-app run relay-gateway curl -4 https://api.ipify.org
+nns-app export ovpn relay-gateway --client phone --full-tunnel \
+    --output ~/relay-phone.ovpn
 ```
 
 The gateway accepts incoming OpenVPN connections on the host, while client
-Internet traffic exits through the `hidemy` VPN namespace. `--listen` and
+Internet traffic exits through the `upstream-vpn` VPN namespace. `--listen` and
 `--public` override automatically discovered listener and public endpoint.
 
 ### OpenVPN server — direct UDP or TCP

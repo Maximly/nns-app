@@ -2059,11 +2059,11 @@ EOF_REPAIR_STATE
         printf 'gateway:%s|via:%s|listen:%s|public:%s|transport:%s\n' \
             "$1" "$2" "$3" "$4" "$7"
     }
-    [[ $(main gateway create hidemy-phone --via hidemy) == 'gateway:hidemy-phone|via:hidemy|listen:|public:|transport:direct' ]] ||
+    [[ $(main gateway create relay-phone --via upstream-vpn) == 'gateway:relay-phone|via:upstream-vpn|listen:|public:|transport:direct' ]] ||
         fail 'gateway create did not allow auto-selected listener/public endpoint'
-    [[ $(main gateway create secure-phone --via=hidemy --transport=cloak) == 'gateway:secure-phone|via:hidemy|listen:|public:|transport:cloak' ]] ||
+    [[ $(main gateway create secure-phone --via=upstream-vpn --transport=cloak) == 'gateway:secure-phone|via:upstream-vpn|listen:|public:|transport:cloak' ]] ||
         fail 'gateway create did not allow cloak listener autodiscovery'
-    [[ $(main gateway create fixed --via hidemy --listen udp:18000 --public vpn.example.net:18001) == 'gateway:fixed|via:hidemy|listen:udp:18000|public:vpn.example.net:18001|transport:direct' ]] ||
+    [[ $(main gateway create fixed --via upstream-vpn --listen udp:18000 --public vpn.example.net:18001) == 'gateway:fixed|via:upstream-vpn|listen:udp:18000|public:vpn.example.net:18001|transport:direct' ]] ||
         fail 'gateway create did not preserve explicit endpoint override'
     if (main gateway create missing-via) >/dev/null 2>&1; then
         fail 'gateway create accepted a missing --via'
