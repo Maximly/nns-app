@@ -777,6 +777,10 @@ main() {
                 *) die "Usage: nns-app stop <app_name> [--local-only]" ;;
             esac
             ;;
+        set-via)
+            (( $# == 3 )) || die "Usage: nns-app set-via <gateway-app> <upstream-app|host>"
+            gateway_set_via "$2" "$3"
+            ;;
         route-mode)
             (( $# >= 3 && $# <= 4 )) ||
                 die "Usage: nns-app route-mode <server_name> <client_name> [split|full]"

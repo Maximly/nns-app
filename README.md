@@ -6,7 +6,7 @@ chained namespaces, SSH-managed remote exits, and host-based VPN servers.
 The host's default route and DNS configuration remain independent of individual
 application environments.
 
-**Release:** 2.0.4  
+**Release:** 2.0.5  
 **Supported platforms:** Ubuntu and Fedora with systemd (Debian-family package installation is also supported)  
 **VPN backends:** OpenVPN 2.6+, WireGuard, AmneziaWG, and VPN-free inherited namespaces  
 **License:** GPL-3.0-or-later
@@ -123,6 +123,23 @@ nns-app stop office-vpn
 nns-app start hidemy-mob
 nns-app run hidemy-mob curl -4 https://api.ipify.org  # via hidemy
 ```
+
+### Change a gateway's upstream
+
+```bash
+sudo nns-app set-via hidemy-cursor mlhomeuz
+nns-app status hidemy-cursor
+nns-app run hidemy-cursor curl -4 https://api.ipify.org
+```
+
+`set-via <gateway-app> <upstream-app|host>` changes the egress of an existing
+OpenVPN server/gateway without reissuing client certificates or modifying its
+public endpoint, port, subnet or client routing policy. An active gateway
+checks the new upstream's readiness, disconnects existing clients briefly,
+then restarts on the new exit. If startup fails, nns-app attempts to restore
+the previous configuration and running service. A stopped gateway remains
+stopped; it may be assigned an offline upstream for later use. `host` selects
+the host's uplink. AmneziaWG servers currently support host exit only.
 
 ### Namespace lifecycle
 

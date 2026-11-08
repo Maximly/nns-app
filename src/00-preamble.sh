@@ -66,7 +66,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.0.4"
+readonly VERSION="2.0.5"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -324,6 +324,7 @@ Usage:
   nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
   nns-app start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
   nns-app stop    <app_name> [--local-only]
+  nns-app set-via <gateway-app> <upstream-app|host>
   nns-app run     <app_name> <command> [arguments...]
 
   nns-app gateway create <name> --via <app> [--listen <tcp|udp>:<port>]

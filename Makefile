@@ -9,6 +9,7 @@ test: build
 	./tests/test-list.sh
 	./tests/test-unified-commands.sh
 	./tests/test-managed-clients.sh
+	./tests/test-set-via.sh
 	./tests/test-server-reinstall.sh
 	./tests/test-gateway-autoconfig.sh
 	./tests/test-remote-downgrade.sh

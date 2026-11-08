@@ -66,7 +66,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.0.4"
+readonly VERSION="2.0.5"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -324,6 +324,7 @@ Usage:
   nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
   nns-app start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
   nns-app stop    <app_name> [--local-only]
+  nns-app set-via <gateway-app> <upstream-app|host>
   nns-app run     <app_name> <command> [arguments...]
 
   nns-app gateway create <name> --via <app> [--listen <tcp|udp>:<port>]
@@ -464,7 +465,7 @@ reexec_as_root_if_needed() {
         list|status|myip|start|stop|run)
             sudo_args+=( -n )
             ;;
-        install|remove|add|purge|repair|backup|restore|gateway|remote|link|export|client|revoke|fixed-ip|route-mode|client-to-client)
+        install|remove|add|purge|repair|backup|restore|gateway|remote|link|export|client|revoke|fixed-ip|route-mode|client-to-client|set-via)
             ;;
         *)
             die "Unknown command '$cmd'."
@@ -6314,6 +6315,130 @@ gateway_stop() {
     systemctl reset-failed "nns-gateway@${gateway}.service" 2>/dev/null || true
     gateway_down "$gateway" >/dev/null 2>&1 || true
     log "Stopped gateway '$gateway'."
+}
+
+# Change a public gateway's egress without changing its listener, tunnel,
+# client pool or issued credentials. Stop while the old configuration is still
+# installed: ExecStopPost must tear down the OLD namespace's routes and NAT.
+gateway_set_via() {
+    require_root
+    local gateway=$1 requested=$2 previous backend cfg snapshot was_active=off
+    validate_gateway_name "$gateway"
+    managed_gateway_exists "$gateway" || die "App '$gateway' is not a managed VPN server/gateway."
+
+    # Serialize changes against gateway creation/reinstallation and reserve
+    # this gateway's configuration for the entire transition. Never hold its
+    # gateway lock while stopping/starting systemd: ExecStopPost/ExecStartPre
+    # acquire that lock themselves.
+    acquire_lock global
+    load_gateway_cfg "$gateway"
+    previous=$VIA_APP
+    backend=${GATEWAY_BACKEND:-openvpn}
+    if [[ "$requested" != host ]]; then
+        # Reject missing upstreams, dependency cycles and gateway-as-upstream.
+        # Validation is read-only and must happen BEFORE disrupting clients.
+        if ! ( normalize_via "$gateway" "$requested" >/dev/null ); then
+            release_lock global
+            return 1
+        fi
+        if [[ "$backend" != openvpn ]]; then
+            release_lock global
+            die "Changing the exit of an AmneziaWG server is not supported; only OpenVPN gateways can use --via."
+        fi
+    fi
+    if [[ "$previous" == "$requested" ]]; then
+        release_lock global
+        log "App '$gateway' already uses '$requested'."
+        return 0
+    fi
+    if systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
+        was_active=on
+        if [[ "$requested" != host ]]; then
+            # Validate actual tunnel readiness, not merely a configured name.
+            if ! ( ensure_upstream_ready "$gateway" "$requested" >/dev/null ); then
+                release_lock global
+                warn "Upstream '$requested' is not ready; '$gateway' remains on '$previous'."
+                return 1
+            fi
+        fi
+    fi
+
+    cfg=$(gateway_cfg_file "$gateway")
+    snapshot=$(mktemp "${cfg}.set-via.XXXXXX") || {
+        release_lock global
+        die "Cannot create a rollback snapshot for '$gateway'."
+    }
+    if ! cp -p -- "$cfg" "$snapshot"; then
+        rm -f -- "$snapshot"
+        release_lock global
+        die "Cannot snapshot '$gateway' before changing its exit."
+    fi
+
+    if [[ "$was_active" == on ]]; then
+        if ! ( gateway_stop "$gateway" ) ||
+           systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
+            rm -f -- "$snapshot"
+            release_lock global
+            warn "Could not stop '$gateway' using '$previous'; exit was not changed."
+            return 1
+        fi
+    else
+        # A stopped service should not have a live data plane, but clean up
+        # any stale runtime under the OLD upstream before updating VIA_APP.
+        if ! ( gateway_down "$gateway" ); then
+            rm -f -- "$snapshot"
+            release_lock global
+            warn "Could not clean up '$gateway' before changing its exit."
+            return 1
+        fi
+    fi
+
+    acquire_lock "gateway-$gateway"
+    if ! ( gateway_cfg_set "$gateway" VIA_APP "$requested" ); then
+        release_lock "gateway-$gateway"
+        if cp -p -- "$snapshot" "$cfg"; then
+            rm -f -- "$snapshot"
+            warn "Failed to update '$gateway' exit; previous configuration restored."
+        else
+            warn "Failed to restore '$gateway' configuration; recovery snapshot kept: $snapshot"
+        fi
+        release_lock global
+        return 1
+    fi
+    release_lock "gateway-$gateway"
+
+    if [[ "$was_active" == on ]] && ! ( gateway_start "$gateway" ); then
+        warn "Failed to start '$gateway' via '$requested'; rolling back to '$previous'."
+        # The new upstream's partially provisioned rules must be torn down
+        # while VIA_APP still refers to the new upstream.
+        if ! ( gateway_stop "$gateway" ) ||
+           systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
+            release_lock global
+            warn "Rollback cannot stop the failed new service. Configuration snapshot kept: $snapshot"
+            return 1
+        fi
+        acquire_lock "gateway-$gateway"
+        if ! cp -p -- "$snapshot" "$cfg"; then
+            release_lock "gateway-$gateway"
+            release_lock global
+            warn "Rollback could not restore configuration. Snapshot kept: $snapshot"
+            return 1
+        fi
+        release_lock "gateway-$gateway"
+        rm -f -- "$snapshot"
+        if ! ( gateway_start "$gateway" ); then
+            release_lock global
+            warn "Configuration was restored to '$previous', but gateway '$gateway' did not restart."
+            return 1
+        fi
+        release_lock global
+        warn "Gateway '$gateway' restored to '$previous' after failed switch."
+        return 1
+    fi
+
+    rm -f -- "$snapshot"
+    release_lock global
+    log "Gateway '$gateway' exit changed: $previous -> $requested (previously $was_active)."
 }
 
 gateways_using_app() {
@@ -15040,6 +15165,10 @@ main() {
                     ;;
                 *) die "Usage: nns-app stop <app_name> [--local-only]" ;;
             esac
+            ;;
+        set-via)
+            (( $# == 3 )) || die "Usage: nns-app set-via <gateway-app> <upstream-app|host>"
+            gateway_set_via "$2" "$3"
             ;;
         route-mode)
             (( $# >= 3 && $# <= 4 )) ||

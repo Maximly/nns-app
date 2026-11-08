@@ -4,7 +4,7 @@ Major milestones are grouped by capability. Maintenance-only releases are not li
 
 ## 2.0 — Unified VPN and gateway management (2026-11-07)
 
-- Unified app lifecycle, run and client-management commands for namespace clients, host-exit servers and upstream-backed gateways; gateway `run` follows the configured egress.
+- Unified app lifecycle, run and client-management commands for namespace clients, host-exit servers and upstream-backed gateways; gateway `run` follows the configured egress. Gateways support changing egress with `set-via` while preserving client credentials and endpoint configuration, including rollback on failed startup.
 - Added automatic listener selection and public IPv4 endpoint discovery for
   manually created gateways, preserving explicit network overrides.
 - Prevented listener-port conflicts across host-exit and VPN-exit gateways.
