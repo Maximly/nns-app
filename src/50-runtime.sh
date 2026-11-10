@@ -45,9 +45,9 @@ wireguard_exec() {
         *) die "Unknown WireGuard-family backend '$protocol'." ;;
     esac
     [[ -n "$wg_quick" && -x "$wg_quick" ]] ||
-        die "$protocol requires ${wg_cmd} and ${wg_cmd}-quick. Install AmneziaWG tools (and its kernel module or userspace backend) before starting this app."
+        die "$protocol requires ${wg_cmd} and ${wg_cmd}-quick. On Ubuntu run: sudo nns-app --install amnezia"
     command -v "$wg_cmd" >/dev/null 2>&1 ||
-        die "$protocol requires '$wg_cmd'; install the matching tools before starting this app."
+        die "$protocol requires '$wg_cmd'. On Ubuntu run: sudo nns-app --install amnezia"
 
     prepare_wireguard_runtime_config \
         "$profile" "$runtime_config" "${DISABLE_IPV6:-on}"

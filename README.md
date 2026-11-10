@@ -6,7 +6,7 @@ chained namespaces, SSH-managed remote exits, and host-based VPN servers.
 The host's default route and DNS configuration remain independent of individual
 application environments.
 
-**Release:** 2.0.10  
+**Release:** 2.0.11  
 **Supported platforms:** Ubuntu and Fedora with systemd (Debian-family package installation is also supported)  
 **VPN backends:** OpenVPN 2.6+, WireGuard, AmneziaWG, and VPN-free inherited namespaces  
 **License:** GPL-3.0-or-later
@@ -14,12 +14,33 @@ application environments.
 The distribution contains modular Bash source and a generated single-file installer,
 `nns-app-install.sh`. Commands below assume that installer is available locally.
 
+### Optional AmneziaWG 3.1 tooling (Ubuntu)
+
+The application installer does **not** install AmneziaWG dependencies automatically.
+To explicitly install the userspace tools on Ubuntu, run:
+
+```bash
+sudo nns-app --install amnezia
+```
+
+This installs Ubuntu build prerequisites and builds upstream `awg`, `awg-quick`,
+and `amneziawg-go` from pinned AmneziaWG 3.1 tags into `/usr/local/bin`.
+It uses the userspace backend, not DKMS or kernel modules, and does not alter
+existing VPN app profiles. It needs Internet access to Ubuntu repositories,
+GitHub, and potentially the official Go toolchain service.
+
+Only after provisioning the tools, start the configured app:
+
+```bash
+nns-app start <app_name>
+```
+
 ## Requirements
 
 - Linux with systemd, network namespaces, IPv4 forwarding and iptables; root access to install and manage networking.
 - OpenVPN 2.6+, `iproute2`, `iptables`, `wireguard-tools`, Python 3, OpenSSL, sudo and SSH tools. The installer installs mapped packages using `apt` or `dnf`.
 - On Fedora, `iptables-nft` is used and firewalld integration manages the `nns-app` zone and `nns-app-forward` policy.
-- For AmneziaWG, install compatible `awg`, `awg-quick`, and an AmneziaWG kernel module or `amneziawg-go` separately. nns-app does not install external kernel modules or third-party package repositories.
+- For AmneziaWG, run `sudo nns-app --install amnezia` on Ubuntu to provision the userspace tools explicitly. Other distributions require compatible `awg`, `awg-quick`, and `amneziawg-go` installed separately. nns-app does not install DKMS or third-party package repositories.
 - For Cloak, install `ck-server` on the server and `ck-client` on each client separately.
 - IPv4 is the managed data plane; IPv6-only VPN profiles and IPv6 server forwarding are not supported.
 
@@ -298,8 +319,8 @@ AmneziaWG-compatible client, **not** Tunnelblick or standard WireGuard.
 
 Reinstalling an existing AmneziaWG server preserves peer keys and obfuscation
 settings. Changing its listener or address pool is not supported as an
-in-place migration. `awg` and `awg-quick` are required; a compatible kernel
-module or `amneziawg-go` must be available before installation.
+in-place migration. `awg`, `awg-quick`, and the userspace backend `amneziawg-go` are required for runtime.
+On Ubuntu, provision them explicitly using `nns-app --install amnezia`.
 
 ### OpenVPN clients: fixed IPs, routing and isolation
 

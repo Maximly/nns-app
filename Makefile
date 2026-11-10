@@ -5,6 +5,7 @@ build:
 
 test: build
 	./tests/test-static.sh
+	./tests/test-install-amnezia.sh
 	./tests/test-auto-mtu.sh
 	./tests/test-mtu-hook.sh
 	./tests/test-myloc.sh

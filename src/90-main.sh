@@ -360,6 +360,11 @@ main() {
     reexec_as_root_if_needed "$@"
 
     case "$cmd" in
+        --install)
+            [[ $# -eq 2 && "$2" == amnezia ]] ||
+                die "Usage: nns-app --install amnezia"
+            install_amnezia_userspace_tools
+            ;;
         backup)
             shift
             nns_backup "$@"

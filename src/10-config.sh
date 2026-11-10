@@ -47,7 +47,7 @@ reexec_as_root_if_needed() {
         list|status|myip|myloc|start|stop|run)
             sudo_args+=( -n )
             ;;
-        install|remove|add|purge|repair|backup|restore|gateway|remote|link|export|client|revoke|fixed-ip|route-mode|client-to-client|set-via)
+        --install|install|remove|add|purge|repair|backup|restore|gateway|remote|link|export|client|revoke|fixed-ip|route-mode|client-to-client|set-via)
             ;;
         *)
             die "Unknown command '$cmd'."

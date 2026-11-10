@@ -21,6 +21,7 @@
 # Author: Maxim Lyadvinsky
 #
 # Public commands:
+#   --install amnezia  (explicit Ubuntu userspace AmneziaWG dependencies)
 #   install [--local-only]
 #   install <name> --server [--amnezia] [--listen udp:1194|tcp:443] [--public host:port]
 #                         [--transport direct|cloak] [--server-name <decoy-host>]
@@ -67,7 +68,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.0.10"
+readonly VERSION="2.0.11"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -293,6 +294,7 @@ show_version() {
 usage() {
     cat <<'USAGE'
 Usage:
+  nns-app --install amnezia
   nns-app install [--local-only]
   nns-app install <name> --server [--amnezia] [--listen udp:1194|tcp:443] [--public host:port]
                   [--transport direct|cloak] [--server-name <cloak-decoy-host>]
