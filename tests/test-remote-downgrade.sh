@@ -20,6 +20,7 @@ refresh_managed_unit_metadata() { printf 'regenerate\n' >>"$TEST_TMP/actions"; }
 remote_auto_refresh_configured_nodes() { :; }
 ENGINE_PATH="$TEST_TMP/nns_app.sh"
 USER_PATH="$TEST_TMP/nns-app"
+GIT_VIA_PATH="$TEST_TMP/git-via"
 BASE_DIR="$TEST_TMP/apps"
 RUN_DIR="$TEST_TMP/run"
 CACHE_DIR="$TEST_TMP/cache"
@@ -35,25 +36,25 @@ install() {
     done
     command install "${kept[@]}"
 }
-VERSION=2.0.14
+VERSION=2.0.16
 cat >"$ENGINE_PATH" <<'SH'
 #!/bin/sh
-printf 'nns-app %s\n' "${TEST_INSTALLED_VERSION:-2.0.14}"
+printf 'nns-app %s\n' "${TEST_INSTALLED_VERSION:-2.0.16}"
 printf 'Author: test\n'
 SH
 chmod +x "$ENGINE_PATH"
 : >"$TEST_TMP/actions"
-export TEST_INSTALLED_VERSION=2.0.15
+export TEST_INSTALLED_VERSION=2.0.17
 [[ "$(nns_engine_version_from_output $'nns-app 2.0\nAuthor: Test')" == 2.0 ]] || fail 'two-component release version not parsed'
 [[ "$(nns_engine_version_from_output $'nns-app 1.3.48\nAuthor: Test')" == 1.3.48 ]] || fail 'legacy three-component version not parsed'
 nns_version_is_newer 2.0 1.3.48 || fail 'major upgrade comparison failed'
 nns_version_is_newer 2.0.1 2.0 || fail 'patch upgrade comparison failed'
-nns_version_is_newer 2.0.15 2.0.14 || fail 'next patch comparison failed'
+nns_version_is_newer 2.0.17 2.0.16 || fail 'next patch comparison failed'
 if nns_version_is_newer 1.3.48 2.0.2; then fail 'legacy version considered newer than 2.0.1'; fi
 if ( install_engine off ) >"$TEST_TMP/downgrade-log" 2>&1; then
     fail 'downgrade was accepted'
 fi
-grep -Fq 'Refusing nns-app downgrade 2.0.15 -> 2.0.14' "$TEST_TMP/downgrade-log" || fail 'missing downgrade explanation'
+grep -Fq 'Refusing nns-app downgrade 2.0.17 -> 2.0.16' "$TEST_TMP/downgrade-log" || fail 'missing downgrade explanation'
 ! grep -Eq '^(dependencies|overwrite|regenerate)$' "$TEST_TMP/actions" || fail 'downgrade ran side-effecting operations'
 
 # Equal and older engines may be installed and refreshed.
@@ -86,12 +87,12 @@ remote_auto_user_exec() {
         *) printf 'nns-app %s\nAuthor: Test\n' "$TEST_REMOTE_VERSION" ;;
     esac
 }
-for previous in absent 1.3.48 2.0 2.0.1 2.0.2 2.0.3 2.0.4 2.0.5 2.0.6 2.0.7 2.0.8 2.0.9 2.0.10 2.0.11 2.0.12 2.0.13 2.0.14; do
+for previous in absent 1.3.48 2.0 2.0.1 2.0.2 2.0.3 2.0.4 2.0.5 2.0.6 2.0.7 2.0.8 2.0.9 2.0.10 2.0.11 2.0.12 2.0.13 2.0.14 2.0.15 2.0.16; do
     TEST_REMOTE_VERSION="$previous"
     ( remote_auto_guard_remote_engine alice alice@example.org 2222 /tmp/ctl ) >/dev/null 2>&1 ||
         fail "remote preflight rejected $previous"
 done
-TEST_REMOTE_VERSION=2.0.15
+TEST_REMOTE_VERSION=2.0.17
 if ( remote_auto_guard_remote_engine alice alice@example.org 2222 /tmp/ctl ) >"$TEST_TMP/remote-log" 2>&1; then
     fail 'remote preflight accepted newer engine'
 fi

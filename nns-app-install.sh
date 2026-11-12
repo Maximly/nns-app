@@ -51,6 +51,7 @@
 #   start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
 #   stop    <app_name> [--local-only]
 #   run     <app_name> <command> [args...]
+#   git-via <app_name|-> (repository-local SSH transport switch)
 #   gateway create <gateway> --via <app> --listen tcp|udp:<port>
 #                  --public <host>:<port> [--transport direct|stunnel|cloak]
 #                  [--server-name <cloak-decoy-host>]
@@ -68,12 +69,13 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.0.14"
+readonly VERSION="2.0.16"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
 readonly ENGINE_PATH="/usr/local/sbin/nns_app.sh"
 readonly USER_PATH="/usr/local/bin/nns-app"
+readonly GIT_VIA_PATH="/usr/local/bin/git-via"
 readonly BASE_DIR="/etc/nns-app"
 readonly RUN_DIR="/run/nns-app"
 readonly NETNS_UNIT="/etc/systemd/system/nns-netns@.service"
@@ -333,6 +335,8 @@ Usage:
   nns-app stop    <app_name> [--local-only]
   nns-app set-via <gateway-app> <upstream-app|host>
   nns-app run     <app_name> <command> [arguments...]
+  git-via <app_name>     # route Git SSH via nns-app (current repository)
+  git-via -              # restore previous Git SSH command
 
   nns-app gateway create <name> --via <app> [--listen <tcp|udp>:<port>]
                   [--public <host>:<port>]
@@ -381,6 +385,8 @@ Examples:
   nns-app install my-private-app via --remote user@remote-host
   nns-app add my-private-app ~/my-base-profile.ovpn
   nns-app run my-private-app ping 1.1.1.1
+  git-via my-private-app  # in a Git repository
+  git-via -               # restore previous Git SSH transport
   sudo nns-app add my-upstream-vpn ~/my-base-profile.ovpn
   sudo nns-app install my-private-app --via my-upstream-vpn
   sudo nns-app install my-shared-app --backend inherit --via my-remote-exit
@@ -997,6 +1003,13 @@ install_engine_files() {
 
     local self
     self=$(readlink -f "$0")
+
+    # Preflight before replacing the engine: never clobber an unrelated
+    # executable in the new helper's path, or leave a partial upgrade.
+    if [[ -e "$GIT_VIA_PATH" || -L "$GIT_VIA_PATH" ]]; then
+        [[ -L "$GIT_VIA_PATH" && "$(readlink -f -- "$GIT_VIA_PATH")" == "$ENGINE_PATH" ]] ||
+            die "Refusing to overwrite unrelated $GIT_VIA_PATH."
+    fi
     install -d -o root -g root -m 0755 /usr/local/sbin /usr/local/bin
 
     if [[ "$self" != "$ENGINE_PATH" ]]; then
@@ -1006,6 +1019,10 @@ install_engine_files() {
         chmod 0755 "$ENGINE_PATH"
     fi
     ln -sfn "$ENGINE_PATH" "$USER_PATH"
+
+    # git-via is an entry point to the same installed engine, not another
+    # independent script that would drift from nns-app across upgrades.
+    ln -sfn "$ENGINE_PATH" "$GIT_VIA_PATH"
 
     cat >"$NETNS_UNIT" <<'NETNS_UNIT_EOF'
 [Unit]
@@ -1180,7 +1197,7 @@ CRL_TIMER_EOF
         "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$MTU_SERVICE" "$MTU_TIMER" "$GATEWAY_UNIT" \
         "$GATEWAY_CRL_SERVICE" "$GATEWAY_CRL_TIMER"
     restore_selinux_contexts \
-        "$ENGINE_PATH" "$USER_PATH" \
+        "$ENGINE_PATH" "$USER_PATH" "$GIT_VIA_PATH" \
         "$NETNS_UNIT" "$VPN_UNIT" "$ONLINE_UNIT" "$DNS_PROXY_UNIT" \
         "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$MTU_SERVICE" "$MTU_TIMER" "$GATEWAY_UNIT" \
         "$GATEWAY_CRL_SERVICE" "$GATEWAY_CRL_TIMER"
@@ -1247,6 +1264,7 @@ install_engine() {
 
     log "Installed nns-app $VERSION."
     log "Command: $USER_PATH"
+    log "Git SSH: $GIT_VIA_PATH"
     log "Engine:  $ENGINE_PATH"
 
     # Keep direct automatic-remote nodes at the same engine version as the
@@ -3734,6 +3752,46 @@ delete_veth_everywhere() {
     done < <(ip netns list 2>/dev/null || true)
 }
 
+# Avoid the host's nss-resolve AF_UNIX socket for glibc name lookups.
+# ip netns exec bind-mounts /etc/netns/NAME/nsswitch.conf into /etc, just
+# as it does for resolv.conf.  Only the hosts database is overridden; user,
+# group and other host NSS settings remain unchanged.
+namespace_dns_nsswitch_write() {
+    local source=$1 target=$2 tmp
+    [[ -f "$source" ]] || die "Missing host NSS configuration: $source"
+    [[ ! -L "$target" ]] || die "Refusing symlink NSS destination: $target"
+    tmp=$(mktemp "${target}.XXXXXX") || return 1
+    if ! awk '
+        /^[[:space:]]*hosts[[:space:]]*:/ {
+            # Do not let nss-resolve or mdns short-circuit our
+            # namespace resolver; nss-dns reads our bind-mounted resolv.conf.
+            if (++seen != 1) exit 1
+            print "hosts: files dns"
+            next
+        }
+        { print }
+        END { if (!seen) print "hosts: files dns" }
+    ' "$source" >"$tmp"; then
+        rm -f -- "$tmp"
+        die "Cannot prepare namespace-specific NSS configuration."
+    fi
+    chmod 0644 "$tmp" || { rm -f -- "$tmp"; return 1; }
+    mv -f -- "$tmp" "$target" || { rm -f -- "$tmp"; return 1; }
+}
+
+ensure_namespace_dns_nsswitch() {
+    local app=$1 target
+    load_cfg "$app"
+    target="/etc/netns/$NS_NAME/nsswitch.conf"
+    [[ -d "/etc/netns/$NS_NAME" ]] ||
+        die "Network namespace configuration directory missing for '$app'."
+    [[ ! -L "$target" ]] || die "Refusing symlink NSS destination: $target"
+    # Existing namespaces upgraded in place get the bind mount on the next
+    # nns-app run. Do not replace an administrator's existing per-netns file.
+    [[ -f "$target" ]] && return 0
+    namespace_dns_nsswitch_write /etc/nsswitch.conf "$target"
+}
+
 # Restore the normal per-namespace resolver during WireGuard bootstrap.
 # This permits hostname endpoints to be resolved by wg-quick before the VPN
 # route exists. The pre-tunnel firewall allows DNS only for uid 0.
@@ -3888,6 +3946,7 @@ netns_up() {
     done <"$endpoints_file"
 
     install -d -o root -g root -m 0755 "/etc/netns/$NS_NAME"
+    ensure_namespace_dns_nsswitch "$app"
     : >"/etc/netns/$NS_NAME/resolv.conf"
     local dns dns_list=()
     IFS=' ' read -r -a dns_list <<<"$DNS_SERVERS"
@@ -4549,6 +4608,7 @@ start_app() {
         current_via=$(runtime_via_for_app "$app")
     fi
     if app_is_started "$app" && [[ "$current" == "$profile_marker" && "$current_via" == "$desired_via" ]]; then
+        ensure_namespace_dns_nsswitch "$app"
         activate_namespace_split_dns "$app"
         sync_watchdog_timer "$app"
         if [[ "$ignore_start_error" == off ]] && wait_online "$app" 2; then
@@ -4948,6 +5008,10 @@ purge_engine() {
     systemctl daemon-reload
     systemctl reset-failed 2>/dev/null || true
 
+    # Remove only the helper symlink we installed; preserve unrelated files.
+    if [[ -L "$GIT_VIA_PATH" && "$(readlink -f -- "$GIT_VIA_PATH")" == "$ENGINE_PATH" ]]; then
+        rm -f -- "$GIT_VIA_PATH"
+    fi
     rm -f -- "$USER_PATH"
     rm -f -- "$ENGINE_PATH"
 
@@ -4955,7 +5019,7 @@ purge_engine() {
     if [[ "$cleanup_mode" != local-only ]]; then
         log "Removed automatic remote exits, gateways, clients, and per-owner SSH keys."
     fi
-    log "Removed: $BASE_DIR, /etc/netns/nns-*, NNS systemd units, NNS sudoers rules, $USER_PATH and $ENGINE_PATH"
+    log "Removed: $BASE_DIR, /etc/netns/nns-*, NNS systemd units, NNS sudoers rules, $USER_PATH, $GIT_VIA_PATH and $ENGINE_PATH"
 }
 
 
@@ -12806,6 +12870,7 @@ run_in_app() {
     fi
     ip netns list | awk '{print $1}' | grep -Fxq "$NS_NAME" ||
         die "Namespace '$NS_NAME' does not exist."
+    ensure_namespace_dns_nsswitch "$app"
 
     if bool_on "$KILLSWITCH"; then
         systemctl is-active --quiet "nns-openvpn@${app}.service" ||
@@ -14056,6 +14121,105 @@ myloc_command() {
 
     json=$(myloc_query "$ns") || die "IP geolocation unavailable from '$context' (DNS, network, API, or rate limit)."
     printf '%s\n' "$json" | myloc_format "$format" "$context"
+}
+
+# nns-app source module: repository-local SSH transport routing for Git.
+# This module is intentionally unprivileged and never runs Git through sudo.
+# `git-via <app>` affects this repository's Git SSH transport only. HTTPS
+# remotes, other repositories, and the host's SSH configuration are unchanged.
+
+git_via_command() {
+    if (( $# != 1 )); then
+        die "Usage: git-via <nns-app-name>|- (run inside a Git repository)"
+    fi
+    case "$1" in
+        -h|--help)
+            printf 'Usage: git-via <nns-app-name>|-\n  git-via app  Configure this repository SSH through nns-app\n  git-via -    Restore previous repository SSH command\n'
+            return 0
+            ;;
+    esac
+
+    command -v git >/dev/null 2>&1 || die "git is not installed."
+    git rev-parse --git-dir >/dev/null 2>&1 ||
+        die "git-via must be run inside a Git repository."
+
+    # Read local config only, so inherited/global SSH settings are restored
+    # automatically by clearing our local override. Preserve an explicit
+    # local command precisely, including whitespace, if one already exists.
+    local -a current_commands=()
+    mapfile -d '' -t current_commands < <(git config --local --null --get-all core.sshCommand || true)
+    (( ${#current_commands[@]} <= 1 )) ||
+        die "Multiple local core.sshCommand values exist; resolve them before git-via."
+
+    local active="" previous_set="" previous="" desired="" app=$1
+    active=$(git config --local --get nnsGitVia.activeApp 2>/dev/null || true)
+
+    if [[ "$app" == - ]]; then
+        if [[ -z "$active" ]]; then
+            # Support resetting older manually configured nns-app SSH overrides
+            # without modifying an unrelated pre-existing SSH command.
+            if (( ${#current_commands[@]} == 1 )) &&
+               [[ "${current_commands[0]}" =~ ^(nns-app|/usr/local/bin/nns-app)[[:space:]]+run[[:space:]]+[A-Za-z0-9][A-Za-z0-9._-]{0,31}[[:space:]]+ssh$ ]]; then
+                git config --local --unset-all core.sshCommand
+                log "Removed the manual nns-app Git SSH override; Git now uses its ordinary SSH configuration."
+            else
+                log "No git-via Git SSH override is active in this repository."
+            fi
+            return 0
+        fi
+
+        desired="$USER_PATH run $active ssh"
+        if (( ${#current_commands[@]} != 1 )) || [[ "${current_commands[0]}" != "$desired" ]]; then
+            die "core.sshCommand was changed outside git-via; refusing to overwrite it. Inspect git config --local --get core.sshCommand."
+        fi
+        previous_set=$(git config --local --get nnsGitVia.previousSet 2>/dev/null || true)
+        case "$previous_set" in
+            yes)
+                previous=$(git config --local --get nnsGitVia.previousSSHCommand) ||
+                    die "Saved Git SSH command missing; refusing to discard it."
+                git config --local --replace-all core.sshCommand "$previous"
+                log "Restored the previous repository-local Git SSH command."
+                ;;
+            no)
+                git config --local --unset-all core.sshCommand
+                log "Removed the repository-local Git SSH override; Git uses its ordinary SSH configuration."
+                ;;
+            *) die "Saved git-via state is incomplete; refusing to alter Git SSH settings." ;;
+        esac
+        git config --local --unset-all nnsGitVia.activeApp
+        git config --local --unset-all nnsGitVia.previousSet
+        if [[ "$previous_set" == yes ]]; then
+            git config --local --unset-all nnsGitVia.previousSSHCommand
+        fi
+        return 0
+    fi
+
+    validate_app_name "$app"
+    [[ -f "$(cfg_file "$app")" ]] ||
+        die "NNS app '$app' is not installed. Install it with nns-app before configuring Git."
+
+    # Switching to another app must not replace the original SSH setting
+    # saved before the first git-via invocation.
+    if [[ -n "$active" ]]; then
+        desired="$USER_PATH run $active ssh"
+        if (( ${#current_commands[@]} != 1 )) || [[ "${current_commands[0]}" != "$desired" ]]; then
+            die "core.sshCommand was changed outside git-via; refusing to overwrite it."
+        fi
+    else
+        [[ -z "$(git config --local --get nnsGitVia.previousSet 2>/dev/null || true)" ]] ||
+            die "Incomplete previous git-via state; refusing to replace saved settings."
+        if (( ${#current_commands[@]} == 1 )); then
+            git config --local --replace-all nnsGitVia.previousSSHCommand "${current_commands[0]}"
+            git config --local --replace-all nnsGitVia.previousSet yes
+        else
+            git config --local --replace-all nnsGitVia.previousSet no
+        fi
+    fi
+
+    git config --local --replace-all core.sshCommand "$USER_PATH run $app ssh"
+    git config --local --replace-all nnsGitVia.activeApp "$app"
+    log "This repository's Git SSH transport now uses nns-app '$app'."
+    log "Use ordinary git pull/fetch/push; run 'git-via -' to restore Git SSH."
 }
 
 # nns-app source module: conservative state and lifecycle reconciliation.
@@ -15633,6 +15797,14 @@ managed_client_remove() {
 }
 
 main() {
+    # Both /usr/local/bin/nns-app and /usr/local/bin/git-via link to this
+    # executable. git-via is intentionally unprivileged and edits only the
+    # current Git repository's config.
+    if [[ "${0##*/}" == git-via ]]; then
+        git_via_command "$@"
+        return
+    fi
+
     local cmd=${1:-}
     if [[ -z "$cmd" ]]; then
         show_version
@@ -15785,6 +15957,12 @@ main() {
             exit
             ;;
     esac
+
+    if [[ "$cmd" == git-via ]]; then
+        shift
+        git_via_command "$@"
+        return
+    fi
 
     reexec_as_root_if_needed "$@"
 

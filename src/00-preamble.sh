@@ -51,6 +51,7 @@
 #   start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
 #   stop    <app_name> [--local-only]
 #   run     <app_name> <command> [args...]
+#   git-via <app_name|-> (repository-local SSH transport switch)
 #   gateway create <gateway> --via <app> --listen tcp|udp:<port>
 #                  --public <host>:<port> [--transport direct|stunnel|cloak]
 #                  [--server-name <cloak-decoy-host>]
@@ -68,12 +69,13 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.0.14"
+readonly VERSION="2.0.16"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
 readonly ENGINE_PATH="/usr/local/sbin/nns_app.sh"
 readonly USER_PATH="/usr/local/bin/nns-app"
+readonly GIT_VIA_PATH="/usr/local/bin/git-via"
 readonly BASE_DIR="/etc/nns-app"
 readonly RUN_DIR="/run/nns-app"
 readonly NETNS_UNIT="/etc/systemd/system/nns-netns@.service"
@@ -333,6 +335,8 @@ Usage:
   nns-app stop    <app_name> [--local-only]
   nns-app set-via <gateway-app> <upstream-app|host>
   nns-app run     <app_name> <command> [arguments...]
+  git-via <app_name>     # route Git SSH via nns-app (current repository)
+  git-via -              # restore previous Git SSH command
 
   nns-app gateway create <name> --via <app> [--listen <tcp|udp>:<port>]
                   [--public <host>:<port>]
@@ -381,6 +385,8 @@ Examples:
   nns-app install my-private-app via --remote user@remote-host
   nns-app add my-private-app ~/my-base-profile.ovpn
   nns-app run my-private-app ping 1.1.1.1
+  git-via my-private-app  # in a Git repository
+  git-via -               # restore previous Git SSH transport
   sudo nns-app add my-upstream-vpn ~/my-base-profile.ovpn
   sudo nns-app install my-private-app --via my-upstream-vpn
   sudo nns-app install my-shared-app --backend inherit --via my-remote-exit

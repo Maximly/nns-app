@@ -1,64 +1,20 @@
-## 2.0.14 — 2026-11-12
-
-- Honor standard WireGuard/AmneziaWG `DNS = IPv4, search.domain` in the imported profile; DNS= now configures the namespace's DNS proxy instead of being silently ignored.
-- Forward ordinary `DNS=` queries to the profile resolvers over AllowedIPs, preserve DNS search suffixes in namespace-local resolv.conf, and keep `~domain` hook policies route-only.
-- Reject unsupported, duplicate, mixed or non-VPN-routed DNS settings; do not execute profile shell hooks or modify host DNS.
-- Activate the DNS stub after tunnel startup, while retaining bootstrap resolvers for WireGuard endpoint hostname resolution and root-only pre-tunnel traffic.
-
-## 2.0.13 — 2026-11-12
-
-- Fix Ubuntu 26.04 AppArmor denial when `wg-quick` attempts to read the generated WireGuard configuration from `/run/nns-app/`. Runtime configurations now live under `/etc/wireguard/nns-app/` with root-only permissions while running.
-- Generate the private-key runtime file atomically with mode `0600`, including during replacement; cleanup removes both the new path and legacy `/run/nns-app/` artifacts.
-- Keep split DNS, kill-switch and profile validation behavior unchanged from 2.0.12.
-
-## 2.0.12 — 2026-11-12
-
-- Accept only the declarative WireGuard/AmneziaWG `resolvectl dns %i`, `resolvectl domain %i ~domain`, and `resolvectl revert %i` hooks; arbitrary hooks remain forbidden.
-- Apply profile-specific route-only DNS inside the application network namespace via the existing unprivileged UDP/TCP DNS proxy; preserve normal fallback DNS for other domains subject to the namespace kill switch.
-- Delay resolver redirection until VPN routes are ready to preserve DNS bootstrap for hostname-based endpoints, including systemd autostart.
-- Strip all accepted hooks from the runtime `wg-quick` configuration. Revalidate profiles on backend start.
-
 # Changelog
 
-Major milestones are grouped by capability. Maintenance-only releases are not listed separately.
+Highlights are grouped by major release series. Individual patch and minor releases are intentionally omitted.
 
-## 2.0 — Unified VPN and gateway management (2026-11-07)
+## 2.x — Unified private networking (2026)
 
-- Unified app lifecycle, run and client-management commands for namespace clients, host-exit servers and upstream-backed gateways; gateway `run` follows the configured egress. Gateways support changing egress with `set-via` while preserving client credentials and endpoint configuration, including rollback on failed startup.
-- Added automatic listener selection and public IPv4 endpoint discovery for
-  manually created gateways, preserving explicit network overrides.
-- Prevented listener-port conflicts across host-exit and VPN-exit gateways.
-- Unified the local inventory of application namespaces, public VPN servers, managed gateways and exported client identities, with filtered views and detailed health reporting.
-- Added host-based OpenVPN servers with UDP or TCP listeners, automatic client enrollment on export, revocation and full client removal, fixed server-assigned IPv4 addresses, independent split/full routing and optional client-to-client forwarding.
-- Added Cloak-protected OpenVPN server transport, per-client Cloak credentials and paired client configuration exports.
-- Added AmneziaWG 3.1 host servers, randomized obfuscation parameters, fixed peer allocations, native split/full client exports and peer revocation.
-- Extended WireGuard and AmneziaWG client import to preserve IPv4 split-tunnel routes and AmneziaWG 3.1 header-protection settings.
-- Added full-state backup and restore with archive validation, credential preservation and recovery of managed systemd service state.
-- Protected destination hosts against remote-bootstrap downgrades and supported in-place server configuration reconciliation without replacing client credentials.
+- Unified management of VPN apps, host-exit servers, gateways, clients and routing, including inventory, health checks, `run`, `set-via`, export and revocation.
+- Added OpenVPN and AmneziaWG servers, Cloak transport, client-specific addresses, split/full routes and optional client-to-client access.
+- Improved WireGuard/AmneziaWG split-tunnel support and DNS isolation: validated profile DNS settings and safe `resolvectl` hooks, namespace DNS proxy, and NSS overrides for Git/SSH hostname resolution.
+- Added `git-via <app>` to route a repository's SSH connections through an NNS app, with `git-via -` to restore its prior settings.
+- Added automatic gateway endpoint configuration, full-state backup/restore, safer remote upgrades and in-place server configuration reconciliation.
+- Hardened private-key handling, AppArmor compatibility, kill switches, DNS routing and service lifecycle cleanup.
 
-## 1.3 — Automatic remote application exits
+## 1.x — Per-application VPN namespaces (2026)
 
-- Introduced `install <app> via --remote <user@host>` for remotely provisioned VPN exits with a private, SSH-forwarded gateway.
-- Added automated provider-profile deployment, unique gateway/client enrollment, remote runtime synchronization, credential rotation and supervised reconnect behavior.
-- Added client profile export and revocation for remotely managed public OpenVPN access.
-- Consolidated local and remote runtime status, external exit-IP inspection, repair and inventory reporting.
-
-## 1.2 — Chaining, remote gateways and recovery
-
-- Introduced inherited namespaces and multi-hop chaining, with dependency-aware startup/shutdown and protection against host-uplink fallback.
-- Added manually managed remote hosts, OpenVPN gateways, `direct`/`stunnel`/`cloak` transports and versioned `.nnslink` bundles.
-- Added adaptive data-path watchdogs, network-namespace recovery and safer desktop/Electron/Snap launch support.
-- Strengthened remote SSH trust, bundle import validation and credential rotation.
-
-## 1.1 — Reliability and packaging
-
-- Split the implementation into ordered source modules, added a deterministic single-file installer build and regression tests.
-- Improved network and policy-route allocation, resource ownership, firewall isolation, DNS handling and startup diagnosis.
-- Added transactional gateway certificate issuance/revocation, service dependency management, OpenVPN version checks and CRL renewal.
-- Improved privilege handling and application launcher behavior.
-
-## 1.0 — Per-application VPN namespaces
-
-- Introduced per-app Linux network namespaces with veth routing, DNS isolation and kill switches.
-- Added OpenVPN and WireGuard client profiles, application launch helpers, start/stop/status commands and optional VPN Gate relay selection.
-- Added upstream-gateway routing, per-client OpenVPN certificates and initial public profile export.
+- Introduced isolated Linux network namespaces with per-app routing, DNS configuration, kill switches, and OpenVPN/WireGuard profile support.
+- Added application launch and lifecycle commands, VPN Gate relay selection, status reporting and basic client profile export.
+- Introduced VPN chaining, inherited namespaces, remote gateways, `.nnslink` bundles, and direct/stunnel/Cloak transports.
+- Added automated remote VPN exits, SSH-forwarded private gateways, credential management and remote synchronization.
+- Improved reliability with watchdogs, recovery tools, Snap/desktop compatibility, modular builds and regression tests.

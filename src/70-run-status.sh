@@ -463,6 +463,7 @@ run_in_app() {
     fi
     ip netns list | awk '{print $1}' | grep -Fxq "$NS_NAME" ||
         die "Namespace '$NS_NAME' does not exist."
+    ensure_namespace_dns_nsswitch "$app"
 
     if bool_on "$KILLSWITCH"; then
         systemctl is-active --quiet "nns-openvpn@${app}.service" ||

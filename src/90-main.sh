@@ -206,6 +206,14 @@ managed_client_remove() {
 }
 
 main() {
+    # Both /usr/local/bin/nns-app and /usr/local/bin/git-via link to this
+    # executable. git-via is intentionally unprivileged and edits only the
+    # current Git repository's config.
+    if [[ "${0##*/}" == git-via ]]; then
+        git_via_command "$@"
+        return
+    fi
+
     local cmd=${1:-}
     if [[ -z "$cmd" ]]; then
         show_version
@@ -358,6 +366,12 @@ main() {
             exit
             ;;
     esac
+
+    if [[ "$cmd" == git-via ]]; then
+        shift
+        git_via_command "$@"
+        return
+    fi
 
     reexec_as_root_if_needed "$@"
 

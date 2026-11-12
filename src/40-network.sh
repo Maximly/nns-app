@@ -307,6 +307,46 @@ delete_veth_everywhere() {
     done < <(ip netns list 2>/dev/null || true)
 }
 
+# Avoid the host's nss-resolve AF_UNIX socket for glibc name lookups.
+# ip netns exec bind-mounts /etc/netns/NAME/nsswitch.conf into /etc, just
+# as it does for resolv.conf.  Only the hosts database is overridden; user,
+# group and other host NSS settings remain unchanged.
+namespace_dns_nsswitch_write() {
+    local source=$1 target=$2 tmp
+    [[ -f "$source" ]] || die "Missing host NSS configuration: $source"
+    [[ ! -L "$target" ]] || die "Refusing symlink NSS destination: $target"
+    tmp=$(mktemp "${target}.XXXXXX") || return 1
+    if ! awk '
+        /^[[:space:]]*hosts[[:space:]]*:/ {
+            # Do not let nss-resolve or mdns short-circuit our
+            # namespace resolver; nss-dns reads our bind-mounted resolv.conf.
+            if (++seen != 1) exit 1
+            print "hosts: files dns"
+            next
+        }
+        { print }
+        END { if (!seen) print "hosts: files dns" }
+    ' "$source" >"$tmp"; then
+        rm -f -- "$tmp"
+        die "Cannot prepare namespace-specific NSS configuration."
+    fi
+    chmod 0644 "$tmp" || { rm -f -- "$tmp"; return 1; }
+    mv -f -- "$tmp" "$target" || { rm -f -- "$tmp"; return 1; }
+}
+
+ensure_namespace_dns_nsswitch() {
+    local app=$1 target
+    load_cfg "$app"
+    target="/etc/netns/$NS_NAME/nsswitch.conf"
+    [[ -d "/etc/netns/$NS_NAME" ]] ||
+        die "Network namespace configuration directory missing for '$app'."
+    [[ ! -L "$target" ]] || die "Refusing symlink NSS destination: $target"
+    # Existing namespaces upgraded in place get the bind mount on the next
+    # nns-app run. Do not replace an administrator's existing per-netns file.
+    [[ -f "$target" ]] && return 0
+    namespace_dns_nsswitch_write /etc/nsswitch.conf "$target"
+}
+
 # Restore the normal per-namespace resolver during WireGuard bootstrap.
 # This permits hostname endpoints to be resolved by wg-quick before the VPN
 # route exists. The pre-tunnel firewall allows DNS only for uid 0.
@@ -461,6 +501,7 @@ netns_up() {
     done <"$endpoints_file"
 
     install -d -o root -g root -m 0755 "/etc/netns/$NS_NAME"
+    ensure_namespace_dns_nsswitch "$app"
     : >"/etc/netns/$NS_NAME/resolv.conf"
     local dns dns_list=()
     IFS=' ' read -r -a dns_list <<<"$DNS_SERVERS"

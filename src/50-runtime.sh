@@ -501,6 +501,7 @@ start_app() {
         current_via=$(runtime_via_for_app "$app")
     fi
     if app_is_started "$app" && [[ "$current" == "$profile_marker" && "$current_via" == "$desired_via" ]]; then
+        ensure_namespace_dns_nsswitch "$app"
         activate_namespace_split_dns "$app"
         sync_watchdog_timer "$app"
         if [[ "$ignore_start_error" == off ]] && wait_online "$app" 2; then
@@ -900,6 +901,10 @@ purge_engine() {
     systemctl daemon-reload
     systemctl reset-failed 2>/dev/null || true
 
+    # Remove only the helper symlink we installed; preserve unrelated files.
+    if [[ -L "$GIT_VIA_PATH" && "$(readlink -f -- "$GIT_VIA_PATH")" == "$ENGINE_PATH" ]]; then
+        rm -f -- "$GIT_VIA_PATH"
+    fi
     rm -f -- "$USER_PATH"
     rm -f -- "$ENGINE_PATH"
 
@@ -907,7 +912,7 @@ purge_engine() {
     if [[ "$cleanup_mode" != local-only ]]; then
         log "Removed automatic remote exits, gateways, clients, and per-owner SSH keys."
     fi
-    log "Removed: $BASE_DIR, /etc/netns/nns-*, NNS systemd units, NNS sudoers rules, $USER_PATH and $ENGINE_PATH"
+    log "Removed: $BASE_DIR, /etc/netns/nns-*, NNS systemd units, NNS sudoers rules, $USER_PATH, $GIT_VIA_PATH and $ENGINE_PATH"
 }
 
 

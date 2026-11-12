@@ -6,7 +6,7 @@ chained namespaces, SSH-managed remote exits, and host-based VPN servers.
 The host's default route and DNS configuration remain independent of individual
 application environments.
 
-**Release:** 2.0.14  
+**Release:** 2.0.16  
 **Supported platforms:** Ubuntu and Fedora with systemd (Debian-family package installation is also supported)  
 **VPN backends:** OpenVPN 2.6+, WireGuard, AmneziaWG, and VPN-free inherited namespaces  
 **License:** GPL-3.0-or-later
@@ -64,6 +64,18 @@ DNS server must belong to the peer's IPv4 `AllowedIPs` routes. An inactive
 private resolver never falls back to a public DNS server for matching domains.
 After the tunnel becomes ready, `/etc/netns/nns-<app>/resolv.conf` points at the
 namespace-local resolver on `127.0.0.53`. The host resolver is unchanged.
+On systems that enable `nss-resolve` (including Ubuntu), nns-app also creates
+`/etc/netns/nns-<app>/nsswitch.conf` with `hosts: files dns`; `ip netns exec`
+bind-mounts it into the command's private mount namespace. This ensures glibc,
+SSH, and `git-via` use the application DNS configuration rather than querying
+host `systemd-resolved` through its Unix socket. All other NSS databases are
+copied unchanged and the host's `/etc/nsswitch.conf` is never edited.
+Existing namespaces are updated automatically by `nns-app run`.
+
+Standard WireGuard `DNS = 192.168.83.10, promobit.loc` is also supported. It
+uses the private DNS server for all names; `promobit.loc` is additionally a
+search suffix. To limit forwarding to only private names, use the supported
+route-only `PostUp`/`PostDown` hook declarations instead.
 
 For a private-only split tunnel with `KILLSWITCH=on`, ordinary public DNS will
 be unreachable unless the DNS server itself is accessible through the VPN;
@@ -530,3 +542,19 @@ network-resource ownership and testing requirements.
 ## License
 
 GNU General Public License v3.0 or later; see [LICENSE](LICENSE).
+
+### Git SSH through an NNS application
+
+Run `git-via bitblaze` inside a Git repository after installing the `bitblaze`
+NNS app. Normal `git fetch`, `git pull`, and `git push` then use the SSH
+transport `/usr/local/bin/nns-app run bitblaze ssh` within that namespace.
+`git-via another-app` switches the transport without discarding the original
+repository-local `core.sshCommand`. `git-via -` restores the original command,
+or removes the local override if there was none. Run without `sudo`.
+
+This affects only SSH remotes for the current Git repository (and other
+worktrees sharing its local config). HTTPS remotes, global SSH config, and other
+repositories are unchanged. The selected NNS app must be running when Git needs
+network access. Inherited `GIT_SSH_COMMAND`, `GIT_SSH`, and Git `includeIf`
+settings can override the local setting. Use `git config --show-origin --get
+core.sshCommand` to see the effective configuration.

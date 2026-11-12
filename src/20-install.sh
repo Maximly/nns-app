@@ -174,6 +174,13 @@ install_engine_files() {
 
     local self
     self=$(readlink -f "$0")
+
+    # Preflight before replacing the engine: never clobber an unrelated
+    # executable in the new helper's path, or leave a partial upgrade.
+    if [[ -e "$GIT_VIA_PATH" || -L "$GIT_VIA_PATH" ]]; then
+        [[ -L "$GIT_VIA_PATH" && "$(readlink -f -- "$GIT_VIA_PATH")" == "$ENGINE_PATH" ]] ||
+            die "Refusing to overwrite unrelated $GIT_VIA_PATH."
+    fi
     install -d -o root -g root -m 0755 /usr/local/sbin /usr/local/bin
 
     if [[ "$self" != "$ENGINE_PATH" ]]; then
@@ -183,6 +190,10 @@ install_engine_files() {
         chmod 0755 "$ENGINE_PATH"
     fi
     ln -sfn "$ENGINE_PATH" "$USER_PATH"
+
+    # git-via is an entry point to the same installed engine, not another
+    # independent script that would drift from nns-app across upgrades.
+    ln -sfn "$ENGINE_PATH" "$GIT_VIA_PATH"
 
     cat >"$NETNS_UNIT" <<'NETNS_UNIT_EOF'
 [Unit]
@@ -357,7 +368,7 @@ CRL_TIMER_EOF
         "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$MTU_SERVICE" "$MTU_TIMER" "$GATEWAY_UNIT" \
         "$GATEWAY_CRL_SERVICE" "$GATEWAY_CRL_TIMER"
     restore_selinux_contexts \
-        "$ENGINE_PATH" "$USER_PATH" \
+        "$ENGINE_PATH" "$USER_PATH" "$GIT_VIA_PATH" \
         "$NETNS_UNIT" "$VPN_UNIT" "$ONLINE_UNIT" "$DNS_PROXY_UNIT" \
         "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" "$MTU_SERVICE" "$MTU_TIMER" "$GATEWAY_UNIT" \
         "$GATEWAY_CRL_SERVICE" "$GATEWAY_CRL_TIMER"
@@ -424,6 +435,7 @@ install_engine() {
 
     log "Installed nns-app $VERSION."
     log "Command: $USER_PATH"
+    log "Git SSH: $GIT_VIA_PATH"
     log "Engine:  $ENGINE_PATH"
 
     # Keep direct automatic-remote nodes at the same engine version as the
