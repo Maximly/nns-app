@@ -320,6 +320,8 @@ main() {
             [[ $# -eq 3 ]] || die "_wait-online requires app_name and timeout."
             wait_online "$2" "$3" ||
                 die "NNS app '$2' did not become online within $3 seconds."
+            activate_namespace_split_dns "$2" ||
+                die "NNS split DNS activation failed for '$2'."
             mtu_auto_repair "$2"
             exit
             ;;

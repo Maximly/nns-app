@@ -1,3 +1,10 @@
+## 2.0.12 — 2026-11-12
+
+- Accept only the declarative WireGuard/AmneziaWG `resolvectl dns %i`, `resolvectl domain %i ~domain`, and `resolvectl revert %i` hooks; arbitrary hooks remain forbidden.
+- Apply profile-specific route-only DNS inside the application network namespace via the existing unprivileged UDP/TCP DNS proxy; preserve normal fallback DNS for other domains subject to the namespace kill switch.
+- Delay resolver redirection until VPN routes are ready to preserve DNS bootstrap for hostname-based endpoints, including systemd autostart.
+- Strip all accepted hooks from the runtime `wg-quick` configuration. Revalidate profiles on backend start.
+
 # Changelog
 
 Major milestones are grouped by capability. Maintenance-only releases are not listed separately.

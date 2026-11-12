@@ -6,7 +6,7 @@ chained namespaces, SSH-managed remote exits, and host-based VPN servers.
 The host's default route and DNS configuration remain independent of individual
 application environments.
 
-**Release:** 2.0.11  
+**Release:** 2.0.12  
 **Supported platforms:** Ubuntu and Fedora with systemd (Debian-family package installation is also supported)  
 **VPN backends:** OpenVPN 2.6+, WireGuard, AmneziaWG, and VPN-free inherited namespaces  
 **License:** GPL-3.0-or-later
@@ -43,6 +43,32 @@ nns-app start <app_name>
 - For AmneziaWG, run `sudo nns-app --install amnezia` on Ubuntu to provision the userspace tools explicitly. Other distributions require compatible `awg`, `awg-quick`, and `amneziawg-go` installed separately. nns-app does not install DKMS or third-party package repositories.
 - For Cloak, install `ck-server` on the server and `ck-client` on each client separately.
 - IPv4 is the managed data plane; IPv6-only VPN profiles and IPv6 server forwarding are not supported.
+
+## Route-only DNS in WireGuard profiles
+
+WireGuard and AmneziaWG client profiles may use **only** the following
+`wg-quick` hook forms in `[Interface]` (with literal IPv4 servers and
+route-only DNS suffixes):
+
+```ini
+PostUp = resolvectl dns %i 192.168.83.10
+PostUp = resolvectl domain %i '~promobit.loc'
+PostDown = resolvectl revert %i
+```
+
+`nns-app` validates these declarations, **does not execute** them, and strips
+them from the runtime config. Instead, its unprivileged namespace DNS proxy
+forwards `promobit.loc` and subdomains to `192.168.83.10`; all other queries
+use `DNS_SERVERS` and remain subject to the namespace kill switch. The private
+DNS server must belong to the peer's IPv4 `AllowedIPs` routes. An inactive
+private resolver never falls back to a public DNS server for matching domains.
+After the tunnel becomes ready, `/etc/netns/nns-<app>/resolv.conf` points at the
+namespace-local resolver on `127.0.0.53`. The host resolver is unchanged.
+
+For a private-only split tunnel with `KILLSWITCH=on`, ordinary public DNS will
+be unreachable unless the DNS server itself is accessible through the VPN;
+this is intentional to prevent DNS leakage. Unsupported script hooks remain
+rejected at import.
 
 ## Quick start
 

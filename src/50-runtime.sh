@@ -49,6 +49,12 @@ wireguard_exec() {
     command -v "$wg_cmd" >/dev/null 2>&1 ||
         die "$protocol requires '$wg_cmd'. On Ubuntu run: sudo nns-app --install amnezia"
 
+    validate_wireguard "$profile" "$protocol"
+    # A reconnect may start with a DNS stub left by the prior successful
+    # session. Restore bootstrap DNS for hostname endpoints before wg-quick.
+    if [[ -n "$(wireguard_profile_dns_policy "$profile")" ]]; then
+        reset_namespace_bootstrap_dns "$app"
+    fi
     prepare_wireguard_runtime_config \
         "$profile" "$runtime_config" "${DISABLE_IPV6:-on}"
 
@@ -490,6 +496,7 @@ start_app() {
         current_via=$(runtime_via_for_app "$app")
     fi
     if app_is_started "$app" && [[ "$current" == "$profile_marker" && "$current_via" == "$desired_via" ]]; then
+        activate_namespace_split_dns "$app"
         sync_watchdog_timer "$app"
         if [[ "$ignore_start_error" == off ]] && wait_online "$app" 2; then
             mtu_auto_repair "$app"
@@ -561,6 +568,11 @@ start_app() {
             ext=$(ip netns exec "$NS_NAME" curl -4fsS \
                   --connect-timeout 1 --max-time 1 \
                   "$EXTERNAL_IP_URL" 2>/dev/null || true)
+        fi
+        if ! ( activate_namespace_split_dns "$app" ); then
+            warn "Split DNS initialization failed for '$app'; stopping the environment."
+            stop_app "$app"
+            return 1
         fi
         if watchdog_enabled_for_type "$vpn_type"; then
             watchdog_mark_online "$app"

@@ -24,6 +24,7 @@ test: build
 	./tests/test-amneziawg.sh
 	./tests/test-awg-server.sh
 	./tests/test-split-tunnel.sh
+	./tests/test-split-dns.sh
 
 clean:
 	rm -f nns-app-install.sh

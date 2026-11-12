@@ -101,6 +101,7 @@ import base64
 import binascii
 import ipaddress
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -124,7 +125,52 @@ if amnezia:
 allowed_peer = {
     "publickey", "presharedkey", "allowedips", "endpoint", "persistentkeepalive"
 }
-forbidden = {"preup", "postup", "predown", "postdown", "saveconfig"}
+forbidden = {"preup", "predown", "saveconfig"}
+dns_hook_servers = []
+dns_hook_domains = []
+dns_hook_revert = 0
+
+
+def parse_dns_hook(key, value, line_no):
+    global dns_hook_revert
+    # A hook is data only: no shell is ever executed. shlex handles quotes
+    # accepted by wg-quick profiles but does NOT run shell expansion.
+    try:
+        args = shlex.split(value, posix=True)
+    except ValueError:
+        fail(line_no, "malformed DNS hook quoting")
+    if key == "postdown":
+        if args != ["resolvectl", "revert", "%i"] or dns_hook_revert:
+            fail(line_no, "only one 'PostDown = resolvectl revert %i' is permitted")
+        dns_hook_revert = 1
+        return
+    if len(args) < 4 or args[:1] != ["resolvectl"] or args[2] != "%i":
+        fail(line_no, "only resolvectl dns/domain %i DNS settings are permitted in PostUp")
+    if args[1] == "dns" and not dns_hook_servers:
+        servers = []
+        for item in args[3:]:
+            try:
+                address = ipaddress.ip_address(item)
+            except ValueError:
+                fail(line_no, "PostUp DNS requires literal IPv4 addresses")
+            if address.version != 4 or address.is_unspecified or address.is_multicast:
+                fail(line_no, "PostUp DNS requires usable IPv4 addresses")
+            servers.append(str(address))
+        dns_hook_servers.extend(servers)
+    elif args[1] == "domain" and not dns_hook_domains:
+        for item in args[3:]:
+            if not item.startswith("~"):
+                fail(line_no, "PostUp domain must be route-only (~domain)")
+            domain = item[1:].lower().rstrip(".")
+            labels = domain.split(".")
+            if len(domain) > 253 or not labels or any(
+                len(label) > 63 or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+                for label in labels
+            ):
+                fail(line_no, "invalid route-only DNS domain")
+            dns_hook_domains.append(domain)
+    else:
+        fail(line_no, "duplicate or unsupported PostUp DNS hook")
 
 section = None
 interface_count = 0
@@ -249,6 +295,11 @@ for line_no, raw in enumerate(lines, 1):
         fail(line_no, "empty key or value")
     if key in forbidden:
         fail(line_no, f"unsafe or state-changing option '{key_raw.strip()}' is not supported")
+    if key in {"postup", "postdown"}:
+        if section != "interface":
+            fail(line_no, "DNS hooks are allowed only in [Interface]")
+        parse_dns_hook(key, value, line_no)
+        continue
 
     allowed = allowed_interface if section == "interface" else allowed_peer
     if key not in allowed:
@@ -346,6 +397,13 @@ if peer_count < 1:
 if endpoint_count < 1:
     raise SystemExit("profile must contain at least one IPv4/hostname Endpoint")
 
+if dns_hook_servers or dns_hook_domains or dns_hook_revert:
+    if not (dns_hook_servers and dns_hook_domains and dns_hook_revert == 1):
+        raise SystemExit("resolvectl hooks require PostUp dns, PostUp domain and PostDown revert")
+    if any(not any(address in net for net in allowed_networks)
+           for address in map(ipaddress.ip_address, dns_hook_servers)):
+        raise SystemExit("route-only DNS servers must be reachable through peer AllowedIPs")
+
 # A VPN namespace may intentionally route only selected private networks.
 # Preserve AllowedIPs verbatim; the namespace kill switch prevents packets to
 # other destinations from escaping through its host-facing veth.
@@ -434,6 +492,85 @@ app_split_tunnel() {
     [[ "$(wireguard_profile_route_mode "$(profiles_dir "$app")/$profile")" == split ]]
 }
 
+# Return two newline-separated fields: routed IPv4 DNS servers and routed
+# domain suffixes. Empty output means this profile does not configure split DNS.
+# Validation is performed at import and again before starting the backend.
+wireguard_profile_dns_policy() {
+    local profile=$1
+    python3 - "$profile" <<'PY_WG_DNS_POLICY'
+import ipaddress
+import re
+import shlex
+import sys
+from pathlib import Path
+
+servers = []
+domains = []
+reverts = 0
+section = None
+for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = line.split("#", 1)[0].strip()
+    if not line:
+        continue
+    if line.startswith("["):
+        section = line.strip("[] ").lower()
+        continue
+    if "=" not in line:
+        continue
+    key, value = line.split("=", 1)
+    key = key.strip().lower()
+    if key not in {"postup", "postdown"}:
+        continue
+    if section != "interface":
+        raise SystemExit("DNS hook outside [Interface]")
+    args = shlex.split(value.strip())
+    if key == "postdown":
+        if args != ["resolvectl", "revert", "%i"]:
+            raise SystemExit("unsupported PostDown hook")
+        reverts += 1
+    elif len(args) >= 4 and args[:3] == ["resolvectl", "dns", "%i"]:
+        if servers:
+            raise SystemExit("duplicate DNS hook")
+        for token in args[3:]:
+            address = ipaddress.ip_address(token)
+            if address.version != 4 or address.is_unspecified or address.is_multicast:
+                raise SystemExit("invalid hook DNS server")
+            servers.append(str(address))
+    elif len(args) >= 4 and args[:3] == ["resolvectl", "domain", "%i"]:
+        if domains:
+            raise SystemExit("duplicate domain hook")
+        for token in args[3:]:
+            if not token.startswith("~"):
+                raise SystemExit("domain hook requires route-only DNS")
+            suffix = token[1:].lower().rstrip(".")
+            if not suffix or len(suffix) > 253 or not all(
+                re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", x)
+                and len(x) <= 63 for x in suffix.split(".")
+            ):
+                raise SystemExit("invalid DNS domain suffix")
+            domains.append(suffix)
+    else:
+        raise SystemExit("unsupported PostUp hook")
+
+if servers or domains or reverts:
+    if not (servers and domains and reverts == 1):
+        raise SystemExit("incomplete WireGuard split DNS hooks")
+    print(" ".join(servers))
+    print(" ".join(domains))
+PY_WG_DNS_POLICY
+}
+
+# True if this WireGuard-family application's profile defines route-only DNS.
+app_has_split_dns() {
+    local app=$1 vpn_type profile policy
+    vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    [[ "$vpn_type" == wireguard || "$vpn_type" == amneziawg ]] || return 1
+    profile=$(cfg_read_value "$app" DEFAULT_PROFILE 2>/dev/null || true)
+    [[ -n "$profile" && -f "$(profiles_dir "$app")/$profile" ]] || return 1
+    policy=$(wireguard_profile_dns_policy "$(profiles_dir "$app")/$profile") || return 1
+    [[ -n "$policy" ]]
+}
+
 prepare_wireguard_runtime_config() {
     local source=$1 target=$2 disable_ipv6=${3:-on}
     python3 - "$source" "$target" "$disable_ipv6" <<'PY_WG_RUNTIME'
@@ -465,7 +602,11 @@ for raw in text.splitlines():
     key = key_raw.strip().casefold()
     value = value_raw.split("#", 1)[0].strip()
 
-    if key in {"preup", "postup", "predown", "postdown", "saveconfig"}:
+    # The only accepted PostUp/PostDown hooks are declarative resolvectl
+    # hints. They were validated on import and must NEVER reach wg-quick.
+    if key in {"postup", "postdown"}:
+        continue
+    if key in {"preup", "predown", "saveconfig"}:
         raise SystemExit(f"unsafe WireGuard option reached runtime: {key_raw.strip()}")
     if key == "dns":
         continue
@@ -765,8 +906,12 @@ add_profile() {
         else
             log "OpenVPN profile fixups are disabled in $(cfg_file "$app")."
         fi
-    elif grep -Eiq '^[[:space:]]*DNS[[:space:]]*=' "$dest"; then
-        log "VPN profile DNS setting is ignored at runtime; namespace DNS_SERVERS remains authoritative."
+    else
+        if [[ -n "$(wireguard_profile_dns_policy "$dest")" ]]; then
+            log "Split DNS policy imported; route-only domains use the profile's DNS server inside the namespace."
+        elif grep -Eiq '^[[:space:]]*DNS[[:space:]]*=' "$dest"; then
+            log "VPN profile DNS setting is ignored at runtime; namespace DNS_SERVERS remains authoritative."
+        fi
     fi
 
     if [[ "$type" == wireguard || "$type" == amneziawg ]]; then

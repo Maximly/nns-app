@@ -307,6 +307,44 @@ delete_veth_everywhere() {
     done < <(ip netns list 2>/dev/null || true)
 }
 
+# Restore the normal per-namespace resolver during WireGuard bootstrap.
+# This permits hostname endpoints to be resolved by wg-quick before the VPN
+# route exists. The pre-tunnel firewall allows DNS only for uid 0.
+reset_namespace_bootstrap_dns() {
+    local app=$1 dns
+    load_cfg "$app"
+    local target="/etc/netns/$NS_NAME/resolv.conf"
+    [[ -f "$target" ]] || return 0
+    : >"$target"
+    local -a dns_list=()
+    IFS=' ' read -r -a dns_list <<<"$DNS_SERVERS"
+    for dns in "${dns_list[@]}"; do
+        [[ -n "$dns" ]] && printf 'nameserver %s\n' "$dns" >>"$target"
+    done
+    printf 'options timeout:2 attempts:2 rotate\n' >>"$target"
+    chmod 0644 "$target"
+}
+
+# Called once tunnel routing is ready. DNS remains isolated within the app's
+# network namespace; systemd-resolved on the host is not modified.
+activate_namespace_split_dns() {
+    local app=$1 vpn_type profile policy target
+    load_cfg "$app"
+    vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    [[ "$vpn_type" == wireguard || "$vpn_type" == amneziawg ]] || return 0
+    profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
+    policy=$(wireguard_profile_dns_policy "$profile") || return 1
+    [[ -n "$policy" ]] || return 0
+    target="/etc/netns/$NS_NAME/resolv.conf"
+    [[ -f "$target" ]] || { warn "Missing namespace resolver for '$app'."; return 1; }
+    # Start the daemon before pointing subsequent execs at the stub.
+    ensure_snap_dns_proxy "$app"
+    if ! grep -Fxq 'nameserver 127.0.0.53' "$target"; then
+        printf 'nameserver 127.0.0.53\noptions timeout:2 attempts:2\n' >"$target"
+        chmod 0644 "$target"
+    fi
+}
+
 netns_up() {
     require_root
     local app=$1
@@ -458,6 +496,26 @@ netns_up() {
         -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     ip netns exec "$NS_NAME" iptables -w 5 -A OUTPUT \
         -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    # Keep route-only DNS pinned to the VPN even with KILLSWITCH=off.
+    # When the tunnel disappears these DNS packets must not fall back through
+    # the veth into the host network or other nested upstreams.
+    if [[ "$vpn_type" == wireguard || "$vpn_type" == amneziawg ]]; then
+        local policy private_dns field
+        local -a private_servers=()
+        policy=$(wireguard_profile_dns_policy "$profile") ||
+            die "Invalid managed WireGuard DNS policy for '$app'."
+        if [[ -n "$policy" ]]; then
+            private_dns=${policy%%$'\n'*}
+            IFS=' ' read -r -a private_servers <<<"$private_dns"
+            for field in "${private_servers[@]}"; do
+                ip netns exec "$NS_NAME" iptables -w 5 -A OUTPUT \
+                    -o "$VETH_NS" -d "$field" -p udp --dport 53 -j REJECT
+                ip netns exec "$NS_NAME" iptables -w 5 -A OUTPUT \
+                    -o "$VETH_NS" -d "$field" -p tcp --dport 53 -j REJECT
+            done
+        fi
+    fi
 
     if bool_on "$KILLSWITCH"; then
         while IFS='|' read -r endpoint_ip endpoint_port endpoint_proto; do

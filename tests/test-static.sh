@@ -9,7 +9,7 @@ bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fxq 'nns-app 2.0.11' <<<"$(head -n1 <<<"$version")"
+grep -Fxq 'nns-app 2.0.12' <<<"$(head -n1 <<<"$version")"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -167,7 +167,7 @@ grep -Fq '_dns-proxy %i' "$INSTALLER"
 grep -Fq 'ensure_snap_dns_proxy "$app"' "$INSTALLER"
 grep -Fq '127.0.0.53' "$INSTALLER"
 grep -Fq 'os.setuid(nobody.pw_uid)' "$INSTALLER"
-grep -Fq 'Snap DNS proxy:    active on 127.0.0.53:53' "$INSTALLER"
+grep -Fq 'Namespace DNS:     proxy active on 127.0.0.53:53' "$INSTALLER"
 grep -Fq 'nns-watchdog@.service' "$INSTALLER"
 grep -Fq 'nns-watchdog@.timer' "$INSTALLER"
 grep -Fq '_watchdog %i' "$INSTALLER"
@@ -222,7 +222,7 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 2.0.11' "$ROOT/README.md"
+grep -Fq '**Release:** 2.0.12' "$ROOT/README.md"
 grep -Fq '## Quick start' "$ROOT/README.md"
 grep -Fq '### Run a VPN locally' "$ROOT/README.md"
 grep -Fq 'nns-app install my-private-app' "$ROOT/README.md"

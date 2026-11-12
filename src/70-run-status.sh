@@ -136,6 +136,18 @@ dns_proxy_exec() {
     ip netns list | awk '{print $1}' | grep -Fxq "$NS_NAME" ||
         die "Namespace '$NS_NAME' does not exist for the DNS compatibility proxy."
 
+    local profile policy split_servers="" split_domains="" vpn_type
+    vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    if [[ "$vpn_type" == wireguard || "$vpn_type" == amneziawg ]]; then
+        profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
+        policy=$(wireguard_profile_dns_policy "$profile") ||
+            die "Invalid WireGuard DNS policy for '$app'."
+        if [[ -n "$policy" ]]; then
+            split_servers=${policy%%$'\n'*}
+            split_domains=${policy#*$'\n'}
+        fi
+    fi
+
     # Snap reuses a persistent mount namespace and can therefore see the
     # host's systemd-resolved stub (127.0.0.53) instead of the resolver file
     # bind-mounted by `ip netns exec`.  Run a tiny proxy on that address inside
@@ -144,7 +156,7 @@ dns_proxy_exec() {
     # root-only DNS exception cannot leak application DNS around the kill
     # switch while the VPN is down.
     exec "$(ip_binary)" netns exec "$NS_NAME" \
-        /usr/bin/python3 - "$DNS_SERVERS" <<'PY_NNS_DNS_PROXY'
+        /usr/bin/python3 - "$DNS_SERVERS" "$split_servers" "$split_domains" <<'PY_NNS_DNS_PROXY'
 from __future__ import annotations
 
 import ipaddress
@@ -175,6 +187,48 @@ for item in sys.argv[1].split():
 if not upstreams:
     raise SystemExit("nns-app DNS proxy requires at least one IPv4 DNS server")
 
+# A private DNS server is selected only for matching QNAME suffixes. There is
+# no fallback to ordinary DNS for private names, even if that server is down.
+private_upstreams = [(address, UPSTREAM_PORT) for address in sys.argv[2].split()]
+private_domains = tuple(suffix.lower() for suffix in sys.argv[3].split())
+if bool(private_upstreams) != bool(private_domains):
+    raise SystemExit("incomplete namespace split DNS policy")
+
+
+def dns_question_name(packet: bytes) -> str | None:
+    # Require a conventional single-question query with uncompressed QNAME.
+    # Malformed or compressed questions are discarded rather than leaking to
+    # an untrusted default resolver.
+    if len(packet) < 17 or struct.unpack_from("!H", packet, 4)[0] != 1:
+        return None
+    offset = 12
+    labels = []
+    while offset < len(packet):
+        length = packet[offset]
+        offset += 1
+        if length == 0:
+            if offset + 4 > len(packet):
+                return None
+            try:
+                return b".".join(labels).decode("ascii").lower()
+            except UnicodeDecodeError:
+                return None
+        if length > 63 or offset + length > len(packet) or len(labels) >= 127:
+            return None
+        labels.append(packet[offset:offset + length])
+        offset += length
+    return None
+
+
+def dns_upstreams(packet: bytes) -> list[tuple[str, int]]:
+    name = dns_question_name(packet)
+    if name is None:
+        return []
+    if private_domains and any(name == suffix or name.endswith("." + suffix)
+                               for suffix in private_domains):
+        return private_upstreams
+    return upstreams
+
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
     chunks: list[bytes] = []
@@ -189,7 +243,7 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
 
 
 def forward_udp(payload: bytes) -> bytes | None:
-    for upstream in upstreams:
+    for upstream in dns_upstreams(payload):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
                 sock.settimeout(QUERY_TIMEOUT)
@@ -203,7 +257,7 @@ def forward_udp(payload: bytes) -> bytes | None:
 
 def forward_tcp(payload: bytes) -> bytes | None:
     request = struct.pack("!H", len(payload)) + payload
-    for upstream in upstreams:
+    for upstream in dns_upstreams(payload):
         try:
             with socket.create_connection(upstream, timeout=QUERY_TIMEOUT) as sock:
                 sock.settimeout(QUERY_TIMEOUT)
@@ -266,7 +320,8 @@ for thread in threads:
 
 print(
     f"nns-app DNS compatibility proxy listening on {LISTEN_ADDRESS}:{LISTEN_PORT}; "
-    f"upstreams={','.join(address for address, _port in upstreams)}",
+    f"upstreams={','.join(address for address, _port in upstreams)}; "
+    f"private={','.join(private_domains)} via {','.join(address for address, _port in private_upstreams)}",
     flush=True,
 )
 
@@ -416,6 +471,10 @@ run_in_app() {
             die "VPN tunnel for '$app' is not ready."
         wait_online "$app" 2 ||
             die "VPN data path for '$app' is not online yet."
+    fi
+
+    if app_has_split_dns "$app"; then
+        activate_namespace_split_dns "$app"
     fi
 
     # Snap keeps its own persistent mount namespace and can bypass the resolver
@@ -1067,10 +1126,22 @@ status_app() {
     fi
     printf 'Kill switch:       %s\n' "${KILLSWITCH:-unknown}"
     printf 'DNS servers:       %s\n' "${DNS_SERVERS:-not configured}"
+    if [[ "$type" == wireguard || "$type" == amneziawg ]]; then
+        local dns_policy="" routed_dns="" routed_domains=""
+        if [[ -n "${DEFAULT_PROFILE:-}" && -f "$(profiles_dir "$app")/$DEFAULT_PROFILE" ]]; then
+            dns_policy=$(wireguard_profile_dns_policy "$(profiles_dir "$app")/$DEFAULT_PROFILE" 2>/dev/null || true)
+        fi
+        if [[ -n "$dns_policy" ]]; then
+            routed_dns=${dns_policy%%$'\n'*}
+            routed_domains=${dns_policy#*$'\n'}
+            printf 'Split DNS domains: %s\n' "$routed_domains"
+            printf 'Split DNS servers: %s\n' "$routed_dns"
+        fi
+    fi
     if [[ "$dns_proxy_state" == active ]]; then
-        printf 'Snap DNS proxy:    active on 127.0.0.53:53\n'
+        printf 'Namespace DNS:     proxy active on 127.0.0.53:53\n'
     else
-        printf 'Snap DNS proxy:    inactive; starts on demand\n'
+        printf 'Namespace DNS:     proxy inactive (on demand / split DNS start)\n'
     fi
     printf 'Tunnel interface:  %s\n' "${route_iface:-not ready}"
     if [[ "$type" == openvpn ]]; then
