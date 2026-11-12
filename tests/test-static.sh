@@ -45,7 +45,7 @@ grep -Fq 'remote_auto_snapshot_provider_ipv4s' "$INSTALLER"
 grep -Fq 'start_app "$exit_app" probe __default__' "$INSTALLER"
 grep -Fq 'PROVIDER_VPN_IPV4' "$INSTALLER"
 grep -Fq 'POOL_ID' "$INSTALLER"
-grep -Fq 'shared pool' "$ROOT/README.md"
+grep -Fq 'remote exit' "$ROOT/README.md"
 autostart_sets=$(grep -Fc 'cfg_set "$app" AUTOSTART on' "$INSTALLER")
 (( autostart_sets >= 2 )) || {
     echo 'automatic-remote install/deploy does not enable boot startup' >&2
@@ -222,19 +222,19 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Release:** 2.0.16' "$ROOT/README.md"
+grep -Fq '**Current release:** 2.0.16' "$ROOT/README.md"
 grep -Fq '## Quick start' "$ROOT/README.md"
-grep -Fq '### Run a VPN locally' "$ROOT/README.md"
-grep -Fq 'nns-app install my-private-app' "$ROOT/README.md"
+grep -Fq '## Quick start' "$ROOT/README.md"
+grep -Fq 'nns-app install work-vpn' "$ROOT/README.md"
 grep -Fq 'install --local-only' "$ROOT/README.md"
 grep -Fq 'remote_auto_refresh_configured_nodes' "$INSTALLER"
 grep -Fq "install --local-only; sudo /bin/bash '\$remote_tmp' _remote-auto-authorize" "$INSTALLER"
-grep -Fq '### Run a VPN on a remote Linux host' "$ROOT/README.md"
-grep -Fq 'nns-app install my-private-app via --remote user@remote-host' "$ROOT/README.md"
-grep -Fq 'nns-app run my-private-app ping -c 4 1.1.1.1' "$ROOT/README.md"
-grep -Fq 'nns-app export ovpn my-private-app --client my-laptop' "$ROOT/README.md"
-grep -Fq 'optional even on the first export' "$ROOT/README.md"
-grep -Fq 'nns-app revoke my-private-app my-phone' "$ROOT/README.md"
+grep -Fq '### Remote VPN exit' "$ROOT/README.md"
+grep -Fq 'nns-app install remote-work via --remote user@remote.example' "$ROOT/README.md"
+grep -Fq 'nns-app run work-vpn ip route get 10.77.0.53' "$ROOT/README.md"
+grep -Fq 'nns-app export ovpn office-server --client laptop' "$ROOT/README.md"
+grep -Fq 're-export profiles when public endpoints' "$ROOT/README.md"
+grep -Fq 'nns-app client revoke office-server laptop' "$ROOT/README.md"
 grep -Fq 'remote_auto_public_export_internal' "$INSTALLER"
 grep -Fq 'remote_auto_public_revoke_internal' "$INSTALLER"
 grep -Fq 'remote_auto_public_gateway_name' "$INSTALLER"
@@ -243,16 +243,16 @@ grep -Fq 'OPENVPN_COMPAT="$openvpn_compat"' "$INSTALLER"
 grep -Fq "printf 'tls-auth %s 0\\n'" "$INSTALLER"
 grep -Fq 'public-export)' "$INSTALLER"
 grep -Fq 'public-revoke)' "$INSTALLER"
-grep -Fq 'nns-app add my-private-app any' "$ROOT/README.md"
-grep -Fq 'nns-app add my-private-app any JP' "$ROOT/README.md"
-grep -Fq 'VPN Gate relay list is downloaded and candidates are probed' "$ROOT/README.md"
-grep -Fq 'local client does not need access to VPN Gate' "$ROOT/README.md"
+grep -Fq 'nns-app add work-vpn any' "$ROOT/README.md"
+grep -Fq 'nns-app add work-vpn any JP' "$ROOT/README.md"
+grep -Fq 'relay selection and probing occur on the remote host' "$ROOT/README.md"
+grep -Fq 'VPN Gate relay' "$ROOT/README.md"
 grep -Fq 'add_selected_profile_for_app' "$INSTALLER"
 grep -Fq 'remote_auto_add_any_profile "$app" "$country" "$force_refresh"' "$INSTALLER"
 grep -Fq 'deploy-any)' "$INSTALLER"
 grep -Fq 'Selection, CSV download, endpoint probing, and profile decoding' "$INSTALLER"
 grep -Fq 'OpenVPN 2.6+' "$ROOT/README.md"
-grep -Fq '**Supported platforms:** Ubuntu and Fedora with systemd' "$ROOT/README.md"
+grep -Fq 'Ubuntu and Fedora tested' "$ROOT/README.md"
 grep -Fq 'iptables-nft' "$ROOT/README.md"
 grep -Fq 'nns-app-forward' "$ROOT/README.md"
 grep -Fq "fedora:iptables) printf 'iptables-nft\\n'" "$INSTALLER"
@@ -272,22 +272,22 @@ grep -Fq 'ufw allow "$port/$proto" comment "$marker"' "$INSTALLER"
 grep -Fq 'ufw delete allow "$port/$proto" comment "$marker"' "$INSTALLER"
 grep -Fq -- '--add-port="$port/$proto"' "$INSTALLER"
 grep -Fq -- '--remove-port="$port/$proto"' "$INSTALLER"
-grep -Fq 'tagged iptables INPUT rule' "$ROOT/README.md"
-grep -Fq 'administrator firewall rules are not removed or globally flushed.' "$ROOT/README.md"
+grep -Fq 'Network and firewall resources are owned by nns-app' "$ROOT/README.md"
+grep -Fq 'cloud firewall policies or router port forwarding are' "$ROOT/README.md"
 grep -Fq 'restore_selinux_contexts' "$INSTALLER"
 if grep -Fq '/usr/sbin/openvpn' "$INSTALLER"; then
     echo 'hard-coded Ubuntu OpenVPN path remains in installer' >&2
     exit 1
 fi
 
-# Public documentation and help use one descriptive example-name set.
+# Public documentation uses generic examples only.
 for expected_name in \
-    my-private-app \
-    my-upstream-vpn \
-    my-remote-exit \
-    my-relay \
-    my-linux-client \
-    my-remote-profile.ovpn; do
+    work-vpn \
+    upstream-vpn \
+    remote-work \
+    relay-gateway \
+    dev-sandbox \
+    corp.example; do
     grep -Fq "$expected_name" "$ROOT/README.md"
 done
 
@@ -368,7 +368,7 @@ if grep -Fq '"Peer Connection Initiated" in log_text' "$INSTALLER"; then
     echo 'VPN Gate probe still accepts TLS-only peer connection' >&2
     exit 1
 fi
-grep -Fq 'credentials (`vpn` / `vpn`)' "$ROOT/README.md"
+grep -Fq 'Availability and trust of volunteer relays vary' "$ROOT/README.md"
 
 grep -Fq 'nns-app list [apps|namespaces|gateways|clients|all]' "$INSTALLER" || {
     echo 'extended list usage is missing' >&2
@@ -408,7 +408,7 @@ for list_form in 'list all' 'list gateway' 'list clients'; do
         exit 1
     }
 done
-grep -Fq 'nns-app list all         # local and remote apps + exported clients' "$ROOT/README.md" || {
+grep -Fq 'nns-app list all' "$ROOT/README.md" || {
     echo 'README does not document list all' >&2
     exit 1
 }

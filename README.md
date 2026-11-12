@@ -1,88 +1,52 @@
 # nns-app
 
-`nns-app` isolates Linux application traffic in network namespaces and manages VPN
-clients and servers from one CLI. It supports OpenVPN, WireGuard, AmneziaWG,
-chained namespaces, SSH-managed remote exits, and host-based VPN servers.
-The host's default route and DNS configuration remain independent of individual
-application environments.
+**Private networks for individual Linux applications, without changing the host's default route.**
 
-**Release:** 2.0.16  
-**Supported platforms:** Ubuntu and Fedora with systemd (Debian-family package installation is also supported)  
-**VPN backends:** OpenVPN 2.6+, WireGuard, AmneziaWG, and VPN-free inherited namespaces  
-**License:** GPL-3.0-or-later
+`nns-app` creates isolated Linux network namespaces and connects them through OpenVPN,
+WireGuard, AmneziaWG, other NNS applications, or managed VPN gateways. Applications
+run with their regular user privileges; network routing, DNS, and kill switches are
+managed per namespace.
 
-The distribution contains modular Bash source and a generated single-file installer,
-`nns-app-install.sh`. Commands below assume that installer is available locally.
+**Current release:** 2.0.16 · **License:** GPL-3.0-or-later · **Platforms:** Linux with systemd (Ubuntu and Fedora tested; Debian-family package installation supported) · **Network stack:** IPv4
 
-### Optional AmneziaWG 3.1 tooling (Ubuntu)
+## Contents
 
-The application installer does **not** install AmneziaWG dependencies automatically.
-To explicitly install the userspace tools on Ubuntu, run:
+- [Capabilities](#capabilities)
+- [Install and upgrade](#install-and-upgrade)
+- [Quick start](#quick-start)
+- [Client workflows](#client-workflows)
+  - [WireGuard and private DNS](#wireguard-and-private-dns)
+  - [Git over a private VPN](#git-over-a-private-vpn)
+  - [VPN chaining and inherited networks](#vpn-chaining-and-inherited-networks)
+  - [Remote VPN exit](#remote-vpn-exit)
+- [VPN servers and gateways](#vpn-servers-and-gateways)
+  - [OpenVPN server](#openvpn-server)
+  - [VPN-backed gateway](#vpn-backed-gateway)
+  - [Cloak transport](#cloak-transport)
+  - [AmneziaWG server](#amneziawg-server)
+  - [Client management](#client-management)
+- [Operate and troubleshoot](#operate-and-troubleshoot)
+- [Backup and restore](#backup-and-restore)
+- [Security and limitations](#security-and-limitations)
+- [Build and contribute](#build-and-contribute)
 
-```bash
-sudo nns-app --install amnezia
-```
+## Capabilities
 
-This installs Ubuntu build prerequisites and builds upstream `awg`, `awg-quick`,
-and `amneziawg-go` from pinned AmneziaWG 3.1 tags into `/usr/local/bin`.
-It uses the userspace backend, not DKMS or kernel modules, and does not alter
-existing VPN app profiles. It needs Internet access to Ubuntu repositories,
-GitHub, and potentially the official Go toolchain service.
+| Feature | Description |
+| --- | --- |
+| Application isolation | Separate network namespace, veth, resolver, routing policy, and kill switch for each app |
+| VPN clients | OpenVPN 2.6+, WireGuard, and AmneziaWG; full- and split-tunnel IPv4 routes |
+| Chaining | Route one VPN through another, or inherit a VPN connection without starting an inner tunnel |
+| Private DNS | Honor validated WireGuard `DNS =` and safe `resolvectl` hook declarations within the namespace |
+| Git integration | `git-via <app>` routes a repository's SSH transport through the selected app; `git-via -` resets it |
+| VPN servers | Host-egress OpenVPN and AmneziaWG; OpenVPN gateways with an upstream VPN exit |
+| Remote networking | SSH-managed remote exits, managed clients, `.nnslink` bundles, optional Cloak/stunnel transports |
+| Operations | Inventory, status, external-IP/geolocation inspection, watchdogs, backups, and repair |
 
-Only after provisioning the tools, start the configured app:
+## Install and upgrade
 
-```bash
-nns-app start <app_name>
-```
-
-## Requirements
-
-- Linux with systemd, network namespaces, IPv4 forwarding and iptables; root access to install and manage networking.
-- OpenVPN 2.6+, `iproute2`, `iptables`, `wireguard-tools`, Python 3, OpenSSL, sudo and SSH tools. The installer installs mapped packages using `apt` or `dnf`.
-- On Fedora, `iptables-nft` is used and firewalld integration manages the `nns-app` zone and `nns-app-forward` policy.
-- For AmneziaWG, run `sudo nns-app --install amnezia` on Ubuntu to provision the userspace tools explicitly. Other distributions require compatible `awg`, `awg-quick`, and `amneziawg-go` installed separately. nns-app does not install DKMS or third-party package repositories.
-- For Cloak, install `ck-server` on the server and `ck-client` on each client separately.
-- IPv4 is the managed data plane; IPv6-only VPN profiles and IPv6 server forwarding are not supported.
-
-## Route-only DNS in WireGuard profiles
-
-WireGuard and AmneziaWG client profiles may use **only** the following
-`wg-quick` hook forms in `[Interface]` (with literal IPv4 servers and
-route-only DNS suffixes):
-
-```ini
-PostUp = resolvectl dns %i 192.168.83.10
-PostUp = resolvectl domain %i '~promobit.loc'
-PostDown = resolvectl revert %i
-```
-
-`nns-app` validates these declarations, **does not execute** them, and strips
-them from the runtime config. Instead, its unprivileged namespace DNS proxy
-forwards `promobit.loc` and subdomains to `192.168.83.10`; all other queries
-use `DNS_SERVERS` and remain subject to the namespace kill switch. The private
-DNS server must belong to the peer's IPv4 `AllowedIPs` routes. An inactive
-private resolver never falls back to a public DNS server for matching domains.
-After the tunnel becomes ready, `/etc/netns/nns-<app>/resolv.conf` points at the
-namespace-local resolver on `127.0.0.53`. The host resolver is unchanged.
-On systems that enable `nss-resolve` (including Ubuntu), nns-app also creates
-`/etc/netns/nns-<app>/nsswitch.conf` with `hosts: files dns`; `ip netns exec`
-bind-mounts it into the command's private mount namespace. This ensures glibc,
-SSH, and `git-via` use the application DNS configuration rather than querying
-host `systemd-resolved` through its Unix socket. All other NSS databases are
-copied unchanged and the host's `/etc/nsswitch.conf` is never edited.
-Existing namespaces are updated automatically by `nns-app run`.
-
-Standard WireGuard `DNS = 192.168.83.10, promobit.loc` is also supported. It
-uses the private DNS server for all names; `promobit.loc` is additionally a
-search suffix. To limit forwarding to only private names, use the supported
-route-only `PostUp`/`PostDown` hook declarations instead.
-
-For a private-only split tunnel with `KILLSWITCH=on`, ordinary public DNS will
-be unreachable unless the DNS server itself is accessible through the VPN;
-this is intentional to prevent DNS leakage. Unsupported script hooks remain
-rejected at import.
-
-## Quick start
+The release archive contains modular `src/` files and a generated standalone
+`nns-app-install.sh`. Install from a **trusted local copy**:
 
 ```bash
 sudo bash nns-app-install.sh install
@@ -90,471 +54,397 @@ nns-app --version
 nns-app list
 ```
 
-`install` refreshes configured automatic-remote nodes as well as the local engine.
-To upgrade only the current machine without contacting remote hosts:
+To update only the local machine without refreshing managed remote hosts:
 
 ```bash
 sudo bash nns-app-install.sh install --local-only
 ```
 
-Remote bootstrap checks destination versions and refuses to replace a newer
-engine with an older one. Upgrade the initiating and destination hosts to the
-same release before performing remote-management operations.
+Installer-managed packages include `iproute2`, `iptables`, Python 3, OpenSSL,
+SSH, OpenVPN, WireGuard tools, and other runtime dependencies as appropriate.
+The installer supports `apt` and `dnf`; it does not automatically add third-party
+repositories or install a kernel module for AmneziaWG.
+On Fedora, `iptables-nft` is used and firewalld integration manages the
+`nns-app` zone and `nns-app-forward` policy.
 
-### Run a VPN locally
-
-```bash
-nns-app install my-private-app
-nns-app add my-private-app ~/my-base-profile.ovpn
-nns-app start my-private-app
-nns-app run my-private-app ping -c 4 1.1.1.1
-nns-app status my-private-app
-```
-
-Use a WireGuard `.conf` or AmneziaWG `.conf` instead of an `.ovpn` file to
-select those backends. AmneziaWG parameters are validated and preserved.
-WireGuard and AmneziaWG accept IPv4 split-tunnel `AllowedIPs` such as
-`10.30.0.0/16`; a split-route configuration can be `READY` without confirming
-reachability to an actual remote service. The kill switch blocks unmatched
-traffic by default.
-
-**Automatic OpenVPN MTU recovery:** On startup, a full-tunnel OpenVPN app
-first checks IP reachability, then verifies completed HTTPS transfers using
-Cloudflare's 32-KiB speed-test download and the ipify IPv4 endpoint. If both
-succeed, the interface MTU is unchanged unless a previously saved value
-needs reapplication. If a transfer stalls *after* TLS
-ClientHello, nns-app temporarily tests smaller TUN MTUs (1400, 1360, 1320,
-1280, 1200). It saves the first setting at which every previously failing
-transfer recovers twice and every initially healthy probe remains working;
-otherwise it restores the original MTU. Unavailable targets do not prevent
-recovery of an independently confirmed TLS stall. DNS failures, TCP connection
-failures, certificate errors, and split-tunnel apps cannot by themselves
-trigger tuning. Probes are budget-limited, and the
-last result is displayed in `nns-app status`. Set `AUTO_MTU="off"` in the
-app configuration to disable checks; `TUN_MTU` holds the last measured value
-and is reapplied at TUN creation/reconnect by OpenVPN's `--up` callback.
-An independent, network-free 10-second timer reconciles later MTU drift;
-its check is not delayed by the connectivity watchdog. Clearing `TUN_MTU`
-returns to the profile's MTU on the next restart. External probe hosts are not guaranteed to
-be available on every network.
-
-For free VPN Gate OpenVPN relay selection:
+**Optional AmneziaWG userspace tools (Ubuntu):**
 
 ```bash
-nns-app add my-private-app any
-nns-app add my-private-app any JP
+sudo nns-app --install amnezia
 ```
 
-The VPN Gate relay list is downloaded and candidates are probed before a
-profile is installed. Public relays may use documented public OpenVPN
-credentials (`vpn` / `vpn`); availability and trust vary by provider.
+This explicitly builds `awg`, `awg-quick`, and `amneziawg-go` from pinned
+upstream AmneziaWG 3.1 tags. It needs Internet access and build tools. Other
+Linux distributions need compatible tools installed separately; DKMS is not
+required by the userspace implementation.
 
-### Run a VPN on a remote Linux host
+**Prerequisites:** systemd, Linux network namespaces, IPv4 forwarding, iptables,
+root privileges for network administration, and appropriate SSH/sudo access for
+remote management. For Cloak, install `ck-server`/`ck-client` separately.
+
+## Quick start
+
+Create an application environment, import a profile, and run a program through
+that environment:
 
 ```bash
-nns-app install my-private-app via --remote user@remote-host
-nns-app add my-private-app ~/my-remote-profile.ovpn
-nns-app run my-private-app ping -c 4 1.1.1.1
+nns-app install work-vpn
+nns-app add work-vpn ~/work.conf   # .conf: WireGuard or AmneziaWG; .ovpn: OpenVPN
+nns-app start work-vpn
+nns-app status work-vpn
+nns-app run work-vpn curl -4 https://api.ipify.org
 ```
 
-In automatic-remote mode, nns-app installs a managed remote exit environment,
-creates a private gateway and forwards its OpenVPN control connection over a
-supervised SSH tunnel. The local client does not need access to VPN Gate when
-using `nns-app add my-private-app any`; selection and probing take place on
-the remote host. Remote bootstrap requires SSH access and suitable remote sudo
-permissions, and protects newer destination engines from downgrade.
-
-A public OpenVPN profile can also be exported from a managed automatic-remote
-app; `--embedded` is optional even on the first export:
+Run your normal program in place of `curl`. The command retains the configured
+application user's privileges and file access; only its network context changes.
+When the profile contains **only private IPv4 `AllowedIPs`**, a public IP probe
+will not work by design. Use the private destination instead:
 
 ```bash
-nns-app export ovpn my-private-app --client my-laptop \
-    --output ~/my-laptop.ovpn
-nns-app export ovpn my-private-app --client my-phone \
-    --embedded --output ~/my-phone.ovpn
-nns-app revoke my-private-app my-phone
+nns-app run work-vpn ip route get 10.77.0.53
+nns-app run work-vpn getent ahostsv4 git.corp.example
 ```
 
-The remote SSH transport is part of the local app's managed runtime; exported
-public OpenVPN profiles are a separate access method and require a reachable
-public gateway endpoint.
+Stop or remove the environment with `nns-app stop work-vpn` or
+`sudo nns-app remove work-vpn`. An app marked *started* with split routes
+ready is not necessarily able to reach its remote peer; check the handshake
+and application service separately.
 
-## Application environments
+## Client workflows
 
-### Unified app lifecycle
+### WireGuard and private DNS
 
-Every name shown by `nns-app list` is a managed app. The same `start`, `stop`,
-`status`, `remove` and `run` commands accept VPN clients, OpenVPN servers,
-AmneziaWG servers and upstream-backed gateways. The `gateway` subcommands
-remain available for managing gateway-specific settings and client identities.
+Two safe ways to configure a WireGuard or AmneziaWG private DNS resolver are
+supported. **Use one method per profile.** The addresses and names below are
+illustrative only.
 
-For gateway apps, `run` executes through the gateway's configured **exit**, not
-inside its OpenVPN listener: a `via host` server uses the host network and a
-`via <vpn-app>` gateway runs in the upstream VPN namespace. Commands run with
-non-root user privileges; gateways must be started before `run`.
+**Standard WireGuard DNS** sends all DNS queries to the VPN resolver and adds a
+search suffix:
+
+```ini
+[Interface]
+Address = 10.77.0.20/24
+DNS = 10.77.0.53, corp.example
+```
+
+**Route-only DNS** sends only `corp.example` and its subdomains to the private
+resolver; other queries use the application's configured fallback DNS servers,
+subject to the kill switch:
+
+```ini
+[Interface]
+PostUp = resolvectl dns %i 10.77.0.53
+PostUp = resolvectl domain %i '~corp.example'
+PostDown = resolvectl revert %i
+```
+
+`nns-app` **validates but does not execute** these precise hook forms. It
+extracts the DNS policy and removes hooks before passing the profile to
+`wg-quick`/`awg-quick`. Other shell hooks are rejected. The private DNS server
+must be reachable via the profile's IPv4 `AllowedIPs`; private DNS queries are
+never redirected outside the tunnel if that resolver is unreachable.
+
+Namespace DNS uses a local resolver at `127.0.0.53` and a namespace-specific
+`/etc/resolv.conf`. On systems with `nss-resolve`, a namespace-specific
+`nsswitch.conf` selects `hosts: files dns` so Git/SSH/glibc resolution does not
+accidentally use the host's `systemd-resolved` socket. Neither host file is
+modified. For a private-only split tunnel, public DNS may intentionally be
+unavailable unless the private server can answer those names.
+
+### Git over a private VPN
+
+In the Git repository that needs private SSH access:
 
 ```bash
-nns-app start office-vpn
-nns-app status office-vpn
-nns-app run office-vpn ping -c 4 ya.ru   # host-exit server: host network
-nns-app stop office-vpn
-
-nns-app start relay-gateway
-nns-app run relay-gateway curl -4 https://api.ipify.org  # via upstream-vpn
+nns-app start work-vpn
+cd ~/src/project
+git-via work-vpn
+git pull
+git fetch
+git push
 ```
 
-### Change a gateway's upstream
+To switch namespace, run `git-via other-vpn`. To restore the previous
+repository-local SSH setting (or remove the override if none existed):
 
 ```bash
-sudo nns-app set-via relay-gateway secondary-vpn
-nns-app status relay-gateway
-nns-app run relay-gateway curl -4 https://api.ipify.org
+git-via -
 ```
 
-`set-via <gateway-app> <upstream-app|host>` changes the egress of an existing
-OpenVPN server/gateway without reissuing client certificates or modifying its
-public endpoint, port, subnet or client routing policy. An active gateway
-checks the new upstream's readiness, disconnects existing clients briefly,
-then restarts on the new exit. If startup fails, nns-app attempts to restore
-the previous configuration and running service. A stopped gateway remains
-stopped; it may be assigned an offline upstream for later use. `host` selects
-the host's uplink. AmneziaWG servers currently support host exit only.
+`git-via` only changes the current repository's `core.sshCommand`; it does
+**not** alter global Git configuration or HTTPS remotes. Run it without
+`sudo`. If needed, inspect the effective command with
+`git config --show-origin --get core.sshCommand`. The selected NNS app must
+be running when SSH connects. Environment-level Git/SSH overrides may still
+take precedence.
 
-### Namespace lifecycle
+For HTTPS remotes, run Git itself inside the namespace:
 
 ```bash
-nns-app install my-upstream-vpn
-nns-app add my-upstream-vpn ~/upstream.ovpn
-nns-app start my-upstream-vpn
-nns-app run my-upstream-vpn curl -4 https://api.ipify.org
-nns-app stop my-upstream-vpn
-nns-app remove my-upstream-vpn
+nns-app run work-vpn git -C ~/src/project pull
 ```
 
-Each app gets its own network namespace, veth pair, resolver, routing policy and
-kill switch. `nns-app run` enters the namespace and then drops privileges to the
-configured application user. Desktop sessions, Electron applications and Snap
-launches receive the required restricted session and mount integration.
+### VPN chaining and inherited networks
 
-### Chained namespaces and shared VPN connections
+Use one VPN tunnel to carry another:
 
 ```bash
-nns-app install my-private-app --via my-upstream-vpn
-nns-app add my-private-app ~/another-vpn.ovpn
-nns-app start my-private-app
+nns-app install upstream-vpn
+nns-app add upstream-vpn ~/upstream.ovpn
+nns-app start upstream-vpn
 
-nns-app install my-linux-client --backend inherit --via my-upstream-vpn
-nns-app start my-linux-client
-nns-app run my-linux-client curl -4 https://api.ipify.org
+nns-app install downstream-vpn --via upstream-vpn
+nns-app add downstream-vpn ~/downstream.ovpn
+nns-app start downstream-vpn
 ```
 
-A chained VPN app sends its encrypted tunnel through an upstream app's VPN.
-An `inherit` child has no inner VPN client and shares the upstream VPN through
-an isolated namespace. Upstream dependency cycles are rejected. Child data
-paths have no fallback to the ordinary host uplink.
+Alternatively, use the upstream tunnel directly from a second namespace,
+without running a second VPN client:
 
-### Application configuration and monitoring
+```bash
+nns-app install dev-sandbox --backend inherit --via upstream-vpn
+nns-app start dev-sandbox
+nns-app run dev-sandbox curl -4 https://api.ipify.org
+```
 
-App configuration lives under `/etc/nns-app/<app>/<app>.cfg`. Relevant fields
-include `KILLSWITCH`, `AUTOSTART`, `UPSTREAM_APP`, `DNS_SERVERS`,
-`DISABLE_IPV6`, `DISABLE_DCO`, `WATCHDOG_MODE`, `WATCHDOG_FAILURES` and
-`WATCHDOG_COOLDOWN`. Configuration files are root-owned and validated before
-being loaded.
+An inherited namespace requires an upstream NNS app (not `host`). Dependency
+cycles are rejected and the kill switch prevents a fallback through the host
+uplink. All app environments have separate names and lifecycles.
 
-The watchdog monitors established OpenVPN/WireGuard namespace connectivity,
-waits for consecutive failures and restarts only the VPN backend. It avoids
-restarting a child while its upstream is offline and applies a cooldown.
-Use `nns-app status <app>` to inspect readiness, routes, DNS and recovery state.
+### Remote VPN exit
 
-## VPN servers
+For a managed VPN exit on another Linux host:
 
-### OpenVPN gateway with a VPN upstream
+```bash
+nns-app install remote-work via --remote user@remote.example
+nns-app add remote-work ~/provider.ovpn
+nns-app run remote-work curl -4 https://api.ipify.org
+```
+
+The remote host receives a managed provider exit and private gateway; the
+local client connects through a supervised SSH-forwarded OpenVPN control
+channel. SSH access and appropriate non-interactive sudo permissions are
+required. Remote upgrades reject downgrading a newer destination engine.
+
+To select a publicly listed VPN Gate relay instead of supplying a profile:
+
+```bash
+nns-app add work-vpn any
+nns-app add work-vpn any JP
+```
+
+Availability and trust of volunteer relays vary. In automatic-remote mode,
+relay selection and probing occur on the remote host.
+
+For explicitly registered remote gateway clients:
+
+```bash
+sudo nns-app remote add remote-one --ssh user@remote.example
+sudo nns-app remote connect remote-one --client laptop --name remote-client
+sudo nns-app remote sync remote-client
+sudo nns-app remote rotate remote-client
+nns-app remote status remote-one
+```
+
+Manual gateways support direct, stunnel and Cloak transport. Versioned
+`.nnslink` bundles convey validated connection settings. Automatic remote
+SSH forwarding is distinct from exported public OpenVPN profiles.
+
+## VPN servers and gateways
+
+### OpenVPN server
+
+Create a server that routes clients through the host's Internet connection:
+
+```bash
+sudo nns-app install office-server --server \
+  --listen udp:1194 --public vpn.example.net:1194 \
+  --pool 10.253.50.0/24 --dns "1.1.1.1 9.9.9.9"
+
+nns-app export ovpn office-server --client laptop \
+  --fixed-ip --split-tunnel --output ~/laptop.ovpn
+```
+
+`--listen tcp:443` selects TCP. Without `--listen`, the application selects an
+available UDP port. Supply `--public` if clients connect through DNS, NAT, or
+a load balancer. Configure router/cloud ingress and forwarding separately.
+Re-running `install <name> --server` preserves its CA and client identities;
+re-export profiles when public endpoints or transports change.
+
+### VPN-backed gateway
+
+A managed OpenVPN gateway can route client traffic through another app's VPN:
 
 ```bash
 sudo nns-app gateway create relay-gateway --via upstream-vpn
 nns-app start relay-gateway
-nns-app status relay-gateway
-nns-app run relay-gateway curl -4 https://api.ipify.org
 nns-app export ovpn relay-gateway --client phone --full-tunnel \
-    --output ~/relay-phone.ovpn
+  --output ~/phone.ovpn
 ```
 
-The gateway accepts incoming OpenVPN connections on the host, while client
-Internet traffic exits through the `upstream-vpn` VPN namespace. `--listen` and
-`--public` override automatically discovered listener and public endpoint.
-
-### OpenVPN server — direct UDP or TCP
-
-Create a host-egress OpenVPN server without a separate upstream VPN app:
+Change the existing gateway's exit without reissuing its client credentials:
 
 ```bash
-sudo nns-app install office-vpn --server \
-    --listen udp:1194 --public vpn.example.net:1194 \
-    --pool 10.253.50.0/24 --dns "1.1.1.1 9.9.9.9"
-
-nns-app export ovpn office-vpn --client laptop \
-    --fixed-ip --split-tunnel --output ~/laptop.ovpn
-nns-app status office-vpn
+sudo nns-app set-via relay-gateway other-vpn
+nns-app status relay-gateway
 ```
 
-`--listen tcp:443` creates a TCP OpenVPN server. If no explicit listener is
-specified, a free UDP listener is selected. `--public` identifies the address
-clients use, including installations behind NAT; router port forwarding and
-cloud ingress policy must be configured outside nns-app.
+Active clients briefly disconnect during upstream switching. The gateway
+attempts to restore the previous configuration if the switch fails. `host`
+selects direct host egress. AmneziaWG servers currently support host exit only.
 
-Re-running `install <name> --server` reconciles an existing server while
-preserving its CA, certificates and client identities. Re-export client
-profiles after changing their public endpoint or transport.
+The public listener remains on the host; the gateway's decrypted client
+traffic uses its configured exit. Consequently, `nns-app run <gateway>
+<command>` executes in the egress context, not the listener context.
 
-The server forwards IPv4 client traffic through the Linux host's normal uplink.
-Per-server firewall/NAT rules are owned by nns-app; starting a host VPN server
-enables runtime IPv4 forwarding. It does not provision external NAT rules.
+### Cloak transport
 
-### Cloak-protected OpenVPN server
+Cloak can protect a TCP OpenVPN listener (requires separately provisioned
+Cloak binaries):
 
 ```bash
-sudo nns-app install private-vpn --server \
-    --transport cloak --listen tcp:443 \
-    --public vpn.example.net:443 \
-    --server-name www.example.org
+sudo nns-app install protected-server --server \
+  --transport cloak --listen tcp:443 \
+  --public vpn.example.net:443 --server-name www.example.org
 
-nns-app export ovpn private-vpn --client mac \
-    --split-tunnel --output ~/private-vpn-mac.ovpn
+nns-app export ovpn protected-server --client laptop \
+  --split-tunnel --output ~/protected-laptop.ovpn
 ```
 
-Cloak exposes a public TCP listener and forwards to an OpenVPN TCP listener
-bound to loopback. Export creates both `private-vpn-mac.ovpn` and
-`private-vpn-mac.cloak.json`. Copy both files to the client. On macOS, run:
-
-```bash
-ck-client -c ./private-vpn-mac.cloak.json \
-    -s vpn.example.net -p 443 -l 11940
-```
-
-Then import the `.ovpn` profile into Tunnelblick. It connects to
-`127.0.0.1:11940`, not directly to the public Cloak endpoint. Cloak binaries
-must be supplied independently. Existing server certificates survive a
-transport change, but exported client transport settings must be refreshed.
+Export produces both `.ovpn` and `.cloak.json` files. Start `ck-client`
+locally with the exported transport configuration, and import the `.ovpn`
+profile in a compatible OpenVPN client. The client OpenVPN connection uses
+the local Cloak forward rather than the public listener directly.
 
 ### AmneziaWG server
 
 ```bash
-sudo nns-app install my-awg --server --amnezia \
-    --listen udp:51821 --public vpn.example.net:51821 \
-    --client-to-client=on
+sudo nns-app install awg-server --server --amnezia \
+  --listen udp:51821 --public vpn.example.net:51821 \
+  --client-to-client=on
 
-nns-app export awg my-awg --client mac \
-    --split-tunnel --output ~/mac-awg.conf
-nns-app status my-awg
+nns-app export awg awg-server --client laptop \
+  --split-tunnel --output ~/laptop-awg.conf
 ```
 
-The AmneziaWG server creates its key material, header-protection key,
-obfuscation parameters, a managed UDP interface and client peer allocations.
-Each exported native `.conf` contains its own private key and the matching
-server parameters. In split mode the exported `AllowedIPs` contains the VPN
-client pool; `--full-tunnel` selects `0.0.0.0/0`. Import it into an
-AmneziaWG-compatible client, **not** Tunnelblick or standard WireGuard.
+Each exported native AmneziaWG profile has its own keys and the appropriate
+server obfuscation settings. Use an AmneziaWG-compatible client, not standard
+WireGuard or an OpenVPN application. `--full-tunnel` uses `0.0.0.0/0`.
+Reinstalling an existing server preserves peer keys and parameters; listener
+and pool migrations are not currently performed in place.
 
-Reinstalling an existing AmneziaWG server preserves peer keys and obfuscation
-settings. Changing its listener or address pool is not supported as an
-in-place migration. `awg`, `awg-quick`, and the userspace backend `amneziawg-go` are required for runtime.
-On Ubuntu, provision them explicitly using `nns-app --install amnezia`.
-
-### OpenVPN clients: fixed IPs, routing and isolation
-
-```bash
-sudo nns-app fixed-ip office-vpn laptop on
-nns-app fixed-ip office-vpn laptop
-sudo nns-app route-mode office-vpn laptop split
-sudo nns-app route-mode office-vpn laptop full
-sudo nns-app client-to-client office-vpn on
-sudo nns-app client-to-client office-vpn off
-```
-
-`--fixed-ip` and `fixed-ip` assign stable addresses on the server through
-OpenVPN client-specific configuration; no static address is embedded in the
-exported `.ovpn`. Dynamic clients occupy the lower portion of the client pool
-when fixed addresses are enabled. `route-mode split` retains the client's
-normal Internet default route and DNS; `full` pushes the server's default
-Internet route and DNS. Route changes reconnect active OpenVPN clients.
-
-Client-to-client connectivity is disabled by default. Enabling it restarts an
-active server and disables OpenVPN DCO so OpenVPN can forward between clients.
-
-### Client lifecycle and server management
+### Client management
 
 ```bash
 nns-app list clients
+sudo nns-app fixed-ip office-server laptop on
+sudo nns-app route-mode office-server laptop split
+sudo nns-app client-to-client office-server on
+sudo nns-app client export office-server laptop --full-tunnel \
+  --output ~/laptop-full.ovpn
+sudo nns-app client revoke office-server laptop
+sudo nns-app client remove office-server laptop
+```
+
+Fixed IPs are assigned on the server, not embedded in exported OpenVPN
+profiles. Split routes keep clients' default Internet paths; full routes push
+the VPN's default IPv4 route and DNS. Client-to-client access is disabled by
+default; enabling it may restart OpenVPN and disable DCO. Client removal
+revokes credentials before deleting managed metadata. Exported files may
+remain on client machines but revoked credentials cannot authenticate.
+
+**Destructive action:** `nns-app remove <server>` permanently removes server
+CA/private keys and managed client records. Back up before removing it.
+
+## Operate and troubleshoot
+
+Inspect and manage environments:
+
+```bash
+nns-app list
+nns-app list namespaces
 nns-app list gateways
-nns-app gateway client list office-vpn
-# Export creates missing client identities; repeat export reuses existing keys.
-sudo nns-app client export office-vpn laptop --full-tunnel --output ~/laptop.ovpn
-sudo nns-app client export my-awg mac --full-tunnel --output ~/mac.conf
-
-# Revoke without deleting the record, or revoke and completely remove it.
-sudo nns-app client revoke office-vpn laptop
-sudo nns-app client remove office-vpn laptop
-sudo nns-app client remove my-awg mac
-sudo nns-app stop office-vpn
-sudo nns-app start office-vpn
-sudo nns-app remove office-vpn
-```
-
-Removing a server permanently deletes its CA, private keys and managed client
-records. Back up first. Client removal first revokes access, then deletes that client's credentials,
-keys and metadata from the server. For OpenVPN, the CA database and CRL keep
-the revoked certificate serial so deleted clients cannot reconnect. For
-AmneziaWG, the peer is removed from the running server and its keys are deleted.
-Previously exported profiles remain on client devices but cannot authenticate.
-Re-exporting an existing active client preserves its credentials. Output files
-are never overwritten; choose a new path to export again.
-
-## Managed remote gateways
-
-For advanced setups, a gateway can send clients through a separately managed
-upstream namespace rather than through the server host's default uplink:
-
-```bash
-nns-app install my-remote-exit
-nns-app add my-remote-exit ~/my-remote-profile.ovpn
-nns-app start my-remote-exit
-
-sudo nns-app gateway create my-relay --via my-remote-exit
-
-sudo nns-app gateway client add my-relay my-linux-client
-sudo nns-app gateway client export my-relay my-linux-client \
-    --output ~/my-linux-client.ovpn
-```
-
-The gateway automatically selects an unused host UDP listener (starting at
-1194), discovers the host's public IPv4 address, and advertises that port in
-client profiles. Supply `--listen udp:<port>` and `--public <host>:<port>`
-when a specific port, DNS hostname, external NAT mapping, or load balancer
-is required. nns-app manages the local firewall, not the cloud provider's
-security group or an upstream router's port forwarding. Use `--transport cloak`
-or `--transport stunnel` for a TCP gateway; those default to the first
-available host TCP port starting at 443.
-
-Manual remote registration, connection and credential updates use these commands:
-
-```bash
-sudo nns-app remote add remote-one --ssh user@remote-host
-sudo nns-app remote connect remote-one --client laptop --name client-vpn
-sudo nns-app remote sync client-vpn
-sudo nns-app remote rotate client-vpn
-nns-app remote status remote-one
-```
-
-Manual gateways support `direct`, `stunnel` and `cloak` transport types.
-Versioned `.nnslink` bundles carry transport settings for managed client
-imports; untrusted bundles are validated before extraction. Automatic-remote
-apps use a supervised SSH-forward transport instead of exposing a new public
-listener. Different remote apps can reuse a shared pool of remote provider
-exit resources when their configuration permits it.
-
-## Inventory and diagnosis
-
-```bash
-nns-app list             # all managed local instance types
-nns-app list namespaces  # namespace applications only
-nns-app list gateway     # managed gateways and servers
-nns-app list clients     # exported client identities
-nns-app list all         # local and remote apps + exported clients
-nns-app status office-vpn
-nns-app myip my-private-app
-nns-app myip office-vpn
-nns-app myloc my-private-app   # geolocation of its Internet exit
-nns-app myloc office-vpn     # geolocation of the gateway upstream exit
-nns-app myloc --json         # machine-readable JSON for the current context
+nns-app list clients
+nns-app list all
+nns-app status work-vpn
+nns-app myip work-vpn
+nns-app myloc work-vpn
+nns-app myloc --json
 sudo nns-app repair
 sudo nns-app repair --local-only
 ```
 
-`myloc` queries the public exit through the selected app namespace or gateway
-upstream. Its free ip-api.com endpoint uses unencrypted HTTP, is limited to
-45 requests/minute per exit address and permits non-commercial use only.
-Geolocation is approximate; a query failure never falls back to the host network.
+`myip` describes the namespace and route context. `myloc` queries the public
+Internet exit using ip-api.com (unencrypted HTTP, non-commercial usage limit
+of 45 requests/minute per exit). A private-only split tunnel may have no
+public exit at all. An `active` tunnel service does not prove peer reachability.
 
-`status` reports runtime readiness; a locally healthy listener does not
-establish public reachability. Check host/firewall rules, router forwarding,
-provider ingress policy and client logs when a remote connection fails.
-
-A managed public server opens a tagged iptables INPUT rule for its listener;
-UFW and firewalld integration is handled where available. Pre-existing
-administrator firewall rules are not removed or globally flushed.
-For Fedora, inspect the `nns-app-forward` firewalld forwarding policy.
-
-Typical diagnostics:
+Check DNS and WireGuard without changing host networking:
 
 ```bash
-sudo systemctl status 'nns-gateway@office-vpn.service'
-sudo journalctl -u 'nns-gateway@office-vpn.service' -n 100 --no-pager
-sudo systemctl status 'nns-openvpn@my-private-app.service'
-sudo iptables-save | grep -i nns
+nns-app run work-vpn cat /etc/resolv.conf
+nns-app run work-vpn getent ahostsv4 git.corp.example
+nns-app run work-vpn dig @10.77.0.53 git.corp.example A
+sudo ip netns exec nns-work-vpn wg show
+systemctl status nns-dns@work-vpn.service --no-pager
+sudo journalctl -u nns-openvpn@work-vpn.service -n 50 --no-pager
 ```
+
+For OpenVPN, `nns-app status` reports readiness and recent connectivity
+checks. Full-tunnel OpenVPN apps can automatically test and recover from a
+verified TLS/HTTPS transfer stall by trying smaller TUN MTUs. Recovery is
+bounded; failure restores the original MTU. Set `AUTO_MTU="off"` in
+`/etc/nns-app/<app>/<app>.cfg` to disable it; clear `TUN_MTU` and restart
+to return to profile defaults. The watchdog restarts failed backends with
+cooldowns and avoids restarting children while their upstream is offline.
+
+The app configuration also supports `KILLSWITCH`, `AUTOSTART`, `UPSTREAM_APP`,
+`DNS_SERVERS`, `DISABLE_IPV6`, `WATCHDOG_MODE`, and related settings. Files are
+root-owned and validated. Network and firewall resources are owned by nns-app;
+cloud firewall policies or router port forwarding are **not** configured.
 
 ## Backup and restore
 
-Create an archive of managed configurations, keys, client identities and
-service state:
-
 ```bash
 sudo nns-app backup --output /var/backups/nns-app.tar.gz
-```
-
-Restore using a trusted installer on a compatible host:
-
-```bash
 sudo bash nns-app-install.sh restore /var/backups/nns-app.tar.gz
 # Restore without starting saved services:
 sudo bash nns-app-install.sh restore /var/backups/nns-app.tar.gz --no-start
 ```
 
-A backup embeds the installed engine for emergency recovery, but running the
-current trusted installer is preferred. Restore checks archive structure and
-hashes before applying data. Backup archives contain VPN private keys and
-potentially SSH identities: restrict their access and encrypt them at rest and
-in transit. Remote hosts must be backed up independently. Moving to another
-host may require updated public endpoints, forwarding or cloud firewall rules.
+The backup contains managed configuration, keys, identities, and service
+state. Treat it as highly sensitive: restrict file access and encrypt at rest
+and in transit. Restore validates structure and hashes. Remote hosts require
+their own backups. Changes in public IPs, firewall rules, and NAT after a
+migration must be handled separately.
 
 ## Security and limitations
 
-- Profile imports reject dangerous OpenVPN directives and WireGuard hooks.
-- Root-owned state, dedicated per-instance firewall rules and verified SSH host keys protect managed connections.
-- Kill switches are applied per namespace; a disabled kill switch can allow traffic outside a split-tunnel route.
-- Full-tunnel gateway operation covers IPv4 only. It does not provide IPv6 leak protection outside the managed namespace or a complete site-to-site router.
-- Cloak and AmneziaWG provide different traffic signatures, but no transport guarantees operation through all filtering networks.
-- VPN Gate is a public volunteer service. Public credentials and transport availability can change independently of nns-app.
-- Live cross-platform deployment and connectivity must be verified on the intended kernel, VPN runtime and firewall configuration.
+- **No arbitrary VPN script execution:** unsafe OpenVPN directives and
+  WireGuard/AmneziaWG hooks are rejected. The narrowly accepted DNS hooks
+  are parsed as data and never executed.
+- **Per-namespace enforcement:** kill switches block non-VPN fallback.
+  Disabling the kill switch changes this guarantee, particularly for split
+  tunnels and DNS.
+- **Credentials:** private material is root-owned, and managed SSH connections
+  use pinned host keys. Never commit real VPN profiles or keys to the repo.
+- **IPv4 focus:** IPv6-only profiles and IPv6 server forwarding are not
+  supported; this is not a general site-to-site router.
+- **Operational limits:** VPN Gate and obfuscation transports cannot guarantee
+  availability or reachability through every network. Test your actual kernel,
+  firewall and VPN backend before relying on the deployment.
 
 ## Build and contribute
 
 ```bash
-make build       # regenerate nns-app-install.sh from src/
-make test        # static and source-level regression tests
+make build   # regenerate the standalone installer from src/
+make test    # static checks and source-level regression tests
 ```
 
-The generated installer concatenates ordered `src/[0-9][0-9]-*.sh` modules.
-Release archives include the source, prebuilt installer and tests.
-See [CONTRIBUTING.md](CONTRIBUTING.md) for source layout, trust boundaries,
-network-resource ownership and testing requirements.
+Source is organized into ordered `src/[0-9][0-9]-*.sh` modules. Releases
+include the generated `nns-app-install.sh`, source, and tests. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for trust boundaries, lifecycle invariants,
+resource ownership and test expectations.
 
-## License
-
-GNU General Public License v3.0 or later; see [LICENSE](LICENSE).
-
-### Git SSH through an NNS application
-
-Run `git-via bitblaze` inside a Git repository after installing the `bitblaze`
-NNS app. Normal `git fetch`, `git pull`, and `git push` then use the SSH
-transport `/usr/local/bin/nns-app run bitblaze ssh` within that namespace.
-`git-via another-app` switches the transport without discarding the original
-repository-local `core.sshCommand`. `git-via -` restores the original command,
-or removes the local override if there was none. Run without `sudo`.
-
-This affects only SSH remotes for the current Git repository (and other
-worktrees sharing its local config). HTTPS remotes, global SSH config, and other
-repositories are unchanged. The selected NNS app must be running when Git needs
-network access. Inherited `GIT_SSH_COMMAND`, `GIT_SSH`, and Git `includeIf`
-settings can override the local setting. Use `git config --show-origin --get
-core.sshCommand` to see the effective configuration.
+License: GNU GPL v3.0 or later ([LICENSE](LICENSE)). Release-series highlights:
+[CHANGELOG.md](CHANGELOG.md).
