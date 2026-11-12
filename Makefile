@@ -25,6 +25,7 @@ test: build
 	./tests/test-awg-server.sh
 	./tests/test-split-tunnel.sh
 	./tests/test-split-dns.sh
+	./tests/test-wg-apparmor.sh
 
 clean:
 	rm -f nns-app-install.sh

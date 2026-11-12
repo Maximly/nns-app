@@ -224,7 +224,7 @@ def dns_upstreams(packet: bytes) -> list[tuple[str, int]]:
     name = dns_question_name(packet)
     if name is None:
         return []
-    if private_domains and any(name == suffix or name.endswith("." + suffix)
+    if private_domains and any(suffix == "." or name == suffix or name.endswith("." + suffix)
                                for suffix in private_domains):
         return private_upstreams
     return upstreams
@@ -1134,8 +1134,12 @@ status_app() {
         if [[ -n "$dns_policy" ]]; then
             routed_dns=${dns_policy%%$'\n'*}
             routed_domains=${dns_policy#*$'\n'}
-            printf 'Split DNS domains: %s\n' "$routed_domains"
-            printf 'Split DNS servers: %s\n' "$routed_dns"
+            if [[ "$routed_domains" == "." ]]; then
+                printf 'Profile DNS:       %s (all queries through VPN)\n' "$routed_dns"
+            else
+                printf 'Split DNS domains: %s\n' "$routed_domains"
+                printf 'Split DNS servers: %s\n' "$routed_dns"
+            fi
         fi
     fi
     if [[ "$dns_proxy_state" == active ]]; then

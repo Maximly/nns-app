@@ -68,7 +68,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.0.12"
+readonly VERSION="2.0.14"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -1753,7 +1753,18 @@ wireguard_iface_name() {
     printf 'nwg%s\n' "$hex"
 }
 
+# The wg-quick and wg AppArmor profiles shipped by newer Ubuntu releases
+# permit WireGuard configuration files under /etc/wireguard, not arbitrary
+# locations like /run/nns-app. The generated profile must never be executable
+# and is removed whenever the application stops.
 wireguard_runtime_config_path() {
+    local app=$1 iface
+    iface=$(wireguard_iface_name "$app")
+    printf '/etc/wireguard/nns-app/%s.conf\n' "$iface"
+}
+
+# Clean up runtime files created by nns-app <= 2.0.12 after an upgrade.
+wireguard_legacy_runtime_config_path() {
     local app=$1 iface
     iface=$(wireguard_iface_name "$app")
     printf '%s/%s.conf\n' "$RUN_DIR" "$iface"
@@ -1817,6 +1828,45 @@ forbidden = {"preup", "predown", "saveconfig"}
 dns_hook_servers = []
 dns_hook_domains = []
 dns_hook_revert = 0
+dns_servers = []
+dns_search_domains = []
+dns_route_domains = []
+dns_seen = False
+
+
+def validate_dns_domain(domain, line_no):
+    name = domain.lower().rstrip(".")
+    labels = name.split(".")
+    if len(name) > 253 or not labels or any(
+        len(label) > 63 or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+        for label in labels
+    ):
+        fail(line_no, "invalid DNS search/route domain")
+    return name
+
+
+def parse_profile_dns(value, line_no):
+    global dns_seen
+    if dns_seen:
+        fail(line_no, "duplicate DNS option")
+    dns_seen = True
+    tokens = [item.strip() for item in value.split(",")]
+    if not tokens or any(not item for item in tokens):
+        fail(line_no, "DNS requires nonempty comma-separated values")
+    for item in tokens:
+        try:
+            address = ipaddress.ip_address(item)
+        except ValueError:
+            if item.startswith("~"):
+                dns_route_domains.append(validate_dns_domain(item[1:], line_no))
+            else:
+                dns_search_domains.append(validate_dns_domain(item, line_no))
+        else:
+            if address.version != 4 or address.is_unspecified or address.is_multicast:
+                fail(line_no, "DNS requires usable IPv4 server addresses")
+            dns_servers.append(str(address))
+    if not dns_servers:
+        fail(line_no, "DNS must include at least one IPv4 nameserver")
 
 
 def parse_dns_hook(key, value, line_no):
@@ -2008,8 +2058,7 @@ for line_no, raw in enumerate(lines, 1):
                 if interface.version == 4:
                     ipv4_addresses.append(interface)
         elif key == "dns":
-            # Accepted at import, but ignored at runtime; nns-app owns resolv.conf.
-            pass
+            parse_profile_dns(value, line_no)
         elif key == "mtu":
             if not value.isdigit() or not 576 <= int(value) <= 9000:
                 fail(line_no, "MTU must be an integer from 576 through 9000")
@@ -2088,9 +2137,13 @@ if endpoint_count < 1:
 if dns_hook_servers or dns_hook_domains or dns_hook_revert:
     if not (dns_hook_servers and dns_hook_domains and dns_hook_revert == 1):
         raise SystemExit("resolvectl hooks require PostUp dns, PostUp domain and PostDown revert")
-    if any(not any(address in net for net in allowed_networks)
-           for address in map(ipaddress.ip_address, dns_hook_servers)):
-        raise SystemExit("route-only DNS servers must be reachable through peer AllowedIPs")
+    if dns_seen:
+        raise SystemExit("Do not mix DNS = with resolvectl DNS hooks; specify DNS policy once")
+
+all_dns_servers = dns_hook_servers or dns_servers
+if any(not any(address in net for net in allowed_networks)
+       for address in map(ipaddress.ip_address, all_dns_servers)):
+    raise SystemExit("DNS server is outside IPv4 AllowedIPs; profile DNS must use the VPN route")
 
 # A VPN namespace may intentionally route only selected private networks.
 # Preserve AllowedIPs verbatim; the namespace kill switch prevents packets to
@@ -2180,12 +2233,14 @@ app_split_tunnel() {
     [[ "$(wireguard_profile_route_mode "$(profiles_dir "$app")/$profile")" == split ]]
 }
 
-# Return two newline-separated fields: routed IPv4 DNS servers and routed
-# domain suffixes. Empty output means this profile does not configure split DNS.
-# Validation is performed at import and again before starting the backend.
+# Output two newline-separated fields: upstream IPv4 addresses and matching
+# domain suffixes. A suffix of '.' means ALL DNS queries should use the DNS=
+# resolvers (wg-quick's standard semantics); other suffixes are route-only.
+# In search mode, output the search list supplied by DNS= (never by ~domains).
+# No arbitrary profile-supplied commands are executed.
 wireguard_profile_dns_policy() {
-    local profile=$1
-    python3 - "$profile" <<'PY_WG_DNS_POLICY'
+    local profile=$1 mode=${2:-routing}
+    python3 - "$profile" "$mode" <<'PY_WG_DNS_POLICY'
 import ipaddress
 import re
 import shlex
@@ -2193,62 +2248,119 @@ import sys
 from pathlib import Path
 
 servers = []
-domains = []
+search_domains = []
+route_domains = []
+hook_servers = []
+hook_domains = []
 reverts = 0
 section = None
-for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
-    line = line.split("#", 1)[0].strip()
+dns_seen = False
+allowed_networks = []
+
+
+def valid_domain(token):
+    suffix = token.lower().rstrip(".")
+    if not suffix or len(suffix) > 253 or any(
+        not 1 <= len(label) <= 63 or not re.fullmatch(
+            r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label
+        ) for label in suffix.split(".")
+    ):
+        raise SystemExit("invalid WireGuard DNS domain")
+    return suffix
+
+
+def valid_ip(token):
+    address = ipaddress.ip_address(token)
+    if address.version != 4 or address.is_unspecified or address.is_multicast:
+        raise SystemExit("WireGuard DNS requires usable IPv4 address")
+    return str(address)
+
+for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = raw.split("#", 1)[0].strip()
     if not line:
         continue
-    if line.startswith("["):
-        section = line.strip("[] ").lower()
+    match = re.fullmatch(r"\[\s*([^\]]+)\s*\]", line)
+    if match:
+        section = match.group(1).strip().lower()
         continue
     if "=" not in line:
         continue
     key, value = line.split("=", 1)
-    key = key.strip().lower()
+    key, value = key.strip().lower(), value.strip()
+    if key == "allowedips" and section == "peer":
+        allowed_networks.extend(
+            network for item in value.split(",")
+            if (network := ipaddress.ip_network(item.strip(), strict=False)).version == 4
+        )
+    if key == "dns" and section == "interface":
+        if dns_seen:
+            raise SystemExit("duplicate DNS setting")
+        dns_seen = True
+        for token in (item.strip() for item in value.split(",")):
+            if not token:
+                raise SystemExit("empty DNS setting")
+            try:
+                ipaddress.ip_address(token)
+            except ValueError:
+                if token.startswith("~"):
+                    route_domains.append(valid_domain(token[1:]))
+                else:
+                    search_domains.append(valid_domain(token))
+            else:
+                servers.append(valid_ip(token))
+        if not servers:
+            raise SystemExit("DNS setting requires at least one IPv4 nameserver")
     if key not in {"postup", "postdown"}:
         continue
     if section != "interface":
         raise SystemExit("DNS hook outside [Interface]")
-    args = shlex.split(value.strip())
+    args = shlex.split(value)
     if key == "postdown":
         if args != ["resolvectl", "revert", "%i"]:
             raise SystemExit("unsupported PostDown hook")
         reverts += 1
     elif len(args) >= 4 and args[:3] == ["resolvectl", "dns", "%i"]:
-        if servers:
+        if hook_servers:
             raise SystemExit("duplicate DNS hook")
-        for token in args[3:]:
-            address = ipaddress.ip_address(token)
-            if address.version != 4 or address.is_unspecified or address.is_multicast:
-                raise SystemExit("invalid hook DNS server")
-            servers.append(str(address))
+        hook_servers.extend(valid_ip(token) for token in args[3:])
     elif len(args) >= 4 and args[:3] == ["resolvectl", "domain", "%i"]:
-        if domains:
+        if hook_domains:
             raise SystemExit("duplicate domain hook")
         for token in args[3:]:
             if not token.startswith("~"):
                 raise SystemExit("domain hook requires route-only DNS")
-            suffix = token[1:].lower().rstrip(".")
-            if not suffix or len(suffix) > 253 or not all(
-                re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", x)
-                and len(x) <= 63 for x in suffix.split(".")
-            ):
-                raise SystemExit("invalid DNS domain suffix")
-            domains.append(suffix)
+            hook_domains.append(valid_domain(token[1:]))
     else:
         raise SystemExit("unsupported PostUp hook")
 
-if servers or domains or reverts:
-    if not (servers and domains and reverts == 1):
+if hook_servers or hook_domains or reverts:
+    if not (hook_servers and hook_domains and reverts == 1):
         raise SystemExit("incomplete WireGuard split DNS hooks")
-    print(" ".join(servers))
-    print(" ".join(domains))
+    if dns_seen:
+        raise SystemExit("DNS= cannot be combined with resolvectl hooks")
+
+upstreams = hook_servers or servers
+if upstreams and any(
+    not any(ipaddress.ip_address(address) in net for net in allowed_networks)
+    for address in upstreams
+):
+    raise SystemExit("DNS server is outside AllowedIPs")
+if sys.argv[2] == "search":
+    print(" ".join(dict.fromkeys(search_domains)))
+elif sys.argv[2] == "routing":
+    if upstreams:
+        domains = hook_domains if hook_servers else route_domains or ["."]
+        # Ordinary DNS= entries are used for all queries, even with a search
+        # suffix. Only explicitly ~route-only domains narrow forwarding.
+        print(" ".join(dict.fromkeys(upstreams)))
+        print(" ".join(dict.fromkeys(domains)))
+else:
+    raise SystemExit("invalid WireGuard DNS policy mode")
 PY_WG_DNS_POLICY
 }
 
-# True if this WireGuard-family application's profile defines route-only DNS.
+# True if the WireGuard profile configures an internal DNS policy.
+
 app_has_split_dns() {
     local app=$1 vpn_type profile policy
     vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
@@ -2263,8 +2375,10 @@ prepare_wireguard_runtime_config() {
     local source=$1 target=$2 disable_ipv6=${3:-on}
     python3 - "$source" "$target" "$disable_ipv6" <<'PY_WG_RUNTIME'
 import ipaddress
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 source = Path(sys.argv[1])
@@ -2322,8 +2436,17 @@ for raw in text.splitlines():
 
     out.append(raw)
 
-target.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
-target.chmod(0o600)
+# Never create a world-readable WireGuard private-key file, even briefly.
+# Atomic replacement also avoids leaving a partial file after a crash.
+fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write("\n".join(out).rstrip() + "\n")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, target)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
 PY_WG_RUNTIME
 }
 
@@ -2595,10 +2718,15 @@ add_profile() {
             log "OpenVPN profile fixups are disabled in $(cfg_file "$app")."
         fi
     else
-        if [[ -n "$(wireguard_profile_dns_policy "$dest")" ]]; then
-            log "Split DNS policy imported; route-only domains use the profile's DNS server inside the namespace."
-        elif grep -Eiq '^[[:space:]]*DNS[[:space:]]*=' "$dest"; then
-            log "VPN profile DNS setting is ignored at runtime; namespace DNS_SERVERS remains authoritative."
+        local dns_policy="" dns_domains=""
+        dns_policy=$(wireguard_profile_dns_policy "$dest")
+        if [[ -n "$dns_policy" ]]; then
+            dns_domains=${dns_policy#*$'\n'}
+            if [[ "$dns_domains" == "." ]]; then
+                log "WireGuard DNS imported: all DNS queries use the profile's DNS servers via the tunnel."
+            else
+                log "Split DNS policy imported: matching domains use profile DNS via the tunnel."
+            fi
         fi
     fi
 
@@ -3627,7 +3755,7 @@ reset_namespace_bootstrap_dns() {
 # Called once tunnel routing is ready. DNS remains isolated within the app's
 # network namespace; systemd-resolved on the host is not modified.
 activate_namespace_split_dns() {
-    local app=$1 vpn_type profile policy target
+    local app=$1 vpn_type profile policy target search_domains
     load_cfg "$app"
     vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
     [[ "$vpn_type" == wireguard || "$vpn_type" == amneziawg ]] || return 0
@@ -3637,11 +3765,17 @@ activate_namespace_split_dns() {
     target="/etc/netns/$NS_NAME/resolv.conf"
     [[ -f "$target" ]] || { warn "Missing namespace resolver for '$app'."; return 1; }
     # Start the daemon before pointing subsequent execs at the stub.
+    # Unlike the bootstrap resolver, this proxy lives in the app namespace.
     ensure_snap_dns_proxy "$app"
-    if ! grep -Fxq 'nameserver 127.0.0.53' "$target"; then
-        printf 'nameserver 127.0.0.53\noptions timeout:2 attempts:2\n' >"$target"
-        chmod 0644 "$target"
-    fi
+    search_domains=$(wireguard_profile_dns_policy "$profile" search) || return 1
+    {
+        printf 'nameserver 127.0.0.53\n'
+        if [[ -n "$search_domains" ]]; then
+            printf 'search %s\n' "$search_domains"
+        fi
+        printf 'options timeout:2 attempts:2\n'
+    } >"$target"
+    chmod 0644 "$target"
 }
 
 netns_up() {
@@ -3906,7 +4040,8 @@ netns_down() {
         "$RUN_DIR/${app}.profile" \
         "$RUN_DIR/${app}.type" \
         "$RUN_DIR/${app}.endpoints" \
-        "$(wireguard_runtime_config_path "$app")"
+        "$(wireguard_runtime_config_path "$app")" \
+        "$(wireguard_legacy_runtime_config_path "$app")"
     log "Namespace '$NS_NAME' stopped."
 }
 
@@ -3968,6 +4103,11 @@ wireguard_exec() {
     if [[ -n "$(wireguard_profile_dns_policy "$profile")" ]]; then
         reset_namespace_bootstrap_dns "$app"
     fi
+    # Ubuntu 26.04 confines wg-quick/wg using AppArmor rules which accept
+    # /etc/wireguard/*.conf but reject /run/nns-app/*.conf. Keep the directory
+    # root-owned and non-world-readable, and materialize a temporary 0600
+    # runtime copy there without weakening AppArmor confinement.
+    install -d -o root -g root -m 0700 /etc/wireguard/nns-app
     prepare_wireguard_runtime_config \
         "$profile" "$runtime_config" "${DISABLE_IPV6:-on}"
 
@@ -4566,7 +4706,8 @@ stop_app_internal() {
         "$RUN_DIR/${app}.type" \
         "$RUN_DIR/${app}.via" \
         "$(watchdog_state_file "$app")" \
-        "$(wireguard_runtime_config_path "$app")"
+        "$(wireguard_runtime_config_path "$app")" \
+        "$(wireguard_legacy_runtime_config_path "$app")"
     log "Stopped '$app'."
 }
 
@@ -4654,7 +4795,8 @@ remove_app() {
         "$RUN_DIR/${app}.type" \
         "$RUN_DIR/${app}.via" \
         "$(watchdog_state_file "$app")" \
-        "$(wireguard_runtime_config_path "$app")"
+        "$(wireguard_runtime_config_path "$app")" \
+        "$(wireguard_legacy_runtime_config_path "$app")"
 
     if [[ -n "$auto_alias" ]] &&
        ! remote_alias_used_by_other_app "$auto_alias" "$app"; then
@@ -12425,7 +12567,7 @@ def dns_upstreams(packet: bytes) -> list[tuple[str, int]]:
     name = dns_question_name(packet)
     if name is None:
         return []
-    if private_domains and any(name == suffix or name.endswith("." + suffix)
+    if private_domains and any(suffix == "." or name == suffix or name.endswith("." + suffix)
                                for suffix in private_domains):
         return private_upstreams
     return upstreams
@@ -13335,8 +13477,12 @@ status_app() {
         if [[ -n "$dns_policy" ]]; then
             routed_dns=${dns_policy%%$'\n'*}
             routed_domains=${dns_policy#*$'\n'}
-            printf 'Split DNS domains: %s\n' "$routed_domains"
-            printf 'Split DNS servers: %s\n' "$routed_dns"
+            if [[ "$routed_domains" == "." ]]; then
+                printf 'Profile DNS:       %s (all queries through VPN)\n' "$routed_dns"
+            else
+                printf 'Split DNS domains: %s\n' "$routed_domains"
+                printf 'Split DNS servers: %s\n' "$routed_dns"
+            fi
         fi
     fi
     if [[ "$dns_proxy_state" == active ]]; then

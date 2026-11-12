@@ -1,3 +1,16 @@
+## 2.0.14 — 2026-11-12
+
+- Honor standard WireGuard/AmneziaWG `DNS = IPv4, search.domain` in the imported profile; DNS= now configures the namespace's DNS proxy instead of being silently ignored.
+- Forward ordinary `DNS=` queries to the profile resolvers over AllowedIPs, preserve DNS search suffixes in namespace-local resolv.conf, and keep `~domain` hook policies route-only.
+- Reject unsupported, duplicate, mixed or non-VPN-routed DNS settings; do not execute profile shell hooks or modify host DNS.
+- Activate the DNS stub after tunnel startup, while retaining bootstrap resolvers for WireGuard endpoint hostname resolution and root-only pre-tunnel traffic.
+
+## 2.0.13 — 2026-11-12
+
+- Fix Ubuntu 26.04 AppArmor denial when `wg-quick` attempts to read the generated WireGuard configuration from `/run/nns-app/`. Runtime configurations now live under `/etc/wireguard/nns-app/` with root-only permissions while running.
+- Generate the private-key runtime file atomically with mode `0600`, including during replacement; cleanup removes both the new path and legacy `/run/nns-app/` artifacts.
+- Keep split DNS, kill-switch and profile validation behavior unchanged from 2.0.12.
+
 ## 2.0.12 — 2026-11-12
 
 - Accept only the declarative WireGuard/AmneziaWG `resolvectl dns %i`, `resolvectl domain %i ~domain`, and `resolvectl revert %i` hooks; arbitrary hooks remain forbidden.

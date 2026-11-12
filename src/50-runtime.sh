@@ -55,6 +55,11 @@ wireguard_exec() {
     if [[ -n "$(wireguard_profile_dns_policy "$profile")" ]]; then
         reset_namespace_bootstrap_dns "$app"
     fi
+    # Ubuntu 26.04 confines wg-quick/wg using AppArmor rules which accept
+    # /etc/wireguard/*.conf but reject /run/nns-app/*.conf. Keep the directory
+    # root-owned and non-world-readable, and materialize a temporary 0600
+    # runtime copy there without weakening AppArmor confinement.
+    install -d -o root -g root -m 0700 /etc/wireguard/nns-app
     prepare_wireguard_runtime_config \
         "$profile" "$runtime_config" "${DISABLE_IPV6:-on}"
 
@@ -653,7 +658,8 @@ stop_app_internal() {
         "$RUN_DIR/${app}.type" \
         "$RUN_DIR/${app}.via" \
         "$(watchdog_state_file "$app")" \
-        "$(wireguard_runtime_config_path "$app")"
+        "$(wireguard_runtime_config_path "$app")" \
+        "$(wireguard_legacy_runtime_config_path "$app")"
     log "Stopped '$app'."
 }
 
@@ -741,7 +747,8 @@ remove_app() {
         "$RUN_DIR/${app}.type" \
         "$RUN_DIR/${app}.via" \
         "$(watchdog_state_file "$app")" \
-        "$(wireguard_runtime_config_path "$app")"
+        "$(wireguard_runtime_config_path "$app")" \
+        "$(wireguard_legacy_runtime_config_path "$app")"
 
     if [[ -n "$auto_alias" ]] &&
        ! remote_alias_used_by_other_app "$auto_alias" "$app"; then

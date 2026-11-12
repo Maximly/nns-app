@@ -56,6 +56,45 @@ if (validate_wireguard "$TMP/unsafe.conf") >/dev/null 2>&1; then fail 'DNS witho
 # The exact supported hooks also work for AmneziaWG.
 validate_amneziawg "$TMP/bitblaze.conf" || fail 'legitimate AmneziaWG DNS policy rejected'
 
+# Standard wg-quick DNS= must be effective, not accepted and silently ignored.
+cat >"$TMP/bitblaze-dns.conf" <<EOF
+[Interface]
+Address = 10.3.1.52/24
+PrivateKey = $KEY
+DNS = 192.168.83.10, promobit.loc
+
+[Peer]
+PublicKey = $KEY
+AllowedIPs = 10.3.1.1/32, 192.168.83.0/24
+Endpoint = 77.221.196.190:49018
+EOF
+validate_wireguard "$TMP/bitblaze-dns.conf" || fail 'rejected standard WireGuard DNS setting'
+validate_amneziawg "$TMP/bitblaze-dns.conf" || fail 'rejected standard AmneziaWG DNS setting'
+[[ "$(wireguard_profile_dns_policy "$TMP/bitblaze-dns.conf")" == $'192.168.83.10\n.' ]] || fail 'standard DNS= did not select all DNS through VPN'
+[[ "$(wireguard_profile_dns_policy "$TMP/bitblaze-dns.conf" search)" == 'promobit.loc' ]] || fail 'missing DNS search domain'
+[[ "$(wireguard_profile_route_mode "$TMP/bitblaze-dns.conf")" == split ]] || fail 'standard DNS changed split routes'
+prepare_wireguard_runtime_config "$TMP/bitblaze-dns.conf" "$TMP/runtime-dns.conf" on
+! grep -Eiq '^[[:space:]]*DNS[[:space:]]*=' "$TMP/runtime-dns.conf" || fail 'DNS leaked into wg-quick runtime'
+grep -Fq 'search_domains=$(wireguard_profile_dns_policy "$profile" search)' "$ROOT/src/40-network.sh" || fail 'DNS search suffix not wired into resolver'
+grep -Fq 'ensure_snap_dns_proxy "$app"' "$ROOT/src/40-network.sh" || fail 'DNS proxy not started during namespace initialization'
+
+# Accept an explicit route-only DNS= suffix without adding it to search.
+sed 's/, promobit.loc/, ~promobit.loc/' "$TMP/bitblaze-dns.conf" >"$TMP/route-dns.conf"
+validate_wireguard "$TMP/route-dns.conf" || fail 'rejected DNS= route-only suffix'
+[[ "$(wireguard_profile_dns_policy "$TMP/route-dns.conf")" == $'192.168.83.10\npromobit.loc' ]] || fail 'route-only DNS= classification wrong'
+[[ -z "$(wireguard_profile_dns_policy "$TMP/route-dns.conf" search)" ]] || fail 'route-only domain unexpectedly became search suffix'
+
+# DNS= must fail closed on commands, duplicate options, mixed hooks, and
+# nameserver addresses not covered by AllowedIPs.
+sed 's/DNS = 192.168.83.10, promobit.loc/DNS = 192.168.84.11, promobit.loc/' "$TMP/bitblaze-dns.conf" >"$TMP/invalid-dns.conf"
+if (validate_wireguard "$TMP/invalid-dns.conf") >/dev/null 2>&1; then fail 'DNS server outside AllowedIPs accepted'; fi
+sed 's/DNS = 192.168.83.10, promobit.loc/DNS = 192.168.83.10; touch \/tmp\/nns-unsafe/' "$TMP/bitblaze-dns.conf" >"$TMP/invalid-dns.conf"
+if (validate_wireguard "$TMP/invalid-dns.conf") >/dev/null 2>&1; then fail 'DNS= command injection accepted'; fi
+sed '/^DNS =/a DNS = 192.168.83.10' "$TMP/bitblaze-dns.conf" >"$TMP/invalid-dns.conf"
+if (validate_wireguard "$TMP/invalid-dns.conf") >/dev/null 2>&1; then fail 'duplicate DNS= accepted'; fi
+sed '/^PostUp = resolvectl dns %i/a DNS = 192.168.83.10' "$TMP/bitblaze.conf" >"$TMP/invalid-dns.conf"
+if (validate_wireguard "$TMP/invalid-dns.conf") >/dev/null 2>&1; then fail 'mixed hook and DNS= accepted'; fi
+
 # Test the packet-level suffix dispatcher without binding port 53 or needing root.
 python3 - "$ROOT/src/70-run-status.sh" <<'PY'
 import pathlib, struct, sys
@@ -82,6 +121,13 @@ sys.argv = ['proxy', '1.1.1.1', '', '']
 scope = {}
 exec(code, scope)
 assert scope['dns_upstreams'](query('promobit.loc')) == [('1.1.1.1', 53)]
+# Standard DNS= sends all names through the profile resolver.
+sys.argv = ['proxy', '1.1.1.1 9.9.9.9', '192.168.83.10', '.']
+scope = {}
+exec(code, scope)
+assert scope['dns_upstreams'](query('promobit.loc')) == [('192.168.83.10', 53)]
+assert scope['dns_upstreams'](query('ya.ru')) == [('192.168.83.10', 53)]
+assert scope['dns_upstreams'](query('notpromobit.loc')) == [('192.168.83.10', 53)]
 PY
 
 echo 'Split DNS tests passed.'

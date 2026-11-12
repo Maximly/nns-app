@@ -328,7 +328,7 @@ reset_namespace_bootstrap_dns() {
 # Called once tunnel routing is ready. DNS remains isolated within the app's
 # network namespace; systemd-resolved on the host is not modified.
 activate_namespace_split_dns() {
-    local app=$1 vpn_type profile policy target
+    local app=$1 vpn_type profile policy target search_domains
     load_cfg "$app"
     vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
     [[ "$vpn_type" == wireguard || "$vpn_type" == amneziawg ]] || return 0
@@ -338,11 +338,17 @@ activate_namespace_split_dns() {
     target="/etc/netns/$NS_NAME/resolv.conf"
     [[ -f "$target" ]] || { warn "Missing namespace resolver for '$app'."; return 1; }
     # Start the daemon before pointing subsequent execs at the stub.
+    # Unlike the bootstrap resolver, this proxy lives in the app namespace.
     ensure_snap_dns_proxy "$app"
-    if ! grep -Fxq 'nameserver 127.0.0.53' "$target"; then
-        printf 'nameserver 127.0.0.53\noptions timeout:2 attempts:2\n' >"$target"
-        chmod 0644 "$target"
-    fi
+    search_domains=$(wireguard_profile_dns_policy "$profile" search) || return 1
+    {
+        printf 'nameserver 127.0.0.53\n'
+        if [[ -n "$search_domains" ]]; then
+            printf 'search %s\n' "$search_domains"
+        fi
+        printf 'options timeout:2 attempts:2\n'
+    } >"$target"
+    chmod 0644 "$target"
 }
 
 netns_up() {
@@ -607,7 +613,8 @@ netns_down() {
         "$RUN_DIR/${app}.profile" \
         "$RUN_DIR/${app}.type" \
         "$RUN_DIR/${app}.endpoints" \
-        "$(wireguard_runtime_config_path "$app")"
+        "$(wireguard_runtime_config_path "$app")" \
+        "$(wireguard_legacy_runtime_config_path "$app")"
     log "Namespace '$NS_NAME' stopped."
 }
 

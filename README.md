@@ -6,7 +6,7 @@ chained namespaces, SSH-managed remote exits, and host-based VPN servers.
 The host's default route and DNS configuration remain independent of individual
 application environments.
 
-**Release:** 2.0.12  
+**Release:** 2.0.14  
 **Supported platforms:** Ubuntu and Fedora with systemd (Debian-family package installation is also supported)  
 **VPN backends:** OpenVPN 2.6+, WireGuard, AmneziaWG, and VPN-free inherited namespaces  
 **License:** GPL-3.0-or-later

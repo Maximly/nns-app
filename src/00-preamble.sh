@@ -68,7 +68,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.0.12"
+readonly VERSION="2.0.14"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
