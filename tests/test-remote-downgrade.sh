@@ -36,10 +36,10 @@ install() {
     done
     command install "${kept[@]}"
 }
-VERSION=2.1.0
-cat >"$ENGINE_PATH" <<'SH'
+VERSION=$(tr -d '[:space:]\r' < "$ROOT/VERSION")
+cat >"$ENGINE_PATH" <<SH
 #!/bin/sh
-printf 'nns-app %s\n' "${TEST_INSTALLED_VERSION:-2.1.0}"
+printf 'nns-app %s\n' "\${TEST_INSTALLED_VERSION:-$VERSION}"
 printf 'Author: test\n'
 SH
 chmod +x "$ENGINE_PATH"
@@ -54,7 +54,7 @@ if nns_version_is_newer 1.3.48 2.0.2; then fail 'legacy version considered newer
 if ( install_engine off ) >"$TEST_TMP/downgrade-log" 2>&1; then
     fail 'downgrade was accepted'
 fi
-grep -Fq 'Refusing nns-app downgrade 2.1.1 -> 2.1.0' "$TEST_TMP/downgrade-log" || fail 'missing downgrade explanation'
+grep -Fq "Refusing nns-app downgrade 2.1.1 -> $VERSION" "$TEST_TMP/downgrade-log" || fail 'missing downgrade explanation'
 ! grep -Eq '^(dependencies|overwrite|regenerate)$' "$TEST_TMP/actions" || fail 'downgrade ran side-effecting operations'
 
 # Equal and older engines may be installed and refreshed.
@@ -87,7 +87,7 @@ remote_auto_user_exec() {
         *) printf 'nns-app %s\nAuthor: Test\n' "$TEST_REMOTE_VERSION" ;;
     esac
 }
-for previous in absent 1.3.48 2.0 2.0.1 2.0.2 2.0.3 2.0.4 2.0.5 2.0.6 2.0.7 2.0.8 2.0.9 2.0.10 2.0.11 2.0.12 2.0.13 2.0.14 2.0.15 2.0.16 2.0.17 2.1.0; do
+for previous in absent 1.3.48 2.0 2.0.1 2.0.2 2.0.3 2.0.4 2.0.5 2.0.6 2.0.7 2.0.8 2.0.9 2.0.10 2.0.11 2.0.12 2.0.13 2.0.14 2.0.15 2.0.16 2.0.17 "$VERSION"; do
     TEST_REMOTE_VERSION="$previous"
     ( remote_auto_guard_remote_engine alice alice@example.org 2222 /tmp/ctl ) >/dev/null 2>&1 ||
         fail "remote preflight rejected $previous"

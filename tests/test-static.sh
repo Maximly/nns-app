@@ -4,12 +4,24 @@ IFS=$'\n\t'
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 INSTALLER="$ROOT/install_linux"
+EXPECTED_VERSION=$(tr -d '[:space:]\r' < "$ROOT/VERSION")
 
 bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
+grep -Fq "_nns_version=\"$EXPECTED_VERSION\"" "$INSTALLER" || {
+    echo "install_linux does not embed VERSION=$EXPECTED_VERSION; rebuild with ./build.sh" >&2
+    exit 1
+}
+! grep -Fq '@@NNS_VERSION@@' "$INSTALLER" || {
+    echo 'install_linux still contains @@NNS_VERSION@@ placeholder' >&2
+    exit 1
+}
 
-version=$("$INSTALLER" --version)
-grep -Fxq 'nns-app 2.1.0' <<<"$(head -n1 <<<"$version")"
+# --version exercises the Linux installer entrypoint (blocked on Darwin).
+if [[ "$(uname -s)" == Linux ]]; then
+    version=$("$INSTALLER" --version)
+    grep -Fxq "nns-app $EXPECTED_VERSION" <<<"$(head -n1 <<<"$version")"
+fi
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -222,7 +234,7 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Current release:** 2.1.0' "$ROOT/README.md"
+grep -Fq "**Current release:** $EXPECTED_VERSION" "$ROOT/README.md"
 grep -Fq '## Quick start' "$ROOT/README.md"
 grep -Fq '## Quick start' "$ROOT/README.md"
 grep -Fq 'nns-app install work-vpn' "$ROOT/README.md"

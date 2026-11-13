@@ -76,7 +76,23 @@ if [[ "$(uname -s)" == Darwin && "${NNS_APP_SOURCE_ONLY:-0}" != 1 ]]; then
     exit 1
 fi
 
-readonly VERSION="2.1.0"
+# Sole source of truth is the repo-root VERSION file. build.sh substitutes the
+# @@NNS_VERSION@@ token when assembling install_linux. An unsubstituted value
+# still contains "@", which triggers the source-tree file lookup.
+_nns_version="@@NNS_VERSION@@"
+if [[ "$_nns_version" == *@* ]]; then
+    _nns_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    if [[ -f "$_nns_dir/VERSION" ]]; then
+        _nns_version=$(tr -d '[:space:]\r' < "$_nns_dir/VERSION")
+    elif [[ -f "$_nns_dir/../VERSION" ]]; then
+        _nns_version=$(tr -d '[:space:]\r' < "$_nns_dir/../VERSION")
+    else
+        printf 'ERROR: VERSION file missing (expected next to this script or at repo root).\n' >&2
+        exit 1
+    fi
+fi
+readonly VERSION="$_nns_version"
+unset -v _nns_version _nns_dir
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
