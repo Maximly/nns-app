@@ -1,15 +1,16 @@
 # nns-app
 
-**Per-application private networking on Linux, with an experimental macOS WireGuard backend.**
+**Per-application private networking on Linux, with an experimental macOS VPN client backend.**
 
 On Linux, `nns-app` creates isolated network namespaces and connects them through
 OpenVPN, WireGuard, AmneziaWG, other NNS applications, or managed VPN gateways.
 Applications retain their user privileges and receive namespace-local routes, DNS
-and a kill switch. On macOS, **only the IPv4 TCP WireGuard client subset** is
-available: a managed kernel `utun`, interface-scoped route and an opt-in C socket
-interposer. The macOS backend is **not a network namespace or a security sandbox**.
+and a kill switch. On macOS, the **IPv4 WireGuard and OpenVPN client subset**
+is available: a managed kernel `utun`, interface-scoped route and an opt-in C
+socket interposer. The macOS backend is **not a network namespace or a security
+sandbox**.
 
-**Current release:** 2.1.0 · **License:** GPL-3.0-or-later · **Platforms:** Linux with systemd (Ubuntu and Fedora tested); experimental macOS WireGuard TCP backend · **Network stack:** IPv4
+**Current release:** 2.1.0 · **License:** GPL-3.0-or-later · **Platforms:** Linux with systemd (Ubuntu and Fedora tested); experimental macOS WireGuard/OpenVPN TCP client · **Network stack:** IPv4
 
 ## Contents
 
@@ -43,18 +44,18 @@ The macOS backend is a separate implementation, not a fork of Linux modules.
 
 | Feature / command | Linux (systemd) | macOS 2.1.0 |
 | --- | --- | --- |
-| `install <app>`, `add <app> profile` | Supported | Supported for **WireGuard `.conf` only** |
+| `install <app>`, `add <app> profile` | Supported | Supported for **WireGuard `.conf`** and **OpenVPN `.ovpn`** |
 | `start`, `stop`, `status`, `list`, `remove` | Supported | Supported; `start/stop/recover` require `sudo` |
-| `run <app> command` | General Linux network namespace | **Compatible unsandboxed IPv4 TCP executables only** via DYLD interposition |
+| `run <app> command` | General Linux network namespace | **Compatible unsandboxed IPv4 executables only**: DYLD interposition for TCP, plus native bind options for `ping`, `nc`, `ssh`/`scp`/`sftp`, `curl`, `dig` and `traceroute` |
 | Host network impact | Host default route unchanged; namespace/veth/firewall infrastructure | Default route and DNS unchanged; **creates system-visible `utun` + interface-scoped route** |
 | VPN clients: WireGuard | Supported | Supported (`wireguard-go`, `wg`, `wg-quick strip`) |
-| VPN clients: OpenVPN | Supported | Not implemented |
+| VPN clients: OpenVPN | Supported | Experimental client (`openvpn --route-noexec`; inline certs only) |
 | VPN clients: AmneziaWG | Supported | Not implemented |
 | Separate namespace / routing domain | True Linux `ip netns` | **No**: shared macOS kernel network stack |
-| Per-app routing | Namespace routes | `IP_BOUND_IF` + source IP + interface-scoped route for intercepted TCP |
+| Per-app routing | Namespace routes | `IP_BOUND_IF` + source IP + interface-scoped route for intercepted TCP; native source/interface binding for supported SIP tools |
 | DNS isolation | Namespace-specific resolver and NSS policy | Limited IPv4 A queries in injected `getaddrinfo()`, via optional VPN DNS; no host DNS changes |
 | DNS search domains, CNAME chains, IPv6/AAAA, DNS-over-TCP | Linux resolver behavior | Not fully implemented; DNS responses containing an A record supported |
-| UDP / ICMP / IPv6 app traffic | IPv4 UDP/ICMP via namespace; IPv6 policy depends on settings | Not routed or isolated; do **not** use for applications needing these protocols |
+| UDP / ICMP / IPv6 app traffic | IPv4 UDP/ICMP via namespace; IPv6 policy depends on settings | No general routing or isolation. `ping`, `traceroute`, `nc` and `dig` work only through their native bind options; IPv6 is unsupported. |
 | `git-via <app|->` (SSH) | Supported | Supported for compatible **Homebrew OpenSSH**; Apple-protected SSH unsupported |
 | Git via HTTPS | `nns-app run <app> git ...` | Experimental with compatible Homebrew Git/curl and configured private DNS |
 | `myip` | Supported | Supported only if VPN `AllowedIPs` and gateway permit Internet egress |
@@ -63,9 +64,9 @@ The macOS backend is a separate implementation, not a fork of Linux modules.
 | Managed OpenVPN/AWG servers and gateways | Supported | Not implemented |
 | Remote exit, `.nnslink`, clients, export/revoke | Supported | Not implemented |
 | Backup/restore, repair, watchdog, timers | Supported | Not implemented; macOS has limited `recover` cleanup command |
-| Kill switch / network leak prevention | Namespace-based policy enforcement | **Not guaranteed**: DYLD injection can be bypassed |
+| Kill switch / network leak prevention | Namespace-based policy enforcement | **Not guaranteed**: SIP tools without a bind option and child processes can bypass the launcher |
 | Firewall modifications | Per-namespace/system integration | **None (no PF)** |
-| System DNS modifications | None; namespace-specific DNS | None; resolver hook only within compatible injected processes |
+| System DNS modifications | None; namespace-specific DNS | None; resolver hook only within compatible injected processes. SIP tools use the system resolver. |
 
 ### macOS install and quick start
 
@@ -74,17 +75,16 @@ The macOS installer is created on macOS, once per target architecture:
 and Darwin CLI in a **single executable `install_macos`** next to `build.sh`.
 Installing it requires no sources, compiler or build step. Homebrew is the
 prerequisite for runtime dependencies (`wireguard-go`, `wireguard-tools`,
-Homebrew curl and OpenSSH), which `install_macos` installs when missing.
-The Linux-built release ZIP contains `install_linux`; run `./build.sh` on your
-Mac to produce its platform-specific `install_macos` (do not copy a Linux or
-other-architecture binary in its place).
+`openvpn`, Homebrew curl and OpenSSH), which `install_macos` installs when
+missing. The Linux-built release ZIP contains `install_linux`; run `./build.sh`
+on your Mac to produce its platform-specific `install_macos` (do not copy a
+Linux or other-architecture binary in its place).
 
-A WireGuard client profile with an IPv4
-`[Interface] Address` is required. The profile's peer `AllowedIPs` must include
-the private destination and the VPN server must route replies to the tunnel IP.
-Do not reuse the same tunnel IP for two managed instances. **This release has
-not been runtime-tested on macOS as an integrated package; the earlier
-standalone tunnel prototype completed TCP/TLS/HTTP tests.**
+WireGuard profiles need an IPv4 `[Interface] Address` and peer `AllowedIPs` that
+cover the private destination. OpenVPN profiles must be self-contained `.ovpn`
+files with inline certificates/keys (no `up`/`down` scripts); `start` runs
+`openvpn --route-noexec` so pulled routes do not replace the host default.
+Do not reuse the same tunnel IP for two managed instances.
 
 ```bash
 # On macOS, only when the prebuilt install_macos is not already provided:
@@ -93,23 +93,28 @@ sudo ./install_macos
 nns-app --version
 
 nns-app install work-vpn
-nns-app add work-vpn ~/work-wg.conf
-# If [Interface] DNS = <IPv4> is absent, specify the reachable VPN resolver:
+nns-app add work-vpn ~/work-wg.conf    # or ~/work.ovpn
+# If profile DNS is absent, specify the reachable VPN resolver:
 nns-app dns work-vpn 10.3.1.1
 sudo nns-app start work-vpn
 nns-app status work-vpn
 nns-app run work-vpn /opt/homebrew/opt/curl/bin/curl -4 -vk https://gitlab.example.internal/
+# SIP-protected tools receive their native bind option automatically.
+# Prefer numeric addresses: hostname lookup in these tools still uses the host resolver.
+nns-app run work-vpn ping -c 3 10.3.1.10
+nns-app run work-vpn nc -vz 10.3.1.10 22
+nns-app run work-vpn ssh user@10.3.1.10
 sudo nns-app stop work-vpn
 ```
 
 `install` creates a user-owned configuration directory under
 `~/Library/Application Support/nns-app/apps/`; `add` copies the profile with
-permissions `0600`. `start` creates an instance-owned `utunN` through
-`wireguard-go`, configures an IPv4 `/32` address and adds **only** a route scoped
-to that interface. It does **not** execute profile shell hooks, call
-`wg-quick up`, change the default route, enable PF, create Unix groups, or
-modify host DNS. Runtime metadata is under `/var/run/nns-app-macos/<uid>/`.
-`stop` removes the scoped route **before** closing the tunnel. If interrupted,
+permissions `0600`. `start` brings up WireGuard (`wireguard-go`) or OpenVPN,
+records the tunnel IPv4/`utun`, and adds **only** a route scoped to that
+interface. It does **not** execute profile shell hooks, change the unscoped
+default route, enable PF, create Unix groups, or modify host DNS. Runtime
+metadata is under `/var/run/nns-app-macos/<uid>/`. `stop` removes the scoped
+route **before** closing the tunnel. If interrupted,
 `sudo nns-app recover <app>` retries cleanup.
 
 `nns-app run` must be invoked **without sudo**. The C helper sets `IP_BOUND_IF`
@@ -119,6 +124,22 @@ per-app VPN resolver, when configured. If no private DNS server is configured,
 non-numeric non-localhost hostname lookup fails rather than falling back to
 host DNS within compatible processes. It does not implement system-wide DNS,
 DNS search suffixes, DNS TCP fallback, or a universal DNS leak blocker.
+
+Apple SIP-protected platform binaries ignore `DYLD_INSERT_LIBRARIES`, so the
+launcher also understands the native bind switches of common network tools:
+`ping` and `nc` get `-b <utun>`, `ssh` gets `-b <vpn-ip>`, `scp`/`sftp` get
+`-o BindAddress=<vpn-ip>`, `curl` gets `--interface <utun>`, `wget` gets
+`--bind-address=<vpn-ip>`, `rsync` gets `--address=<vpn-ip>`, `dig` gets
+`-b <vpn-ip>`, `traceroute` gets `-s <vpn-ip>`, and `openssl s_client` gets
+`-bind <vpn-ip>:0`. These options make the tool's own socket use the
+interface-scoped route, which is why `nns-app run work-vpn /sbin/ping 10.3.1.10`
+works without injection. A bind or source option supplied by the user is
+preserved, and loopback/link-local/multicast destinations are left on the host
+stack. `ping6` and `traceroute6` are rejected because the backend is IPv4-only.
+Apple platform binaries without a known bind option (`host`, `nslookup`,
+`telnet`, most GUI apps) print a warning and still use ordinary host
+connectivity; set `NNS_BIND_QUIET=1` to hide that warning. Shell scripts that
+spawn commands, Network.framework clients, and child helpers are also unbound.
 
 For Git over SSH, use a compatible Homebrew OpenSSH binary rather than
 Apple's protected `/usr/bin/ssh`:
@@ -131,11 +152,14 @@ git-via -           # restore prior repository-local SSH command
 ```
 
 Apple System Integrity Protection/hardened executables, apps using different
-socket APIs, child helper services and UDP traffic may ignore this interposer
-and use ordinary host connectivity. **Do not interpret `nns-app run` on macOS
-as secure or fail-closed isolation** until an OS-level interception and
-blocking backend has been implemented and verified. Start/stop may also send
-system network-change notifications because `utun` exists in the shared stack.
+socket APIs, child helper services and traffic without a native bind option
+may ignore this launcher and use ordinary host connectivity. SIP-protected
+tools also use the macOS resolver for hostnames; use numeric addresses or a
+compatible Homebrew client when private DNS matters. **Do not interpret
+`nns-app run` on macOS as secure or fail-closed isolation** until an OS-level
+interception and blocking backend has been implemented and verified.
+Start/stop may also send system network-change notifications because `utun`
+exists in the shared stack.
 
 Do not run `install_linux` on macOS: it is a Linux-only installer.
 The release provides OS-specific installers; `build.sh` generates **only the
