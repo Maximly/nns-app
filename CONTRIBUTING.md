@@ -5,7 +5,9 @@ preserve. The user-facing topology and commands are documented in `README.md`.
 
 ## Build and generated artifact
 
-The maintained source is split into ordered modules under `src/`. `build.sh`
+The maintained source is split into ordered modules under `src/`. The sole
+release version lives in the repo-root `VERSION` file; `build.sh` embeds it
+into `install_linux` / `install_macos` (replacing `@@NNS_VERSION@@`). `build.sh`
 dispatches by build host OS. On Linux, it syntax-checks every source module,
 concatenates them, validates the combined Bash file and embedded Python, and
 writes `install_linux`. On macOS, it compiles the Darwin C launcher and
