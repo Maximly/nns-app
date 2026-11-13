@@ -69,7 +69,14 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.0.16"
+# The Linux installer must never configure Linux namespaces/systemd on Darwin.
+# The release provides a separate generated install_macos and Darwin CLI backend.
+if [[ "$(uname -s)" == Darwin && "${NNS_APP_SOURCE_ONLY:-0}" != 1 ]]; then
+    printf 'ERROR: use ./build.sh && sudo ./install_macos on macOS; Linux installer is not compatible.\n' >&2
+    exit 1
+fi
+
+readonly VERSION="2.1.0"
 readonly PROGRAM_NAME="nns-app"
 readonly AUTHOR="Maxim Lyadvinsky"
 readonly LICENSE_ID="GPL-3.0-or-later"
@@ -310,7 +317,7 @@ Usage:
   nns-app backup --output </absolute/path/backup.tar.gz>
   nns-app restore <backup.tar.gz> [--no-start]
   nns-app list [apps|namespaces|gateways|clients|all]
-  nns-app status  <app_name>
+  nns-app status  <app_name|client_name|gateway/client>
   nns-app myip [<app_or_gateway_name>]
   nns-app myloc [<app_or_gateway_name>] [--json]
   nns-app export awg <server_name> --client <client_name> --output <file.conf>
@@ -328,6 +335,7 @@ Usage:
   nns-app client add <app_name> <client_name> [--fixed-ip]
   nns-app client revoke <app_name> <client_name>
   nns-app client list <app_name>
+  nns-app client status <gateway_name> <client_name>
   nns-app revoke <app_name> <client_name> [--modern|--embedded]
   nns-app add     <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf>
   nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
@@ -355,6 +363,7 @@ Usage:
   nns-app gateway client fixed-ip <gateway_name> <client_name> [on|off]
   nns-app gateway client route-mode <gateway_name> <client_name> [split|full]
   nns-app gateway client list   <gateway_name>
+  nns-app gateway client status <gateway_name> <client_name>
   nns-app gateway client export <gateway_name> <client_name>
                   [--fixed-ip] [--split-tunnel|--full-tunnel]
                   [--format ovpn|nnslink] --output <file|->

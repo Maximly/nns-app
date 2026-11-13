@@ -6,13 +6,19 @@ preserve. The user-facing topology and commands are documented in `README.md`.
 ## Build and generated artifact
 
 The maintained source is split into ordered modules under `src/`. `build.sh`
-syntax-checks every module, concatenates them, validates the combined Bash
-file, compiles all embedded Python heredocs, and writes
-`nns-app-install.sh`.
+dispatches by build host OS. On Linux, it syntax-checks every source module,
+concatenates them, validates the combined Bash file and embedded Python, and
+writes `install_linux`. On macOS, it compiles the Darwin C launcher and
+interposer, runs macOS static/mock tests, and embeds the prebuilt binaries
+with the Darwin backend into the single-file `install_macos` script.
 
-The generated installer is committed as a release artifact. A source change is
-complete only when the generated installer is rebuilt and `make test` remains
-deterministic.
+Both installers are standalone at install time; only macOS `build.sh` needs
+Clang. Linux installation is `sudo ./install_linux` (no `install` subcommand);
+`sudo ./install_linux --local-only` skips remote hosts. The installed
+`nns-app install` command remains unchanged. Runtime WireGuard and developer-tool dependencies on macOS are installed
+through Homebrew. A source change is complete only when the relevant native
+installer is rebuilt and the matching platform tests pass. Do not describe
+a macOS installer as prebuilt until it has actually been built on macOS.
 
 ## Comment style
 

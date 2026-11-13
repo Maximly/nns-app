@@ -2,6 +2,24 @@
 
 Highlights are grouped by major release series. Individual patch and minor releases are intentionally omitted.
 
+## 2.1.0 — Experimental macOS WireGuard client backend (2026)
+
+- Client inventories now show IP instead of creation time; live OpenVPN/AWG
+  addresses take precedence over configured fixed addresses. Added detailed
+  `status <client>` / `client status <gateway> <client>` including connection
+  information, traffic counters, and metadata (also for managed remote clients).
+
+- Added a separate macOS installer and Bash 3-compatible CLI for WireGuard
+  clients (`install/add/start/stop/status/list/run/remove/recover/dns/myip/git-via`).
+- Uses `wireguard-go`-owned kernel `utun`, IPv4 /32 address, an interface-scoped
+  route, and a C interposer for selected TCP sockets. Host default route, DNS,
+  PF rules and Unix groups remain unmodified.
+- Added a constrained per-app IPv4 A DNS resolver through the selected VPN
+  in compatible injected processes; no system DNS changes.
+- Added an explicit Linux/macOS feature comparison and macOS static/mock tests.
+- Linux feature implementation preserved from 2.0.16. The Darwin backend is
+  experimental and has weaker process isolation than Linux namespaces.
+
 ## 2.x — Unified private networking (2026)
 
 - Unified management of VPN apps, host-exit servers, gateways, clients and routing, including inventory, health checks, `run`, `set-via`, export and revocation.

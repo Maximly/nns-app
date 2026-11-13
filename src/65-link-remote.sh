@@ -2119,7 +2119,7 @@ remote_auto_topology_internal() {
     local compat public_gateway public_state public_endpoint public_counts
     local public_total public_active public_revoked public_connected
     local all_public_active=0 all_public_revoked=0 all_public_connected=0
-    local any_public=0 dir client connected
+    local any_public=0 dir client connected current display_ip
 
     remote_auto_load_state "$owner"
     members=$(remote_auto_pool_member_count "$RA_POOL_ID")
@@ -2176,7 +2176,7 @@ remote_auto_topology_internal() {
 
     printf '\nExternal client details:\n'
     printf '%-10s %-24s %-10s %-10s %s\n' \
-        'Mode' 'Client' 'Status' 'Connected' 'Created'
+        'Mode' 'Client' 'Status' 'Connected' 'IP'
     printf '%-10s %-24s %-10s %-10s %s\n' \
         '----------' '------------------------' '----------' '----------' '--------------------'
     for compat in modern embedded; do
@@ -2192,8 +2192,11 @@ remote_auto_topology_internal() {
                gateway_client_is_connected "$public_gateway" "$client"; then
                 connected=yes
             fi
+            current=$(gateway_client_current_ip "$public_gateway" "$client" 2>/dev/null || true)
+            display_ip=${current:-${FIXED_IP:--}}
+            [[ "${STATUS:-unknown}" == active ]] || display_ip=-
             printf '%-10s %-24s %-10s %-10s %s\n' \
-                "$compat" "$client" "${STATUS:-unknown}" "$connected" "${CREATED_AT:-unknown}"
+                "$compat" "$client" "${STATUS:-unknown}" "$connected" "$display_ip"
         done
         shopt -u nullglob
     done
@@ -2223,6 +2226,28 @@ remote_auto_inventory_clients_internal() {
         [[ -f "$(gateway_cfg_file "$public_gateway")" ]] || continue
         gateway_external_client_records "$public_gateway" "remote"
     done
+}
+
+# Read-only detail endpoint for externally exported clients on the owner's
+# public gateway. An automatic-remote owner may not inspect unrelated gateways.
+remote_auto_client_status_internal() {
+    require_root
+    local owner=$1 gateway=$2 client=$3 compat public_gateway permitted=no
+    validate_gateway_name "$gateway"
+    validate_gateway_client_name "$client"
+    remote_auto_load_state "$owner"
+    for compat in modern embedded; do
+        public_gateway=$(remote_auto_public_gateway_name "$RA_POOL_ID" "$compat")
+        if [[ "$public_gateway" == "$gateway" &&
+              -f "$(gateway_cfg_file "$gateway")" ]]; then
+            permitted=yes
+            break
+        fi
+    done
+    [[ "$permitted" == yes ]] || die "Gateway '$gateway' is not public for this remote owner."
+    [[ "$(gateway_cfg_value "$gateway" REMOTE_MANAGED_OWNER_ID)" == "$RA_POOL_ID" ]] ||
+        die "Gateway '$gateway' does not belong to the remote pool."
+    gateway_client_status "$gateway" "$client"
 }
 
 remote_auto_status_internal() {
@@ -2547,6 +2572,10 @@ remote_auto_dispatch() {
         inventory-clients)
             [[ $# -eq 1 ]] || die "_remote-auto inventory-clients requires owner."
             remote_auto_inventory_clients_internal "$1"
+            ;;
+        client-status)
+            [[ $# -eq 3 ]] || die "_remote-auto client-status requires owner, gateway and client."
+            remote_auto_client_status_internal "$1" "$2" "$3"
             ;;
         locate)
             [[ $# -eq 1 ]] || die "_remote-auto locate requires owner."

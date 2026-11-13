@@ -18,6 +18,59 @@ managed_app_kind() {
     fi
 }
 
+# Resolve a client without guessing when multiple gateways reuse its name.
+# App names always retain precedence for the existing `nns-app status <app>`.
+managed_client_status_by_name() {
+    require_root
+    local ref=$1 gateway='' client='' dir matches=0 found_gateway=''
+    local record kind rec_client rec_status rec_gateway rec_endpoint rec_ip rec_connected rec_source
+    local remote_app='' remote_gateway='' remote_client='' source_app alias owner
+    if [[ "$ref" == */* ]]; then
+        gateway=${ref%%/*}
+        client=${ref#*/}
+        validate_gateway_name "$gateway"
+        validate_gateway_client_name "$client"
+    else
+        validate_gateway_client_name "$ref"
+        client=$ref
+    fi
+    shopt -s nullglob
+    for dir in "$GATEWAY_BASE_DIR"/*; do
+        [[ -f "$dir/gateway.cfg" && -f "$dir/clients/$client/client.cfg" ]] || continue
+        [[ -z "$gateway" || "${dir##*/}" == "$gateway" ]] || continue
+        matches=$((matches+1))
+        found_gateway=${dir##*/}
+    done
+    shopt -u nullglob
+    while IFS= read -r record; do
+        [[ "$record" == CLIENT\|* ]] || continue
+        IFS='|' read -r kind rec_client rec_status rec_gateway rec_endpoint rec_ip rec_connected rec_source <<<"$record"
+        [[ "$rec_client" == "$client" ]] || continue
+        [[ -z "$gateway" || "$rec_gateway" == "$gateway" ]] || continue
+        [[ "$rec_source" == remote:* ]] || continue
+        matches=$((matches+1))
+        remote_app=${rec_source#remote:}
+        remote_gateway=$rec_gateway
+        remote_client=$rec_client
+    done < <(list_remote_auto_records inventory-clients)
+    if (( matches > 1 )); then
+        die "Client '$client' exists on multiple gateways; use nns-app status <gateway>/$client."
+    elif (( matches == 0 )); then
+        die "Neither app nor accessible managed client '$ref' exists."
+    elif [[ -n "$found_gateway" ]]; then
+        gateway_client_status "$found_gateway" "$client"
+    else
+        source_app=$remote_app
+        alias=$(cfg_read_value "$source_app" REMOTE_ALIAS 2>/dev/null || true)
+        owner=$(cfg_read_value "$source_app" REMOTE_OWNER_ID 2>/dev/null || true)
+        [[ -n "$alias" && -n "$owner" ]] ||
+            die "Remote client '$client' has incomplete connection metadata."
+        printf 'Source:            remote:%s\n' "$source_app"
+        remote_auto_command "$alias" client-status "$owner" "$remote_gateway" "$remote_client" ||
+            die "Cannot read remote client status; ensure remote nns-app supports client-status."
+    fi
+}
+
 managed_app_start() {
     local app=$1 ignore=${2:-off} via=${3:-__default__} kind
     kind=$(managed_app_kind "$app") || return 1
@@ -612,8 +665,14 @@ main() {
             esac
             ;;
         status)
-            [[ $# -eq 2 ]] || die "Usage: nns-app status <app_name>"
-            managed_app_status "$2"
+            [[ $# -eq 2 ]] || die "Usage: nns-app status <app_or_client_name|gateway/client>"
+            if [[ "$2" == */* ]]; then
+                managed_client_status_by_name "$2"
+            elif [[ -f "$(cfg_file "$2")" ]] || managed_gateway_exists "$2"; then
+                managed_app_status "$2"
+            else
+                managed_client_status_by_name "$2"
+            fi
             ;;
         myip)
             (( $# <= 2 )) || die "Usage: nns-app myip [<app_or_gateway_name>]"
@@ -725,6 +784,10 @@ main() {
                 list)
                     [[ $# -eq 3 ]] || die "Usage: nns-app client list <app>"
                     gateway_client_list "$3"
+                    ;;
+                status)
+                    [[ $# -eq 4 ]] || die "Usage: nns-app client status <gateway> <client>"
+                    managed_client_status_by_name "$3/$4"
                     ;;
                 *) die "Unknown client command '$2'." ;;
             esac
@@ -967,6 +1030,10 @@ main() {
                                 die "Usage: nns-app gateway client list <gateway_name>"
                             gateway_client_list "$4"
                             ;;
+                        status)
+                            [[ $# -eq 5 ]] || die "Usage: nns-app gateway client status <gateway_name> <client_name>"
+                            managed_client_status_by_name "$4/$5"
+                            ;;
                         export)
                             (( $# >= 6 )) ||
                                 die "Usage: nns-app gateway client export <gateway_name> <client_name> --output <file.ovpn>"
@@ -1106,6 +1173,25 @@ main() {
     esac
 }
 
-if [[ "${NNS_APP_SOURCE_ONLY:-0}" != 1 ]]; then
+# The release artifact is both a standalone installer and the runtime CLI.
+# Only the prebuilt installer gets a default action: the installed nns-app
+# command must keep its existing no-argument help behavior.
+linux_installer_entrypoint() {
+    local invocation=${1##*/}
+    shift
+    if [[ "$invocation" == install_linux ]]; then
+        if (( $# == 0 )); then
+            main install
+            return
+        fi
+        if (( $# == 1 )) && [[ "$1" == --local-only ]]; then
+            main install --local-only
+            return
+        fi
+    fi
     main "$@"
+}
+
+if [[ "${NNS_APP_SOURCE_ONLY:-0}" != 1 ]]; then
+    linux_installer_entrypoint "$0" "$@"
 fi

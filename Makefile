@@ -1,10 +1,13 @@
-.PHONY: build test clean
+.PHONY: build test test-macos clean
 
 build:
 	./build.sh
 
 test: build
+ifeq ($(shell uname -s),Linux)
 	./tests/test-static.sh
+	./tests/test-installer-entrypoint.sh
+	./macos/tests/test-static.sh
 	./tests/test-install-amnezia.sh
 	./tests/test-auto-mtu.sh
 	./tests/test-mtu-hook.sh
@@ -28,6 +31,12 @@ test: build
 	./tests/test-split-dns.sh
 	./tests/test-nsswitch.sh
 	./tests/test-wg-apparmor.sh
+else
+	./macos/tests/test-static.sh
+endif
+
+test-macos:
+	./macos/tests/test-static.sh
 
 clean:
-	rm -f nns-app-install.sh
+	rm -f install_linux install_macos

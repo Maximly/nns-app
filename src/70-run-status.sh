@@ -1329,10 +1329,15 @@ list_gateway_record_print() {
 }
 
 list_client_record_print() {
-    local record=$1 client status gateway endpoint created connected source
-    IFS='|' read -r _ client status gateway endpoint created connected source <<<"$record"
+    local record=$1 client status gateway endpoint ip connected source
+    IFS='|' read -r _ client status gateway endpoint ip connected source <<<"$record"
+    # Previous remotely deployed engines emitted Created in this field.
+    # Never present their timestamp as a VPN address during rolling upgrades.
+    if [[ "$ip" != - && ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        ip=-
+    fi
     printf '%-24s %-10s %-22s %-28s %-10s %-20s %s\n' \
-        "$client" "$status" "$gateway" "$endpoint" "$connected" "$created" "$source"
+        "$client" "$status" "$gateway" "$endpoint" "$connected" "$ip" "$source"
 }
 
 list_remote_auto_records() {
@@ -1383,7 +1388,7 @@ list_gateways_header() {
 
 list_external_clients_header() {
     printf '%-24s %-10s %-22s %-28s %-10s %-20s %s\n' \
-        'Client' 'Status' 'Gateway' 'Endpoint' 'Connected' 'Created' 'Source'
+        'Client' 'Status' 'Gateway' 'Endpoint' 'Connected' 'IP' 'Source'
     printf '%-24s %-10s %-22s %-28s %-10s %-20s %s\n' \
         '------------------------' '----------' '----------------------' \
         '----------------------------' '----------' '--------------------' '----------------'

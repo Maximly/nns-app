@@ -2625,14 +2625,52 @@ gateway_client_revoke() {
     log "Revoked client '$client' on gateway '$gateway'."
 }
 
+# Current VPN address and connection metadata come from the server's live
+# OpenVPN status file / AmneziaWG handshake.  A disconnected dynamic client
+# has no current address, while an assigned fixed IP is retained separately.
+gateway_client_live_records() {
+    local gateway=$1
+    # OpenVPN status files may survive service shutdown. Never label cached
+    # sessions as currently connected when the gateway service is offline.
+    systemctl is-active --quiet "nns-gateway@${gateway}.service" >/dev/null 2>&1 || return 0
+    gateway_connected_clients "$gateway"
+}
+
+gateway_client_connection_record() {
+    local gateway=$1 client=$2 record name
+    while IFS= read -r record; do
+        [[ -n "$record" ]] || continue
+        IFS='|' read -r name _ <<<"$record"
+        if [[ "$name" == "$client" ]]; then
+            printf '%s\n' "$record"
+            return 0
+        fi
+    done < <(gateway_client_live_records "$gateway")
+    return 1
+}
+
+gateway_client_current_ip() {
+    local gateway=$1 client=$2 record cn real ip rx tx since
+    record=$(gateway_client_connection_record "$gateway" "$client") || return 1
+    IFS='|' read -r cn real ip rx tx since <<<"$record"
+    [[ -n "$ip" && "$ip" != '-' ]] || return 1
+    # OpenVPN status v3 can return an IPv4 + IPv6 pair. Prefer IPv4.
+    printf '%s\n' "${ip%%,*}"
+}
+
 gateway_client_list() {
     require_root
-    local gateway=$1 dir client status serial created fixed route_mode
+    local gateway=$1 dir client status serial fixed route_mode current cn real ip rx tx since
+    declare -A live_ips=()
     validate_gateway_name "$gateway"
     acquire_lock "gateway-$gateway" shared
     load_gateway_cfg "$gateway"
-    printf '%-24s %-10s %-16s %-10s %-20s %s\n' "Client" "Status" "Fixed IP" "Route" "Serial" "Created"
-    printf '%-24s %-10s %-16s %-10s %-20s %s\n' "------------------------" "----------" "----------------" "----------" "--------------------" "--------------------"
+    while IFS='|' read -r cn real ip rx tx since; do
+        [[ -n "$cn" && -n "$ip" && "$ip" != - ]] || continue
+        live_ips["$cn"]=${ip%%,*}
+    done < <(gateway_client_live_records "$gateway")
+    printf '%-24s %-10s %-16s %-10s %-20s %s\n' "Client" "Status" "Fixed IP" "Route" "Serial" "IP"
+    printf '%-24s %-10s %-16s %-10s %-20s %s\n' "------------------------" "----------" "----------------" "----------" "--------------------" "----------------"
     local found=0
     shopt -s nullglob
     for dir in "$(gateway_clients_dir "$gateway")"/*; do
@@ -2640,15 +2678,84 @@ gateway_client_list() {
         client=$(basename "$dir")
         gateway_client_load "$gateway" "$client"
         status=${STATUS:-unknown}
-        serial=${CERT_SERIAL:-unknown}
-        created=${CREATED_AT:-unknown}
+        serial=${CERT_SERIAL:--}
         fixed=${FIXED_IP:--}
         route_mode=${ROUTE_MODE:-full}
-        [[ "$status" == active ]] || { fixed=-; route_mode=-; }
-        printf '%-24s %-10s %-16s %-10s %-20s %s\n' "$client" "$status" "$fixed" "$route_mode" "$serial" "$created"
+        current=${live_ips[$client]-}
+        [[ "$status" == active ]] || { fixed=-; route_mode=-; current=''; }
+        printf '%-24s %-10s %-16s %-10s %-20s %s\n' \
+            "$client" "$status" "$fixed" "$route_mode" "$serial" "${current:--}"
         found=1
     done
+    shopt -u nullglob
     (( found )) || log "No clients configured for gateway '$gateway'."
+    release_lock "gateway-$gateway"
+}
+
+# Detailed metadata deliberately excludes credential material (client.key,
+# private keys, TLS secrets).  No network/host configuration is modified.
+gateway_client_status() {
+    require_root
+    local gateway=$1 client=$2 record cn real current rx tx since connected=no
+    local assigned status backend publickey='' endpoint='' handshake=0 latest='-'
+    local created revoked serial generation cloak route_mode service
+    validate_gateway_name "$gateway"
+    validate_gateway_client_name "$client"
+    acquire_lock "gateway-$gateway" shared
+    load_gateway_cfg "$gateway"
+    gateway_client_load "$gateway" "$client"
+    backend=${GATEWAY_BACKEND:-openvpn}
+    status=${STATUS:-unknown}
+    assigned=${FIXED_IP:-}
+    route_mode=${ROUTE_MODE:-full}
+    created=${CREATED_AT:--}
+    revoked=${REVOKED_AT:--}
+    serial=${CERT_SERIAL:--}
+    generation=${GENERATION:-1}
+    cloak=${CLOAK_UID:-}
+    record=$(gateway_client_connection_record "$gateway" "$client" 2>/dev/null || true)
+    current=''; real=''; rx=''; tx=''; since=''
+    if [[ -n "$record" && "$status" == active ]]; then
+        IFS='|' read -r cn real current rx tx since <<<"$record"
+        current=${current%%,*}
+        connected=yes
+    fi
+    service=$(systemctl is-active "nns-gateway@${gateway}.service" 2>/dev/null || true)
+    [[ -n "$service" ]] || service=unknown
+    printf 'Client:            %s\nGateway:           %s\nBackend:           %s\n' \
+        "$client" "$gateway" "$backend"
+    printf 'Status:            %s\nConnected:         %s\nGateway service:   %s\n' \
+        "$status" "$connected" "$service"
+    printf 'Current VPN IP:    %s\nAssigned VPN IP:   %s\n' \
+        "${current:--}" "${assigned:--}"
+    printf 'Remote address:    %s\nPublic endpoint:   %s:%s/%s\n' \
+        "${real:--}" "${PUBLIC_HOST:-unknown}" "${PUBLIC_PORT:-unknown}" "${LISTEN_PROTO:-unknown}"
+    printf 'Client pool:       %s\nTunnel:            %s\nRoute mode:        %s\n' \
+        "${CLIENT_POOL:--}" "${GATEWAY_TUN:--}" "$route_mode"
+    printf 'Transport:         %s\nUpstream:          %s\nClient-to-client:  %s\n' \
+        "${TRANSPORT:-direct}" "${VIA_APP:-host}" "${CLIENT_TO_CLIENT:-off}"
+    printf 'Created:           %s\nRevoked:           %s\nGeneration:        %s\n' \
+        "$created" "$revoked" "$generation"
+    if [[ "$backend" == amneziawg ]]; then
+        publickey=$(cat "$(gateway_client_dir "$gateway" "$client")/public.key" 2>/dev/null || true)
+        if [[ -n "$publickey" ]]; then
+            printf 'Peer public key:   %s\n' "$publickey"
+            endpoint=$(awg show "$GATEWAY_TUN" endpoints 2>/dev/null | awk -v k="$publickey" '$1==k {print $2; exit}')
+            handshake=$(awg show "$GATEWAY_TUN" latest-handshakes 2>/dev/null | awk -v k="$publickey" '$1==k {print $2; exit}')
+            if [[ "$handshake" =~ ^[0-9]+$ ]] && (( handshake > 0 )); then
+                latest=$(date -u -d "@$handshake" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo "$handshake")
+            fi
+            printf 'Peer endpoint:     %s\nLast handshake:    %s\n' "${endpoint:--}" "$latest"
+            if [[ -z "$rx" || -z "$tx" ]]; then
+                IFS=$'\t' read -r rx tx < <(awg show "$GATEWAY_TUN" transfer 2>/dev/null | awk -v k="$publickey" '$1==k {printf "%s\t%s\n", $2, $3; exit}') || true
+            fi
+        fi
+    else
+        printf 'Certificate serial: %s\n' "$serial"
+        [[ -z "$cloak" ]] || printf 'Cloak UID:         %s\n' "$cloak"
+    fi
+    printf 'Connected since:   %s\n' "${since:--}"
+    printf 'Bytes received:    %s\nBytes sent:        %s\n' "${rx:--}" "${tx:--}"
     release_lock "gateway-$gateway"
 }
 
@@ -2715,26 +2822,35 @@ gateway_inventory_record() {
 }
 
 gateway_external_client_records() {
-    # External clients are identities exposed through a non-SSH gateway.
-    # The SSH transport is the private nns-app-to-nns-app gateway and is not
-    # shown as an external client surface.
-    local gateway=$1 source=${2:-local} dir client endpoint connected
+    # CLIENT|name|status|gateway|endpoint|IP|connected|source
+    # IP means live VPN IP when connected, otherwise configured fixed IP, or '-'.
+    local gateway=$1 source=${2:-local} dir client endpoint connected current display_ip cn real ip rx tx since
+    declare -A live_ips=()
     validate_gateway_name "$gateway"
     load_gateway_cfg "$gateway"
     [[ "${TRANSPORT:-direct}" != ssh ]] || return 0
     endpoint="${PUBLIC_HOST}:${PUBLIC_PORT}/${LISTEN_PROTO}"
+    while IFS='|' read -r cn real ip rx tx since; do
+        [[ -n "$cn" && -n "$ip" && "$ip" != - ]] || continue
+        live_ips["$cn"]=${ip%%,*}
+    done < <(gateway_client_live_records "$gateway")
     shopt -s nullglob
     for dir in "$(gateway_clients_dir "$gateway")"/*; do
         [[ -f "$dir/client.cfg" ]] || continue
         client=$(basename "$dir")
         gateway_client_load "$gateway" "$client" 2>/dev/null || continue
-        connected=no
-        if [[ "${STATUS:-unknown}" == active ]] && gateway_client_is_connected "$gateway" "$client"; then
-            connected=yes
+        current=''
+        if [[ "${STATUS:-unknown}" == active ]]; then
+            current=${live_ips[$client]-}
+            display_ip=${current:-${FIXED_IP:--}}
+        else
+            display_ip=-
         fi
+        connected=no
+        [[ -z "$current" ]] || connected=yes
         printf 'CLIENT|%s|%s|%s|%s|%s|%s|%s\n' \
             "$client" "${STATUS:-unknown}" "$gateway" "$endpoint" \
-            "${CREATED_AT:-unknown}" "$connected" "$source"
+            "$display_ip" "$connected" "$source"
     done
     shopt -u nullglob
 }
@@ -2779,7 +2895,7 @@ for row in rows:
 for item in clients:
     cn = item.get("Common Name", "unknown")
     real = item.get("Real Address", "-")
-    virtual = item.get("Virtual Address", "-")
+    virtual = item.get("Virtual IPv4 Address") or item.get("Virtual Address", "-")
     rx = item.get("Bytes Received", "0")
     tx = item.get("Bytes Sent", "0")
     since = item.get("Connected Since", item.get("Connected Since (time_t)", "-"))
