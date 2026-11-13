@@ -10,6 +10,17 @@ ROOT=$(cd "$(dirname "$0")" && pwd -P)
   exit 1
 }
 
+# @@NNS_VERSION@@ is substituted by build.sh; "@" means still unsubstituted.
+NNS_VERSION="@@NNS_VERSION@@"
+if [[ "$NNS_VERSION" == *@* ]]; then
+  if [ -f "$ROOT/../VERSION" ]; then
+    NNS_VERSION=$(tr -d '[:space:]\r' < "$ROOT/../VERSION")
+  else
+    echo 'ERROR: VERSION file missing.' >&2
+    exit 1
+  fi
+fi
+
 # The installer includes nns-app's own executable, launcher and dylib.
 # Like install_linux using apt/dnf, runtime tools are installed through the
 # platform package manager only when absent. Homebrew itself is a prerequisite.
@@ -17,8 +28,10 @@ has_command() {
   local command_name=$1 location
   for location in \
     "/opt/homebrew/bin/$command_name" "/usr/local/bin/$command_name" \
+    "/opt/homebrew/sbin/$command_name" "/usr/local/sbin/$command_name" \
     "/opt/homebrew/opt/curl/bin/$command_name" "/usr/local/opt/curl/bin/$command_name" \
-    "/opt/homebrew/opt/openssh/bin/$command_name" "/usr/local/opt/openssh/bin/$command_name"; do
+    "/opt/homebrew/opt/openssh/bin/$command_name" "/usr/local/opt/openssh/bin/$command_name" \
+    "/opt/homebrew/opt/openvpn/sbin/$command_name" "/usr/local/opt/openvpn/sbin/$command_name"; do
     [ ! -x "$location" ] || return 0
   done
   return 1
@@ -27,6 +40,8 @@ has_command() {
 packages=()
 has_command wireguard-go || packages+=(wireguard-go)
 if ! has_command wg || ! has_command wg-quick; then packages+=(wireguard-tools); fi
+# OpenVPN client backend (optional until an .ovpn profile is used).
+has_command openvpn || packages+=(openvpn)
 has_command curl || packages+=(curl)
 # macOS /usr/bin/ssh is SIP-protected; Git needs a Homebrew-compatible SSH.
 has_command ssh || packages+=(openssh)
@@ -37,7 +52,7 @@ if [ "${#packages[@]}" -ne 0 ]; then
     if [ -x "$candidate" ]; then BREW=$candidate; break; fi
   done
   [ -n "$BREW" ] || {
-    echo 'ERROR: Homebrew is required to install WireGuard/SSH runtime dependencies.' >&2
+    echo 'ERROR: Homebrew is required to install WireGuard/OpenVPN/SSH runtime dependencies.' >&2
     echo 'Install Homebrew first, then rerun sudo ./install_macos.' >&2
     exit 1
   }
@@ -54,4 +69,4 @@ install -m 755 "$ROOT/nns-app-darwin.sh" /usr/local/bin/nns-app
 install -m 755 "$ROOT/bin/nns-run" /usr/local/libexec/nns-app/nns-run
 install -m 755 "$ROOT/bin/libnnsbind.dylib" /usr/local/libexec/nns-app/libnnsbind.dylib
 ln -sf /usr/local/bin/nns-app /usr/local/bin/git-via
-printf 'Installed nns-app 2.1.0 (macOS) at /usr/local/bin/nns-app\n'
+printf 'Installed nns-app %s (macOS) at /usr/local/bin/nns-app\n' "$NNS_VERSION"
