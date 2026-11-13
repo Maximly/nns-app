@@ -16,6 +16,12 @@ Revision History:
 
 #include <stdint.h>
 
+/* Internal helper / interposed syscall failure (same as libc -1). */
+enum nns_status {
+    NNS_OK = 0,
+    NNS_ERR = -1
+};
+
 /* IPv4 class checks on host-order addresses */
 enum nns_ipv4_class {
     NNS_IPV4_OCTET_SHIFT = 24,

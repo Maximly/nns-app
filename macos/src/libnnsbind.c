@@ -53,12 +53,6 @@ Revision History:
 
 #define NNS_LOG_BUF 300
 
-/* Internal helper / interposed syscall failure (same as libc -1). */
-enum nns_status {
-    NNS_OK = 0,
-    NNS_ERR = -1
-};
-
 /* DNS wire format (RFC 1035) */
 enum nns_dns_wire {
     NNS_DNS_NAME_MAX = 253,

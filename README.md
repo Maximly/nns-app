@@ -10,7 +10,7 @@ is available: a managed kernel `utun`, interface-scoped route and an opt-in C
 socket interposer. The macOS backend is **not a network namespace or a security
 sandbox**.
 
-**Current release:** 2.1.0 · **License:** GPL-3.0-or-later · **Platforms:** Linux with systemd (Ubuntu and Fedora tested); experimental macOS WireGuard/OpenVPN TCP client · **Network stack:** IPv4
+**Current release:** 2.1.1 · **License:** GPL-3.0-or-later · **Platforms:** Linux with systemd (Ubuntu and Fedora tested); experimental macOS WireGuard/OpenVPN TCP client · **Network stack:** IPv4
 
 ## Contents
 
