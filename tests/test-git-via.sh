@@ -6,7 +6,7 @@ TEST_TMP=$(mktemp -d)
 trap 'rm -rf -- "$TEST_TMP"' EXIT
 export NNS_APP_LOCK_DIR="$TEST_TMP/locks"
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
-source "$ROOT/nns-app-install.sh"
+source "$ROOT/install_linux"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # The helper requires only a real app name and an installed app directory.
@@ -76,7 +76,7 @@ cd "$TEST_TMP"
 if (git_via_command demo-vpn) >"$TEST_TMP/outside.err" 2>&1; then fail 'non-repository invocation accepted'; fi
 
 # The installed helper symlink dispatches without sudo and exposes help.
-ln -s "$ROOT/nns-app-install.sh" "$TEST_TMP/git-via"
+ln -s "$ROOT/install_linux" "$TEST_TMP/git-via"
 NNS_APP_SOURCE_ONLY=0 "$TEST_TMP/git-via" --help | grep -q 'Usage: git-via' || fail 'symlink entrypoint'
 
 # The ordinary nns-app command also dispatches without requiring root.

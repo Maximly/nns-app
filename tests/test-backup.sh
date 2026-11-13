@@ -6,7 +6,7 @@ TMP=$(mktemp -d)
 trap 'rm -rf -- "$TMP"' EXIT
 export NNS_APP_SOURCE_ONLY=1 NNS_BACKUP_TEST_ROOT="$TMP/source"
 export NNS_APP_LOCK_DIR="$TMP/locks"
-source "$ROOT/nns-app-install.sh"
+source "$ROOT/install_linux"
 
 mkdir -p "$NNS_BACKUP_TEST_ROOT/etc/nns-app/gateways/server1/pki/private" \
  "$NNS_BACKUP_TEST_ROOT/etc/nns-app/gateways/server1/clients/phone" \
@@ -41,7 +41,7 @@ printf '[Service]\nEnvironment=TEST=1\n' > "$NNS_BACKUP_TEST_ROOT/etc/systemd/sy
 printf 'SSHPRIVATE' > "$NNS_BACKUP_TEST_ROOT/home/sample/.ssh/remote-id"
 chmod 0600 "$NNS_BACKUP_TEST_ROOT/etc/nns-app/gateways/server1/pki/private/ca.key"
 archive="$TMP/backup.tar.gz"
-nns_backup_archive_tool create "$archive" "$ROOT/nns-app-install.sh"
+nns_backup_archive_tool create "$archive" "$ROOT/install_linux"
 [[ $(stat -c '%a' "$archive") == 600 ]]
 python3 - "$archive" <<'PY'
 import json,sys,tarfile

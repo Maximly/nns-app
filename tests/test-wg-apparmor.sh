@@ -6,7 +6,7 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 export NNS_APP_SOURCE_ONLY=1 NNS_APP_LOCK_DIR="$TMP/locks"
-source "$ROOT/nns-app-install.sh"
+source "$ROOT/install_linux"
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
 # Both wg-quick and wg AppArmor profiles permit /etc/wireguard/** by default.

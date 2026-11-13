@@ -5,7 +5,7 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 export NNS_APP_SOURCE_ONLY=1 NNS_APP_LOCK_DIR="$TMP/locks"
-source "$ROOT/nns-app-install.sh"
+source "$ROOT/install_linux"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 KEY=$(python3 - <<'PY'
 import base64

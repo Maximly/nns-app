@@ -6,7 +6,7 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 TEST_TMP=$(mktemp -d)
 trap 'rm -rf "$TEST_TMP"' EXIT
 export NNS_APP_SOURCE_ONLY=1
-source "$ROOT/nns-app-install.sh"
+source "$ROOT/install_linux"
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 log() { :; }

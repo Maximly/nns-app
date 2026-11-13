@@ -7,7 +7,7 @@ TEST_TMP=$(mktemp -d)
 trap 'rm -rf "$TEST_TMP"' EXIT
 export NNS_APP_SOURCE_ONLY=1 NNS_APP_LOCK_DIR="$TEST_TMP/locks"
 # shellcheck source=/dev/null
-source "$ROOT/nns-app-install.sh"
+source "$ROOT/install_linux"
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 require_root() { :; }
 acquire_lock() { :; }

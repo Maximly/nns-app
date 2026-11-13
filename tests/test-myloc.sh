@@ -5,7 +5,7 @@ export NNS_APP_SOURCE_ONLY=1
 TEST_TMP=$(mktemp -d)
 trap 'rm -rf "$TEST_TMP"' EXIT
 export NNS_APP_LOCK_DIR="$TEST_TMP/locks"
-source "$ROOT/nns-app-install.sh"
+source "$ROOT/install_linux"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 fixture='{"status":"success","query":"203.0.113.41","country":"Example Land","countryCode":"EX","regionName":"Example Region","city":"Example City","isp":"Example ISP","org":"Example Network","as":"AS64501 Example","lat":0,"lon":3.1}'
 

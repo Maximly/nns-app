@@ -6,7 +6,7 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 export NNS_APP_SOURCE_ONLY=1 NNS_APP_LOCK_DIR="$TMP/locks"
 # shellcheck source=/dev/null
-source "$ROOT/nns-app-install.sh"
+source "$ROOT/install_linux"
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 key=$(python3 - <<'PY'
 import base64
@@ -181,7 +181,7 @@ export AWG_TEST_TMP="$TMP" AWG_TEST_PROFILE="$TMP/a3.conf"
 if PATH="$TMP/bin:$PATH" bash -c '
     set -Eeuo pipefail
     export NNS_APP_SOURCE_ONLY=1 NNS_APP_LOCK_DIR="$AWG_TEST_TMP/locks"
-    source "'"$ROOT"'/nns-app-install.sh"
+    source "'"$ROOT"'/install_linux"
     load_cfg() { NS_NAME=mock-netns; }
     wireguard_runtime_config_path() { printf "%s/runawg.conf\n" "$AWG_TEST_TMP"; }
     ip() {

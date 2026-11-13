@@ -3,13 +3,13 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-INSTALLER="$ROOT/nns-app-install.sh"
+INSTALLER="$ROOT/install_linux"
 
 bash -n "$INSTALLER"
 python3 "$ROOT/tools/check_embedded_python.py" "$INSTALLER"
 
 version=$("$INSTALLER" --version)
-grep -Fxq 'nns-app 2.0.16' <<<"$(head -n1 <<<"$version")"
+grep -Fxq 'nns-app 2.1.0' <<<"$(head -n1 <<<"$version")"
 
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
@@ -222,11 +222,11 @@ if grep -Fq 'rm -f "$tmp" "$backup"' "$INSTALLER"; then
     exit 1
 fi
 
-grep -Fq '**Current release:** 2.0.16' "$ROOT/README.md"
+grep -Fq '**Current release:** 2.1.0' "$ROOT/README.md"
 grep -Fq '## Quick start' "$ROOT/README.md"
 grep -Fq '## Quick start' "$ROOT/README.md"
 grep -Fq 'nns-app install work-vpn' "$ROOT/README.md"
-grep -Fq 'install --local-only' "$ROOT/README.md"
+grep -Fq 'sudo ./install_linux --local-only' "$ROOT/README.md"
 grep -Fq 'remote_auto_refresh_configured_nodes' "$INSTALLER"
 grep -Fq "install --local-only; sudo /bin/bash '\$remote_tmp' _remote-auto-authorize" "$INSTALLER"
 grep -Fq '### Remote VPN exit' "$ROOT/README.md"

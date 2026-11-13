@@ -61,7 +61,7 @@ grep -Fq 'openvpn-server' <<<"$output" || fail 'server-only inventory missing se
 rm -rf "$GATEWAY_BASE_DIR/vpn"
 list_remote_auto_records() {
     case "$1" in
-        inventory-clients) printf 'CLIENT|laptop|active|remote-gw|vpn.example.net:1194/udp|2026-11-06|yes|remote:app\n' ;;
+        inventory-clients) printf 'CLIENT|laptop|active|remote-gw|vpn.example.net:1194/udp|10.0.9.12|yes|remote:app\n' ;;
     esac
 }
 [[ "$(list_managed_objects)" == 'No apps configured.' ]] || fail 'remote-only credentials leak into local apps'
@@ -69,6 +69,7 @@ output=$(list_all_objects)
 ! grep -Fq 'Apps:' <<<"$output" || fail 'remote-only exported credentials create apps table'
 grep -Fq 'Exported clients:' <<<"$output" || fail 'remote credentials missing'
 grep -Fq 'laptop' <<<"$output" || fail 'remote credential missing name'
+grep -Fq '10.0.9.12' <<<"$output" || fail 'remote credential IP missing'
 
 list_remote_auto_records() {
     case "$1" in
