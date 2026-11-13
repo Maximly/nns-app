@@ -30,6 +30,8 @@ Revision History:
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "nns_net.h"
+
 #ifndef DYLD_INTERPOSE
 /**
  * DYLD_INTERPOSE() - register a dyld function interpose pair
@@ -56,17 +58,6 @@ enum nns_status {
     NNS_OK = 0,
     NNS_ERR = -1
 };
-
-/* IPv4 class checks on host-order addresses */
-enum nns_ipv4_class {
-    NNS_IPV4_OCTET_SHIFT = 24,
-    NNS_IPV4_LOOPBACK_OCTET = 127,     /* 127.0.0.0/8 */
-    NNS_IPV4_THIS_OCTET = 0,           /* 0.0.0.0/8 */
-    NNS_IPV4_MULTICAST_OCTET = 224     /* 224.0.0.0/4 and above */
-};
-
-#define NNS_IPV4_LINKLOCAL_MASK 0xffff0000u
-#define NNS_IPV4_LINKLOCAL_NET  0xa9fe0000u /* 169.254.0.0/16 */
 
 /* DNS wire format (RFC 1035) */
 enum nns_dns_wire {
@@ -217,13 +208,8 @@ static int nns_connect(int fd, const struct sockaddr *address, socklen_t address
     uint32_t d = ntohl(dst->sin_addr.s_addr);
 
     /* localhost, 0/8, multicast, and link-local stay on the host stack */
-    unsigned octet = d >> NNS_IPV4_OCTET_SHIFT;
-    if (octet == NNS_IPV4_LOOPBACK_OCTET ||
-        octet == NNS_IPV4_THIS_OCTET ||
-        octet >= NNS_IPV4_MULTICAST_OCTET ||
-        (d & NNS_IPV4_LINKLOCAL_MASK) == NNS_IPV4_LINKLOCAL_NET) {
+    if (nns_ipv4_is_host_local(d))
         return connect(fd, address, address_len);
-    }
 
     int socket_type = 0;
     socklen_t socket_type_len = sizeof(socket_type);
