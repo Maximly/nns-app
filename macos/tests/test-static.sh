@@ -354,4 +354,43 @@ SH
   fi
 fi
 
+
+# Regression: git-via must work when the repository has no core.sshCommand.
+# `set -o pipefail` previously aborted the "count existing values" pipeline
+# before git-via could write the new setting.
+if [ "$(uname -s)" = Darwin ]; then
+  test_ssh=''
+  for candidate in /opt/homebrew/bin/ssh /usr/local/bin/ssh \
+    /opt/homebrew/opt/openssh/bin/ssh /usr/local/opt/openssh/bin/ssh; do
+    if [ -x "$candidate" ]; then test_ssh=$candidate; break; fi
+  done
+  if [ -n "$test_ssh" ]; then
+    mkdir "$T/gitvia-repo"
+    (
+      cd "$T/gitvia-repo"
+      git init -q
+      git config user.email test@example.invalid
+      git config user.name test
+    )
+    bash "$ROOT/nns-app-darwin.sh" install gitviavpn >/dev/null
+    bash "$ROOT/nns-app-darwin.sh" add gitviavpn "$T/test.conf" >/dev/null
+    (
+      cd "$T/gitvia-repo"
+      bash "$ROOT/nns-app-darwin.sh" git-via gitviavpn >/dev/null
+    )
+    desired=$(cd "$T/gitvia-repo" && git config --local --get core.sshCommand)
+    [ "$desired" = "/usr/local/bin/nns-app run gitviavpn $test_ssh" ] || {
+      echo "git-via did not set core.sshCommand: '$desired'" >&2; exit 1
+    }
+    (
+      cd "$T/gitvia-repo"
+      bash "$ROOT/nns-app-darwin.sh" git-via - >/dev/null
+    )
+    [ -z "$(cd "$T/gitvia-repo" && git config --local --get core.sshCommand 2>/dev/null || true)" ] || {
+      echo 'git-via - did not remove core.sshCommand' >&2; exit 1
+    }
+    bash "$ROOT/nns-app-darwin.sh" remove gitviavpn >/dev/null
+  fi
+fi
+
 echo 'macOS static + mock CLI tests passed.'
