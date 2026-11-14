@@ -386,7 +386,10 @@ activate_namespace_split_dns() {
         if [[ -n "$search_domains" ]]; then
             printf 'search %s\n' "$search_domains"
         fi
-        printf 'options timeout:2 attempts:2\n'
+        # The proxy answers cached/stale entries instantly, so several quick
+        # attempts cost nothing; four attempts let the resolver outlast a
+        # multi-second blackout of the private DNS upstream for uncached names.
+        printf 'options timeout:2 attempts:4\n'
     } >"$target"
     chmod 0644 "$target"
 }
