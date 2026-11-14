@@ -38,11 +38,11 @@ sandbox**.
 
 ## Linux vs macOS feature compatibility
 
-**Linux behavior is unchanged in 2.1.1** apart from the version number and an
+**Linux behavior is unchanged in 2.1** apart from the version number and an
 explicit guard preventing the Linux installer from executing on macOS.
 The macOS backend is a separate implementation, not a fork of Linux modules.
 
-| Feature / command | Linux (systemd) | macOS 2.1.1 |
+| Feature / command | Linux (systemd) | macOS |
 | --- | --- | --- |
 | `install <app>`, `add <app> profile` | Supported | Supported for **WireGuard `.conf`** and **OpenVPN `.ovpn`** |
 | `start`, `stop`, `status`, `list`, `remove` | Supported | Supported; `start/stop/recover` require `sudo` |
