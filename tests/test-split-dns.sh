@@ -97,7 +97,7 @@ if (validate_wireguard "$TMP/invalid-dns.conf") >/dev/null 2>&1; then fail 'mixe
 
 # Test the packet-level suffix dispatcher without binding port 53 or needing root.
 python3 - "$ROOT/src/70-run-status.sh" <<'PY'
-import pathlib, struct, sys
+import os, pathlib, struct, sys
 src = pathlib.Path(sys.argv[1]).read_text()
 preamble = src.split("<<'PY_NNS_DNS_PROXY'\n", 1)[1].split('\nPY_NNS_DNS_PROXY', 1)[0]
 code = preamble.split('udp_server = ThreadingUDPServer(', 1)[0]
@@ -128,6 +128,133 @@ exec(code, scope)
 assert scope['dns_upstreams'](query('corp.example')) == [('10.77.0.53', 53)]
 assert scope['dns_upstreams'](query('ya.ru')) == [('10.77.0.53', 53)]
 assert scope['dns_upstreams'](query('notcorp.example')) == [('10.77.0.53', 53)]
+
+# forward_udp must retry transient upstream failures while staying inside the
+# resolver client's timeout budget, and must not retry a healthy first answer.
+NOERROR = b'\x12\x34\x81\x80\x00\x01\x00\x00\x00\x00\x00\x00'
+SERVFAIL = b'\x12\x34\x81\x82\x00\x01\x00\x00\x00\x00\x00\x00'
+assert scope['dns_rcode'](NOERROR) == 0
+assert scope['dns_rcode'](SERVFAIL) == 2
+assert scope['attempt_timeout']() == scope['QUERY_BUDGET'] / scope['QUERY_ATTEMPTS']
+assert 0.5 < scope['attempt_timeout']() < 1.0
+real_socket = scope['socket'].socket
+
+
+def query_with_opt(name):
+    qname = b''.join(bytes([len(l)])+l.encode('ascii') for l in name.split('.'))+b'\0'
+    opt = b'\x00\x00\x29\x10\x00\x00\x00\x00\x00\x00\x00'
+    return struct.pack('!HHHHHH', 123, 0x0100, 1, 0, 0, 1) + qname + struct.pack('!HH', 1, 1) + opt
+
+
+def clear_cache():
+    with scope['_cache_lock']:
+        scope['_cache'].clear()
+
+
+def run_scenario(replies, payload=None, clear=True):
+    if clear:
+        clear_cache()
+    if payload is None:
+        payload = query('corp.example')
+    calls, recv_count = [], [0]
+
+    class FakeSock:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def settimeout(self, t):
+            calls.append(('timeout', t))
+
+        def sendto(self, wire, upstream):
+            calls.append(('send', upstream, wire))
+
+        def recvfrom(self, n):
+            idx = min(recv_count[0], len(replies) - 1)
+            recv_count[0] += 1
+            calls.append(('recv', None))
+            if replies[idx] == 'timeout':
+                raise TimeoutError('probe timeout')
+            return replies[idx], ('10.77.0.53', 53)
+
+    scope['socket'].socket = FakeSock
+    saved_stderr = sys.stderr
+    sys.stderr = open(os.devnull, 'w')
+    try:
+        result = scope['forward_udp'](payload)
+    finally:
+        scope['socket'].socket = real_socket
+        sys.stderr = saved_stderr
+    return result, calls
+
+
+result, calls = run_scenario(['timeout', NOERROR])
+assert result == NOERROR, 'timeout then healthy answer was not retried'
+assert len(calls) == 6, calls
+for entry in calls:
+    assert entry[0] != 'timeout' or entry[1] == scope['attempt_timeout'](), calls
+result, calls = run_scenario([SERVFAIL, NOERROR])
+assert result == NOERROR, 'SERVFAIL was not retried'
+result, calls = run_scenario([SERVFAIL, SERVFAIL])
+assert result == SERVFAIL, 'final SERVFAIL was not returned to the client'
+assert len(calls) == 6, calls
+result, calls = run_scenario([NOERROR])
+assert result == NOERROR
+assert len(calls) == 3, 'healthy first answer must not be retried'
+
+# EDNS0 fallback: the retry for private resolvers must drop the OPT record so
+# legacy servers see a plain RFC 1035 query (what the macOS client always sends).
+assert scope['strip_edns'](query_with_opt('corp.example')) == query('corp.example')
+assert scope['strip_edns'](query('corp.example')) == query('corp.example')
+assert scope['strip_edns'](b'\x00\x01\x00\x00') == b'\x00\x01\x00\x00'
+result, calls = run_scenario(['timeout', NOERROR], payload=query_with_opt('corp.example'))
+assert result == NOERROR
+sent = [entry for entry in calls if entry[0] == 'send']
+assert len(sent) == 2, calls
+assert sent[0][2] == query_with_opt('corp.example'), 'first attempt must stay verbatim'
+assert sent[1][2] == query('corp.example'), 'fallback attempt must drop EDNS0 OPT'
+
+# Answer cache: fresh answers replay without upstream traffic, and during an
+# upstream blackout an expired answer is served stale with the current query ID.
+real_monotonic = scope['time'].monotonic
+clock = [100.0]
+scope['time'].monotonic = lambda: clock[0]
+clear_cache()
+result, calls = run_scenario([NOERROR])
+assert result == NOERROR
+assert len(calls) == 3, calls
+result, calls = run_scenario(['timeout', 'timeout'], clear=False)
+assert result[0:2] == query('corp.example')[0:2], 'cache hit must carry the new query ID'
+assert result[2:] == NOERROR[2:]
+assert calls == [], 'fresh cache hit must not touch the upstream'
+clock[0] = 115.0
+result, calls = run_scenario(['timeout', 'timeout'], clear=False)
+assert result[0:2] == query('corp.example')[0:2], 'stale answer must carry the new query ID'
+assert result[2:] == NOERROR[2:]
+assert len(calls) == 6, 'stale path must try the upstream first'
+clock[0] = 500.0
+result, calls = run_scenario(['timeout', 'timeout'], clear=False)
+assert result is None, 'answer older than the stale window must not be served'
+assert len(calls) == 6, calls
+scope['time'].monotonic = real_monotonic
+clear_cache()
+# Public upstreams must keep EDNS0 verbatim on every attempt.
+sys.argv = ['proxy', '1.1.1.1', '', '']
+scope = {}
+exec(code, scope)
+result, calls = run_scenario(['timeout', NOERROR], payload=query_with_opt('corp.example'))
+assert result == NOERROR
+sent = [entry for entry in calls if entry[0] == 'send']
+assert len(sent) == 2, calls
+assert sent[0][2] == sent[1][2] == query_with_opt('corp.example'), 'public upstream must keep EDNS0'
 PY
+
+grep -Fq "options timeout:2 attempts:4" "$ROOT/src/40-network.sh" ||
+    fail 'resolver persistence was not raised for split-DNS namespaces'
 
 echo 'Split DNS tests passed.'
