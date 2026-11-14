@@ -168,12 +168,20 @@ import socketserver
 import struct
 import sys
 import threading
+import time
 
 LISTEN_ADDRESS = "127.0.0.53"
 LISTEN_PORT = 53
 UPSTREAM_PORT = 53
-QUERY_TIMEOUT = 3.0
 MAX_DNS_PACKET = 65535
+# Resolver clients configured with 'options timeout:2' abandon a query after
+# roughly two seconds, so a single slow upstream attempt wastes that window.
+# Split the budget across retries instead: one fast attempt that catches a
+# slow responder, plus a retry that survives transient UDP loss on the tunnel
+# and brief SERVFAIL/REFUSED episodes on a corporate DNS server. The per-attempt
+# timeouts are derived below; the total budget stays under the client window.
+QUERY_ATTEMPTS = 2
+QUERY_BUDGET = 1.9
 
 upstreams: list[tuple[str, int]] = []
 for item in sys.argv[1].split():
@@ -242,30 +250,259 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
     return b"".join(chunks)
 
 
+def dns_rcode(packet: bytes) -> int:
+    if len(packet) < 4:
+        return -1
+    return packet[3] & 0x0F
+
+
+def dns_retryable(packet: bytes) -> bool:
+    # SERVFAIL/REFUSED often reflect a transient upstream condition; retrying
+    # once is cheap and turns many brief episodes into a successful answer.
+    return dns_rcode(packet) in (2, 5)
+
+
+def _skip_dns_name(packet: bytes, offset: int) -> int:
+    while True:
+        if offset >= len(packet):
+            raise ValueError("truncated DNS name")
+        length = packet[offset]
+        if length == 0:
+            return offset + 1
+        if length & 0xC0 == 0xC0:
+            return offset + 2
+        offset += 1 + length
+
+
+def strip_edns(payload: bytes) -> bytes:
+    # Remove EDNS0 OPT pseudo-records from the additional section, producing a
+    # plain RFC 1035 query. Legacy corporate DNS servers and stateful
+    # firewalls sometimes blackhole OPT-bearing queries; the macOS client's
+    # resolver never sends EDNS0 and therefore never hits that failure mode.
+    # Anything unparseable is returned verbatim rather than mangled.
+    try:
+        if len(payload) < 12:
+            return payload
+        qd, an, ns, ar = struct.unpack_from("!HHHH", payload, 4)
+        offset = 12
+        for _ in range(qd):
+            offset = _skip_dns_name(payload, offset) + 4
+        for _ in range(an + ns):
+            offset = _skip_dns_name(payload, offset)
+            if offset + 10 > len(payload):
+                return payload
+            rdlen = struct.unpack_from("!H", payload, offset + 8)[0]
+            offset += 10 + rdlen
+        if ar == 0 or offset >= len(payload):
+            return payload
+        additional_start = offset
+        kept = []
+        for _ in range(ar):
+            start = offset
+            offset = _skip_dns_name(payload, offset)
+            if offset + 10 > len(payload):
+                return payload
+            rtype = struct.unpack_from("!H", payload, offset)[0]
+            rdlen = struct.unpack_from("!H", payload, offset + 8)[0]
+            offset += 10 + rdlen
+            if offset > len(payload):
+                return payload
+            if rtype != 41:
+                kept.append(payload[start:offset])
+        if len(kept) == ar:
+            return payload
+        out = bytearray(payload[:additional_start])
+        struct.pack_into("!H", out, 10, len(kept))
+        for chunk in kept:
+            out += chunk
+        return bytes(out)
+    except (ValueError, struct.error):
+        return payload
+
+
+def _log_failure(payload: bytes, upstream_list: list[tuple[str, int]]) -> None:
+    name = dns_question_name(payload) or "<unparsed>"
+    targets = ",".join(f"{a}:{p}" for a, p in upstream_list)
+    print(f"nns-dns: no answer for {name} from {targets}", file=sys.stderr, flush=True)
+
+
+def _log_fallback(payload: bytes, upstream: tuple[str, int]) -> None:
+    name = dns_question_name(payload) or "<unparsed>"
+    print(f"nns-dns: resolved {name} via {upstream[0]} without EDNS0 (fallback)",
+          file=sys.stderr, flush=True)
+
+
+# Small in-memory answer cache. A corporate DNS service that briefly black
+# outs for seconds at a time must not take down git/SSH name resolution.
+# Answers are cached for the record's own TTL, capped at CACHE_TTL_CAP — the
+# same behaviour as a standard caching resolver (systemd-resolved masks these
+# episodes on whole-host setups exactly this way). While the upstream is
+# unreachable, an expired entry is served stale for up to CACHE_STALE_MAX
+# seconds. Responses are rewritten to carry the current query ID, as any
+# forwarding resolver does.
+CACHE_TTL_CAP = 3600.0
+CACHE_STALE_MAX = 300.0
+_cache_lock = threading.Lock()
+_cache: dict[tuple[str, int, int], tuple[bytes, float]] = {}
+
+
+def _question_key(packet: bytes) -> tuple[str, int, int] | None:
+    name = dns_question_name(packet)
+    if name is None or len(packet) < 16:
+        return None
+    try:
+        offset = _skip_dns_name(packet, 12)
+        qtype, qclass = struct.unpack_from("!HH", packet, offset)
+    except (ValueError, struct.error):
+        return None
+    return (name, qtype, qclass)
+
+
+def _min_answer_ttl(packet: bytes) -> int | None:
+    try:
+        if len(packet) < 12:
+            return None
+        qd, an, ns, _ar = struct.unpack_from("!HHHH", packet, 4)
+        offset = 12
+        for _ in range(qd):
+            offset = _skip_dns_name(packet, offset) + 4
+        ttl = None
+        for _ in range(an + ns):
+            offset = _skip_dns_name(packet, offset)
+            if offset + 10 > len(packet):
+                return None
+            rr_ttl = struct.unpack_from("!I", packet, offset + 4)[0]
+            offset += 10 + struct.unpack_from("!H", packet, offset + 8)[0]
+            if offset > len(packet):
+                return None
+            if ttl is None or rr_ttl < ttl:
+                ttl = rr_ttl
+        return ttl
+    except (ValueError, struct.error):
+        return None
+
+
+def _rewrite_id(response: bytes, query: bytes) -> bytes:
+    if len(response) < 2 or len(query) < 2:
+        return response
+    out = bytearray(response)
+    out[0] = query[0]
+    out[1] = query[1]
+    return bytes(out)
+
+
+def _cache_store(payload: bytes, response: bytes) -> None:
+    if dns_rcode(response) != 0 or len(response) < 3:
+        return
+    if response[2] & 0x02:  # truncated answers are not cached
+        return
+    key = _question_key(payload)
+    if key is None:
+        return
+    ttl = _min_answer_ttl(response)
+    lifetime = min(float(ttl or 10), CACHE_TTL_CAP)
+    if lifetime <= 0:
+        return
+    with _cache_lock:
+        _cache[key] = (response, time.monotonic() + lifetime)
+
+
+def _cache_lookup(payload: bytes, allow_stale: bool) -> bytes | None:
+    key = _question_key(payload)
+    if key is None:
+        return None
+    now = time.monotonic()
+    with _cache_lock:
+        entry = _cache.get(key)
+        if entry is None:
+            return None
+        response, expiry = entry
+        if now - expiry > CACHE_STALE_MAX:
+            _cache.pop(key, None)
+            return None
+        if now <= expiry or allow_stale:
+            return response
+    return None
+
+
+def _log_stale(payload: bytes) -> None:
+    name = dns_question_name(payload) or "<unparsed>"
+    print(f"nns-dns: serving stale answer for {name} (upstream unreachable)",
+          file=sys.stderr, flush=True)
+
+
+def attempt_timeout() -> float:
+    return QUERY_BUDGET / QUERY_ATTEMPTS
+
+
+def attempt_payload(payload: bytes, attempt: int, fallback: bool) -> bytes:
+    # The first attempt always forwards the client query verbatim so
+    # EDNS-capable servers are unaffected. The fallback attempt for private
+    # resolvers drops the OPT record to match plain-query clients (macOS).
+    if attempt > 0 and fallback:
+        return strip_edns(payload)
+    return payload
+
+
 def forward_udp(payload: bytes) -> bytes | None:
-    for upstream in dns_upstreams(payload):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-                sock.settimeout(QUERY_TIMEOUT)
-                sock.sendto(payload, upstream)
-                response, _ = sock.recvfrom(MAX_DNS_PACKET)
-                return response
-        except OSError:
-            continue
+    cached = _cache_lookup(payload, allow_stale=False)
+    if cached is not None:
+        return _rewrite_id(cached, payload)
+    upstream_list = dns_upstreams(payload)
+    fallback = bool(private_upstreams) and upstream_list == private_upstreams
+    for upstream in upstream_list:
+        for attempt in range(QUERY_ATTEMPTS):
+            wire = attempt_payload(payload, attempt, fallback)
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                    sock.settimeout(attempt_timeout())
+                    sock.sendto(wire, upstream)
+                    response, _ = sock.recvfrom(MAX_DNS_PACKET)
+                    if dns_retryable(response) and attempt + 1 < QUERY_ATTEMPTS:
+                        continue
+                    if attempt > 0 and wire != payload:
+                        _log_fallback(payload, upstream)
+                    _cache_store(payload, response)
+                    return response
+            except OSError:
+                continue
+    stale = _cache_lookup(payload, allow_stale=True)
+    if stale is not None:
+        _log_stale(payload)
+        return _rewrite_id(stale, payload)
+    _log_failure(payload, upstream_list)
     return None
 
 
 def forward_tcp(payload: bytes) -> bytes | None:
-    request = struct.pack("!H", len(payload)) + payload
-    for upstream in dns_upstreams(payload):
-        try:
-            with socket.create_connection(upstream, timeout=QUERY_TIMEOUT) as sock:
-                sock.settimeout(QUERY_TIMEOUT)
-                sock.sendall(request)
-                response_size = struct.unpack("!H", recv_exact(sock, 2))[0]
-                return recv_exact(sock, response_size)
-        except OSError:
-            continue
+    cached = _cache_lookup(payload, allow_stale=False)
+    if cached is not None:
+        return _rewrite_id(cached, payload)
+    upstream_list = dns_upstreams(payload)
+    fallback = bool(private_upstreams) and upstream_list == private_upstreams
+    for upstream in upstream_list:
+        for attempt in range(QUERY_ATTEMPTS):
+            wire = attempt_payload(payload, attempt, fallback)
+            request = struct.pack("!H", len(wire)) + wire
+            try:
+                with socket.create_connection(upstream, timeout=attempt_timeout()) as sock:
+                    sock.settimeout(attempt_timeout())
+                    sock.sendall(request)
+                    response_size = struct.unpack("!H", recv_exact(sock, 2))[0]
+                    response = recv_exact(sock, response_size)
+                    if dns_retryable(response) and attempt + 1 < QUERY_ATTEMPTS:
+                        continue
+                    if attempt > 0 and wire != payload:
+                        _log_fallback(payload, upstream)
+                    _cache_store(payload, response)
+                    return response
+            except (ConnectionError, OSError, struct.error):
+                continue
+    stale = _cache_lookup(payload, allow_stale=True)
+    if stale is not None:
+        _log_stale(payload)
+        return _rewrite_id(stale, payload)
+    _log_failure(payload, upstream_list)
     return None
 
 
@@ -325,7 +562,15 @@ print(
     flush=True,
 )
 
-stop_event.wait()
+# A silent serve_forever death leaves a zombie unit that systemd sees as
+# "running" while it answers nothing (ICMP port-unreachable to clients).
+# Monitor both listener threads: exit non-zero so the unit's Restart=on-failure
+# policy replaces the proxy within seconds.
+while not stop_event.wait(10):
+    if not all(thread.is_alive() for thread in threads):
+        print("nns-app DNS proxy: a listener thread exited unexpectedly; exiting for restart.",
+              file=sys.stderr, flush=True)
+        os._exit(1)
 udp_server.shutdown()
 tcp_server.shutdown()
 udp_server.server_close()
