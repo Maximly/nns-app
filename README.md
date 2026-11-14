@@ -564,6 +564,14 @@ bounded; failure restores the original MTU. Set `AUTO_MTU="off"` in
 to return to profile defaults. The watchdog restarts failed backends with
 cooldowns and avoids restarting children while their upstream is offline.
 
+If a WireGuard app resolves private names only intermittently while the
+tunnel service stays active and direct queries work from the host, check
+whether the profile's keypair is in use in more than one place (a host-level
+`wg-quick` interface, another app, or another machine). The server keeps one
+endpoint per peer key, so every rekey roams it to the most recent instance
+and the others are blackholed until their next rekey. Use one keypair per
+device, or run only one instance of the profile at a time.
+
 The app configuration also supports `KILLSWITCH`, `AUTOSTART`, `UPSTREAM_APP`,
 `DNS_SERVERS`, `DISABLE_IPV6`, `WATCHDOG_MODE`, and related settings. Files are
 root-owned and validated. Network and firewall resources are owned by nns-app;
