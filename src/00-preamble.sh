@@ -438,6 +438,7 @@ Examples:
   nns-app myip office-vpn   # managed OpenVPN server
   nns-app myloc my-private-app
   nns-app myloc office-vpn --json
+  # myloc requires a public Internet exit; a private-only split tunnel has none.
 
   # Export a standard OpenVPN profile for a client that does not run nns-app.
   # The current automatic-remote host and a free OpenVPN port are used by default.

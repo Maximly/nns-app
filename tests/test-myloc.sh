@@ -68,6 +68,46 @@ fixture='{"status":"success","query":"203.0.113.41","country":"Example Land","co
     grep -Fq 'private range' "$TEST_TMP/error.out" || fail 'API failure did not show error'
 )
 (
+    require_root() { :; }
+    validate_app_name() { :; }
+    managed_gateway_exists() { return 1; }
+    load_cfg() { NS_NAME=nns-private; }
+    app_split_tunnel() { [[ "$1" == private-app ]]; }
+    cfg_read_value() { [[ "$1" == private-app && "$2" == KILLSWITCH ]] || fail 'wrong split guard lookup'; printf 'on\n'; }
+    myloc_namespace_ready() { return 0; }
+    myloc_query() { fail 'queried a kill-switched split tunnel'; }
+    die() { echo "$*" >&2; return 1; }
+    if (myloc_command private-app) >"$TEST_TMP/split.out" 2>&1; then fail 'split tunnel with kill switch accepted'; fi
+    grep -Fq 'no public Internet exit' "$TEST_TMP/split.out" || fail 'split-tunnel diagnostic'
+)
+(
+    require_root() { :; }
+    validate_app_name() { :; }
+    managed_gateway_exists() { return 1; }
+    load_cfg() { NS_NAME=nns-soft; }
+    app_split_tunnel() { [[ "$1" == soft-app ]]; }
+    cfg_read_value() { [[ "$1" == soft-app && "$2" == KILLSWITCH ]] || fail 'wrong split guard lookup'; printf 'off\n'; }
+    myloc_namespace_ready() { return 0; }
+    myloc_query() { [[ "$1" == nns-soft ]] || fail 'split app with kill switch off did not use namespace'; printf '%s\n' "$fixture"; }
+    output=$(myloc_command soft-app)
+    grep -Fq 'Context:           app:soft-app' <<<"$output" || fail 'soft split app context'
+)
+(
+    require_root() { :; }
+    validate_app_name() { :; }
+    managed_gateway_exists() { [[ "$1" == relay ]]; }
+    load_gateway_cfg() { VIA_APP=upstream; }
+    systemctl() { [[ "$1" == is-active ]] || fail 'wrong service check'; }
+    load_cfg() { NS_NAME=nns-upstream; }
+    app_split_tunnel() { [[ "$1" == upstream ]]; }
+    cfg_read_value() { [[ "$1" == upstream && "$2" == KILLSWITCH ]] || fail 'wrong gateway guard lookup'; printf 'on\n'; }
+    myloc_namespace_ready() { [[ "$1" == nns-upstream ]]; }
+    myloc_query() { fail 'gateway via split tunnel queried'; }
+    die() { echo "$*" >&2; return 1; }
+    if (myloc_command relay) >"$TEST_TMP/gw-split.out" 2>&1; then fail 'gateway via split tunnel accepted'; fi
+    grep -Fq 'gateway:relay via upstream' "$TEST_TMP/gw-split.out" || fail 'gateway split diagnostic context'
+)
+(
     printf '%s\n' 'bad JSON' | myloc_format json host >"$TEST_TMP/bad.out" 2>&1 && fail 'invalid JSON accepted'
     grep -Fq 'Invalid geolocation response' "$TEST_TMP/bad.out" || fail 'invalid JSON diagnostic'
 )

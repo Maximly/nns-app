@@ -19,6 +19,15 @@ myloc_namespace_ready() {
     [[ -e "/run/netns/$1" ]]
 }
 
+# A private-only split tunnel with the kill switch enabled drops every packet
+# outside AllowedIPs, so its namespace has no public Internet exit to query.
+myloc_private_only() {
+    local app=$1 killswitch
+    app_split_tunnel "$app" || return 1
+    killswitch=$(cfg_read_value "$app" KILLSWITCH 2>/dev/null || true)
+    bool_on "${killswitch:-off}"
+}
+
 myloc_format() {
     local format=$1 context=$2
     python3 -c '
@@ -56,7 +65,7 @@ print("Provider:          ip-api.com (approximate location; HTTP)")
 }
 
 myloc_command() {
-    local requested="" format=pretty context="host" ns="" via="" json=""
+    local requested="" format=pretty context="host" ns="" via="" json="" egress=""
     while (( $# > 0 )); do
         case "$1" in
             --json) format=json ;;
@@ -84,6 +93,10 @@ myloc_command() {
                 myloc_namespace_ready "$NS_NAME" || die "Gateway upstream '$via' has no active namespace."
                 ns=$NS_NAME
                 context="gateway:$requested via $via"
+                egress=$via
+                if [[ -n "${UPSTREAM_APP:-}" && "$UPSTREAM_APP" != host ]]; then
+                    egress=$UPSTREAM_APP
+                fi
             fi
         else
             require_root
@@ -91,6 +104,10 @@ myloc_command() {
             myloc_namespace_ready "$NS_NAME" || die "App '$requested' has no active namespace."
             ns=$NS_NAME
             context="app:$requested"
+            egress=$requested
+            if [[ -n "${UPSTREAM_APP:-}" && "$UPSTREAM_APP" != host ]]; then
+                egress=$UPSTREAM_APP
+            fi
         fi
     else
         local detected
@@ -103,6 +120,10 @@ myloc_command() {
         elif ! myip_host_namespace; then
             context='current network namespace'
         fi
+    fi
+
+    if [[ -n "$egress" ]] && myloc_private_only "$egress"; then
+        die "IP geolocation is impossible from '$context': app '$egress' is a private-only split tunnel with the kill switch enabled (no public Internet exit)."
     fi
 
     json=$(myloc_query "$ns") || die "IP geolocation unavailable from '$context' (DNS, network, API, or rate limit)."
