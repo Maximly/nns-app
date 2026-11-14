@@ -9,7 +9,8 @@ Abstract:
     Not a security boundary: Network.framework/connectx/UDP/SIP-protected apps,
     existing sockets, and direct syscalls can bypass this.
     getaddrinfo() queries the specified IPv4 DNS server through utun without
-    touching the macOS system DNS configuration. A-only DNS, no TCP fallback.
+    touching the macOS system DNS configuration. A-only DNS, no TCP fallback;
+    answers are cached briefly and served stale during short upstream outages.
 
 Revision History:
 
@@ -19,6 +20,7 @@ Revision History:
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
+#include <pthread.h>
 #include <sys/select.h>
 #include <time.h>
 #include <netinet/in.h>
@@ -27,6 +29,7 @@ Revision History:
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -65,7 +68,7 @@ enum nns_dns_wire {
     NNS_DNS_RESP_CAP = 2048,
     NNS_DNS_PORT = 53,
     NNS_DNS_TIMEOUT_SEC = 2,
-    NNS_DNS_TRIES = 2,
+    NNS_DNS_TRIES = 5,
     NNS_DNS_TYPE_A = 1,
     NNS_DNS_CLASS_IN = 1,
     NNS_DNS_A_RDLEN = 4,
@@ -84,8 +87,38 @@ enum nns_dns_wire {
     /* RR fixed-part offsets (after the owner name) */
     NNS_DNS_RR_OFF_TYPE = 0,
     NNS_DNS_RR_OFF_CLASS = 2,
-    NNS_DNS_RR_OFF_RDLEN = 8
+    NNS_DNS_RR_OFF_RDLEN = 8,
+
+    /* Per-process answer cache: ride out brief corporate DNS blackouts.
+     * Fresh answers are kept for the smaller of the record TTL and this cap
+     * (caching resolvers honour TTL; systemd-resolved hides the same
+     * episodes on whole-host setups). */
+    NNS_DNS_CACHE_SLOTS = 32,
+    NNS_DNS_CACHE_TTL_SEC = 3600,
+    NNS_DNS_CACHE_STALE_SEC = 300
 };
+
+
+/**
+ * Per-process DNS answer cache.
+ *
+ * The private DNS upstream may briefly stop answering for seconds at a time;
+ * without memory each episode fails every getaddrinfo() in flight. Fresh
+ * answers are cached for NNS_DNS_CACHE_TTL_SEC, and once the upstream stops
+ * responding, an expired entry is served stale for a further
+ * NNS_DNS_CACHE_STALE_SEC seconds. Slots are shared across threads behind one
+ * mutex; a collision simply replaces the older entry.
+ */
+struct nns_dns_cache_entry {
+    char name[NNS_DNS_NAME_MAX + 1];
+    struct in_addr addr;
+    time_t expires;
+    time_t stale_until;
+    bool used;
+};
+
+static struct nns_dns_cache_entry nns_dns_cache[NNS_DNS_CACHE_SLOTS];
+static pthread_mutex_t nns_dns_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 
 
 /**
@@ -112,12 +145,29 @@ static void nns_dns_put_u16(unsigned char *p, uint16_t host)
 }
 
 
+static uint nns_dns_cache_slot(const char *hostname)
+{
+    uint hash = 5381;
+    const uint8_t* p = (void*)hostname;
+
+    while (*p) {
+        unsigned char c = *p;
+        if (c >= 'A' && c <= 'Z')
+            c += 'a' - 'A';
+        hash = hash * 33 + c;
+        p++;
+    }
+
+    return hash % NNS_DNS_CACHE_SLOTS;
+}
+
+
 /**
  * nns_log_enabled() - whether NNS_BIND_DEBUG requests stderr tracing
  *
  * Return: non-zero when debug logging should be emitted
  */
-static int nns_log_enabled(void)
+static bool nns_log_enabled(void)
 {
     const char* s = getenv("NNS_BIND_DEBUG");
     return s && strcmp(s, "0") != 0 && *s;
@@ -417,6 +467,23 @@ static int nns_dns_lookup(const char *hostname, struct in_addr *out)
         return NNS_ERR;
     }
 
+    struct nns_dns_cache_entry *slot = &nns_dns_cache[nns_dns_cache_slot(hostname)];
+    time_t now = time(NULL);
+
+    pthread_mutex_lock(&nns_dns_cache_lock);
+    int cache_hit = slot->used && now <= slot->expires &&
+        strcasecmp(slot->name, hostname) == 0;
+    struct in_addr cached_addr = {0};
+    if (cache_hit)
+        cached_addr = slot->addr;
+    pthread_mutex_unlock(&nns_dns_cache_lock);
+
+    if (cache_hit) {
+        *out = cached_addr;
+        nns_log("dns-cache-hit", hostname);
+        return NNS_OK;
+    }
+
     if (inet_pton(AF_INET, dns, &server.sin_addr) != 1 ||
         inet_pton(AF_INET, source, &src.sin_addr) != 1) {
         return NNS_ERR;
@@ -525,6 +592,15 @@ static int nns_dns_lookup(const char *hostname, struct in_addr *out)
             if (type == NNS_DNS_TYPE_A && cls == NNS_DNS_CLASS_IN &&
                 rdlen == NNS_DNS_A_RDLEN) {
                 memcpy(&out->s_addr, resp + p, NNS_DNS_A_RDLEN);
+                if (strlen(hostname) <= NNS_DNS_NAME_MAX) {
+                    pthread_mutex_lock(&nns_dns_cache_lock);
+                    snprintf(slot->name, sizeof(slot->name), "%s", hostname);
+                    slot->addr = *out;
+                    slot->expires = now + NNS_DNS_CACHE_TTL_SEC;
+                    slot->stale_until = slot->expires + NNS_DNS_CACHE_STALE_SEC;
+                    slot->used = true;
+                    pthread_mutex_unlock(&nns_dns_cache_lock);
+                }
                 return nns_dns_finish(fd, hostname, NNS_OK);
             }
 
@@ -532,7 +608,26 @@ static int nns_dns_lookup(const char *hostname, struct in_addr *out)
         }
     }
 
-    return nns_dns_finish(fd, hostname, NNS_ERR);
+    close(fd);
+
+    /* The upstream stopped answering: serve a recent answer instead of
+     * failing the caller for a seconds-long blackout. */
+    pthread_mutex_lock(&nns_dns_cache_lock);
+    int serve_stale = slot->used && now <= slot->stale_until &&
+        strcasecmp(slot->name, hostname) == 0;
+    struct in_addr stale_addr = {0};
+    if (serve_stale)
+        stale_addr = slot->addr;
+    pthread_mutex_unlock(&nns_dns_cache_lock);
+
+    if (serve_stale) {
+        *out = stale_addr;
+        nns_log("dns-stale", hostname);
+        return NNS_OK;
+    }
+
+    nns_log("dns-failed", hostname);
+    return NNS_ERR;
 }
 
 
