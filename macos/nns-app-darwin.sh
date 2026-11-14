@@ -757,7 +757,7 @@ git_via() {
   git rev-parse --git-dir >/dev/null 2>&1 || fail 'Run git-via inside a Git repository.'
   local desired previous state active current num ssh bin
   active=$(git config --local --get nnsGitVia.activeApp 2>/dev/null || true)
-  num=$(git config --local --get-all core.sshCommand 2>/dev/null | wc -l | tr -d ' ')
+  num=$({ git config --local --get-all core.sshCommand 2>/dev/null || true; } | wc -l | tr -d ' ')
   [ "$num" -le 1 ] || fail 'Multiple local core.sshCommand values; refusing changes.'
   current=$(git config --local --get core.sshCommand 2>/dev/null || true)
   if [ "$1" = - ]; then

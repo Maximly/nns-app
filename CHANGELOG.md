@@ -2,7 +2,7 @@
 
 Highlights are grouped by major release series. Individual patch and minor releases are intentionally omitted.
 
-## 2.1.0 — Experimental macOS WireGuard/OpenVPN client backend (2026)
+## 2.1.2 — Experimental macOS WireGuard/OpenVPN client backend (2026)
 
 - Client inventories now show IP instead of creation time; live OpenVPN/AWG
   addresses take precedence over configured fixed addresses. Added detailed
