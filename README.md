@@ -10,7 +10,7 @@ is available: a managed kernel `utun`, interface-scoped route and an opt-in C
 socket interposer. The macOS backend is **not a network namespace or a security
 sandbox**.
 
-**Current release:** 2.1.2 · **License:** GPL-3.0-or-later · **Platforms:** Linux with systemd (Ubuntu and Fedora tested); experimental macOS WireGuard/OpenVPN TCP client · **Network stack:** IPv4
+**Current release:** 2.1.3 · **License:** GPL-3.0-or-later · **Platforms:** Linux with systemd (Ubuntu and Fedora tested); experimental macOS WireGuard/OpenVPN TCP client · **Network stack:** IPv4
 
 ## Contents
 
@@ -42,7 +42,7 @@ sandbox**.
 explicit guard preventing the Linux installer from executing on macOS.
 The macOS backend is a separate implementation, not a fork of Linux modules.
 
-| Feature / command | Linux (systemd) | macOS |
+| Feature / command | Linux (systemd) | macOS (experimental) |
 | --- | --- | --- |
 | `install <app>`, `add <app> profile` | Supported | Supported for **WireGuard `.conf`** and **OpenVPN `.ovpn`** |
 | `start`, `stop`, `status`, `list`, `remove` | Supported | Supported; `start/stop/recover` require `sudo` |
@@ -58,8 +58,8 @@ The macOS backend is a separate implementation, not a fork of Linux modules.
 | UDP / ICMP / IPv6 app traffic | IPv4 UDP/ICMP via namespace; IPv6 policy depends on settings | No general routing or isolation. `ping`, `traceroute`, `nc` and `dig` work only through their native bind options; IPv6 is unsupported. |
 | `git-via <app|->` (SSH) | Supported | Supported for compatible **Homebrew OpenSSH**; Apple-protected SSH unsupported |
 | Git via HTTPS | `nns-app run <app> git ...` | Experimental with compatible Homebrew Git/curl and configured private DNS |
-| `myip` | Supported | Supported only if VPN `AllowedIPs` and gateway permit Internet egress |
-| `myloc` | Supported | Not implemented |
+| `myip` | Supported | Supported for host or app egress; app probe requires Internet via the tunnel |
+| `myloc` | Supported | Supported for host or app egress via `ip-api.com`; app probe requires Internet via the tunnel |
 | VPN chaining, inherited networks, `set-via` | Supported | Not implemented |
 | Managed OpenVPN/AWG servers and gateways | Supported | Not implemented |
 | Remote exit, `.nnslink`, clients, export/revoke | Supported | Not implemented |
@@ -116,6 +116,17 @@ default route, enable PF, create Unix groups, or modify host DNS. Runtime
 metadata is under `/var/run/nns-app-macos/<uid>/`. `stop` removes the scoped
 route **before** closing the tunnel. If interrupted,
 `sudo nns-app recover <app>` retries cleanup.
+
+`myip` and `myloc` are available without an app name for the host’s current
+egress, or with an app name to probe the selected tunnel. An app probe runs
+Homebrew `curl` through the same interposer and therefore only works when the
+profile’s `AllowedIPs` and VPN gateway permit Internet egress; a split-tunnel
+profile can resolve names and reach VPN hosts but has no public exit to report.
+`myloc` uses the free `ip-api.com` HTTP endpoint and needs `python3` for
+formatting. App-scoped `myip`/`myloc` resolve only these fixed public probe
+names on the host and pass the numeric address to `curl --resolve`; this
+keeps a broken or unrouted private VPN resolver from blocking a public-exit
+diagnostic. Normal `nns-app run` hostname resolution is unchanged.
 
 `nns-app run` must be invoked **without sudo**. The C helper sets `IP_BOUND_IF`
 and binds the selected VPN IPv4 source on supported `connect()` sockets.

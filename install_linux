@@ -77,9 +77,9 @@ if [[ "$(uname -s)" == Darwin && "${NNS_APP_SOURCE_ONLY:-0}" != 1 ]]; then
 fi
 
 # Sole source of truth is the repo-root VERSION file. build.sh substitutes the
-# 2.1.2 token when assembling install_linux. An unsubstituted value
+# 2.1.3 token when assembling install_linux. An unsubstituted value
 # still contains "@", which triggers the source-tree file lookup.
-_nns_version="2.1.2"
+_nns_version="2.1.3"
 if [[ "$_nns_version" == *@* ]]; then
     _nns_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
     if [[ -f "$_nns_dir/VERSION" ]]; then

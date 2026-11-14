@@ -25,6 +25,7 @@ if [[ "$VERSION" == *@* ]]; then
 fi
 STATE_BASE=/var/run/nns-app-macos
 LIBEXEC=/usr/local/libexec/nns-app
+MYLOC_URL="http://ip-api.com/json/?fields=status,message,query,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,org,as"
 if [ ! -x "$LIBEXEC/nns-run" ] && [ -x "$(dirname "$SELF")/bin/nns-run" ]; then
   LIBEXEC=$(cd "$(dirname "$SELF")/bin" && pwd -P)
 fi
@@ -678,6 +679,133 @@ run_app() {
   export NNS_DNS_IPV4="$dns"
   exec "$LIBEXEC/nns-run" --vpn-ip "$VPN_IP" --vpn-if "$UTUN" --lib "$LIBEXEC/libnnsbind.dylib" -- "$@"
 }
+# Prefer Homebrew curl because Apple's /usr/bin/curl is SIP-protected.
+homebrew_curl() {
+  local c
+  if [ -n "${NNS_MAC_TEST_CURL:-}" ] && [ -x "$NNS_MAC_TEST_CURL" ]; then
+    printf '%s\n' "$NNS_MAC_TEST_CURL"
+    return 0
+  fi
+  for c in /opt/homebrew/opt/curl/bin/curl /usr/local/opt/curl/bin/curl; do
+    if [ -x "$c" ]; then
+      printf '%s\n' "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Like run_app, but keeps the shell so command output can be captured.
+run_app_output() {
+  [ "$(id -u)" -ne 0 ] || fail 'Run apps without sudo: nns-app run <app> command.'
+  read_runtime
+  check_iface || fail "Managed interface $UTUN is absent."
+  ensure_binaries
+  [ "$#" -gt 0 ] || fail 'Missing command.'
+  local dns
+  dns=$(selected_dns)
+  if [ -n "$dns" ]; then valid_ipv4 "$dns" || fail 'Configured DNS server is invalid.'; fi
+  NNS_DNS_IPV4="$dns" "$LIBEXEC/nns-run" --vpn-ip "$VPN_IP" --vpn-if "$UTUN" \
+    --lib "$LIBEXEC/libnnsbind.dylib" -- "$@"
+}
+
+# Resolve the fixed public probe hostname on the host, then pass the numeric
+# address to curl with --resolve. App-scoped probes must not depend on the
+# selected VPN's private resolver being reachable: mlcloud, for example, has
+# a private DNS address that is not routed through its 10.253/24 split tunnel.
+resolve_host_ipv4() {
+  python3 - "$1" <<'PY_RESOLVE'
+import socket
+import sys
+try:
+    infos = socket.getaddrinfo(sys.argv[1], None, socket.AF_INET, socket.SOCK_STREAM)
+except OSError:
+    sys.exit(1)
+for info in infos:
+    print(info[4][0])
+    break
+else:
+    sys.exit(1)
+PY_RESOLVE
+}
+
+myloc_format() {
+  local format=$1 context=$2
+  python3 -c '
+import json
+import sys
+try:
+    data = json.load(sys.stdin)
+except (ValueError, UnicodeError):
+    sys.exit("ERROR: Invalid geolocation response.")
+if not isinstance(data, dict):
+    sys.exit("ERROR: Invalid geolocation response type.")
+if data.get("status") != "success":
+    sys.exit("ERROR: IP geolocation query failed: " + str(data.get("message", "unknown")))
+if not isinstance(data.get("query"), str) or not data["query"]:
+    sys.exit("ERROR: Geolocation response lacks public IP.")
+if sys.argv[1] == "json":
+    print(json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2))
+    sys.exit(0)
+print("Context:           " + sys.argv[2])
+fields = [
+    ("query", "Public IPv4"), ("country", "Country"),
+    ("countryCode", "Country code"), ("regionName", "Region"),
+    ("city", "City"), ("zip", "Postal code"),
+    ("timezone", "Timezone"), ("isp", "ISP"),
+    ("org", "Organization"), ("as", "ASN"),
+]
+for key, label in fields:
+    value = data.get(key)
+    if value is not None and value != "":
+        print(f"{label + chr(58):<19}{value}")
+if data.get("lat") is not None and data.get("lon") is not None:
+    print("Coordinates:       {}, {}".format(data["lat"], data["lon"]))
+print("Provider:          ip-api.com (approximate location; HTTP)")
+' "$format" "$context"
+}
+
+myloc_query() {
+  local mode=$1 curl_bin probe_ip
+  curl_bin=$(homebrew_curl) || fail 'Homebrew curl required (brew install curl).'
+  local -a cmd=("$curl_bin" -4fsS --noproxy '*' --connect-timeout 3 --max-time 10)
+  if [ "$mode" = app ]; then
+    probe_ip=$(resolve_host_ipv4 ip-api.com) ||
+      fail 'Cannot resolve ip-api.com via host DNS.'
+    cmd+=(--resolve "ip-api.com:80:$probe_ip")
+  fi
+  cmd+=("${NNS_MYLOC_URL:-$MYLOC_URL}")
+  if [ "$mode" = app ]; then
+    run_app_output "${cmd[@]}"
+  else
+    "${cmd[@]}"
+  fi
+}
+
+myloc_command() {
+  local requested='' format=pretty context=host mode=host json
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json) format=json ;;
+      --*) fail "Unknown myloc option '$1'." ;;
+      *)
+        [ -z "$requested" ] || fail 'Usage: nns-app myloc [<name>] [--json]'
+        requested=$1
+        ;;
+    esac
+    shift
+  done
+  if [ -n "$requested" ]; then
+    app_paths "$requested"
+    require_profile
+    [ -f "$RUNSTATE/ready" ] || fail "App '$APP' not running (use sudo nns-app start $APP)."
+    context="app:$APP"
+    mode=app
+  fi
+  json=$(myloc_query "$mode") ||
+    fail "IP geolocation unavailable from '$context' (no Internet egress through this profile, DNS/API, or rate limit)."
+  printf '%s\n' "$json" | myloc_format "$format" "$context"
+}
 status_app() {
   if [ ! -f "$RUNSTATE/ready" ]; then
     info "$APP: stopped (type=$(app_type_label), configured profile: $([ -f "$CONF" ] && echo yes || echo no))"
@@ -816,7 +944,8 @@ nns-app $VERSION macOS (experimental IPv4 WireGuard/OpenVPN client)
   sudo nns-app recover <name>            Cleanup interrupted tunnel start/stop
   nns-app remove <name>                  Remove stopped app profile
   nns-app git-via <name|->               Set/restore repository SSH transport
-  nns-app myip <name>                    Probe public IP (requires Internet via tunnel)
+  nns-app myip [<name>]                  Probe public IP (host, or app via tunnel)
+  nns-app myloc [<name>] [--json]        Geolocate host or app egress (ip-api.com)
   nns-app --version
 
 OpenVPN on macOS uses --route-noexec (host default unchanged). Profiles must be
@@ -945,14 +1074,27 @@ main() {
       git_via "$@"
       ;;
     myip)
-      [ "$#" -eq 1 ] || fail 'Usage: nns-app myip <name>'
-      app_paths "$1"; require_profile
-      local curl_bin=''
-      for curl_bin in /opt/homebrew/opt/curl/bin/curl /usr/local/opt/curl/bin/curl; do
-        [ ! -x "$curl_bin" ] || break
-      done
-      [ -x "$curl_bin" ] || fail 'Homebrew curl required (brew install curl).'
-      run_app "$curl_bin" -4 -fSs --connect-timeout 8 --max-time 15 https://api.ipify.org
+      local requested='' curl_bin ip probe_ip
+      [ "$#" -le 1 ] || fail 'Usage: nns-app myip [<name>]'
+      requested=${1:-}
+      curl_bin=$(homebrew_curl) || fail 'Homebrew curl required (brew install curl).'
+      if [ -n "$requested" ]; then
+        app_paths "$requested"; require_profile
+        probe_ip=$(resolve_host_ipv4 api.ipify.org) ||
+          fail 'Cannot resolve api.ipify.org via host DNS.'
+        ip=$(run_app_output "$curl_bin" -4 -fSs --noproxy '*' \
+          --resolve "api.ipify.org:443:$probe_ip" \
+          --connect-timeout 8 --max-time 15 https://api.ipify.org) ||
+          fail "Public-IP probe failed for '$APP' (no Internet egress through this profile or network)."
+      else
+        ip=$("$curl_bin" -4 -fSs --noproxy '*' \
+          --connect-timeout 8 --max-time 15 https://api.ipify.org) ||
+          fail 'Public-IP probe failed (DNS or network).'
+      fi
+      printf '%s\n' "$ip"
+      ;;
+    myloc)
+      myloc_command "$@"
       ;;
     *) fail "Command '$cmd' is not implemented on macOS $VERSION. See README compatibility table.";;
   esac

@@ -393,4 +393,30 @@ if [ "$(uname -s)" = Darwin ]; then
   fi
 fi
 
+
+# Host-mode myip/myloc work without an app name. Use a fake curl so the
+# test stays offline and deterministic.
+if [ "$(uname -s)" = Darwin ]; then
+  cat > "$T/fake-myip-curl" <<'S'
+#!/bin/sh
+printf '%s\n' '203.0.113.7'
+S
+  cat > "$T/fake-myloc-curl" <<'S'
+#!/bin/sh
+printf '%s\n' '{"status":"success","message":"","query":"203.0.113.9","country":"Testland","countryCode":"TL","regionName":"Test Region","city":"Test City","zip":"00000","lat":1.5,"lon":2.5,"timezone":"Etc/UTC","isp":"Test ISP","org":"Test Org","as":"AS64500 Test"}'
+S
+  chmod +x "$T/fake-myip-curl" "$T/fake-myloc-curl"
+  [[ "$(NNS_MAC_TEST_CURL="$T/fake-myip-curl" bash "$ROOT/nns-app-darwin.sh" myip)" == '203.0.113.7' ]] || {
+    echo 'host-mode myip mismatch' >&2; exit 1
+  }
+  loc_json=$(NNS_MAC_TEST_CURL="$T/fake-myloc-curl" bash "$ROOT/nns-app-darwin.sh" myloc --json)
+  grep -Fq '"query": "203.0.113.9"' <<<"$loc_json" || {
+    echo "host-mode myloc --json mismatch: $loc_json" >&2; exit 1
+  }
+  loc_pretty=$(NNS_MAC_TEST_CURL="$T/fake-myloc-curl" bash "$ROOT/nns-app-darwin.sh" myloc)
+  grep -Fq '203.0.113.9' <<<"$loc_pretty" && grep -Fq 'Context:           host' <<<"$loc_pretty" || {
+    echo "host-mode myloc mismatch: $loc_pretty" >&2; exit 1
+  }
+fi
+
 echo 'macOS static + mock CLI tests passed.'

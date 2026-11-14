@@ -2,7 +2,7 @@
 
 Highlights are grouped by major release series. Individual patch and minor releases are intentionally omitted.
 
-## 2.1.2 — Experimental macOS WireGuard/OpenVPN client backend (2026)
+## 2.1.3 — Experimental macOS WireGuard/OpenVPN client backend (2026)
 
 - Client inventories now show IP instead of creation time; live OpenVPN/AWG
   addresses take precedence over configured fixed addresses. Added detailed
@@ -10,7 +10,7 @@ Highlights are grouped by major release series. Individual patch and minor relea
   information, traffic counters, and metadata (also for managed remote clients).
 
 - Added a separate macOS installer and Bash 3-compatible CLI for WireGuard and
-  OpenVPN clients (`install/add/start/stop/status/list/run/remove/recover/dns/myip/git-via`).
+  OpenVPN clients (`install/add/start/stop/status/list/run/remove/recover/dns/myip/myloc/git-via`).
   OpenVPN uses `--route-noexec` with self-contained `.ovpn` profiles (inline
   certs; no up/down scripts).
 - Uses an owned kernel `utun`, IPv4 address, an interface-scoped route, and a C
@@ -23,6 +23,11 @@ Highlights are grouped by major release series. Individual patch and minor relea
   user-supplied bind/source options and leaves localhost on the host stack.
 - Added a constrained per-app IPv4 A DNS resolver through the selected VPN
   in compatible injected processes; no system DNS changes.
+- Added macOS `myloc` for host or per-app egress via `ip-api.com`, and made
+  `myip` optional-name (host by default, app when named). App probes still
+  require Internet egress through the VPN profile. Public probe hostnames are
+  resolved on the host and passed to `curl --resolve`, so an unrouted private
+  VPN DNS address does not hide a working public exit.
 - Added an explicit Linux/macOS feature comparison and macOS static/mock tests.
 - Linux feature implementation preserved from 2.0.16. The Darwin backend is
   experimental and has weaker process isolation than Linux namespaces.
