@@ -185,6 +185,12 @@ is restored on failure.
   Every configured gateway unit must stay enabled (`WantedBy=multi-user.target`)
   so gateways come back after a reboot; install/repair reconcile enablement and
   removal is the supported way to take a gateway permanently off.
+- App units follow the same restore semantics: `start_app` enables the
+  namespace/backend/online units (and watchdog/MTU timers) while an app runs,
+  so a running app survives a reboot. `AUTOSTART=on` keeps them enabled even
+  when stopped; an explicit `nns-app stop` with `AUTOSTART=off` disables them
+  again. An enabled gateway whose `Requires=` chain pulls in an app restarts
+  that app at boot as its dependency, regardless of the app's own flag.
 - `nns-gateway-crl-refresh@.timer` renews gateway CRLs weekly.
 
 Keep the distinction between a running process, a created tunnel, and a

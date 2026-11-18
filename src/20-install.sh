@@ -674,7 +674,9 @@ VPN_TYPE=""
 # off: direct fallback through the host uplink is allowed.
 KILLSWITCH="on"
 
-# on starts this application environment during boot; off leaves it stopped.
+# on: start this application environment at every boot, even if it was stopped.
+# off: start at boot only if it was running when the system shut down; an
+#      explicitly stopped environment stays stopped after a reboot.
 AUTOSTART="off"
 
 # Empty/host uses the host uplink. An app name routes this environment

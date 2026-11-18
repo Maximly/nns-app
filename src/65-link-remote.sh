@@ -2998,6 +2998,19 @@ stop_app_cli() {
     # gateway and provider exit are being shut down.
     stop_app "$app"
 
+    # An explicitly stopped app with AUTOSTART=off must stay stopped across
+    # reboots. start_app keeps the units and timers enabled while the app
+    # runs, so a reboot restores a previously running environment.
+    if ! bool_on "${AUTOSTART:-off}"; then
+        systemctl disable \
+            "nns-online@${app}.service" \
+            "nns-openvpn@${app}.service" \
+            "nns-netns@${app}.service" \
+            "nns-watchdog@${app}.timer" \
+            "nns-mtu@${app}.timer" \
+            >/dev/null 2>&1 || true
+    fi
+
     if (( deployed )) && [[ "$mode" != local-only ]]; then
         if ! remote_auto_lifecycle_app stop "$app"; then
             warn "Local app '$app' was stopped, but its automatic remote gateway/exit could not be stopped. Retry when the remote host is reachable, or use --local-only to acknowledge a local-only stop."

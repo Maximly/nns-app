@@ -723,6 +723,17 @@ repair_local_apps() {
         write_app_unit_dropin "$app"
         write_sudoers_for_app "$app" "$APP_USER"
         sync_watchdog_timer "$app"
+        # Keep the boot restore contract: a running app must survive a reboot.
+        # Older engines disabled units for AUTOSTART=off apps; re-enable them
+        # here so an upgrade does not break the next reboot.
+        if app_is_started "$app" &&
+           ! systemctl is-enabled --quiet "nns-netns@${app}.service" 2>/dev/null; then
+            systemctl enable \
+                "nns-netns@${app}.service" \
+                "nns-openvpn@${app}.service" \
+                "nns-online@${app}.service" >/dev/null 2>&1 &&
+                repair_fixed "enabled units for running app '$app' so it survives reboots"
+        fi
         repair_local_ssh_forward "$app" || true
     done
     shopt -u nullglob

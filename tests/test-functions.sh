@@ -1416,6 +1416,7 @@ manual_payload=$(remote_command_payload gateway client export \
         fi
     }
     stop_app() { printf 'local-stop:%s\n' "$1"; }
+    systemctl() { :; }
     remote_auto_lifecycle_app() {
         printf 'remote-%s:%s\n' "$1" "$2"
     }
@@ -1441,6 +1442,62 @@ manual_payload=$(remote_command_payload gateway client export \
     if grep -Fq 'remote-stop:local-app' <<<"$output"; then
         fail 'manual app stop attempted remote lifecycle'
     fi
+)
+
+# Explicitly stopping an app with AUTOSTART=off disables its units and timers
+# so a reboot does not resurrect an environment the user stopped.
+(
+    require_root() { :; }
+    validate_app_name() { :; }
+    assert_destructive_command_from_host() { :; }
+    load_cfg() {
+        REMOTE_MODE=
+        REMOTE_ALIAS=
+        REMOTE_OWNER_ID=
+        DEFAULT_PROFILE=local.ovpn
+        VPN_TYPE=openvpn
+        AUTOSTART=off
+    }
+    stop_app() { :; }
+    sysctl_log="$TEST_TMP/stop-disable.log"
+    : >"$sysctl_log"
+    systemctl() {
+        [[ "$1" == disable ]] || return 0
+        shift
+        printf '%s\n' "$@" >>"$sysctl_log"
+    }
+    stop_app_cli local-app local-only >/dev/null 2>&1
+    grep -Fqx 'nns-netns@local-app.service' "$sysctl_log" ||
+        fail 'AUTOSTART=off stop did not disable the netns unit'
+    grep -Fqx 'nns-openvpn@local-app.service' "$sysctl_log" ||
+        fail 'AUTOSTART=off stop did not disable the backend unit'
+    grep -Fqx 'nns-online@local-app.service' "$sysctl_log" ||
+        fail 'AUTOSTART=off stop did not disable the online unit'
+    grep -Fqx 'nns-watchdog@local-app.timer' "$sysctl_log" ||
+        fail 'AUTOSTART=off stop did not disable the watchdog timer'
+    grep -Fqx 'nns-mtu@local-app.timer' "$sysctl_log" ||
+        fail 'AUTOSTART=off stop did not disable the MTU timer'
+)
+
+# Stopping an app with AUTOSTART=on keeps its units enabled so it still
+# starts at the next boot.
+(
+    require_root() { :; }
+    validate_app_name() { :; }
+    assert_destructive_command_from_host() { :; }
+    load_cfg() {
+        REMOTE_MODE=
+        REMOTE_ALIAS=
+        REMOTE_OWNER_ID=
+        DEFAULT_PROFILE=local.ovpn
+        VPN_TYPE=openvpn
+        AUTOSTART=on
+    }
+    stop_app() { :; }
+    systemctl() {
+        [[ "$1" != disable ]] || fail 'AUTOSTART=on stop incorrectly disabled units'
+    }
+    stop_app_cli local-app local-only >/dev/null 2>&1
 )
 
 # CLI stop parsing must select symmetric or local-only semantics explicitly.

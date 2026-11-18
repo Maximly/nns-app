@@ -243,6 +243,22 @@ grep -Fq 'enabled gateway' "$INSTALLER" >/dev/null || {
     echo 'repair does not reconcile gateway enablement' >&2
     exit 1
 }
+grep -Fq 'A running app must survive a reboot' "$INSTALLER" || {
+    echo 'start_app no longer keeps running app units enabled for boot' >&2
+    exit 1
+}
+grep -Fq 'An explicitly stopped app with AUTOSTART=off must stay stopped' "$INSTALLER" || {
+    echo 'explicit stop does not disable units for AUTOSTART=off apps' >&2
+    exit 1
+}
+grep -Fq 'explicitly stopped environment stays stopped after a reboot' "$INSTALLER" || {
+    echo 'AUTOSTART documentation comment not updated' >&2
+    exit 1
+}
+grep -Fq 'Keep the boot restore contract' "$INSTALLER" || {
+    echo 'repair does not re-enable units for running apps' >&2
+    exit 1
+}
 grep -Fq 'CONTRIBUTING.md' "$ROOT/README.md"
 test -s "$ROOT/CONTRIBUTING.md"
 test ! -e "$ROOT/ARCHITECTURE.md"

@@ -10,7 +10,7 @@ is available: a managed kernel `utun`, interface-scoped route and an opt-in C
 socket interposer. The macOS backend is **not a network namespace or a security
 sandbox**.
 
-**Current release:** 2.1.6 · **License:** GPL-3.0-or-later · **Platforms:** Linux with systemd (Ubuntu and Fedora tested); experimental macOS WireGuard/OpenVPN TCP client · **Network stack:** IPv4
+**Current release:** 2.1.7 · **License:** GPL-3.0-or-later · **Platforms:** Linux with systemd (Ubuntu and Fedora tested); experimental macOS WireGuard/OpenVPN TCP client · **Network stack:** IPv4
 
 ## Contents
 
@@ -576,6 +576,11 @@ The app configuration also supports `KILLSWITCH`, `AUTOSTART`, `UPSTREAM_APP`,
 `DNS_SERVERS`, `DISABLE_IPV6`, `WATCHDOG_MODE`, and related settings. Files are
 root-owned and validated. Network and firewall resources are owned by nns-app;
 cloud firewall policies or router port forwarding are **not** configured.
+
+`AUTOSTART=on` starts an app at every boot. With `AUTOSTART=off` (default) an
+app that was running when the system shut down is restored at boot; explicitly
+stopping it with `nns-app stop` disables boot start until it is started again.
+Configured gateways are always enabled and come back at every boot.
 
 ## Backup and restore
 

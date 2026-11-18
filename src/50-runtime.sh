@@ -286,7 +286,7 @@ sync_mtu_timer() {
     kind=$(vpn_type_for_app "$app" 2>/dev/null || true)
     if [[ "$kind" == openvpn && "${TUN_MTU:-}" =~ ^[0-9]+$ ]] &&
        (( TUN_MTU >= 576 && TUN_MTU <= 1500 )); then
-        if bool_on "${AUTOSTART:-off}"; then
+        if bool_on "${AUTOSTART:-off}" || app_is_started "$app"; then
             systemctl enable "nns-mtu@${app}.timer" >/dev/null 2>&1 || true
         else
             systemctl disable "nns-mtu@${app}.timer" >/dev/null 2>&1 || true
@@ -309,7 +309,7 @@ sync_watchdog_timer() {
     type=$(vpn_type_for_app "$app" 2>/dev/null || true)
 
     if [[ -n "$type" ]] && watchdog_enabled_for_type "$type"; then
-        if bool_on "${AUTOSTART:-off}"; then
+        if bool_on "${AUTOSTART:-off}" || app_is_started "$app"; then
             systemctl enable "nns-watchdog@${app}.timer" >/dev/null 2>&1 || true
         else
             systemctl disable "nns-watchdog@${app}.timer" >/dev/null 2>&1 || true
@@ -521,21 +521,17 @@ start_app() {
     printf '%s\n' "$desired_via" >"$RUN_DIR/${app}.via"
     chmod 0600 "$RUN_DIR/${app}.via"
 
-    if bool_on "$AUTOSTART"; then
-        if [[ "$via_override" != __default__ ]]; then
-            warn "A one-start --via override is not persistent across boot; set UPSTREAM_APP in $(cfg_file "$app")."
-        fi
-        systemctl enable \
-            "nns-netns@${app}.service" \
-            "nns-openvpn@${app}.service" \
-            "nns-online@${app}.service" >/dev/null
-    else
-        systemctl disable \
-            "nns-netns@${app}.service" \
-            "nns-openvpn@${app}.service" \
-            "nns-online@${app}.service" \
-            >/dev/null 2>&1 || true
+    # A running app must survive a reboot: keep its units enabled while it
+    # runs. AUTOSTART=on additionally keeps them enabled when stopped, so
+    # the environment starts at boot even without a previous run. An explicit
+    # `nns-app stop` disables the units again for AUTOSTART=off apps.
+    if [[ "$via_override" != __default__ ]]; then
+        warn "A one-start --via override is not persistent across boot; set UPSTREAM_APP in $(cfg_file "$app")."
     fi
+    systemctl enable \
+        "nns-netns@${app}.service" \
+        "nns-openvpn@${app}.service" \
+        "nns-online@${app}.service" >/dev/null
 
     if ! systemctl start "nns-netns@${app}.service"; then
         warn "Failed to create the network namespace for '$app'."
