@@ -77,9 +77,9 @@ if [[ "$(uname -s)" == Darwin && "${NNS_APP_SOURCE_ONLY:-0}" != 1 ]]; then
 fi
 
 # Sole source of truth is the repo-root VERSION file. build.sh substitutes the
-# 2.1.5 token when assembling install_linux. An unsubstituted value
+# 2.1.6 token when assembling install_linux. An unsubstituted value
 # still contains "@", which triggers the source-tree file lookup.
-_nns_version="2.1.5"
+_nns_version="2.1.6"
 if [[ "$_nns_version" == *@* ]]; then
     _nns_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
     if [[ -f "$_nns_dir/VERSION" ]]; then
@@ -1075,6 +1075,7 @@ Description=VPN transport for NNS app %i
 Requires=nns-netns@%i.service
 After=nns-netns@%i.service
 BindsTo=nns-netns@%i.service
+PartOf=nns-netns@%i.service
 
 [Service]
 Type=simple
@@ -1094,6 +1095,7 @@ Description=Online data path for NNS app %i
 Requires=nns-openvpn@%i.service
 After=nns-openvpn@%i.service
 BindsTo=nns-openvpn@%i.service
+PartOf=nns-openvpn@%i.service
 
 [Service]
 Type=oneshot
@@ -1252,6 +1254,9 @@ refresh_managed_unit_metadata() {
         gateway=$(basename "$dir")
         acquire_lock "gateway-$gateway"
         write_gateway_unit_dropin "$gateway"
+        # A configured gateway must survive reboots: keep its unit enabled.
+        # Removal is the only supported way to take a gateway permanently off.
+        systemctl enable "nns-gateway@${gateway}.service" >/dev/null 2>&1 || true
         if [[ "$(gateway_cfg_value "$gateway" GATEWAY_BACKEND)" == amneziawg ]]; then
             awg_server_write_config "$gateway"
         else
@@ -1383,6 +1388,7 @@ write_app_unit_dropin() {
 Requires=nns-online@$via.service
 After=nns-online@$via.service
 BindsTo=nns-online@$via.service
+PartOf=nns-online@$via.service
 APP_DROPIN_EOF
         chmod 0644 "$dir/10-upstream.conf"
     fi
@@ -1406,6 +1412,7 @@ write_gateway_unit_dropin() {
 Requires=nns-online@$via.service
 After=nns-online@$via.service
 BindsTo=nns-online@$via.service
+PartOf=nns-online@$via.service
 GATEWAY_DROPIN_EOF
     chmod 0644 "$dir/10-upstream.conf"
 }
@@ -4562,6 +4569,7 @@ watchdog_check() {
     if systemctl restart "nns-openvpn@${app}.service"; then
         systemctl reset-failed "nns-online@${app}.service" >/dev/null 2>&1 || true
         if systemctl start "nns-online@${app}.service"; then
+            restart_gateways_via_app "$app"
             WD_LAST_RESULT=recovered
             log "Watchdog restored the data path for '$app'."
         else
@@ -4719,6 +4727,9 @@ start_app() {
         if watchdog_enabled_for_type "$vpn_type"; then
             watchdog_mark_online "$app"
         fi
+        # The app chain was just (re)built; any gateway that routes through
+        # this app was stopped with it and must come back with it.
+        restart_gateways_via_app "$app"
         if app_split_tunnel "$app"; then
             log "Started '$app' with '$profile_marker' ($(vpn_type_label "$vpn_type")) via $desired_via. Split routes ready; peer reachability not verified."
         else
@@ -6644,12 +6655,13 @@ GATEWAY_CONFIG_EOF
 
     write_gateway_unit_dropin "$gateway"
     systemctl daemon-reload
+    systemctl enable "nns-gateway@${gateway}.service" >/dev/null
     systemctl enable --now "nns-gateway-crl-refresh@${gateway}.timer" >/dev/null
 
     release_lock "gateway-$gateway"
     release_lock global
 
-    log "Created managed OpenVPN gateway '$gateway' with '$transport' transport."
+    log "Created managed OpenVPN gateway '$gateway' with '$transport' transport (enabled at boot)."
     if [[ "$transport" == ssh ]]; then
         log "SSH endpoint:    $public_host:$public_port/tcp"
         log "Private OpenVPN listener: 127.0.0.1:$openvpn_listen_port/tcp"
@@ -7389,6 +7401,24 @@ stop_gateways_via_app() {
         if systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
             warn "Stopping gateway '$gateway' before its upstream app '$app'."
             gateway_stop "$gateway"
+        fi
+    done < <(gateways_using_app "$app")
+}
+
+# systemd propagates a dependency restart only to dependents that are already
+# active; a gateway that a BindsTo= stop has already taken down is not started
+# again by the upstream's PartOf= restart.  After the app chain (namespace,
+# backend, online path) has recovered, explicitly bring every gateway that
+# routes through it back up.  `systemctl restart` also starts inactive units,
+# so this covers both still-running and previously-stopped gateways.
+restart_gateways_via_app() {
+    local app=$1 gateway
+    while IFS= read -r gateway; do
+        [[ -n "$gateway" ]] || continue
+        if systemctl restart "nns-gateway@${gateway}.service" >/dev/null 2>&1; then
+            log "Restarted gateway '$gateway' after its upstream app '$app' recovered."
+        else
+            warn "Could not restart gateway '$gateway' after its upstream app '$app' recovered."
         fi
     done < <(gateways_using_app "$app")
 }
@@ -14981,6 +15011,17 @@ repair_gateway_one() {
     fi
     acquire_lock "gateway-$gateway"
     load_gateway_cfg "$gateway"
+    # A configured gateway must come back after a reboot. Older engines did
+    # not always enable the unit at creation; reconcile it here so every
+    # gateway is started at boot. Removal is the supported way to take a
+    # gateway permanently off.
+    if ! systemctl is-enabled --quiet "nns-gateway@${gateway}.service" 2>/dev/null; then
+        if systemctl enable "nns-gateway@${gateway}.service" >/dev/null 2>&1; then
+            repair_fixed "enabled gateway '$gateway' for automatic start at boot"
+        else
+            repair_unresolved "could not enable gateway '$gateway' for automatic start at boot"
+        fi
+    fi
     if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
         write_gateway_unit_dropin "$gateway"
         awg_server_write_config "$gateway"
@@ -15251,6 +15292,7 @@ repair_local_ssh_forward() {
             if ip netns exec "$ns" ss -H -lnt 2>/dev/null |
                grep -Eq "127\\.0\\.0\\.1:${local_port}([[:space:]]|$)"; then
                 systemctl start "nns-online@${app}.service" >/dev/null 2>&1 || true
+                restart_gateways_via_app "$app"
                 repair_fixed "restarted dead SSH forward for app '$app' on 127.0.0.1:$local_port"
                 return 0
             fi

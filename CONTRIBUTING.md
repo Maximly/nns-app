@@ -175,8 +175,16 @@ is restored on failure.
   failures, defer to an offline upstream, honor cooldown, and restart only the
   backend unit so application processes keep their network namespace.
 - Per-instance drop-ins order chained apps and gateways after the upstream
-  online unit and bind their lifecycle to it.
+  online unit, bind their lifecycle to it (`BindsTo=`), and propagate upstream
+  restarts (`PartOf=`). Note that systemd propagates a restart only to
+  dependents that are already active: after `BindsTo=` has stopped a dependent,
+  the upstream's restart does not start it again. nns-app therefore explicitly
+  restarts gateways (`restart_gateways_via_app`) after `start_app`, the
+  watchdog, or repair rebuild an app's data path.
 - `nns-gateway@.service` owns the managed OpenVPN server and gateway data path.
+  Every configured gateway unit must stay enabled (`WantedBy=multi-user.target`)
+  so gateways come back after a reboot; install/repair reconcile enablement and
+  removal is the supported way to take a gateway permanently off.
 - `nns-gateway-crl-refresh@.timer` renews gateway CRLs weekly.
 
 Keep the distinction between a running process, a created tunnel, and a

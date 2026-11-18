@@ -1334,12 +1334,13 @@ GATEWAY_CONFIG_EOF
 
     write_gateway_unit_dropin "$gateway"
     systemctl daemon-reload
+    systemctl enable "nns-gateway@${gateway}.service" >/dev/null
     systemctl enable --now "nns-gateway-crl-refresh@${gateway}.timer" >/dev/null
 
     release_lock "gateway-$gateway"
     release_lock global
 
-    log "Created managed OpenVPN gateway '$gateway' with '$transport' transport."
+    log "Created managed OpenVPN gateway '$gateway' with '$transport' transport (enabled at boot)."
     if [[ "$transport" == ssh ]]; then
         log "SSH endpoint:    $public_host:$public_port/tcp"
         log "Private OpenVPN listener: 127.0.0.1:$openvpn_listen_port/tcp"
@@ -2079,6 +2080,24 @@ stop_gateways_via_app() {
         if systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
             warn "Stopping gateway '$gateway' before its upstream app '$app'."
             gateway_stop "$gateway"
+        fi
+    done < <(gateways_using_app "$app")
+}
+
+# systemd propagates a dependency restart only to dependents that are already
+# active; a gateway that a BindsTo= stop has already taken down is not started
+# again by the upstream's PartOf= restart.  After the app chain (namespace,
+# backend, online path) has recovered, explicitly bring every gateway that
+# routes through it back up.  `systemctl restart` also starts inactive units,
+# so this covers both still-running and previously-stopped gateways.
+restart_gateways_via_app() {
+    local app=$1 gateway
+    while IFS= read -r gateway; do
+        [[ -n "$gateway" ]] || continue
+        if systemctl restart "nns-gateway@${gateway}.service" >/dev/null 2>&1; then
+            log "Restarted gateway '$gateway' after its upstream app '$app' recovered."
+        else
+            warn "Could not restart gateway '$gateway' after its upstream app '$app' recovered."
         fi
     done < <(gateways_using_app "$app")
 }

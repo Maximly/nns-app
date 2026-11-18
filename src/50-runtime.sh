@@ -426,6 +426,7 @@ watchdog_check() {
     if systemctl restart "nns-openvpn@${app}.service"; then
         systemctl reset-failed "nns-online@${app}.service" >/dev/null 2>&1 || true
         if systemctl start "nns-online@${app}.service"; then
+            restart_gateways_via_app "$app"
             WD_LAST_RESULT=recovered
             log "Watchdog restored the data path for '$app'."
         else
@@ -583,6 +584,9 @@ start_app() {
         if watchdog_enabled_for_type "$vpn_type"; then
             watchdog_mark_online "$app"
         fi
+        # The app chain was just (re)built; any gateway that routes through
+        # this app was stopped with it and must come back with it.
+        restart_gateways_via_app "$app"
         if app_split_tunnel "$app"; then
             log "Started '$app' with '$profile_marker' ($(vpn_type_label "$vpn_type")) via $desired_via. Split routes ready; peer reachability not verified."
         else

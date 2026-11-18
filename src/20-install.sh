@@ -220,6 +220,7 @@ Description=VPN transport for NNS app %i
 Requires=nns-netns@%i.service
 After=nns-netns@%i.service
 BindsTo=nns-netns@%i.service
+PartOf=nns-netns@%i.service
 
 [Service]
 Type=simple
@@ -239,6 +240,7 @@ Description=Online data path for NNS app %i
 Requires=nns-openvpn@%i.service
 After=nns-openvpn@%i.service
 BindsTo=nns-openvpn@%i.service
+PartOf=nns-openvpn@%i.service
 
 [Service]
 Type=oneshot
@@ -397,6 +399,9 @@ refresh_managed_unit_metadata() {
         gateway=$(basename "$dir")
         acquire_lock "gateway-$gateway"
         write_gateway_unit_dropin "$gateway"
+        # A configured gateway must survive reboots: keep its unit enabled.
+        # Removal is the only supported way to take a gateway permanently off.
+        systemctl enable "nns-gateway@${gateway}.service" >/dev/null 2>&1 || true
         if [[ "$(gateway_cfg_value "$gateway" GATEWAY_BACKEND)" == amneziawg ]]; then
             awg_server_write_config "$gateway"
         else
@@ -528,6 +533,7 @@ write_app_unit_dropin() {
 Requires=nns-online@$via.service
 After=nns-online@$via.service
 BindsTo=nns-online@$via.service
+PartOf=nns-online@$via.service
 APP_DROPIN_EOF
         chmod 0644 "$dir/10-upstream.conf"
     fi
@@ -551,6 +557,7 @@ write_gateway_unit_dropin() {
 Requires=nns-online@$via.service
 After=nns-online@$via.service
 BindsTo=nns-online@$via.service
+PartOf=nns-online@$via.service
 GATEWAY_DROPIN_EOF
     chmod 0644 "$dir/10-upstream.conf"
 }

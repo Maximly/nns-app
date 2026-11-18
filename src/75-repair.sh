@@ -312,6 +312,17 @@ repair_gateway_one() {
     fi
     acquire_lock "gateway-$gateway"
     load_gateway_cfg "$gateway"
+    # A configured gateway must come back after a reboot. Older engines did
+    # not always enable the unit at creation; reconcile it here so every
+    # gateway is started at boot. Removal is the supported way to take a
+    # gateway permanently off.
+    if ! systemctl is-enabled --quiet "nns-gateway@${gateway}.service" 2>/dev/null; then
+        if systemctl enable "nns-gateway@${gateway}.service" >/dev/null 2>&1; then
+            repair_fixed "enabled gateway '$gateway' for automatic start at boot"
+        else
+            repair_unresolved "could not enable gateway '$gateway' for automatic start at boot"
+        fi
+    fi
     if [[ "${GATEWAY_BACKEND:-openvpn}" == amneziawg ]]; then
         write_gateway_unit_dropin "$gateway"
         awg_server_write_config "$gateway"
@@ -582,6 +593,7 @@ repair_local_ssh_forward() {
             if ip netns exec "$ns" ss -H -lnt 2>/dev/null |
                grep -Eq "127\\.0\\.0\\.1:${local_port}([[:space:]]|$)"; then
                 systemctl start "nns-online@${app}.service" >/dev/null 2>&1 || true
+                restart_gateways_via_app "$app"
                 repair_fixed "restarted dead SSH forward for app '$app' on 127.0.0.1:$local_port"
                 return 0
             fi

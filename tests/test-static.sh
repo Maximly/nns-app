@@ -215,6 +215,34 @@ grep -Fq 'ip link del "$GATEWAY_TUN"' "$INSTALLER" || {
     echo 'gateway teardown does not remove a stale managed TUN interface' >&2
     exit 1
 }
+grep -Fq 'PartOf=nns-netns@%i.service' "$INSTALLER" || {
+    echo 'VPN backend unit does not propagate namespace restarts' >&2
+    exit 1
+}
+grep -Fq 'PartOf=nns-openvpn@%i.service' "$INSTALLER" || {
+    echo 'online unit does not propagate VPN backend restarts' >&2
+    exit 1
+}
+grep -Fq 'PartOf=nns-online@$via.service' "$INSTALLER" || {
+    echo 'upstream drop-ins do not propagate online-path restarts' >&2
+    exit 1
+}
+grep -Fq 'restart_gateways_via_app' "$INSTALLER" || {
+    echo 'no explicit dependent-gateway recovery after app-chain rebuild' >&2
+    exit 1
+}
+grep -Fq 'systemctl enable "nns-gateway@${gateway}.service" >/dev/null' "$INSTALLER" || {
+    echo 'gateway creation does not enable the unit for boot' >&2
+    exit 1
+}
+grep -Fq 'systemctl enable "nns-gateway@${gateway}.service" >/dev/null 2>&1 || true' "$INSTALLER" || {
+    echo 'install metadata refresh does not reconcile gateway enablement' >&2
+    exit 1
+}
+grep -Fq 'enabled gateway' "$INSTALLER" >/dev/null || {
+    echo 'repair does not reconcile gateway enablement' >&2
+    exit 1
+}
 grep -Fq 'CONTRIBUTING.md' "$ROOT/README.md"
 test -s "$ROOT/CONTRIBUTING.md"
 test ! -e "$ROOT/ARCHITECTURE.md"
