@@ -152,6 +152,16 @@ sys.exit(1)
 PY_MYLOC_NORM
 }
 
+# nsenter binary for probing PID 1's network namespace (host-exit gateways
+# inspected from another namespace). NNS_NSENTER overrides the path (tests).
+myloc_nsenter() {
+    if [[ -n "${NNS_NSENTER:-}" ]]; then
+        printf '%s\n' "$NNS_NSENTER"
+        return 0
+    fi
+    command -v nsenter 2>/dev/null || return 1
+}
+
 myloc_query() {
     local ns="${1:-}" key file url json answer last_msg="" last_err="" errfile
     local -a cmd
@@ -161,7 +171,14 @@ myloc_query() {
     while IFS= read -r url; do
         [[ -n "$url" ]] || continue
         cmd=("${NNS_MYLOC_CURL:-/usr/bin/curl}" -4fsS --noproxy '*' --connect-timeout 3 --max-time 10 "$url")
-        if [[ -n "$ns" ]]; then
+        if [[ "$ns" == /* ]]; then
+            # A namespace *path* (e.g. /proc/1/ns/net) is entered with
+            # nsenter rather than `ip netns exec`, which takes names.
+            json=$("$(myloc_nsenter)" --net="$ns" "${cmd[@]}" 2>"$errfile") || {
+                last_err=$(<"$errfile")
+                continue
+            }
+        elif [[ -n "$ns" ]]; then
             json=$("$(ip_binary)" netns exec "$ns" "${cmd[@]}" 2>"$errfile") || {
                 last_err=$(<"$errfile")
                 continue
@@ -268,7 +285,17 @@ myloc_command() {
             systemctl is-active --quiet "nns-gateway@${requested}.service" ||
                 die "Gateway '$requested' is stopped."
             if [[ "$via" == host ]]; then
-                myip_host_namespace || die "Cannot inspect host-exit gateway '$requested' from another network namespace."
+                # The gateway's exit is the host's egress. In the host
+                # namespace the current shell is the probe; elsewhere root
+                # can still enter PID 1's namespace through nsenter.
+                if myip_host_namespace; then
+                    ns=""
+                else
+                    require_root
+                    myloc_nsenter >/dev/null 2>&1 ||
+                        die "Cannot inspect host-exit gateway '$requested': nsenter (util-linux) is required to probe the host namespace."
+                    ns=/proc/1/ns/net
+                fi
                 context="gateway:$requested via host"
             else
                 require_root

@@ -311,6 +311,28 @@ fi
         fail 'host gateway check accepted unsafe name'
     fi
 )
+# Host-exit gateway myloc escalates automatically when the shell cannot
+# verify the host network namespace (restricted /proc or a foreign
+# namespace); a verified host namespace and context-only myip stay unprivileged.
+(
+    readlink() { printf '%s\n' "$0"; }
+    /usr/bin/sudo() { printf 'SUDO:%s\n' "$*" >"$TEST_TMP/sudo-args"; }
+    die() { echo "DIE:$*" >&2; return 1; }
+    managed_gateway_exists() { return 0; }
+    myip_host_gateway_readable() { return 0; }
+    rm -f "$TEST_TMP/sudo-args"
+    myip_host_namespace() { return 0; }
+    (reexec_as_root_if_needed myloc mlhome)
+    [[ ! -e "$TEST_TMP/sudo-args" ]] || fail 'verified host namespace still escalated'
+    myip_host_namespace() { return 1; }
+    (reexec_as_root_if_needed myloc mlhome)
+    grep -Fq 'myloc mlhome' "$TEST_TMP/sudo-args" || fail 'unverified host-exit myloc did not escalate'
+    grep -Fq -- '-n' "$TEST_TMP/sudo-args" && fail 'gateway myloc must use prompting sudo, not -n'
+    rm -f "$TEST_TMP/sudo-args"
+    (reexec_as_root_if_needed myip mlhome)
+    [[ ! -e "$TEST_TMP/sudo-args" ]] || fail 'myip escalated for host-exit gateway'
+)
+
 # Host-egress report must distinguish the inbound address, exit IP, and VPN
 # client pool. Never infer public listener reachability from systemd alone.
 (

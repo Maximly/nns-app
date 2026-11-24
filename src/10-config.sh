@@ -34,7 +34,12 @@ reexec_as_root_if_needed() {
     fi
     if [[ ( "$cmd" == myip || "$cmd" == myloc ) && $# -ge 2 ]] &&
        [[ "$2" != --json ]] && myip_host_gateway_readable "$2"; then
-        return 0
+        # myloc geolocates the gateway's host exit, which must be probed from
+        # the host network namespace. A non-root shell may be unable to
+        # verify it (restricted /proc mounts) or may live in another
+        # namespace, so escalate automatically; as root the host namespace is
+        # still probeable directly through nsenter.
+        [[ "$cmd" == myloc ]] && ! myip_host_namespace || return 0
     fi
 
     # Sudoers rules for app inspections use the canonical app-first form.

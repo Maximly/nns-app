@@ -203,5 +203,60 @@ S
         fail 'namespaced provider-cache run failed'
     grep -Fq '203.0.113.55' <<<"$out" || fail 'namespaced provider-cache run missing result'
     grep -Fq 'ns:nns-one'$'\t''https://ipwho.is/' "$TEST_TMP/myloc-cache2" || fail 'namespace cache key missing'
+    # A namespace path (PID 1) is probed through nsenter, not `ip netns exec`.
+    cat >"$TEST_TMP/fake-nsenter" <<'S'
+#!/bin/bash
+shift 1
+exec "$@"
+S
+    chmod +x "$TEST_TMP/fake-nsenter"
+    myloc_nsenter() { printf '%s\n' "$TEST_TMP/fake-nsenter"; }
+    rm -f "$TEST_TMP/myloc-cache3" "$TEST_TMP/order5"
+    out=$(NNS_MYLOC_CURL="$TEST_TMP/rec-curl" NNS_MYLOC_CACHE="$TEST_TMP/myloc-cache3" NNS_REC_FILE="$TEST_TMP/order5" myloc_query /proc/1/ns/net) ||
+        fail 'host-namespace path probe failed'
+    grep -Fq '203.0.113.55' <<<"$out" || fail 'host-namespace path probe missing result'
+    grep -Fq 'ns:/proc/1/ns/net'$'\t''https://ipwho.is/' "$TEST_TMP/myloc-cache3" || fail 'host-namespace path cache key missing'
+)
+# A host-exit gateway geolocates the host's egress. Inside the host namespace
+# the current shell is probed; elsewhere the probe targets PID 1's namespace
+# through nsenter, and a missing nsenter is a clear diagnostic.
+(
+    require_root() { :; }
+    validate_app_name() { :; }
+    managed_gateway_exists() { [[ "$1" == mlhome ]]; }
+    load_gateway_cfg() { VIA_APP=host; }
+    systemctl() { [[ "$1" == is-active ]] || fail 'wrong service check'; }
+    myip_host_namespace() { return 1; }
+    myloc_nsenter() { printf '%s\n' "$TEST_TMP/fake-nsenter-ok"; }
+    myloc_query() {
+        [[ "$1" == /proc/1/ns/net ]] || fail 'host-exit probe did not target PID 1 namespace'
+        printf '%s\n' "$fixture"
+    }
+    output=$(myloc_command mlhome)
+    grep -Fq 'Context:           gateway:mlhome via host' <<<"$output" || fail 'host-exit gateway context'
+)
+(
+    require_root() { :; }
+    validate_app_name() { :; }
+    managed_gateway_exists() { [[ "$1" == mlhome ]]; }
+    load_gateway_cfg() { VIA_APP=host; }
+    systemctl() { :; }
+    myip_host_namespace() { return 1; }
+    myloc_nsenter() { return 1; }
+    myloc_query() { fail 'queried without nsenter'; }
+    die() { echo "$*" >&2; return 1; }
+    if (myloc_command mlhome) >"$TEST_TMP/nsenter.out" 2>&1; then fail 'host-exit probe accepted without nsenter'; fi
+    grep -Fq 'nsenter (util-linux) is required' "$TEST_TMP/nsenter.out" || fail 'missing nsenter diagnostic'
+)
+(
+    require_root() { fail 'host-ns gateway myloc required root'; }
+    validate_app_name() { :; }
+    managed_gateway_exists() { [[ "$1" == mlhome ]]; }
+    load_gateway_cfg() { VIA_APP=host; }
+    systemctl() { :; }
+    myip_host_namespace() { return 0; }
+    myloc_query() { [[ -z "$1" ]] || fail 'host-ns gateway probe used a namespace'; printf '%s\n' "$fixture"; }
+    output=$(myloc_command mlhome)
+    grep -Fq 'Context:           gateway:mlhome via host' <<<"$output" || fail 'host-ns gateway context'
 )
 echo 'myloc context, formatting, and failure tests passed.'

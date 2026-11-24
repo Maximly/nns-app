@@ -548,7 +548,10 @@ sudo nns-app repair --local-only
 Internet exit using ip-api.com (unencrypted HTTP, non-commercial usage limit
 of 45 requests/minute per exit) and falls back to ipwho.is (HTTPS) when
 ip-api.com is unreachable. The working provider is remembered per network
-namespace and tried first on later runs. A private-only split tunnel may have no
+namespace and tried first on later runs. Host-exit gateways are probed from
+the host network namespace; when the calling shell is in another namespace
+(or the host namespace cannot be verified), nns-app re-runs itself with sudo
+automatically. A private-only split tunnel may have no
 public exit at all. An `active` tunnel service does not prove peer reachability.
 
 Check DNS and WireGuard without changing host networking:
