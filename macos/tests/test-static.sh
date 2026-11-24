@@ -409,14 +409,49 @@ S
   [[ "$(NNS_MAC_TEST_CURL="$T/fake-myip-curl" bash "$ROOT/nns-app-darwin.sh" myip)" == '203.0.113.7' ]] || {
     echo 'host-mode myip mismatch' >&2; exit 1
   }
-  loc_json=$(NNS_MAC_TEST_CURL="$T/fake-myloc-curl" bash "$ROOT/nns-app-darwin.sh" myloc --json)
+  loc_json=$(NNS_MAC_TEST_CURL="$T/fake-myloc-curl" NNS_MYLOC_CACHE="$T/myloc-cache" bash "$ROOT/nns-app-darwin.sh" myloc --json)
   grep -Fq '"query": "203.0.113.9"' <<<"$loc_json" || {
     echo "host-mode myloc --json mismatch: $loc_json" >&2; exit 1
   }
-  loc_pretty=$(NNS_MAC_TEST_CURL="$T/fake-myloc-curl" bash "$ROOT/nns-app-darwin.sh" myloc)
+  loc_pretty=$(NNS_MAC_TEST_CURL="$T/fake-myloc-curl" NNS_MYLOC_CACHE="$T/myloc-cache" bash "$ROOT/nns-app-darwin.sh" myloc)
   grep -Fq '203.0.113.9' <<<"$loc_pretty" && grep -Fq 'Context:           host' <<<"$loc_pretty" || {
     echo "host-mode myloc mismatch: $loc_pretty" >&2; exit 1
   }
+
+  # When the primary ip-api.com probe fails, host-mode myloc falls back to
+  # ipwho.is and reports the provider that actually answered.
+  cat > "$T/fake-myloc-fb-curl" <<'S'
+#!/bin/sh
+case "$*" in
+  *ip-api.com*) exit 7 ;;
+  *) printf '%s\n' '{"ip":"203.0.113.11","success":true,"country":"Testland","country_code":"TL","region":"Test Region","city":"Test City","postal":"00000","latitude":3.4,"longitude":4.5,"connection":{"asn":64501,"org":"Test Org","isp":"Test ISP"},"timezone":{"id":"Etc/UTC"}}' ;;
+esac
+S
+  chmod +x "$T/fake-myloc-fb-curl"
+  rm -f "$T/myloc-cache"
+  loc_fb=$(NNS_MAC_TEST_CURL="$T/fake-myloc-fb-curl" NNS_MYLOC_CACHE="$T/myloc-cache" bash "$ROOT/nns-app-darwin.sh" myloc)
+  grep -Fq '203.0.113.11' <<<"$loc_fb" && grep -Fq 'Provider:          ipwho.is' <<<"$loc_fb" || {
+    echo "host-mode myloc fallback mismatch: $loc_fb" >&2; exit 1
+  }
+
+  # The provider that last worked is remembered per context and tried first
+  # on the next run, so the blocked primary is not re-probed every time.
+  cat > "$T/fake-myloc-rec-curl" <<'S'
+#!/bin/sh
+printf '%s\n' "$*" >>"${NNS_REC_FILE:-/dev/null}"
+case "$*" in
+  *ipwho.is*) printf '%s\n' '{"ip":"203.0.113.12","success":true,"country":"Testland","country_code":"TL","city":"Test City","connection":{"asn":64502,"org":"Test Org","isp":"Test ISP"},"timezone":{"id":"Etc/UTC"}}'; exit 0 ;;
+  *) exit 7 ;;
+esac
+S
+  chmod +x "$T/fake-myloc-rec-curl"
+  rm -f "$T/myloc-cache" "$T/myloc-order1" "$T/myloc-order2"
+  loc_r1=$(NNS_MAC_TEST_CURL="$T/fake-myloc-rec-curl" NNS_MYLOC_CACHE="$T/myloc-cache" NNS_REC_FILE="$T/myloc-order1" bash "$ROOT/nns-app-darwin.sh" myloc)
+  grep -Fq '203.0.113.12' <<<"$loc_r1" || { echo "cached myloc first run mismatch: $loc_r1" >&2; exit 1; }
+  grep -Fq 'ip-api.com' "$T/myloc-order1" || { echo 'primary not attempted on first cached run' >&2; exit 1; }
+  loc_r2=$(NNS_MAC_TEST_CURL="$T/fake-myloc-rec-curl" NNS_MYLOC_CACHE="$T/myloc-cache" NNS_REC_FILE="$T/myloc-order2" bash "$ROOT/nns-app-darwin.sh" myloc)
+  grep -Fq '203.0.113.12' <<<"$loc_r2" || { echo "cached myloc second run mismatch: $loc_r2" >&2; exit 1; }
+  head -n1 "$T/myloc-order2" | grep -Fq 'ipwho.is' || { echo 'cached provider not tried first on second run' >&2; exit 1; }
 fi
 
 echo 'macOS static + mock CLI tests passed.'

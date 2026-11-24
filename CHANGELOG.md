@@ -28,6 +28,12 @@ Highlights are grouped by major release series. Individual patch and minor relea
   require Internet egress through the VPN profile. Public probe hostnames are
   resolved on the host and passed to `curl --resolve`, so an unrouted private
   VPN DNS address does not hide a working public exit.
+- `myloc` on Linux and macOS now falls back to the `ipwho.is` HTTPS
+  geolocation endpoint when the primary `ip-api.com` probe is unreachable or
+  rate-limited, and reports which provider answered. Probe endpoints are
+  overridable via `NNS_MYLOC_URL` and `NNS_MYLOC_FALLBACK_URLS`. The provider
+  that last answered for a given egress (network namespace or macOS app) is
+  remembered and tried first on later runs.
 - Added an explicit Linux/macOS feature comparison and macOS static/mock tests.
 - Linux feature implementation preserved from 2.0.16. The Darwin backend is
   experimental and has weaker process isolation than Linux namespaces.

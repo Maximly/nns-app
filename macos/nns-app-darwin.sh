@@ -26,6 +26,7 @@ fi
 STATE_BASE=/var/run/nns-app-macos
 LIBEXEC=/usr/local/libexec/nns-app
 MYLOC_URL="http://ip-api.com/json/?fields=status,message,query,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,org,as"
+MYLOC_FALLBACK_URLS="https://ipwho.is/"
 if [ ! -x "$LIBEXEC/nns-run" ] && [ -x "$(dirname "$SELF")/bin/nns-run" ]; then
   LIBEXEC=$(cd "$(dirname "$SELF")/bin" && pwd -P)
 fi
@@ -761,25 +762,211 @@ for key, label in fields:
         print(f"{label + chr(58):<19}{value}")
 if data.get("lat") is not None and data.get("lon") is not None:
     print("Coordinates:       {}, {}".format(data["lat"], data["lon"]))
-print("Provider:          ip-api.com (approximate location; HTTP)")
+provider = data.get("provider")
+if not isinstance(provider, str) or not provider:
+    provider = "ip-api.com"
+transport = "; HTTP" if provider == "ip-api.com" else ""
+print("Provider:          " + provider + " (approximate location" + transport + ")")
 ' "$format" "$context"
 }
 
-myloc_query() {
-  local mode=$1 curl_bin probe_ip
-  curl_bin=$(homebrew_curl) || fail 'Homebrew curl required (brew install curl).'
-  local -a cmd=("$curl_bin" -4fsS --noproxy '*' --connect-timeout 3 --max-time 10)
-  if [ "$mode" = app ]; then
-    probe_ip=$(resolve_host_ipv4 ip-api.com) ||
-      fail 'Cannot resolve ip-api.com via host DNS.'
-    cmd+=(--resolve "ip-api.com:80:$probe_ip")
-  fi
-  cmd+=("${NNS_MYLOC_URL:-$MYLOC_URL}")
-  if [ "$mode" = app ]; then
-    run_app_output "${cmd[@]}"
+# Probe URLs can be overridden for custom or self-hosted endpoints:
+# NNS_MYLOC_URL replaces the primary, NNS_MYLOC_FALLBACK_URLS (space-separated,
+# empty disables fallback) replaces the fallbacks.
+myloc_urls() {
+  local u
+  printf '%s\n' "${NNS_MYLOC_URL:-$MYLOC_URL}"
+  if [ -n "${NNS_MYLOC_FALLBACK_URLS+x}" ]; then
+    # shellcheck disable=SC2086
+    for u in ${NNS_MYLOC_FALLBACK_URLS:-}; do
+      [ -n "$u" ] || continue
+      printf '%s\n' "$u"
+    done
   else
-    "${cmd[@]}"
+    # shellcheck disable=SC2086
+    for u in $MYLOC_FALLBACK_URLS; do
+      printf '%s\n' "$u"
+    done
   fi
+}
+
+# The provider that last worked is remembered per egress context and tried
+# first on later runs, so an unreachable primary does not cost a connect
+# timeout on every invocation. Different apps exit through different VPNs,
+# so the cache is keyed per app (host mode uses a single "host" entry).
+# NNS_MYLOC_CACHE overrides the cache path (tests).
+myloc_cache_file() {
+  if [ -n "${NNS_MYLOC_CACHE:-}" ]; then
+    printf '%s\n' "$NNS_MYLOC_CACHE"
+    return 0
+  fi
+  printf '%s\n' "${HOME_DIR:-$HOME}/Library/Application Support/nns-app/myloc-providers"
+}
+
+myloc_cache_key() {
+  local mode="$1" app="$2"
+  if [ "$mode" = app ] && [ -n "$app" ]; then
+    printf 'app:%s\n' "$app"
+  else
+    printf 'host\n'
+  fi
+}
+
+myloc_cache_read() {
+  local file="$1" key="$2" k url
+  [ -f "$file" ] || return 1
+  while read -r k url rest; do
+    if [ "$k" = "$key" ] && [ -n "$url" ]; then
+      printf '%s\n' "$url"
+      return 0
+    fi
+  done < "$file"
+  return 1
+}
+
+myloc_cache_write() {
+  local file="$1" key="$2" url="$3" line tmp
+  tmp=$(mktemp "${TMPDIR:-/tmp}/nns-myloc-cache.XXXXXX") || return 1
+  if [ -f "$file" ]; then
+    while IFS= read -r line; do
+      [ "${line%%$'\t'*}" = "$key" ] && continue
+      printf '%s\n' "$line"
+    done < "$file" > "$tmp"
+  fi
+  # Tab-separated records: keys/URLs never contain tabs.
+  printf '%s\t%s\t%s\n' "$key" "$url" "$(date +%s)" >> "$tmp"
+  mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+}
+
+# Emit the cached provider (if any) followed by the configured providers,
+# without duplicates; myloc_query tries them in this order.
+myloc_query_urls() {
+  local key="$1" file="$2" cached=''
+  if [ -n "$file" ]; then
+    cached=$(myloc_cache_read "$file" "$key" 2>/dev/null || true)
+  fi
+  {
+    if [ -n "$cached" ]; then
+      printf '%s\n' "$cached"
+    fi
+    myloc_urls
+  } | awk 'NF && !seen[$0]++'
+}
+
+url_host_port() {
+  python3 - "$1" <<'PY_URL_PARSE'
+import sys
+from urllib.parse import urlparse
+u = urlparse(sys.argv[1])
+host = u.hostname or ""
+if not host:
+    sys.exit(1)
+port = u.port or (443 if u.scheme == "https" else 80)
+sys.stdout.write("%s:%d" % (host, port))
+PY_URL_PARSE
+}
+
+# Normalize a provider response onto the ip-api.com field shape and record
+# the originating provider. Exit 0 with normalized JSON on success, exit 1
+# with the provider's failure message, exit 2 on an unparseable response.
+myloc_normalize() {
+  python3 - "$1" "$2" <<'PY_MYLOC_NORM'
+import json
+import sys
+from urllib.parse import urlparse
+
+host = (urlparse(sys.argv[1]).hostname or "").lower()
+try:
+    data = json.loads(sys.argv[2])
+except (ValueError, UnicodeError):
+    sys.exit(2)
+if not isinstance(data, dict):
+    sys.exit(2)
+
+if host.endswith("ipwho.is"):
+    ok = data.get("success") is True
+    conn = data.get("connection")
+    conn = conn if isinstance(conn, dict) else {}
+    tz = data.get("timezone")
+    tz = tz if isinstance(tz, dict) else {}
+    asn = ""
+    if conn.get("asn"):
+        asn = "AS%d" % conn["asn"]
+        if conn.get("org"):
+            asn += " " + str(conn["org"])
+    out = {
+        "status": "success" if ok else "fail",
+        "message": "" if ok else str(data.get("message") or "unknown"),
+        "query": data.get("ip"),
+        "country": data.get("country"),
+        "countryCode": data.get("country_code"),
+        "regionName": data.get("region"),
+        "city": data.get("city"),
+        "zip": data.get("postal"),
+        "lat": data.get("latitude"),
+        "lon": data.get("longitude"),
+        "timezone": tz.get("id"),
+        "isp": conn.get("isp"),
+        "org": conn.get("org"),
+        "as": asn or None,
+        "provider": "ipwho.is",
+    }
+else:
+    # ip-api.com and any user-supplied ip-api-compatible endpoint pass through.
+    out = dict(data)
+    out["provider"] = host or "custom"
+
+if out.get("status") == "success" and isinstance(out.get("query"), str) and out["query"]:
+    print(json.dumps(out, ensure_ascii=False))
+    sys.exit(0)
+print(str(out.get("message") or "unknown"))
+sys.exit(1)
+PY_MYLOC_NORM
+}
+
+myloc_query() {
+  local mode="$1" app="$2" curl_bin key file url host_port probe_ip json answer last_msg='' last_err='' errfile
+  curl_bin=$(homebrew_curl) || fail 'Homebrew curl required (brew install curl).'
+  key=$(myloc_cache_key "$mode" "${app:-}")
+  file=$(myloc_cache_file)
+  errfile=$(mktemp "${TMPDIR:-/tmp}/nns-myloc.XXXXXX") || return 1
+  while IFS= read -r url; do
+    [ -n "$url" ] || continue
+    local -a cmd=("$curl_bin" -4fsS --noproxy '*' --connect-timeout 3 --max-time 10)
+    if [ "$mode" = app ]; then
+      host_port=$(url_host_port "$url") || { last_msg='Cannot parse the geolocation probe URL.'; continue; }
+      probe_ip=$(resolve_host_ipv4 "${host_port%%:*}") ||
+        { last_msg="Cannot resolve ${host_port%%:*} via host DNS."; continue; }
+      cmd+=(--resolve "$host_port:$probe_ip")
+    fi
+    cmd+=("$url")
+    if [ "$mode" = app ]; then
+      json=$(run_app_output "${cmd[@]}" 2>"$errfile") || {
+        last_err=$(cat "$errfile")
+        continue
+      }
+    else
+      json=$("${cmd[@]}" 2>"$errfile") || {
+        last_err=$(cat "$errfile")
+        continue
+      }
+    fi
+    [ -n "$json" ] || continue
+    if answer=$(myloc_normalize "$url" "$json"); then
+      rm -f "$errfile"
+      case "$file" in
+        */*) mkdir -p "${file%/*}" 2>/dev/null || true ;;
+      esac
+      myloc_cache_write "$file" "$key" "$url" 2>/dev/null || true
+      printf '%s\n' "$answer"
+      return 0
+    fi
+    [ -z "$answer" ] || last_msg=$answer
+  done < <(myloc_query_urls "$key" "$file")
+  rm -f "$errfile"
+  [ -z "$last_err" ] || printf '%s\n' "$last_err" >&2
+  [ -z "$last_msg" ] || printf 'myloc: last provider error: %s\n' "$last_msg" >&2
+  return 1
 }
 
 myloc_command() {
@@ -802,7 +989,7 @@ myloc_command() {
     context="app:$APP"
     mode=app
   fi
-  json=$(myloc_query "$mode") ||
+  json=$(myloc_query "$mode" "${APP:-}") ||
     fail "IP geolocation unavailable from '$context' (no Internet egress through this profile, DNS/API, or rate limit)."
   printf '%s\n' "$json" | myloc_format "$format" "$context"
 }
@@ -945,7 +1132,7 @@ nns-app $VERSION macOS (experimental IPv4 WireGuard/OpenVPN client)
   nns-app remove <name>                  Remove stopped app profile
   nns-app git-via <name|->               Set/restore repository SSH transport
   nns-app myip [<name>]                  Probe public IP (host, or app via tunnel)
-  nns-app myloc [<name>] [--json]        Geolocate host or app egress (ip-api.com)
+  nns-app myloc [<name>] [--json]        Geolocate host or app egress (ip-api.com or ipwho.is)
   nns-app --version
 
 OpenVPN on macOS uses --route-noexec (host default unchanged). Profiles must be

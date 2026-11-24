@@ -111,4 +111,97 @@ fixture='{"status":"success","query":"203.0.113.41","country":"Example Land","co
     printf '%s\n' 'bad JSON' | myloc_format json host >"$TEST_TMP/bad.out" 2>&1 && fail 'invalid JSON accepted'
     grep -Fq 'Invalid geolocation response' "$TEST_TMP/bad.out" || fail 'invalid JSON diagnostic'
 )
+# Provider normalization: ipwho.is responses map onto the ip-api.com shape and
+# record the provider; failures keep the provider message; garbage is rejected.
+(
+    whois_fixture='{"ip":"203.0.113.55","success":true,"type":"IPv4","country":"Example Land","country_code":"EX","region":"Example Region","city":"Example City","postal":"12345","latitude":4.2,"longitude":5.3,"connection":{"asn":64500,"org":"Example Org","isp":"Example ISP"},"timezone":{"id":"Example/Zone"}}'
+    out=$(myloc_normalize 'https://ipwho.is/' "$whois_fixture") || fail 'ipwho.is normalization rejected'
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["status"]=="success" and d["query"]=="203.0.113.55" and d["countryCode"]=="EX" and d["lat"]==4.2 and d["lon"]==5.3 and d["as"]=="AS64500 Example Org" and d["provider"]=="ipwho.is", d' <<<"$out" || fail 'ipwho.is normalization fields'
+    if myloc_normalize 'https://ipwho.is/' '{"success":false,"message":"reserved range"}' >"$TEST_TMP/norm-fail.out" 2>&1; then
+        fail 'failed ipwho.is response accepted'
+    fi
+    grep -Fq 'reserved range' "$TEST_TMP/norm-fail.out" || fail 'ipwho.is failure message lost'
+    if myloc_normalize 'https://ipwho.is/' 'not json' >/dev/null 2>&1; then fail 'invalid provider JSON accepted'; fi
+    passthrough=$(myloc_normalize 'http://ip-api.com/json/' '{"status":"success","query":"203.0.113.9","country":"X"}') ||
+        fail 'ip-api passthrough rejected'
+    grep -Fq '"provider": "ip-api.com"' <<<"$passthrough" || fail 'passthrough provider missing'
+)
+# Real myloc_query tries the next provider when the primary is unreachable,
+# honors the URL overrides, and surfaces the last provider error.
+(
+    cat >"$TEST_TMP/fake-myloc-curl" <<'S'
+#!/bin/bash
+case "$*" in
+    *ip-api.com*) exit 7 ;;
+    *ipwho.is*) printf '%s\n' '{"ip":"203.0.113.55","success":true,"country":"Example Land","country_code":"EX","city":"Example City","connection":{"asn":64500,"org":"Example Org","isp":"Example ISP"},"timezone":{"id":"Example/Zone"}}'; exit 0 ;;
+    *) exit 7 ;;
+esac
+S
+    chmod +x "$TEST_TMP/fake-myloc-curl"
+    out=$(NNS_MYLOC_CURL="$TEST_TMP/fake-myloc-curl" myloc_query '') || fail 'fallback provider did not answer'
+    grep -Fq '203.0.113.55' <<<"$out" || fail 'fallback provider result missing'
+    grep -Fq '"provider": "ipwho.is"' <<<"$out" || fail 'fallback provider not recorded'
+    out=$(NNS_MYLOC_CURL="$TEST_TMP/fake-myloc-curl" NNS_MYLOC_URL='https://ipwho.is/' myloc_query '') ||
+        fail 'primary URL override rejected'
+    grep -Fq '203.0.113.55' <<<"$out" || fail 'primary URL override did not answer'
+    if NNS_MYLOC_CURL="$TEST_TMP/fake-myloc-curl" NNS_MYLOC_FALLBACK_URLS='' myloc_query '' >"$TEST_TMP/nofb.out" 2>&1; then
+        fail 'disabled fallback accepted'
+    fi
+    cat >"$TEST_TMP/fake-api-fail-curl" <<'S'
+#!/bin/bash
+case "$*" in
+    *ip-api.com*) printf '%s\n' '{"status":"fail","message":"private range","query":"0.0.0.0"}'; exit 0 ;;
+    *) printf '%s\n' '{"ip":"203.0.113.55","success":true,"country":"Example Land","country_code":"EX","city":"Example City","connection":{"asn":64500,"org":"Example Org","isp":"Example ISP"},"timezone":{"id":"Example/Zone"}}'; exit 0 ;;
+esac
+S
+    chmod +x "$TEST_TMP/fake-api-fail-curl"
+    out=$(NNS_MYLOC_CURL="$TEST_TMP/fake-api-fail-curl" myloc_query '') ||
+        fail 'fallback after API-level failure did not answer'
+    grep -Fq '203.0.113.55' <<<"$out" || fail 'fallback after API-level failure missing'
+    if NNS_MYLOC_CURL="$TEST_TMP/fake-api-fail-curl" NNS_MYLOC_FALLBACK_URLS='' myloc_query '' >"$TEST_TMP/apifail.out" 2>"$TEST_TMP/apifail.err"; then
+        fail 'API-level failure accepted as success'
+    fi
+    grep -Fq 'private range' "$TEST_TMP/apifail.err" || fail 'provider failure detail lost'
+)
+# The provider that last worked is remembered per egress and tried first on
+# later runs, so a blocked primary is not re-probed every time.
+(
+    cat >"$TEST_TMP/rec-curl" <<'S'
+#!/bin/bash
+printf '%s\n' "$*" >>"${NNS_REC_FILE:?}"
+case "$*" in
+    *ipwho.is*) printf '%s\n' '{"ip":"203.0.113.55","success":true,"country":"Example Land","country_code":"EX","city":"Example City","connection":{"asn":64500,"org":"Example Org","isp":"Example ISP"},"timezone":{"id":"Example/Zone"}}'; exit 0 ;;
+    *) exit 7 ;;
+esac
+S
+    chmod +x "$TEST_TMP/rec-curl"
+    rm -f "$TEST_TMP/myloc-cache" "$TEST_TMP/order1" "$TEST_TMP/order2" "$TEST_TMP/order3"
+    out=$(NNS_MYLOC_CURL="$TEST_TMP/rec-curl" NNS_MYLOC_CACHE="$TEST_TMP/myloc-cache" NNS_REC_FILE="$TEST_TMP/order1" myloc_query '') ||
+        fail 'first provider-cache run failed'
+    grep -Fq '203.0.113.55' <<<"$out" || fail 'first provider-cache run missing result'
+    grep -Fq 'ip-api.com' "$TEST_TMP/order1" || fail 'primary not attempted on first run'
+    out=$(NNS_MYLOC_CURL="$TEST_TMP/rec-curl" NNS_MYLOC_CACHE="$TEST_TMP/myloc-cache" NNS_REC_FILE="$TEST_TMP/order2" myloc_query '') ||
+        fail 'second provider-cache run failed'
+    head -n1 "$TEST_TMP/order2" | grep -Fq 'ipwho.is' || fail 'cached provider not tried first'
+    # A stale cached provider is re-evaluated and the cache rewritten.
+    self_key=$(myloc_cache_key '')
+    printf '%s\t%s\t%s\n' "$self_key" 'https://gone.example/' 1 > "$TEST_TMP/myloc-cache"
+    out=$(NNS_MYLOC_CURL="$TEST_TMP/rec-curl" NNS_MYLOC_CACHE="$TEST_TMP/myloc-cache" NNS_REC_FILE="$TEST_TMP/order3" myloc_query '') ||
+        fail 'stale provider-cache run failed'
+    grep -Fq '203.0.113.55' <<<"$out" || fail 'stale provider-cache run missing result'
+    grep -Fq "$self_key"$'\t'"https://ipwho.is/" "$TEST_TMP/myloc-cache" || fail 'cache not rewritten to working provider'
+    # The cache is keyed per network namespace, not globally.
+    cat >"$TEST_TMP/fake-ip" <<'S'
+#!/bin/bash
+shift 3
+exec "$@"
+S
+    chmod +x "$TEST_TMP/fake-ip"
+    ip_binary() { printf '%s\n' "$TEST_TMP/fake-ip"; }
+    rm -f "$TEST_TMP/myloc-cache2" "$TEST_TMP/order4"
+    out=$(NNS_MYLOC_CURL="$TEST_TMP/rec-curl" NNS_MYLOC_CACHE="$TEST_TMP/myloc-cache2" NNS_REC_FILE="$TEST_TMP/order4" myloc_query nns-one) ||
+        fail 'namespaced provider-cache run failed'
+    grep -Fq '203.0.113.55' <<<"$out" || fail 'namespaced provider-cache run missing result'
+    grep -Fq 'ns:nns-one'$'\t''https://ipwho.is/' "$TEST_TMP/myloc-cache2" || fail 'namespace cache key missing'
+)
 echo 'myloc context, formatting, and failure tests passed.'

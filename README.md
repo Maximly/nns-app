@@ -59,7 +59,7 @@ The macOS backend is a separate implementation, not a fork of Linux modules.
 | `git-via <app|->` (SSH) | Supported | Supported for compatible **Homebrew OpenSSH**; Apple-protected SSH unsupported |
 | Git via HTTPS | `nns-app run <app> git ...` | Experimental with compatible Homebrew Git/curl and configured private DNS |
 | `myip` | Supported | Supported for host or app egress; app probe requires Internet via the tunnel |
-| `myloc` | Supported | Supported for host or app egress via `ip-api.com`; app probe requires Internet via the tunnel |
+| `myloc` | Supported | Supported for host or app egress via `ip-api.com` (HTTPS fallback `ipwho.is`); app probe requires Internet via the tunnel |
 | VPN chaining, inherited networks, `set-via` | Supported | Not implemented |
 | Managed OpenVPN/AWG servers and gateways | Supported | Not implemented |
 | Remote exit, `.nnslink`, clients, export/revoke | Supported | Not implemented |
@@ -122,8 +122,12 @@ egress, or with an app name to probe the selected tunnel. An app probe runs
 Homebrew `curl` through the same interposer and therefore only works when the
 profile’s `AllowedIPs` and VPN gateway permit Internet egress; a split-tunnel
 profile can resolve names and reach VPN hosts but has no public exit to report.
-`myloc` uses the free `ip-api.com` HTTP endpoint and needs `python3` for
-formatting. App-scoped `myip`/`myloc` resolve only these fixed public probe
+`myloc` queries the free `ip-api.com` HTTP endpoint, falls back to the
+`ipwho.is` HTTPS endpoint when the primary is unreachable or rate-limited,
+and needs `python3` for normalization and formatting. `NNS_MYLOC_URL` and
+`NNS_MYLOC_FALLBACK_URLS` (space-separated, empty disables fallback) override
+the probe endpoints. The provider that last answered for a given egress
+(host or app) is remembered and tried first on later runs. App-scoped `myip`/`myloc` resolve only these fixed public probe
 names on the host and pass the numeric address to `curl --resolve`; this
 keeps a broken or unrouted private VPN resolver from blocking a public-exit
 diagnostic. Normal `nns-app run` hostname resolution is unchanged.
@@ -542,7 +546,9 @@ sudo nns-app repair --local-only
 
 `myip` describes the namespace and route context. `myloc` queries the public
 Internet exit using ip-api.com (unencrypted HTTP, non-commercial usage limit
-of 45 requests/minute per exit). A private-only split tunnel may have no
+of 45 requests/minute per exit) and falls back to ipwho.is (HTTPS) when
+ip-api.com is unreachable. The working provider is remembered per network
+namespace and tried first on later runs. A private-only split tunnel may have no
 public exit at all. An `active` tunnel service does not prove peer reachability.
 
 Check DNS and WireGuard without changing host networking:
