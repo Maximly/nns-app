@@ -77,9 +77,9 @@ if [[ "$(uname -s)" == Darwin && "${NNS_APP_SOURCE_ONLY:-0}" != 1 ]]; then
 fi
 
 # Sole source of truth is the repo-root VERSION file. build.sh substitutes the
-# 2.1.25 token when assembling install_linux. An unsubstituted value
+# 2.1.27 token when assembling install_linux. An unsubstituted value
 # still contains "@", which triggers the source-tree file lookup.
-_nns_version="2.1.25"
+_nns_version="2.1.27"
 if [[ "$_nns_version" == *@* ]]; then
     _nns_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
     if [[ -f "$_nns_dir/VERSION" ]]; then
@@ -356,6 +356,8 @@ Usage:
   nns-app add     <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf>
   nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
   nns-app start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
+  nns-app restart [-i|--ignore-start-error] [<app_name> [--via <upstream-app>|host]]
+                  # without a name: restart every active app and gateway
   nns-app stop    <app_name> [--local-only]
   nns-app set-via <gateway-app> <upstream-app|host>
   nns-app run     <app_name> <command> [arguments...]
@@ -514,7 +516,7 @@ reexec_as_root_if_needed() {
 
     local sudo_args=(/usr/bin/sudo)
     case "$cmd" in
-        list|status|myip|myloc|start|stop|run)
+        list|status|myip|myloc|start|stop|restart|run)
             sudo_args+=( -n )
             ;;
         --install|install|remove|add|purge|repair|backup|restore|gateway|remote|link|export|client|revoke|fixed-ip|route-mode|client-to-client|set-via)
@@ -527,24 +529,26 @@ reexec_as_root_if_needed() {
     # Gateways don't have a per-user namespace sudoers entry. Use regular sudo
     # for gateway lifecycle commands so existing host sudo policy can prompt
     # instead of failing under -n. Namespace apps keep their NOPASSWD rules.
-    if [[ "$cmd" == status || "$cmd" == stop || "$cmd" == run || "$cmd" == myloc ]] &&
+    if [[ "$cmd" == status || "$cmd" == stop || "$cmd" == restart || "$cmd" == run || "$cmd" == myloc ]] &&
        (( $# >= 2 )) && managed_gateway_exists "$2"; then
         sudo_args=(/usr/bin/sudo)
     fi
 
     # Canonicalize flexible start-option ordering before sudo. This lets the
     # per-app sudoers entry remain narrow while accepting --via in any position.
-    if [[ "$cmd" == start ]]; then
-        shift
-        parse_start_cli "$@"
-        if managed_gateway_exists "$START_APP_NAME"; then
-            sudo_args=(/usr/bin/sudo)
-        fi
-        local -a canonical=(start)
-        bool_on "$START_IGNORE" && canonical+=(-i)
-        canonical+=("$START_APP_NAME")
-        if [[ "$START_VIA" != __default__ ]]; then
-            canonical+=(--via "$START_VIA")
+    if [[ "$cmd" == start || "$cmd" == restart ]]; then
+        local -a canonical=("$cmd")
+        if (( $# > 0 )); then
+            shift
+            parse_start_cli "$@"
+            if managed_gateway_exists "$START_APP_NAME"; then
+                sudo_args=(/usr/bin/sudo)
+            fi
+            bool_on "$START_IGNORE" && canonical+=(-i)
+            canonical+=("$START_APP_NAME")
+            if [[ "$START_VIA" != __default__ ]]; then
+                canonical+=(--via "$START_VIA")
+            fi
         fi
         "${sudo_args[@]}" "$target" "${canonical[@]}"
         exit $?
@@ -1472,6 +1476,13 @@ Cmnd_Alias $alias = \\
     $ENGINE_PATH start $app --via *, \\
     $ENGINE_PATH start -i $app --via *, \\
     $ENGINE_PATH start --ignore-start-error $app --via *, \\
+    $ENGINE_PATH restart, \\
+    $ENGINE_PATH restart $app, \\
+    $ENGINE_PATH restart -i $app, \\
+    $ENGINE_PATH restart --ignore-start-error $app, \\
+    $ENGINE_PATH restart $app --via *, \\
+    $ENGINE_PATH restart -i $app --via *, \\
+    $ENGINE_PATH restart --ignore-start-error $app --via *, \\
     $ENGINE_PATH stop $app, \\
     $ENGINE_PATH run $app *
 $user ALL=(root) NOPASSWD: $alias
@@ -16793,6 +16804,75 @@ managed_app_start() {
     fi
 }
 
+# `restart` without a name: restart every active app and gateway. Gateways are
+# stopped before their upstream apps and started again afterwards (apps first,
+# so each start re-attaches its dependent gateways; host-exit gateways and any
+# remaining ones are then started explicitly). A broken app is deferred and
+# reported instead of aborting the whole pass.
+restart_all() {
+    require_root
+    local app gateway
+    local -a active_apps=() active_gateways=() pending deferred
+    shopt -s nullglob
+    for dir in "$BASE_DIR"/*; do
+        [[ -d "$dir" ]] || continue
+        app=$(basename "$dir")
+        [[ -f "$(cfg_file "$app")" ]] || continue
+        app_is_started "$app" && active_apps+=("$app")
+    done
+    for dir in "$GATEWAY_BASE_DIR"/*; do
+        [[ -d "$dir" ]] || continue
+        gateway=$(basename "$dir")
+        [[ -f "$(gateway_cfg_file "$gateway")" ]] || continue
+        systemctl is-active --quiet "nns-gateway@${gateway}.service" &&
+            active_gateways+=("$gateway")
+    done
+    if (( ${#active_apps[@]} == 0 && ${#active_gateways[@]} == 0 )); then
+        log 'Nothing to restart: no active apps or gateways.'
+        return 0
+    fi
+
+    for gateway in "${active_gateways[@]}"; do
+        log "Restarting gateway '$gateway'."
+        gateway_stop "$gateway" || warn "Could not stop gateway '$gateway'."
+    done
+    for app in "${active_apps[@]}"; do
+        log "Restarting app '$app'."
+        stop_app_cli "$app" remote || warn "Could not stop app '$app'."
+    done
+
+    # Start apps; upstreams must come up before their chained dependents, so
+    # defer failures and retry a bounded number of passes.
+    pending=("${active_apps[@]}")
+    local attempts=0 progress=1
+    while (( ${#pending[@]} > 0 && attempts < 10 && progress > 0 )); do
+        attempts=$((attempts + 1))
+        progress=0
+        deferred=()
+        for app in "${pending[@]}"; do
+            if start_app "$app" off __default__; then
+                progress=1
+            else
+                deferred+=("$app")
+            fi
+        done
+        pending=("${deferred[@]}")
+    done
+    for app in "${pending[@]}"; do
+        warn "'$app' could not be restarted; check its status and upstreams."
+    done
+
+    # Gateways whose upstream was not among the restarted apps (host-exit
+    # gateways, stopped upstreams) are brought back explicitly.
+    for gateway in "${active_gateways[@]}"; do
+        if systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
+            continue
+        fi
+        log "Restarting gateway '$gateway'."
+        gateway_start "$gateway" || warn "Could not start gateway '$gateway'."
+    done
+}
+
 managed_app_stop() {
     local app=$1 mode=${2:-remote} kind
     kind=$(managed_app_kind "$app") || return 1
@@ -17586,6 +17666,17 @@ main() {
                     ;;
                 *) die "Usage: nns-app stop <app_name> [--local-only]" ;;
             esac
+            ;;
+        restart)
+            shift
+            if (( $# == 0 )); then
+                restart_all
+                return 0
+            fi
+            parse_start_cli "$@"
+            # A stopped app is not an error for restart; proceed to start.
+            managed_app_stop "$START_APP_NAME" || true
+            managed_app_start "$START_APP_NAME" "$START_IGNORE" "$START_VIA"
             ;;
         set-via)
             (( $# == 3 )) || die "Usage: nns-app set-via <gateway-app> <upstream-app|host>"

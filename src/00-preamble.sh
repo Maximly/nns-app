@@ -356,6 +356,8 @@ Usage:
   nns-app add     <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf>
   nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
   nns-app start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
+  nns-app restart [-i|--ignore-start-error] [<app_name> [--via <upstream-app>|host]]
+                  # without a name: restart every active app and gateway
   nns-app stop    <app_name> [--local-only]
   nns-app set-via <gateway-app> <upstream-app|host>
   nns-app run     <app_name> <command> [arguments...]

@@ -527,4 +527,10 @@ strings "$ROOT/bin/nns-run" | grep -Fq 'nns_dns_host_is_local' || {
   echo 'nns-run lacks the local-hosts passthrough hook' >&2; exit 1
 }
 
+# restart: stop (if running) then start, with auto-sudo like start/stop.
+grep -Fq 'restart)' "$ROOT/nns-app-darwin.sh" || { echo 'restart command missing' >&2; exit 1; }
+grep -Fq 'nns-app restart' "$ROOT/nns-app-darwin.sh" || { echo 'restart usage missing' >&2; exit 1; }
+grep -Fq 'start|stop|restart|recover)' "$ROOT/nns-app-darwin.sh" || { echo 'restart missing from auto-sudo set' >&2; exit 1; }
+grep -Fq 'restart_all()' "$ROOT/nns-app-darwin.sh" || { echo 'bare restart (all apps) missing' >&2; exit 1; }
+
 echo 'macOS static + mock CLI tests passed.'

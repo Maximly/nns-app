@@ -590,6 +590,13 @@ Cmnd_Alias $alias = \\
     $ENGINE_PATH start $app --via *, \\
     $ENGINE_PATH start -i $app --via *, \\
     $ENGINE_PATH start --ignore-start-error $app --via *, \\
+    $ENGINE_PATH restart, \\
+    $ENGINE_PATH restart $app, \\
+    $ENGINE_PATH restart -i $app, \\
+    $ENGINE_PATH restart --ignore-start-error $app, \\
+    $ENGINE_PATH restart $app --via *, \\
+    $ENGINE_PATH restart -i $app --via *, \\
+    $ENGINE_PATH restart --ignore-start-error $app --via *, \\
     $ENGINE_PATH stop $app, \\
     $ENGINE_PATH run $app *
 $user ALL=(root) NOPASSWD: $alias

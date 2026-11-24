@@ -49,7 +49,7 @@ reexec_as_root_if_needed() {
 
     local sudo_args=(/usr/bin/sudo)
     case "$cmd" in
-        list|status|myip|myloc|start|stop|run)
+        list|status|myip|myloc|start|stop|restart|run)
             sudo_args+=( -n )
             ;;
         --install|install|remove|add|purge|repair|backup|restore|gateway|remote|link|export|client|revoke|fixed-ip|route-mode|client-to-client|set-via)
@@ -62,24 +62,26 @@ reexec_as_root_if_needed() {
     # Gateways don't have a per-user namespace sudoers entry. Use regular sudo
     # for gateway lifecycle commands so existing host sudo policy can prompt
     # instead of failing under -n. Namespace apps keep their NOPASSWD rules.
-    if [[ "$cmd" == status || "$cmd" == stop || "$cmd" == run || "$cmd" == myloc ]] &&
+    if [[ "$cmd" == status || "$cmd" == stop || "$cmd" == restart || "$cmd" == run || "$cmd" == myloc ]] &&
        (( $# >= 2 )) && managed_gateway_exists "$2"; then
         sudo_args=(/usr/bin/sudo)
     fi
 
     # Canonicalize flexible start-option ordering before sudo. This lets the
     # per-app sudoers entry remain narrow while accepting --via in any position.
-    if [[ "$cmd" == start ]]; then
-        shift
-        parse_start_cli "$@"
-        if managed_gateway_exists "$START_APP_NAME"; then
-            sudo_args=(/usr/bin/sudo)
-        fi
-        local -a canonical=(start)
-        bool_on "$START_IGNORE" && canonical+=(-i)
-        canonical+=("$START_APP_NAME")
-        if [[ "$START_VIA" != __default__ ]]; then
-            canonical+=(--via "$START_VIA")
+    if [[ "$cmd" == start || "$cmd" == restart ]]; then
+        local -a canonical=("$cmd")
+        if (( $# > 0 )); then
+            shift
+            parse_start_cli "$@"
+            if managed_gateway_exists "$START_APP_NAME"; then
+                sudo_args=(/usr/bin/sudo)
+            fi
+            bool_on "$START_IGNORE" && canonical+=(-i)
+            canonical+=("$START_APP_NAME")
+            if [[ "$START_VIA" != __default__ ]]; then
+                canonical+=(--via "$START_VIA")
+            fi
         fi
         "${sudo_args[@]}" "$target" "${canonical[@]}"
         exit $?

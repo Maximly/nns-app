@@ -698,6 +698,21 @@ stop_app() {
   cleanup_state
   info "Stopped $APP; removed only its scoped route and tunnel engine."
 }
+# `restart` without a name: restart every running app (macOS has no gateways).
+restart_all() {
+  require_admin
+  local dir app
+  [ -d "$APP_BASE" ] || { info 'No apps installed.'; return 0; }
+  for dir in "$APP_BASE"/*; do
+    [ -d "$dir" ] || continue
+    app=$(basename "$dir")
+    [ -d "$USER_RUNTIME/$app" ] && [ -f "$USER_RUNTIME/$app/ready" ] || continue
+    info "Restarting $app."
+    app_paths "$app"
+    stop_app
+    start_app
+  done
+}
 run_app() {
   [ "$(id -u)" -ne 0 ] || fail 'Run apps without sudo: nns-app run <app> command.'
   read_runtime
@@ -1159,6 +1174,7 @@ nns-app $VERSION macOS (experimental IPv4 WireGuard/OpenVPN client)
                                          Import WireGuard (.conf) or OpenVPN (.ovpn)
   nns-app dns <name> <IPv4|off>          Override private per-app DNS (no host DNS changes)
   sudo nns-app start <name>              Start tunnel (wireguard-go or openvpn) + scoped utun
+  sudo nns-app restart [<name>]          Stop (if running) and start again; no name restarts all running apps
   nns-app run <name> [--] command...     Run command; auto-bind SIP tools (ping/nc/ssh/curl/wget/…)
   nns-app status <name> | list [apps]
   sudo nns-app stop <name>               Stop tunnel and remove scoped route
@@ -1189,7 +1205,7 @@ main() {
   # with sudo automatically instead of failing with an instruction; after the
   # elevation SUDO_USER still identifies the owning account.
   case "$cmd" in
-    start|stop|recover)
+    start|stop|restart|recover)
       if [ "$(id -u)" -ne 0 ]; then
         exec /usr/bin/sudo "$SELF" "$cmd" "$@"
       fi
@@ -1286,6 +1302,20 @@ main() {
     start)
       [ "$#" -eq 1 ] || fail 'Usage: sudo nns-app start <name>'
       app_paths "$1"; start_app
+      ;;
+    restart)
+      if [ "$#" -eq 0 ]; then
+        restart_all
+      else
+        [ "$#" -eq 1 ] || fail 'Usage: sudo nns-app restart [<name>]'
+        app_paths "$1"
+        if [ -d "$RUNSTATE" ]; then
+          stop_app
+        else
+          info "App '$APP' is not running; starting fresh."
+        fi
+        start_app
+      fi
       ;;
     stop|recover)
       [ "$#" -eq 1 ] || fail "Usage: sudo nns-app $cmd <name>"

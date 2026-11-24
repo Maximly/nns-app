@@ -85,6 +85,75 @@ managed_app_start() {
     fi
 }
 
+# `restart` without a name: restart every active app and gateway. Gateways are
+# stopped before their upstream apps and started again afterwards (apps first,
+# so each start re-attaches its dependent gateways; host-exit gateways and any
+# remaining ones are then started explicitly). A broken app is deferred and
+# reported instead of aborting the whole pass.
+restart_all() {
+    require_root
+    local app gateway
+    local -a active_apps=() active_gateways=() pending deferred
+    shopt -s nullglob
+    for dir in "$BASE_DIR"/*; do
+        [[ -d "$dir" ]] || continue
+        app=$(basename "$dir")
+        [[ -f "$(cfg_file "$app")" ]] || continue
+        app_is_started "$app" && active_apps+=("$app")
+    done
+    for dir in "$GATEWAY_BASE_DIR"/*; do
+        [[ -d "$dir" ]] || continue
+        gateway=$(basename "$dir")
+        [[ -f "$(gateway_cfg_file "$gateway")" ]] || continue
+        systemctl is-active --quiet "nns-gateway@${gateway}.service" &&
+            active_gateways+=("$gateway")
+    done
+    if (( ${#active_apps[@]} == 0 && ${#active_gateways[@]} == 0 )); then
+        log 'Nothing to restart: no active apps or gateways.'
+        return 0
+    fi
+
+    for gateway in "${active_gateways[@]}"; do
+        log "Restarting gateway '$gateway'."
+        gateway_stop "$gateway" || warn "Could not stop gateway '$gateway'."
+    done
+    for app in "${active_apps[@]}"; do
+        log "Restarting app '$app'."
+        stop_app_cli "$app" remote || warn "Could not stop app '$app'."
+    done
+
+    # Start apps; upstreams must come up before their chained dependents, so
+    # defer failures and retry a bounded number of passes.
+    pending=("${active_apps[@]}")
+    local attempts=0 progress=1
+    while (( ${#pending[@]} > 0 && attempts < 10 && progress > 0 )); do
+        attempts=$((attempts + 1))
+        progress=0
+        deferred=()
+        for app in "${pending[@]}"; do
+            if start_app "$app" off __default__; then
+                progress=1
+            else
+                deferred+=("$app")
+            fi
+        done
+        pending=("${deferred[@]}")
+    done
+    for app in "${pending[@]}"; do
+        warn "'$app' could not be restarted; check its status and upstreams."
+    done
+
+    # Gateways whose upstream was not among the restarted apps (host-exit
+    # gateways, stopped upstreams) are brought back explicitly.
+    for gateway in "${active_gateways[@]}"; do
+        if systemctl is-active --quiet "nns-gateway@${gateway}.service"; then
+            continue
+        fi
+        log "Restarting gateway '$gateway'."
+        gateway_start "$gateway" || warn "Could not start gateway '$gateway'."
+    done
+}
+
 managed_app_stop() {
     local app=$1 mode=${2:-remote} kind
     kind=$(managed_app_kind "$app") || return 1
@@ -878,6 +947,17 @@ main() {
                     ;;
                 *) die "Usage: nns-app stop <app_name> [--local-only]" ;;
             esac
+            ;;
+        restart)
+            shift
+            if (( $# == 0 )); then
+                restart_all
+                return 0
+            fi
+            parse_start_cli "$@"
+            # A stopped app is not an error for restart; proceed to start.
+            managed_app_stop "$START_APP_NAME" || true
+            managed_app_start "$START_APP_NAME" "$START_IGNORE" "$START_VIA"
             ;;
         set-via)
             (( $# == 3 )) || die "Usage: nns-app set-via <gateway-app> <upstream-app|host>"

@@ -129,6 +129,10 @@ grep -Fq 'nns-app myloc [<app_or_gateway_name>] [--json]' <<<"$help" || {
     echo 'myloc help missing' >&2
     exit 1
 }
+grep -Fq 'nns-app restart [-i|--ignore-start-error]' <<<"$help" || {
+    echo 'restart help missing' >&2
+    exit 1
+}
 grep -Fq '$ENGINE_PATH myip $app' "$INSTALLER" || {
     echo 'per-app sudoers does not allow explicit myip inspection' >&2
     exit 1

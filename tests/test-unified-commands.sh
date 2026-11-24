@@ -52,6 +52,7 @@ for gw in office-server relay-gateway myawg; do
     [[ "$(main start "$gw")" == "gateway-start:$gw" ]] || fail "start gateway $gw"
     [[ "$(main stop "$gw")" == "gateway-stop:$gw" ]] || fail "stop gateway $gw"
     [[ "$(main stop "$gw" --local-only)" == "gateway-stop:$gw" ]] || fail "local-only stop $gw"
+    [[ "$(main restart "$gw")" == $'gateway-stop:'"$gw"$'\ngateway-start:'"$gw" ]] || fail "restart gateway $gw"
     [[ "$(main status "$gw")" == "gateway-status:$gw" ]] || fail "status gateway $gw"
     [[ "$(main remove "$gw")" == "gateway-remove:$gw" ]] || fail "remove gateway $gw"
     [[ "$(main remove "$gw" --local-only)" == "gateway-remove:$gw" ]] || fail "local-only remove $gw"
@@ -61,6 +62,10 @@ done
 [[ "$(main start upstream-vpn)" == 'namespace-start:upstream-vpn|off|__default__' ]] || fail 'namespace start regressed'
 [[ "$(main stop upstream-vpn)" == 'namespace-stop:upstream-vpn|remote' ]] || fail 'namespace stop regressed'
 [[ "$(main stop upstream-vpn --local-only)" == 'namespace-stop:upstream-vpn|local-only' ]] || fail 'namespace stop local-only regressed'
+[[ "$(main restart upstream-vpn)" == $'namespace-stop:upstream-vpn|remote\nnamespace-start:upstream-vpn|off|__default__' ]] || fail 'namespace restart sequence regressed'
+[[ "$(main restart -i upstream-vpn)" == $'namespace-stop:upstream-vpn|remote\nnamespace-start:upstream-vpn|on|__default__' ]] || fail 'namespace restart -i sequence regressed'
+restart_all() { printf 'restart-all\n'; }
+[[ "$(main restart)" == 'restart-all' ]] || fail 'bare restart did not dispatch to restart_all'
 [[ "$(main status upstream-vpn)" == 'namespace-status:upstream-vpn' ]] || fail 'namespace status regressed'
 [[ "$(main remove upstream-vpn)" == 'namespace-remove:upstream-vpn:remote' ]] || fail 'namespace remove regressed'
 [[ "$(main export ovpn relay-gateway --client phone --full-tunnel)" == 'gateway-export:relay-gateway|phone' ]] || fail 'VPN-exit OpenVPN profile dispatch'
