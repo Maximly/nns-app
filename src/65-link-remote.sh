@@ -1076,9 +1076,15 @@ gateway_write_client_profile_file() {
     # A private-only gateway exit cannot carry public Internet. Embed the
     # upstream's private routes and DNS policy in the client profile so the
     # client machine classifies it as private-only without trusting pushes.
+    # An upstream with server-driven routing (AnyConnect/OpenConnect) has no
+    # static networks or DNS policy to inherit; fall back to a full exit so
+    # the exported profile is usable instead of route-less.
     private_exit=off
+    local upstream_networks="" upstream_dns_policy=""
     if [[ "${VIA_APP:-host}" != host ]] && app_is_private_only "$VIA_APP"; then
-        private_exit=on
+        upstream_networks=$(app_profile_networks "$VIA_APP" 2>/dev/null || true)
+        upstream_dns_policy=$(app_profile_dns_policy "$VIA_APP" 2>/dev/null || true)
+        [[ -n "$upstream_networks" || -n "$upstream_dns_policy" ]] && private_exit=on
     fi
 
     if [[ "$target_mode" == local ]]; then
@@ -1132,12 +1138,14 @@ gateway_write_client_profile_file() {
             while read -r net mask; do
                 [[ -n "$net" ]] || continue
                 printf 'route %s %s\n' "$net" "$mask"
-            done < <(app_profile_networks "$VIA_APP" 2>/dev/null || true)
-            dns_policy=$(app_profile_dns_policy "$VIA_APP" 2>/dev/null || true)
+            done <<<"$upstream_networks"
+            dns_policy=$upstream_dns_policy
             if [[ -n "$dns_policy" ]]; then
                 servers=${dns_policy%%$'\n'*}
                 domains=${dns_policy#*$'\n'}
-                for dns in $servers; do
+                local -a gw_dns=()
+                IFS=' ' read -r -a gw_dns <<<"$servers"
+                for dns in "${gw_dns[@]}"; do
                     printf 'dhcp-option DNS %s\n' "$dns"
                 done
                 if [[ "$domains" != "." ]]; then
@@ -3252,11 +3260,12 @@ remote_auto_add_profile() {
     src=$(readlink -f "$src")
     local type
     type=$(profile_type_from_file "$src" 2>/dev/null || true)
-    [[ -n "$type" ]] || die "Cannot identify '$src' as an OpenVPN or WireGuard profile."
+    [[ -n "$type" ]] || die "Cannot identify '$src' as an OpenVPN, WireGuard or AnyConnect profile."
     case "$type" in
         openvpn) validate_ovpn "$src" ;;
         wireguard) validate_wireguard "$src" ;;
         amneziawg) validate_amneziawg "$src" ;;
+        anyconnect) validate_anyconnect "$src" ;;
     esac
     alias=$REMOTE_ALIAS
     owner=$REMOTE_OWNER_ID

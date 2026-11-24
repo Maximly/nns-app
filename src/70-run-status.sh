@@ -782,8 +782,15 @@ run_in_app() {
     if bool_on "$KILLSWITCH"; then
         systemctl is-active --quiet "nns-openvpn@${app}.service" ||
             die "VPN service for '$app' is not running."
-        vpn_route_ready "$app" ||
-            die "VPN tunnel for '$app' is not ready."
+        if ! vpn_route_ready "$app"; then
+            local run_type
+            run_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+            if [[ "$run_type" == anyconnect ]]; then
+                die "VPN tunnel for '$app' is not ready; the AnyConnect session may be re-authenticating. Check: nns-app status $app"
+            else
+                die "VPN tunnel for '$app' is not ready."
+            fi
+        fi
         wait_online "$app" 2 ||
             die "VPN data path for '$app' is not online yet."
     fi
@@ -943,6 +950,22 @@ myip_app_route_path() {
                 printf "app:%s -> %s -> OpenVPN -> Internet\n" "$app" "${route_iface:-tunnel}"
             fi
             ;;
+        anyconnect)
+            if [[ -n "${DEFAULT_PROFILE:-}" ]]; then
+                profile_file="$(profiles_dir "$app")/$DEFAULT_PROFILE"
+                if [[ -f "$profile_file" ]]; then
+                    IFS='|' read -r endpoint_host endpoint_port endpoint_proto < <(
+                        profile_endpoints "$profile_file" 2>/dev/null | head -n 1 || true
+                    )
+                fi
+            fi
+            if [[ -n "${endpoint_host:-}" ]]; then
+                printf "app:%s -> %s -> AnyConnect:%s:%s/%s -> Internet\n" \
+                    "$app" "${route_iface:-tunnel}" "$endpoint_host" "$endpoint_port" "$endpoint_proto"
+            else
+                printf "app:%s -> %s -> AnyConnect -> Internet\n" "$app" "${route_iface:-tunnel}"
+            fi
+            ;;
         wireguard|amneziawg)
             printf "app:%s -> %s -> %s -> Internet\n" "$app" "${route_iface:-tunnel}" "$(vpn_type_label "$type")"
             ;;
@@ -1029,6 +1052,9 @@ myip_report_app() {
     if app_split_tunnel "$app"; then
         if [[ "$(vpn_type_for_app "$app" 2>/dev/null || true)" == openvpn ]]; then
             printf 'Routing mode:      split (client routes only)\n'
+            printf 'VPN tunnel:        %s\n' "${dev:-unavailable}"
+        elif [[ "$(vpn_type_for_app "$app" 2>/dev/null || true)" == anyconnect ]]; then
+            printf 'Routing mode:      split (gateway-pushed routes only)\n'
             printf 'VPN tunnel:        %s\n' "${dev:-unavailable}"
         else
             printf 'Routing mode:      split (IPv4 AllowedIPs only)\n'
@@ -1231,6 +1257,24 @@ openvpn_status_diagnosis() {
     fi
 }
 
+openconnect_status_diagnosis() {
+    local log_file=$1
+    # Only terminal markers are diagnosed. "Login failed." / "signer not
+    # found" appear on every healthy connection to multi-attempt gateways
+    # (first form submission rejected, pin fallback after the trust check).
+    if grep -Eqi 'Failed to complete authentication|Failed to obtain WebVPN cookie|Cookie was rejected by server|not authorized|is no longer valid|401 Unauthorized|User input required in non-interactive mode' "$log_file"; then
+        printf 'AnyConnect authentication failed or the session expired; run: nns-app oc-login <app>'
+    elif grep -Eqi 'SSL connection failure|None of the [0-9]+ fingerprint|Error in the certificate' "$log_file"; then
+        printf 'AnyConnect server certificate verification failed; add fingerprint= to the profile (the openconnect log shows the exact pin-sha256 value) or fix the system trust store.'
+    elif grep -Eqi 'Failed to connect|getaddrinfo|Connection refused|Network is unreachable|No route to host|connection timed out' "$log_file"; then
+        printf 'The AnyConnect gateway is unreachable.'
+    elif grep -Eq 'Connected (as|tun)' "$log_file"; then
+        printf 'AnyConnect connected, but the namespace data path is not currently usable.'
+    else
+        printf 'AnyConnect is running, but no established connection was found in the current service invocation.'
+    fi
+}
+
 status_remote_topology() {
     local app=$1 alias owner output
     # Caller already loaded the app configuration.
@@ -1366,6 +1410,7 @@ status_app() {
         health="STARTING"
         case "$type" in
             openvpn) diagnosis=$(openvpn_status_diagnosis "$vpn_log") ;;
+            anyconnect) diagnosis=$(openconnect_status_diagnosis "$vpn_log") ;;
             wireguard|amneziawg) diagnosis="$(vpn_type_label "$type") is running, but its interface or AllowedIPs routes are not ready." ;;
             inherit) diagnosis="The inherited upstream data path is not ready." ;;
             *) diagnosis="The network backend is active, but no usable route exists." ;;
@@ -1389,6 +1434,7 @@ status_app() {
         health="OFFLINE"
         case "$type" in
             openvpn) diagnosis=$(openvpn_status_diagnosis "$vpn_log") ;;
+            anyconnect) diagnosis=$(openconnect_status_diagnosis "$vpn_log") ;;
             wireguard|amneziawg) diagnosis="The $(vpn_type_label "$type") interface exists, but the Internet data-path probe failed." ;;
             inherit) diagnosis="The upstream route exists, but the inherited Internet data-path probe failed." ;;
             *) diagnosis="The tunnel exists, but the Internet data-path probe failed." ;;
@@ -1444,6 +1490,8 @@ status_app() {
     if app_split_tunnel "$app"; then
         if [[ "$type" == openvpn ]]; then
             printf 'Routing mode:      split (client routes only; no Internet probe)\n'
+        elif [[ "$type" == anyconnect ]]; then
+            printf 'Routing mode:      split (gateway-pushed routes; no Internet probe)\n'
         else
             printf 'Routing mode:      split (AllowedIPs only; no Internet probe)\n'
         fi
@@ -1501,7 +1549,11 @@ status_app() {
         while IFS='|' read -r endpoint_host endpoint_port endpoint_proto; do
             [[ -n "$endpoint_host" && -n "$endpoint_port" && -n "$endpoint_proto" ]] || continue
             endpoint_count=$((endpoint_count + 1))
-            endpoint_line="${endpoint_proto^^} ${endpoint_host}:${endpoint_port}"
+            if [[ "$endpoint_port" == 0 ]]; then
+                endpoint_line="${endpoint_proto^^} ${endpoint_host}:any"
+            else
+                endpoint_line="${endpoint_proto^^} ${endpoint_host}:${endpoint_port}"
+            fi
             if (( endpoint_count == 1 )); then
                 printf 'Endpoint:          %s\n' "$endpoint_line"
             elif (( endpoint_count <= 4 )); then
@@ -1530,6 +1582,24 @@ status_app() {
         else
             printf 'OpenVPN handshake: not established\n'
         fi
+    elif [[ "$type" == anyconnect ]]; then
+        local oc_connected oc_cookie_file oc_tunnel_dns
+        oc_connected=$(grep -E 'Connected as [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$vpn_log" 2>/dev/null | tail -n 1 || true)
+        [[ -z "$oc_connected" ]] || printf 'AnyConnect state:  %s\n' "$oc_connected"
+        if grep -Eq 'Established DTLS' "$vpn_log"; then
+            printf 'AnyConnect DTLS:   established\n'
+        elif grep -Eq 'DTLS' "$vpn_log"; then
+            printf 'AnyConnect DTLS:   negotiating or failed (falling back to TLS)\n'
+        fi
+        oc_cookie_file=$(anyconnect_cookie_path "$app" 2>/dev/null || true)
+        if [[ -n "$oc_cookie_file" && -s "$oc_cookie_file" ]]; then
+            printf 'Authentication:    saved session cookie\n'
+        else
+            printf 'Authentication:    profile credentials\n'
+        fi
+        oc_tunnel_dns=$(awk '/^[[:space:]]*nameserver[[:space:]]+/ {
+            for (i=2;i<=NF;i++) printf "%s ", $i }' "/etc/netns/$NS_NAME/resolv.conf" 2>/dev/null || true)
+        [[ -z "$oc_tunnel_dns" ]] || printf 'Tunnel DNS:        %s\n' "$oc_tunnel_dns"
     elif [[ ( "$type" == wireguard || "$type" == amneziawg ) && -n "$route_iface" ]]; then
         local latest now age peer_count wg_endpoint rx_bytes tx_bytes wg_cmd=wg
         [[ "$type" != amneziawg ]] || wg_cmd=awg
@@ -1566,14 +1636,14 @@ status_app() {
     if [[ "$health" == ONLINE ]]; then
         print_status_log_cut \
             "Recent successful backend markers:" "$vpn_log" \
-            'Initialization Sequence Completed|Peer Connection Initiated|WireGuard interface .* active|latest handshake' 8
+            'Initialization Sequence Completed|Peer Connection Initiated|WireGuard interface .* active|latest handshake|Connected tun|Established DTLS' 8
     else
         print_status_log_cut \
             "Important namespace log cuts:" "$ns_log" \
             'error|warning|failed|invalid|no such|stale|endpoint|upstream|ready|iptables|nft|route' 14
         print_status_log_cut \
             "Important VPN log cuts:" "$vpn_log" \
-            'error|warning|failed|fatal|AUTH_FAILED|VERIFY ERROR|TLS:|TLS Error|TCP connection|Attempting to establish|Peer Connection|Initialization Sequence|WireGuard|AmneziaWG|wg-quick|awg-quick|RTNETLINK|handshake|endpoint|timed out|refused|unreachable' 18
+            'error|warning|failed|fatal|AUTH_FAILED|VERIFY ERROR|TLS:|TLS Error|TCP connection|Attempting to establish|Peer Connection|Initialization Sequence|WireGuard|AmneziaWG|wg-quick|awg-quick|RTNETLINK|handshake|endpoint|timed out|refused|unreachable|Login failed|Connected tun|Established DTLS|cookie' 18
     fi
 
     rm -rf "$tmpdir"
@@ -1607,6 +1677,7 @@ list_apps() {
         else
             profile=${profile%.ovpn}
             profile=${profile%.conf}
+            profile=${profile%.oc}
         fi
         type_label=$(vpn_type_label "${type:-unknown}")
         status=stopped
@@ -1829,11 +1900,13 @@ list_local_instance_records() {
         else
             profile=${profile%.ovpn}
             profile=${profile%.conf}
+            profile=${profile%.oc}
         fi
         case "$vpn_type" in
             openvpn) app_type=vpn-client/ovpn ;;
             wireguard) app_type=vpn-client/wg ;;
             amneziawg) app_type=vpn-client/awg ;;
+            anyconnect) app_type=vpn-client/oc ;;
             inherit) app_type=vpn-client/inherit ;;
             *) app_type=vpn-client ;;
         esac

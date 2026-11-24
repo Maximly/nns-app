@@ -18,6 +18,78 @@ for forbidden in 'pfctl' 'networksetup' 'dseditgroup' 'scutil --set' 'iptables' 
   fi
 done
 grep -Fq -- '-ifscope "$UTUN"' "$ROOT/nns-app-darwin.sh"
+grep -Fq 'normalize_oc_profile' "$ROOT/nns-app-darwin.sh"
+grep -Fq 'write_oc_hook' "$ROOT/nns-app-darwin.sh"
+grep -Fq -- '--passwd-on-stdin' "$ROOT/nns-app-darwin.sh"
+grep -Fq -- '--cookie-on-stdin' "$ROOT/nns-app-darwin.sh"
+grep -Fq 'vpn-client/oc' "$ROOT/nns-app-darwin.sh"
+grep -Fq 'openconnect_bin' "$ROOT/nns-app-darwin.sh"
+grep -Fq 'oc-login' "$ROOT/nns-app-darwin.sh"
+grep -Fq 'oc_obtain_cookie' "$ROOT/nns-app-darwin.sh" || {
+  echo 'macOS start does not auto-obtain the session cookie' >&2; exit 1
+}
+grep -Fq 'engine_alive' "$ROOT/nns-app-darwin.sh" || {
+  echo 'macOS backend lacks the engine-aliveness guard' >&2; exit 1
+}
+grep -Fq 'STALE (the VPN engine exited' "$ROOT/nns-app-darwin.sh" || {
+  echo 'macOS status does not report stale engine state' >&2; exit 1
+}
+grep -Fq 'ensure_engine_running' "$ROOT/nns-app-darwin.sh" || {
+  echo 'macOS run/git does not self-heal stale apps' >&2; exit 1
+}
+grep -Fq 'Clearing stale runtime state' "$ROOT/nns-app-darwin.sh" || {
+  echo 'macOS start does not clear its own stale runtime state' >&2; exit 1
+}
+grep -Fq 'lstart' "$ROOT/nns-app-darwin.sh" || {
+  echo 'engine identity check does not record/compare start times' >&2; exit 1
+}
+grep -Fq 'app_runtime_stale' "$ROOT/nns-app-darwin.sh" || {
+  echo 'macOS backend lacks the comprehensive staleness predicate' >&2; exit 1
+}
+grep -Fq 'resolve_conflicting_address' "$ROOT/nns-app-darwin.sh" || {
+  echo 'macOS start lacks the duplicate-address resolver' >&2; exit 1
+}
+grep -Fq 'engine_alive_in' "$ROOT/nns-app-darwin.sh" || {
+  echo 'start sweep is not identity-aware' >&2; exit 1
+}
+grep -Fq 'ps -o pid=' "$ROOT/nns-app-darwin.sh" || {
+  echo 'engine liveness depends on signalling rights' >&2; exit 1
+}
+grep -Fq 'chmod 644 "$RUNSTATE/ovpn_lstart"' "$ROOT/nns-app-darwin.sh" || {
+  echo 'engine identity file is not owner-readable' >&2; exit 1
+}
+grep -Fq 'chmod 644 "$RUNSTATE/ovpn.log"' "$ROOT/nns-app-darwin.sh" || {
+  echo 'engine log is not owner-readable' >&2; exit 1
+}
+grep -Fq 'sudo -n tail -20' "$ROOT/nns-app-darwin.sh" || {
+  echo 'log dump lacks the root fallback' >&2; exit 1
+}
+grep -Fq 'ps -o command= -p "$pid"' "$ROOT/nns-app-darwin.sh" || {
+  echo 'engine identity fallback no longer checks the command line' >&2; exit 1
+}
+if grep -Fq -- '--setenv NNS_APP_MARK' "$ROOT/nns-app-darwin.sh"; then
+  grep -Fq -- 'openvpn' "$ROOT/nns-app-darwin.sh" || :
+fi
+grep -Fq -- '--no-dtls' "$ROOT/nns-app-darwin.sh" || {
+  echo 'macOS start does not support dtls=off' >&2; exit 1
+}
+grep -Fq -- '--disable-ipv6' "$ROOT/nns-app-darwin.sh" || {
+  echo 'macOS start does not enforce the IPv4-only tunnel' >&2; exit 1
+}
+grep -Fq -- '--queue-len 8' "$ROOT/nns-app-darwin.sh" || {
+  echo 'macOS start does not disable vhost-net' >&2; exit 1
+}
+# The start loop must abort only on terminal failures, never on the benign
+# multi-attempt form noise ("Login failed.") or the trust-check fallback.
+if grep -Fq 'Login failed|Failed to obtain WebVPN' "$ROOT/nns-app-darwin.sh"; then
+  echo 'macOS start still aborts on benign form noise' >&2; exit 1
+fi
+grep -Fq 'Failed to complete authentication' "$ROOT/nns-app-darwin.sh" || {
+  echo 'macOS start lost its terminal auth-failure detection' >&2; exit 1
+}
+if grep -Fq 'has_command openconnect || packages' "$ROOT/install.sh"; then
+  echo 'install_macos still auto-installs openconnect' >&2; exit 1
+fi
 grep -Fq 'DYLD_INTERPOSE(nns_connect, connect)' "$ROOT/src/libnnsbind.c"
 grep -Fq 'DYLD_INTERPOSE(nns_getaddrinfo, getaddrinfo)' "$ROOT/src/libnnsbind.c"
 grep -Fq 'nns_ipv4_is_host_local' "$ROOT/src/nns_net.h"
@@ -307,9 +379,358 @@ grep -Eiq 'unsafe|up' "$T/bad-ovpn.err" || {
 }
 bash "$ROOT/nns-app-darwin.sh" remove ovpnvpn
 
+# AnyConnect .oc import: nns-app key=value profiles; allow-list enforced,
+# inline credentials accepted, type stored, stale backend files removed.
+cat > "$T/corp.oc" <<'S'
+# Corporate AnyConnect gateway
+protocol=anyconnect
+server=https://vpn.example.com
+user=employee
+passwd=correct horse battery staple
+authgroup=Employees
+route-mode=split
+S
+cat > "$T/certs.oc" <<'S'
+server=https://vpn.example.com:8443
+user=employee
+password=secret
+fingerprint=SHA1:AA:BB:CC:DD:EE:FF:11:22:33:44:55:66:77:88:99:00:AB:CD:EF:12
+<cert>
+-----BEGIN CERTIFICATE-----
+MIIBszCCAVmgAwIBAgIUTx+0aGVzdC1jZXJ0IHRlc3QwDQYJKoZIhvcNAQELBQAw
+-----END CERTIFICATE-----
+</cert>
+<key>
+-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCrb3Rlc3Qta2V5
+-----END PRIVATE KEY-----
+</key>
+S
+bash "$ROOT/nns-app-darwin.sh" install occorp
+bash "$ROOT/nns-app-darwin.sh" add occorp "$T/corp.oc" 2>"$T/add-oc-warn.err"
+if ! command -v openconnect >/dev/null 2>&1 &&
+   [ ! -x /opt/homebrew/sbin/openconnect ] && [ ! -x /usr/local/sbin/openconnect ] &&
+   [ ! -x /opt/homebrew/bin/openconnect ] && [ ! -x /usr/local/bin/openconnect ]; then
+  grep -Fq 'brew install openconnect' "$T/add-oc-warn.err" || {
+    echo "anyconnect add missing the brew install hint: $(cat "$T/add-oc-warn.err")" >&2; exit 1
+  }
+fi
+OCCFG="$T/home/Library/Application Support/nns-app/apps/occorp"
+[[ "$(cat "$OCCFG/type")" == anyconnect ]] || {
+  echo 'anyconnect type not stored' >&2; exit 1
+}
+[[ -f "$OCCFG/profile.oc" ]] || { echo 'profile.oc missing' >&2; exit 1; }
+[ ! -e "$OCCFG/profile.conf" ] && [ ! -e "$OCCFG/profile.ovpn" ] || {
+  echo 'stale backend profile not removed by anyconnect import' >&2; exit 1
+}
+[ ! -e "$OCCFG/dns_ipv4" ] || {
+  echo 'anyconnect import must not inherit a DNS override from another backend' >&2; exit 1
+}
+output=$(bash "$ROOT/nns-app-darwin.sh" list)
+grep -Eq 'occorp[[:space:]]+vpn-client/oc[[:space:]]+stopped[[:space:]]+host' <<<"$output" || {
+  echo "anyconnect list row mismatch: $output" >&2; exit 1
+}
+bash "$ROOT/nns-app-darwin.sh" status occorp | grep -q 'vpn-client/oc' || {
+  echo 'anyconnect status missing type' >&2; exit 1
+}
+# Replacing the profile with a certificate-based one drops the stale cookie.
+printf 'stale-cookie' > "$OCCFG/cookie"
+bash "$ROOT/nns-app-darwin.sh" add occorp "$T/certs.oc"
+[ ! -e "$OCCFG/cookie" ] || { echo 'stale cookie survived profile replacement' >&2; exit 1; }
+grep -Fq 'Employees' "$OCCFG/profile.oc" && {
+  echo 'old profile content leaked into the replaced profile' >&2; exit 1
+}
+# oc-login with a mock openconnect stores the session cookie. The mock is
+# only authoritative when the host has no real openconnect (openconnect_bin
+# probes the Homebrew absolute paths before $PATH).
+if ! command -v openconnect >/dev/null 2>&1 &&
+   [ ! -x /opt/homebrew/sbin/openconnect ] && [ ! -x /usr/local/sbin/openconnect ] &&
+   [ ! -x /opt/homebrew/bin/openconnect ] && [ ! -x /usr/local/bin/openconnect ]; then
+  cat > "$T/fake/openconnect" <<'S'
+#!/bin/sh
+# Modern openconnect quotes the cookie: COOKIE='<value>'.
+printf "COOKIE='AbCdEf0123456789+/=_-xyz'\n"
+S
+  chmod +x "$T/fake/openconnect"
+  oclogin_output=$(bash "$ROOT/nns-app-darwin.sh" oc-login occorp)
+  grep -Fq 'cookie saved' <<<"$oclogin_output" || {
+    echo 'oc-login did not report success' >&2; exit 1
+  }
+  [[ "$(cat "$OCCFG/cookie")" == AbCdEf0123456789+/=_-xyz ]] || {
+    echo 'oc-login did not persist the session cookie' >&2; exit 1
+  }
+fi
+cat > "$T/bad.oc" <<'S'
+server=https://vpn.example.com
+script=/etc/vpnc/vpnc-script
+S
+if bash "$ROOT/nns-app-darwin.sh" add occorp "$T/bad.oc" 2>"$T/bad-oc.err"; then
+  echo 'AnyConnect script directive was accepted' >&2; exit 1
+fi
+grep -Eiq 'unsupported directive' "$T/bad-oc.err" || {
+  echo "bad oc error missing: $(cat "$T/bad-oc.err")" >&2; exit 1
+}
+cat > "$T/noserver.oc" <<'S'
+user=employee
+S
+if bash "$ROOT/nns-app-darwin.sh" add occorp "$T/noserver.oc" 2>"$T/noserver-oc.err"; then
+  echo 'AnyConnect profile without server was accepted' >&2; exit 1
+fi
+grep -Eiq "no 'server=' entry" "$T/noserver-oc.err" || {
+  echo "missing-server error missing: $(cat "$T/noserver-oc.err")" >&2; exit 1
+}
+# pin-sha256 is the fingerprint format openconnect prints in its own
+# certificate error; the importer must accept it verbatim.
+cat > "$T/pin.oc" <<'S'
+server=https://rnd.megafon.ru:441
+user=employee
+password=secret
+fingerprint=pin-sha256:+W/ZQRawrDxndKfi1OBPsdJYl53aYmoe1gdx3QPuwg8=
+dns=10.99.0.53
+S
+bash "$ROOT/nns-app-darwin.sh" add occorp "$T/pin.oc" | grep -q 'Imported AnyConnect profile' || {
+  echo 'pin-sha256 profile import failed' >&2; exit 1
+}
+[[ "$(cat "$OCCFG/dns_ipv4")" == 10.99.0.53 ]] || {
+  echo 'profile dns= was not imported as the per-app resolver' >&2; exit 1
+}
+bash "$ROOT/nns-app-darwin.sh" remove occorp
+
 [[ "$(bash "$ROOT/nns-app-darwin.sh" list)" == 'No apps configured.' ]] || {
   echo 'list not empty after remove' >&2; exit 1
 }
+# Darwin-only: the generated openconnect hook must configure only the utun,
+# never host DNS, PF or the host default route; and the placeholder must be
+# substituted with the runtime state path.
+if [ "$(uname -s)" = Darwin ]; then
+  mkdir -p "$T/oc-hook-state"
+  hook_out=$(bash -c '
+    set -e
+    hook_script=$1
+    hook_state=$2
+    # The sourced CLI runs main() at the end; with no arguments it prints
+    # usage and returns, which is harmless here.
+    set --
+    source "$hook_script" >/dev/null
+    RUNSTATE="$hook_state"
+    write_oc_hook utun9
+    list_utuns() { printf "utun0\nutun3\n"; }
+    [ "$(next_utun)" = utun4 ] || { echo "next_utun mismatch: $(next_utun)" >&2; exit 1; }
+    printf "hook written"
+  ' bash "$ROOT/nns-app-darwin.sh" "$T/oc-hook-state")
+  HOOK="$T/oc-hook-state/oc-hook"
+  [ -x "$HOOK" ] || { echo 'oc-hook missing or not executable' >&2; exit 1; }
+  grep -Fq "$T/oc-hook-state" "$HOOK" || { echo '@RUNSTATE@ not substituted' >&2; exit 1; }
+  grep -Fq 'ifconfig "$dev" inet "$ip" "$ip" netmask 255.255.255.255 up' "$HOOK" || {
+    echo 'oc-hook does not narrow the utun address to /32' >&2; exit 1
+  }
+  grep -Fq -- '-ifscope "$dev"' "$HOOK" || {
+    echo 'oc-hook does not use interface-scoped routes' >&2; exit 1
+  }
+  grep -Fq 'route -q -n add -ifscope "$dev" -net' "$HOOK" || {
+    echo 'oc-hook does not scope pushed split routes' >&2; exit 1
+  }
+  # The reason arrives via the `reason` environment variable in modern
+  # openconnect; the requested utun name is baked in as the TUNDEV fallback.
+  grep -Fq 'hook_reason=${reason:-}' "$HOOK" || {
+    echo 'oc-hook does not read the reason environment variable' >&2; exit 1
+  }
+  grep -Fq 'utun9' "$HOOK" || {
+    echo 'oc-hook does not embed the requested utun fallback' >&2; exit 1
+  }
+  grep -Fq 'VPNGATEWAY' "$HOOK" || {
+    echo 'oc-hook lacks the VPN-gateway DNS fallback' >&2; exit 1
+  }
+  grep -Fq 'attempt-reconnect' "$HOOK" || {
+    echo 'oc-hook does not handle attempt-reconnect' >&2; exit 1
+  }
+  # A dead engine must never leave a "started" claim: engine_alive gates on
+  # the recorded engine pid, which is gone once the tunnel process exits.
+  rm -rf "$T/engine-state"; mkdir -p "$T/engine-state"
+  engine_check=$(bash -c '
+    set -e
+    cli_script=$1
+    cli_state=$2
+    set --
+    source "$cli_script" >/dev/null
+    RUNSTATE="$cli_state"
+    ( exec -a openconnect sleep 300 ) &
+    oc_pid=$!
+    printf "%s\n" "$oc_pid" >"$RUNSTATE/oc_pid"
+    engine_alive || { echo "alive-miss" >&2; kill "$oc_pid" 2>/dev/null || true; exit 1; }
+    kill "$oc_pid" 2>/dev/null || true
+    printf "99999999\n" >"$RUNSTATE/oc_pid"
+    if engine_alive; then echo "dead-miss" >&2; exit 1; fi
+    # Pid reuse: a live but unrelated process must count as dead. Only
+    # verifiable where ps can inspect processes (not in sandboxes).
+    if ps -o command= -p "$$" >/dev/null 2>&1; then
+      sleep 300 &
+      reuse_pid=$!
+      printf "%s\n" "$reuse_pid" >"$RUNSTATE/oc_pid"
+      if engine_alive; then echo "reuse-miss" >&2; kill "$reuse_pid" 2>/dev/null || true; exit 1; fi
+      kill "$reuse_pid" 2>/dev/null || true
+    fi
+    # EPERM on kill -0 (engine owned by another uid) must count as alive
+    # when ps proves the pid exists; liveness cannot depend on signalling.
+    printf "424242\n" >"$RUNSTATE/oc_pid"
+    kill() { return 1; }
+    ps() {
+      case "$*" in
+        *"pid="*) printf "424242\n" ;;
+      esac
+      return 0
+    }
+    engine_alive || { echo "eperm-miss" >&2; exit 1; }
+    rm -f "$RUNSTATE/oc_pid"
+    if engine_alive; then echo "absent-miss" >&2; exit 1; fi
+    echo "engine-alive-ok"
+  ' bash "$ROOT/nns-app-darwin.sh" "$T/engine-state")
+  grep -Fq 'engine-alive-ok' <<<"$engine_check" || {
+    echo "engine aliveness checks failed: $engine_check" >&2; exit 1
+  }
+  # run/git must auto-restart a stale app (dead engine) via sudo -n.
+  rm -rf "$T/engine-run"; mkdir -p "$T/engine-run"
+  run_check=$(bash -c '
+    set -e
+    cli_script=$1
+    cli_state=$2
+    cli_log=$3
+    set --
+    source "$cli_script" >/dev/null
+    RUNSTATE="$cli_state"
+    APP=unitapp
+    mkdir -p "$RUNSTATE"
+    : >"$RUNSTATE/ready"
+    printf "99999999\n" >"$RUNSTATE/oc_pid"
+    printf "engine-dies-everywhere\n" >"$RUNSTATE/ovpn.log"
+    SUDO_LOG="$cli_log"
+    : >"$SUDO_LOG"
+    engine_alive() { return 1; }
+    sleep() { return 0; }
+    start_via_sudo() { printf "restart\n" >>"$SUDO_LOG"; return 0; }
+    # A persistently dying engine: bounded restarts, then a failure that
+    # dumps the engine log tail; stdout stays clean for the git channel.
+    msg=$( ( ensure_engine_running ) 2>&1 || true )
+    [ "$(grep -c restart "$SUDO_LOG")" -eq 3 ] || {
+      echo "expected 3 restart attempts: $(cat "$SUDO_LOG")" >&2; exit 1
+    }
+    grep -Fq "keeps exiting after restart" <<<"$msg" || {
+      echo "missing keeps-exiting message: $msg" >&2; exit 1
+    }
+    grep -Fq engine-dies-everywhere <<<"$msg" || {
+      echo "engine log tail not shown: $msg" >&2; exit 1
+    }
+    echo "auto-restart-ok"
+  ' bash "$ROOT/nns-app-darwin.sh" "$T/engine-run" "$T/run-sudo.log")
+  grep -Fq 'auto-restart-ok' <<<"$run_check" || {
+    echo "auto-restart checks failed: $run_check" >&2; exit 1
+  }
+  # start_via_sudo: passwordless attempt first, interactive fallback second.
+  sudo_check=$(bash -c '
+    set -e
+    cli_script=$1
+    cli_log=$2
+    set --
+    source "$cli_script" >/dev/null
+    APP=unitapp
+    SUDO_LOG="$cli_log"
+    : >"$SUDO_LOG"
+    sudo() { printf "%s\n" "$*" >>"$SUDO_LOG"; [ "${1:-}" = -n ] && return 1; return 0; }
+    start_via_sudo
+    [ "$(grep -c restart "$SUDO_LOG")" -eq 2 ] || {
+      echo "sudo fallback broken: $(cat "$SUDO_LOG")" >&2; exit 1
+    }
+    grep -Fq -- "-n" "$SUDO_LOG" || { echo "missing sudo -n attempt" >&2; exit 1; }
+    echo "sudo-fallback-ok"
+  ' bash "$ROOT/nns-app-darwin.sh" "$T/sudo-fallback.log")
+  grep -Fq 'sudo-fallback-ok' <<<"$sudo_check" || {
+    echo "sudo fallback checks failed: $sudo_check" >&2; exit 1
+  }
+  # The comprehensive staleness predicate: a live engine whose claimed utun
+  # no longer carries the claimed address (pid reused by another engine) is
+  # stale and must be recovered, not protected.
+  rm -rf "$T/engine-stale"; mkdir -p "$T/engine-stale"
+  stale_check=$(bash -c '
+    set -e
+    cli_script=$1
+    cli_state=$2
+    set --
+    source "$cli_script" >/dev/null
+    RUNSTATE="$cli_state"
+    APP=unitapp
+    : >"$RUNSTATE/ready"
+    printf "utun9\n" >"$RUNSTATE/utun"
+    printf "10.9.9.9\n" >"$RUNSTATE/vpn_ip"
+    engine_alive() { return 0; }
+    ifconfig() { printf "inet %s --> %s netmask 0xffffffff\n" "$FAKE_IF_IP" "$FAKE_IF_IP"; }
+    FAKE_IF_IP=10.0.0.1
+    app_runtime_stale || { echo "claim-mismatch-not-stale" >&2; exit 1; }
+    FAKE_IF_IP=10.9.9.9
+    if app_runtime_stale; then echo "valid-claim-stale" >&2; exit 1; fi
+    engine_alive() { return 1; }
+    if ! app_runtime_stale; then echo "dead-not-stale" >&2; exit 1; fi
+    echo "stale-predicate-ok"
+  ' bash "$ROOT/nns-app-darwin.sh" "$T/engine-stale")
+  grep -Fq 'stale-predicate-ok' <<<"$stale_check" || {
+    echo "staleness predicate checks failed: $stale_check" >&2; exit 1
+  }
+  # Duplicate-address resolution: correct interface attribution, managed-app
+  # refusal by name, and destruction of orphaned carriers.
+  rm -rf "$T/engine-conflict"; mkdir -p "$T/engine-conflict"
+  conflict_check=$(bash -c '
+    set -e
+    cli_script=$1
+    cli_state=$2
+    set --
+    source "$cli_script" >/dev/null
+    USER_RUNTIME="$cli_state"
+    warn() { :; }
+    # Non-utun carriers must be attributed to their own header, not the
+    # previous utun seen in the listing.
+    ifconfig() { printf "vmenet0: flags=...\n\tinet 10.5.5.5 --> 10.5.5.5 netmask 0xffffffff\nutun7: flags=...\n\tinet 10.6.6.6 --> 10.6.6.6 netmask 0xffffffff\n"; }
+    out=$(iface_for_address 10.5.5.5 "")
+    [ "$out" = "vmenet0" ] || { echo "bad-attribution:$out" >&2; exit 1; }
+    # A carrier owned by another managed app must be refused by name.
+    managed="$cli_state/app1"; mkdir -p "$managed"
+    : >"$managed/ready"
+    printf "utun7\n" >"$managed/utun"
+    # The nested subshell contains the fail() exit so the || true applies
+    # to the substitution instead of the captured command.
+    msg=$( ( resolve_conflicting_address 10.6.6.6 utun9 ) 2>&1 || true )
+    grep -Fq "stop it first: sudo nns-app stop app1" <<<"$msg" || {
+      echo "no-owner-refusal: $msg" >&2; exit 1
+    }
+    # A busy orphaned utun cannot be destroyed; the engine holding it (its
+    # command line carries the app mark) must be killed instead.
+    rm -rf "$cli_state/app1"
+    APP=unitapp
+    : >"$cli_state/utun8-alive"
+    : >"$cli_state/kills"
+    ifconfig() {
+      [ "${2:-}" != destroy ] || return 0
+      case "$1" in
+        -a) [ -e "$cli_state/utun8-alive" ] &&
+            printf "utun8: flags=...\n\tinet 10.7.7.7 --> 10.7.7.7 netmask 0xffffffff\n" ;;
+      esac
+    }
+    pgrep() { printf "4242\n"; }
+    kill() { printf "%s\n" "$1" >>"$cli_state/kills"; rm -f "$cli_state/utun8-alive"; return 0; }
+    sleep() { return 0; }
+    out=$(resolve_conflicting_address 10.7.7.7 utun9)
+    [ -z "$out" ] || { echo "orphan-survivor:$out" >&2; exit 1; }
+    grep -Fxq 4242 "$cli_state/kills" || { echo "orphan-holder-not-killed" >&2; exit 1; }
+    [ ! -e "$cli_state/utun8-alive" ] || { echo "orphan-not-freed" >&2; exit 1; }
+    echo "conflict-resolver-ok"
+  ' bash "$ROOT/nns-app-darwin.sh" "$T/engine-conflict")
+  grep -Fq 'conflict-resolver-ok' <<<"$conflict_check" || {
+    echo "conflict resolver checks failed: $conflict_check" >&2; exit 1
+  }
+  for forbidden in 'networksetup' 'scutil' 'pfctl' 'route -n add -inet default'; do
+    if grep -Fq "$forbidden" "$HOOK"; then
+      echo "oc-hook contains a host-affecting command: $forbidden" >&2; exit 1
+    fi
+  done
+fi
 # The launcher supplies native bind options to SIP-protected tools that
 # cannot receive the DYLD interposer. Fake commands make this deterministic.
 if [ "$(uname -s)" = Darwin ] && [ -x "$ROOT/bin/nns-run" ] && [ -r "$ROOT/bin/libnnsbind.dylib" ]; then

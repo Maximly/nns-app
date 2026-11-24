@@ -2,6 +2,47 @@
 
 Highlights are grouped by major release series. Individual patch and minor releases are intentionally omitted.
 
+## 2.2 — AnyConnect / OpenConnect backend (2026)
+
+- Added a generic OpenConnect VPN backend on Linux: Cisco AnyConnect is the
+  first validated protocol, and `nc`, `pulse`, `gp`, `fortinet`, `f5` and
+  `array` share the same plumbing. `openconnect` runs inside the managed
+  network namespace with an nns-app `vpnc-script` replacement, so pushed
+  addresses, MTU, routes and DNS stay namespace-local and the host network
+  stack is untouched. `nns-app add` accepts `.oc` key=value profiles
+  (`server=`, `user=`, `passwd=` (alias `password=`), `authgroup=`,
+  `fingerprint=` (`SHA1:`/`SHA256:` hex pins and openconnect's own
+  `pin-sha256:` base64 form), `token-mode=`/`token-secret=`, `route-mode=`,
+  `mtu=`, inline `<cert>`/`<key>` blocks); anything else is rejected as
+  untrusted input.
+- Added `nns-app oc-login <app>`: interactive `openconnect --authenticate`
+  (password, push or OTP prompts) stores a session cookie for unattended
+  restarts; the backend prefers the cookie, then inline credentials, and the
+  data-path watchdog records `auth-required` instead of looping on expired
+  sessions. TOTP/HOTP secrets let gateways with one-time codes restart
+  without interaction.
+- Kill-switch endpoint pinning, split-tunnel handling, MTU auto-repair,
+  watchdog, status diagnosis (`AnyConnect state`, DTLS, tunnel DNS,
+  authentication mode), `myip`/`myloc`, `list` (`vpn-client/oc`) and
+  VPN chaining all support the new backend. OpenVPN remains the only
+  default-installed protocol; WireGuard and OpenConnect tools are add-ons
+  installed on demand with `nns-app --install wireguard` /
+  `nns-app --install openconnect` (mirroring the existing
+  `--install amnezia`), and `nns-app add` suggests the matching command
+  when a profile's backend binaries are missing. On macOS `install_macos`
+  likewise no longer installs openconnect; `add`/`start` point at
+  `brew install openconnect`.
+
+  The macOS backend gained engine-aliveness guards: a dead VPN engine
+  (its utun is gone) is reported as STALE instead of "started", `run`
+  refuses stale or utun-reused state instead of routing through the wrong
+  tunnel, and `nns-app run`/`git-via` restart a stale app automatically
+  via passwordless sudo before executing the command.
+- macOS: AnyConnect support with `openconnect` (Homebrew), a managed `utun`,
+  `/32` address confinement, interface-scoped routes for pushed split
+  networks, a generated hook instead of `vpnc-script` (no host DNS/route
+  changes), `oc-login`, and pushed-DNS hand-off to the per-app resolver.
+
 ## 2.1.7 — Experimental macOS WireGuard/OpenVPN client backend (2026)
 
 - Client inventories now show IP instead of creation time; live OpenVPN/AWG

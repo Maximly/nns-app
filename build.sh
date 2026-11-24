@@ -44,6 +44,36 @@ embed_version() {
     rm -f "$temp"
 }
 
+# Keep the README's "**Current release:**" line in sync with the VERSION file.
+# The release version lives in VERSION alone; documentation must never drift,
+# so the build rewrites the README line instead of asking for a manual edit.
+sync_readme_version() {
+    local version=$1 readme="$ROOT/README.md" temp
+    [ -f "$readme" ] || {
+        printf 'ERROR: README.md missing at %s\n' "$readme" >&2
+        exit 1
+    }
+    grep -Fq '**Current release:**' "$readme" || {
+        printf 'ERROR: README.md has no **Current release:** marker line.\n' >&2
+        exit 1
+    }
+    temp=$(mktemp "${TMPDIR:-/tmp}/nns-readme.XXXXXX")
+    LC_ALL=C sed -E "s|^(\*\*Current release:\*\* )[0-9][0-9A-Za-z.-]*|\1$version|" \
+        "$readme" > "$temp"
+    if ! grep -Fq "**Current release:** $version ·" "$temp"; then
+        rm -f "$temp"
+        printf 'ERROR: could not update the release line in %s\n' "$readme" >&2
+        exit 1
+    fi
+    if cmp -s "$temp" "$readme"; then
+        rm -f "$temp"
+    else
+        cat "$temp" > "$readme"
+        rm -f "$temp"
+        printf 'README.md release line synced to %s\n' "$version"
+    fi
+}
+
 build_linux() {
     local output="$ROOT/install_linux" temp module version
     local -a modules=()
@@ -113,7 +143,10 @@ build_macos() {
     embed_version "$stage/macos/nns-app-darwin.sh" "$version"
 
     payload="$stage/payload.tar.gz"
-    tar -czf "$payload" -C "$stage" \
+    # A fixed locale keeps the archive bytes (and thus the installer) identical
+    # across machines whose environment advertises unavailable locales; the
+    # generated installer uses the same guard for its extraction step.
+    LC_ALL=C LANG=C tar -czf "$payload" -C "$stage" \
         macos/install.sh macos/nns-app-darwin.sh \
         macos/bin/nns-run macos/bin/libnnsbind.dylib
 
@@ -151,6 +184,7 @@ INSTALLER
 }
 
 VERSION=$(read_version)
+sync_readme_version "$VERSION"
 case "$(uname -s)" in
     Linux) build_linux ;;
     Darwin) build_linux; build_macos ;;

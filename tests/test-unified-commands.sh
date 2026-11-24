@@ -98,4 +98,87 @@ if ( main run office-server ping ya.ru ) >/dev/null 2>&1; then fail 'stopped hos
 # An impossible duplicate object should not silently pick one backend.
 touch "$BASE_DIR/office-server/office-server.cfg" 2>/dev/null || { mkdir -p "$BASE_DIR/office-server"; touch "$BASE_DIR/office-server/office-server.cfg"; }
 if ( managed_app_kind office-server ) >/dev/null 2>&1; then fail 'ambiguous duplicated managed app accepted'; fi
+
+# The real non-root re-exec must canonicalize start/restart before sudo.
+# A bare `restart` (no app name) must pass through unchanged to restart_all;
+# the command name itself still counts in $# at this point, so it must not be
+# handed to the start-option parser.
+(
+    source "$ROOT/src/10-config.sh"
+    require_root() { :; }
+    managed_gateway_exists() { return 1; }
+    parse_start_cli() { echo called >"$TEST_TMP/parse-called"; }
+    function /usr/bin/sudo { local IFS=' '; printf 'sudo:%s\n' "$*" >>"$TEST_TMP/sudo-calls"; return 0; }
+    reexec_as_root_if_needed restart
+)
+[ ! -e "$TEST_TMP/parse-called" ] || fail 'bare restart re-parsed empty arguments'
+grep -Fq -- "sudo:-n $ROOT/tests/test-unified-commands.sh restart" "$TEST_TMP/sudo-calls" ||
+    fail "bare restart canonicalization wrong: $(cat "$TEST_TMP/sudo-calls")"
+(
+    source "$ROOT/src/10-config.sh"
+    require_root() { :; }
+    managed_gateway_exists() { return 1; }
+    function /usr/bin/sudo { local IFS=' '; printf 'sudo:%s\n' "$*" >>"$TEST_TMP/sudo-calls"; return 0; }
+    reexec_as_root_if_needed restart --via host -i upstream-vpn
+)
+grep -Fq -- "sudo:-n $ROOT/tests/test-unified-commands.sh restart -i upstream-vpn --via host" "$TEST_TMP/sudo-calls" ||
+    fail "named restart canonicalization wrong: $(cat "$TEST_TMP/sudo-calls")"
+
+# `restart` without a name must never double-restart gateways: a gateway whose
+# upstream app recovers is brought back exactly once by the app's own start
+# path, and the trailing explicit pass may only start gateways still inactive
+# (host-exit gateways). The is-active guard is what prevents the second start.
+(
+    # Re-source the real restart_all: the file-level stub above is only for
+    # the bare-restart dispatch check.
+    source "$ROOT/src/90-main.sh"
+    log() { :; }
+    warn() { :; }
+    : >"$TEST_TMP/ra.log"
+    relay_active=1
+    office_active=1
+    app_is_started() { [[ "$1" == upstream-vpn ]]; }
+    gateway_stop() {
+        printf 'gateway-stop:%s\n' "$1" >>"$TEST_TMP/ra.log"
+        case "$1" in
+            office-server) office_active=0 ;;
+            relay-gateway) relay_active=0 ;;
+        esac
+    }
+    systemctl() {
+        local IFS=' '
+        case "$*" in
+            "is-active --quiet nns-gateway@relay-gateway.service")
+                [[ "$relay_active" == 1 ]] ;;
+            "is-active --quiet nns-gateway@office-server.service")
+                [[ "$office_active" == 1 ]] ;;
+            "is-active --quiet nns-gateway@myawg.service")
+                return 1 ;;
+            "restart nns-gateway@relay-gateway.service")
+                printf 'restart:%s\n' "$*" >>"$TEST_TMP/ra.log"
+                relay_active=1
+                return 0 ;;
+            *)
+                printf 'systemctl:%s\n' "$*" >>"$TEST_TMP/ra.log"
+                return 0 ;;
+        esac
+    }
+    start_app() {
+        printf 'namespace-start:%s\n' "$1" >>"$TEST_TMP/ra.log"
+        # Mirrors the real start_app success path: recover gateways via $1.
+        restart_gateways_via_app "$1"
+        return 0
+    }
+    gateway_start() { printf 'gateway-explicit:%s\n' "$1" >>"$TEST_TMP/ra.log"; }
+    restart_all
+)
+[[ "$(grep -c '^restart:restart nns-gateway@relay-gateway.service$' "$TEST_TMP/ra.log")" == 1 ]] ||
+    fail "app-dependent gateway restarted more than once: $(cat "$TEST_TMP/ra.log")"
+grep -Fq 'gateway-explicit:office-server' "$TEST_TMP/ra.log" ||
+    fail 'host-exit gateway was not started by the explicit pass'
+grep -Fq 'gateway-explicit:relay-gateway' "$TEST_TMP/ra.log" &&
+    fail 'app-dependent gateway was double-started by the explicit pass'
+grep -Fq 'namespace-start:upstream-vpn' "$TEST_TMP/ra.log" ||
+    fail 'active app was not restarted'
+
 printf 'Unified app lifecycle, gateway execution and export tests passed.\n'

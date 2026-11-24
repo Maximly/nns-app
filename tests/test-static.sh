@@ -26,6 +26,39 @@ fi
 help=$("$INSTALLER" --help)
 grep -Fq 'nns-app status' <<<"$help"
 grep -Fq 'nns-app --install amnezia' <<<"$help"
+grep -Fq 'nns-app --install openconnect|wireguard|amnezia' <<<"$help" || {
+    echo 'help does not document the openconnect/wireguard add-on installers' >&2
+    exit 1
+}
+grep -Fq 'install_wireguard_tools' "$INSTALLER" || {
+    echo 'wireguard add-on installer missing from the installer' >&2
+    exit 1
+}
+grep -Fq 'install_openconnect_tools' "$INSTALLER" || {
+    echo 'openconnect add-on installer missing from the installer' >&2
+    exit 1
+}
+grep -Fq 'install_backend_packages' "$INSTALLER" || {
+    echo 'shared add-on package installer missing from the installer' >&2
+    exit 1
+}
+# Only OpenVPN is a default dependency; other backends are explicit add-ons.
+grep -Fq 'ip openvpn iptables curl ping setpriv sudo openssl' "$INSTALLER" || {
+    echo 'base dependency list changed unexpectedly' >&2
+    exit 1
+}
+if grep -Fq 'ip openvpn openconnect wg wg-quick' "$INSTALLER"; then
+    echo 'add-on backends are still installed automatically' >&2
+    exit 1
+fi
+grep -Fq 'nns-app --install openconnect' "$ROOT/README.md" || {
+    echo 'README does not document the openconnect add-on installer' >&2
+    exit 1
+}
+grep -Fq 'nns-app --install wireguard' "$ROOT/README.md" || {
+    echo 'README does not document the wireguard add-on installer' >&2
+    exit 1
+}
 grep -Fq 'nns-app myip [<app_or_gateway_name>]' <<<"$help"
 grep -Fq 'nns-app gateway create' <<<"$help"
 grep -Fq 'gateway create <name> --via <app> [--listen' <<<"$help"
@@ -321,6 +354,28 @@ grep -Fq "fedora:ping) printf 'iputils\\n'" "$INSTALLER"
 grep -Fq "fedora:ssh|fedora:scp) printf 'openssh-clients\\n'" "$INSTALLER"
 grep -Fq 'command -v dnf5' "$INSTALLER"
 grep -Fq 'openvpn_supports_dns_updown' "$INSTALLER"
+grep -Fq 'validate_anyconnect' "$INSTALLER"
+grep -Fq 'openconnect_exec' "$INSTALLER"
+grep -Fq 'openconnect_hook' "$INSTALLER"
+grep -Fq 'openconnect_login' "$INSTALLER"
+grep -Fq 'nns-app oc-login <app_name>' "$INSTALLER"
+grep -Fq 'anyconnect) app_type=vpn-client/oc' "$INSTALLER"
+grep -Fq 'anyconnect_auth_failure_detected "$app"' "$INSTALLER"
+grep -Fq 'oc_stop_result=auth-required' "$INSTALLER"
+grep -Fq 'oc_stop_result=config-required' "$INSTALLER"
+grep -Fq 'anyconnect_cert_failure_detected' "$INSTALLER"
+grep -Fq "*:openconnect) printf 'openconnect\\n'" "$INSTALLER"
+grep -Fq 'openconnect_binary' "$INSTALLER"
+grep -Fq 'nns-app add corporate ~/corp.oc' "$ROOT/README.md"
+grep -Fq 'AnyConnect / OpenConnect client' "$ROOT/README.md"
+grep -Fq 'sync_readme_version' "$ROOT/build.sh" || {
+    echo 'build.sh does not keep the README release line in sync with VERSION' >&2
+    exit 1
+}
+grep -Fq '**Current release:**' "$ROOT/README.md" || {
+    echo 'README.md lost its **Current release:** marker line' >&2
+    exit 1
+}
 grep -Fq 'nns_unprivileged_group' "$INSTALLER"
 grep -Fq 'firewalld_ensure_integration' "$INSTALLER"
 grep -Fq 'firewalld_interface_add "$VETH_HOST"' "$INSTALLER"

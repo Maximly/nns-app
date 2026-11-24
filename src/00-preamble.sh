@@ -21,6 +21,8 @@
 # Author: Maxim Lyadvinsky
 #
 # Public commands:
+#   --install openconnect  (OpenConnect add-on for AnyConnect and related protocols)
+#   --install wireguard     (wg and wg-quick tools add-on)
 #   --install amnezia  (explicit Ubuntu userspace AmneziaWG dependencies)
 #   install [--local-only]
 #   install <name> --server [--amnezia] [--listen udp:1194|tcp:443] [--public host:port]
@@ -46,8 +48,9 @@
 #   client  export <app_name> <client_name> --output <file>
 #   client  remove <app_name> <client_name>
 #   revoke  <app_name> <client_name>
-#   add     <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf>
+#   add     <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf|anyconnect.oc>
 #   add     <app_name> any [country] [--refresh] [--via <upstream-app>|host]
+#   oc-login <app_name>
 #   start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
 #   stop    <app_name> [--local-only]
 #   run     <app_name> <command> [args...]
@@ -257,6 +260,14 @@ openvpn_binary() {
     required_binary openvpn
 }
 
+openconnect_binary() {
+    local path
+    path=$(command -v openconnect 2>/dev/null || true)
+    [[ -n "$path" && -x "$path" ]] ||
+        die "Required executable 'openconnect' is unavailable. Install it with: nns-app --install openconnect"
+    readlink -f -- "$path"
+}
+
 ip_binary() {
     required_binary ip
 }
@@ -319,7 +330,7 @@ show_version() {
 usage() {
     cat <<'USAGE'
 Usage:
-  nns-app --install amnezia
+  nns-app --install openconnect|wireguard|amnezia
   nns-app install [--local-only]
   nns-app install <name> --server [--amnezia] [--listen udp:1194|tcp:443] [--public host:port]
                   [--transport direct|cloak] [--server-name <cloak-decoy-host>]
@@ -353,8 +364,9 @@ Usage:
   nns-app client list <app_name>
   nns-app client status <gateway_name> <client_name>
   nns-app revoke <app_name> <client_name> [--modern|--embedded]
-  nns-app add     <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf>
+  nns-app add     <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf|anyconnect.oc>
   nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
+  nns-app oc-login <app_name>
   nns-app start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
   nns-app restart [-i|--ignore-start-error] [<app_name> [--via <upstream-app>|host]]
                   # without a name: restart every active app and gateway
@@ -398,12 +410,15 @@ Usage:
 
 Simple managed-remote mode:
   nns-app install <app_name> via --remote <user@host> [--remote-port <port>]
-  nns-app add <app_name> <self-contained-profile.ovpn|wireguard.conf>
+  nns-app add <app_name> <self-contained-profile.ovpn|wireguard.conf|anyconnect.oc>
   nns-app run <app_name> <command> [arguments...]
 
 Examples:
   sudo ./nns-app.sh install
   sudo ./nns-app.sh install --local-only
+  nns-app --install wireguard    # add-on: wg + wg-quick (auto-elevates via sudo)
+  nns-app --install openconnect  # add-on: AnyConnect and related protocols
+  nns-app --install amnezia      # add-on: Ubuntu AmneziaWG userspace build
   sudo nns-app install my-upstream-vpn
   sudo nns-app install office-vpn --server
   sudo nns-app install amn-test --server --amnezia --listen udp:51821
@@ -419,6 +434,8 @@ Examples:
   sudo nns-app install my-shared-app --backend inherit --via my-remote-exit
   sudo nns-app add my-private-app ~/my-app-profile.ovpn
   sudo nns-app add my-private-app ~/my-wireguard-profile.conf
+  sudo nns-app add my-private-app ~/my-corporate-anyconnect.oc
+  nns-app oc-login my-private-app   # interactive AnyConnect session cookie (auto-elevates)
   sudo nns-app add my-private-app any US --via my-upstream-vpn
   nns-app start my-private-app
   nns-app start -i my-private-app --via my-upstream-vpn

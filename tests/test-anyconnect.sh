@@ -286,6 +286,35 @@ server=https://vpn.example.com
 fingerprint=pin-sha256:not!base64!
 EOF_BAD_PIN
 expect_anyconnect_reject "$TMP/bad-pin.oc" 'invalid pin-sha256 body'
+cat > "$TMP/bad-dtls.oc" <<'EOF_BAD_DTLS'
+server=https://vpn.example.com
+dtls=maybe
+EOF_BAD_DTLS
+expect_anyconnect_reject "$TMP/bad-dtls.oc" 'invalid dtls value'
+cat > "$TMP/dtlsoff.oc" <<'EOF_DTLS_OFF'
+server=https://vpn.example.com
+user=employee
+passwd=secret
+dtls=off
+EOF_DTLS_OFF
+validate_anyconnect "$TMP/dtlsoff.oc" || fail 'dtls=off rejected'
+cat > "$TMP/dnskey.oc" <<'EOF_DNSKEY'
+server=https://vpn.example.com
+dns=10.99.0.53 10.99.0.54
+EOF_DNSKEY
+validate_anyconnect "$TMP/dnskey.oc" || fail 'valid dns= list rejected'
+cat > "$TMP/bad-dns1.oc" <<'EOF_BAD_DNS1'
+server=https://vpn.example.com
+dns=10.99.0.53,10.99.0.54
+EOF_BAD_DNS1
+expect_anyconnect_reject "$TMP/bad-dns1.oc" 'comma-separated dns list'
+cat > "$TMP/bad-dns2.oc" <<'EOF_BAD_DNS2'
+server=https://vpn.example.com
+dns=999.1.1.1
+EOF_BAD_DNS2
+expect_anyconnect_reject "$TMP/bad-dns2.oc" 'out-of-range dns octet'
+
+
 cat > "$TMP/bad-pin2.oc" <<'EOF_BAD_PIN2'
 server=https://vpn.example.com
 fingerprint=pin-sha1:AA==
@@ -301,13 +330,30 @@ validate_anyconnect "$TMP/totp.oc" || fail 'valid TOTP profile rejected'
 
 # --- endpoints --------------------------------------------------------------
 endpoints=$(anyconnect_endpoint_lines "$TMP/corp.oc")
-[[ "$endpoints" == $'vpn.example.com|443|tcp\nvpn.example.com|443|udp' ]] ||
+[[ "$endpoints" == $'vpn.example.com|443|tcp\nvpn.example.com|0|udp' ]] ||
     fail "corp endpoints wrong: $endpoints"
 endpoints=$(anyconnect_endpoint_lines "$TMP/full.oc")
-[[ "$endpoints" == $'10.1.2.3|444|tcp\n10.1.2.3|444|udp' ]] ||
+[[ "$endpoints" == $'10.1.2.3|444|tcp\n10.1.2.3|0|udp' ]] ||
     fail "full endpoints wrong: $endpoints"
-[[ $(profile_endpoints "$TMP/full.oc") == $'10.1.2.3|444|tcp\n10.1.2.3|444|udp' ]] ||
+[[ $(profile_endpoints "$TMP/full.oc") == $'10.1.2.3|444|tcp\n10.1.2.3|0|udp' ]] ||
     fail 'profile_endpoints dispatcher'
+
+# The DTLS port is server-advertised, so the kill switch uses the any-port
+# UDP form (port 0). resolve_profile_endpoints must accept it for udp and
+# reject it for any other protocol.
+(
+    resolve_profile_endpoints "$TMP/full.oc" "$TMP/endpoints-resolved" host
+)
+grep -Fq '10.1.2.3|444|tcp' "$TMP/endpoints-resolved" ||
+    fail 'resolved endpoints lost the TLS line'
+grep -Fq '10.1.2.3|0|udp' "$TMP/endpoints-resolved" ||
+    fail 'resolved endpoints lost the any-port UDP line'
+(
+    profile_endpoints() { printf '10.1.2.3|0|tcp\n'; }
+    if (resolve_profile_endpoints "$TMP/full.oc" "$TMP/endpoints-bad" host) >/dev/null 2>&1; then
+        fail 'any-port marker accepted for tcp'
+    fi
+)
 
 # --- openconnect_exec argument construction ----------------------------------
 cat > "$TMP/fake-ip" <<'FAKE_IP'
@@ -353,8 +399,27 @@ grep -Fq ' --passwd-on-stdin ' "$TMP/exec1.log" || fail 'missing passwd-on-stdin
 grep -Fq ' https://vpn.example.com' "$TMP/exec1.log" || fail 'missing server URL'
 grep -Fq $'stdin: employee\ncorrect horse battery staple' "$TMP/exec1.log" ||
     fail 'credentials not piped on stdin'
+grep -Fq -- ' --disable-ipv6 ' "$TMP/exec1.log" ||
+    fail 'IPv4-only engine did not pass --disable-ipv6'
+grep -Fq -- ' --queue-len 8 ' "$TMP/exec1.log" ||
+    fail 'vhost-net was not disabled via a sub-16 queue length'
 if grep -Fq -- '--cookie-on-stdin' "$TMP/exec1.log"; then fail 'unexpected cookie mode'; fi
 if grep -Fq -- '--servercert' "$TMP/exec1.log"; then fail 'unexpected servercert'; fi
+
+# DISABLE_IPV6=off opts back into openconnect's native dual-stack negotiation.
+NNS_FAKE_LOG="$TMP/exec-ipv6.log"
+(
+    export NNS_FAKE_LOG
+    load_cfg() { NS_NAME=mock-ns; DEFAULT_PROFILE=corp.oc; TUN_MTU=''; DISABLE_IPV6=off; }
+    profiles_dir() { printf '%s\n' "$TMP"; }
+    cfg_read_value() { if [[ "$2" == DEFAULT_PROFILE ]]; then printf 'corp.oc\n'; fi; }
+    openconnect_binary() { printf '%s\n' "$TMP/fake-oc"; }
+    ip_binary() { printf '%s\n' "$TMP/fake-ip"; }
+    reset_namespace_bootstrap_dns() { return 0; }
+    install() { return 0; }
+    openconnect_exec edgewall "$TMP/corp.oc"
+)
+if grep -Fq -- '--disable-ipv6' "$TMP/exec-ipv6.log"; then fail 'DISABLE_IPV6=off still passed --disable-ipv6'; fi
 
 # Saved session cookie wins over inline credentials.
 cookie_file="$TMP/corp.oc.cookie"
@@ -392,6 +457,131 @@ rm -f "$cookie_file"
     fi
 )
 grep -Fq 'oc-login edgewall' "$TMP/nocreds.err" || fail 'missing oc-login hint'
+
+# With scriptable inline credentials, start obtains and persists a session
+# cookie automatically so later restarts skip the gateway's login forms.
+cat > "$TMP/fake-auth-oc" <<'FAKE_AUTH_OC'
+#!/bin/bash
+if [[ " $* " == *" --authenticate "* ]]; then
+    printf "COOKIE='AutoCookie123456789+/=_-xyz'\n"
+    exit 0
+fi
+{
+    printf 'connect-args:'
+    printf ' <%s>' "$@"
+    printf '\nstdin: '
+    cat
+    printf '\n'
+} >>"$NNS_FAKE_LOG"
+exit 0
+FAKE_AUTH_OC
+chmod 755 "$TMP/fake-auth-oc"
+rm -f "$TMP/corp.oc.cookie" "$TMP/corp.oc.cookie.no-auth" "$TMP/auto-saved-cookie"
+NNS_FAKE_LOG="$TMP/exec3.log"
+(
+    export NNS_FAKE_LOG
+    load_cfg() { NS_NAME=mock-ns; DEFAULT_PROFILE=corp.oc; TUN_MTU=''; }
+    profiles_dir() { printf '%s\n' "$TMP"; }
+    cfg_read_value() { if [[ "$2" == DEFAULT_PROFILE ]]; then printf 'corp.oc\n'; fi; }
+    openconnect_binary() { printf '%s\n' "$TMP/fake-auth-oc"; }
+    ip_binary() { printf '%s\n' "$TMP/fake-ip"; }
+    reset_namespace_bootstrap_dns() { return 0; }
+    install() { return 0; }
+    anyconnect_save_cookie() { printf '%s' "$2" >"$TMP/auto-saved-cookie"; }
+    openconnect_exec edgewall "$TMP/corp.oc"
+)
+[[ "$(cat "$TMP/auto-saved-cookie" 2>/dev/null)" == 'AutoCookie123456789+/=_-xyz' ]] ||
+    fail 'start did not persist the automatically obtained cookie'
+grep -Fq -- '--cookie-on-stdin' "$TMP/exec3.log" || fail 'fresh cookie not used for the connection'
+grep -Fq $'stdin: AutoCookie123456789+/=_-xyz' "$TMP/exec3.log" ||
+    fail 'fresh cookie not piped on stdin'
+
+# A cookie the previous invocation logged as rejected is refreshed from the
+# inline credentials instead of being reused.
+printf 'OldCookie0123456789+/=_-xyz' >"$TMP/corp.oc.cookie"
+chmod 600 "$TMP/corp.oc.cookie"
+rm -f "$TMP/auto-saved-cookie"
+NNS_FAKE_LOG="$TMP/exec4.log"
+(
+    export NNS_FAKE_LOG
+    load_cfg() { NS_NAME=mock-ns; DEFAULT_PROFILE=corp.oc; TUN_MTU=''; }
+    profiles_dir() { printf '%s\n' "$TMP"; }
+    cfg_read_value() { if [[ "$2" == DEFAULT_PROFILE ]]; then printf 'corp.oc\n'; fi; }
+    openconnect_binary() { printf '%s\n' "$TMP/fake-auth-oc"; }
+    ip_binary() { printf '%s\n' "$TMP/fake-ip"; }
+    reset_namespace_bootstrap_dns() { return 0; }
+    install() { return 0; }
+    anyconnect_auth_failure_detected() { return 0; }
+    anyconnect_save_cookie() { printf '%s' "$2" >"$TMP/auto-saved-cookie"; }
+    openconnect_exec edgewall "$TMP/corp.oc"
+)
+[[ "$(cat "$TMP/auto-saved-cookie" 2>/dev/null)" == 'AutoCookie123456789+/=_-xyz' ]] ||
+    fail 'rejected cookie was reused instead of being refreshed'
+rm -f "$TMP/corp.oc.cookie"
+
+# A profile whose OTP must be entered interactively cannot auto-obtain a
+# cookie; the direct credential path is used instead.
+cat > "$TMP/totp-int.oc" <<'EOF_TOTP_INT'
+server=https://vpn.example.com
+user=employee
+passwd=secret
+token-mode=totp
+EOF_TOTP_INT
+rm -f "$TMP/auto-saved-cookie"
+NNS_FAKE_LOG="$TMP/exec5.log"
+(
+    export NNS_FAKE_LOG
+    load_cfg() { NS_NAME=mock-ns; DEFAULT_PROFILE=totp-int.oc; TUN_MTU=''; }
+    profiles_dir() { printf '%s\n' "$TMP"; }
+    cfg_read_value() { if [[ "$2" == DEFAULT_PROFILE ]]; then printf 'totp-int.oc\n'; fi; }
+    openconnect_binary() { printf '%s\n' "$TMP/fake-auth-oc"; }
+    ip_binary() { printf '%s\n' "$TMP/fake-ip"; }
+    reset_namespace_bootstrap_dns() { return 0; }
+    install() { return 0; }
+    anyconnect_save_cookie() { printf '%s' "$2" >>"$TMP/auto-saved-cookie"; }
+    openconnect_exec edgewall "$TMP/totp-int.oc"
+)
+[[ ! -e "$TMP/auto-saved-cookie" ]] ||
+    fail 'interactive-OTP profile tried to auto-obtain a cookie'
+# dtls=off must reach openconnect as --no-dtls.
+NNS_FAKE_LOG="$TMP/exec-dtls.log"
+(
+    export NNS_FAKE_LOG
+    load_cfg() { NS_NAME=mock-ns; DEFAULT_PROFILE=dtlsoff.oc; TUN_MTU=''; }
+    profiles_dir() { printf '%s\n' "$TMP"; }
+    cfg_read_value() { if [[ "$2" == DEFAULT_PROFILE ]]; then printf 'dtlsoff.oc\n'; fi; }
+    openconnect_binary() { printf '%s\n' "$TMP/fake-oc"; }
+    ip_binary() { printf '%s\n' "$TMP/fake-ip"; }
+    reset_namespace_bootstrap_dns() { return 0; }
+    install() { return 0; }
+    openconnect_exec edgewall "$TMP/dtlsoff.oc"
+)
+grep -Fq -- ' --no-dtls ' "$TMP/exec-dtls.log" || fail 'dtls=off did not pass --no-dtls'
+
+# Once a gateway is known not to expose a cookie to --authenticate, later
+# starts must skip the doomed round trip and use inline credentials directly.
+rm -f "$TMP/corp.oc.cookie" "$TMP/auto-saved-cookie"
+: >"$TMP/corp.oc.cookie.no-auth"
+NNS_FAKE_LOG="$TMP/exec6.log"
+(
+    export NNS_FAKE_LOG
+    load_cfg() { NS_NAME=mock-ns; DEFAULT_PROFILE=corp.oc; TUN_MTU=''; }
+    profiles_dir() { printf '%s\n' "$TMP"; }
+    cfg_read_value() { if [[ "$2" == DEFAULT_PROFILE ]]; then printf 'corp.oc\n'; fi; }
+    openconnect_binary() { printf '%s\n' "$TMP/fake-auth-oc"; }
+    ip_binary() { printf '%s\n' "$TMP/fake-ip"; }
+    reset_namespace_bootstrap_dns() { return 0; }
+    install() { return 0; }
+    anyconnect_save_cookie() { printf '%s' "$2" >"$TMP/auto-saved-cookie"; }
+    openconnect_exec edgewall "$TMP/corp.oc"
+)
+if grep -Fq -- '--authenticate' "$TMP/exec6.log"; then fail 'no-auth marker did not skip cookie acquisition'; fi
+[[ ! -e "$TMP/auto-saved-cookie" ]] || fail 'no-auth marker still saved a cookie'
+grep -Fq -- '--passwd-on-stdin' "$TMP/exec6.log" || fail 'no-auth marker path did not use inline credentials'
+rm -f "$TMP/corp.oc.cookie.no-auth"
+
+grep -Fq -- '--passwd-on-stdin' "$TMP/exec5.log" ||
+    fail 'interactive-OTP profile did not fall back to direct credentials'
 
 # --- vpn_exec dispatch --------------------------------------------------------
 # vpn_exec writes runtime markers under the root-owned $RUN_DIR, so the full
@@ -467,9 +657,93 @@ grep -Fq 'search corp.example' "$TMP/resolv.conf" || fail 'search domain missing
 grep -Fq -- '-4 route replace 10.0.0.0/8 dev tun2b3c4d5e' "$TMP/ip-split.log" || fail 'missing MASKLEN split route'
 grep -Fq -- '-4 route replace 192.168.50.0/24 dev tun2b3c4d5e' "$TMP/ip-split.log" || fail 'missing MASK split route'
 if grep -Fq -- 'route replace default' "$TMP/ip-split.log"; then fail 'default route in split tunnel'; fi
+# Pushed resolvers must always be reachable through the tunnel, even when the
+# gateway omits them from its split includes; invalid addresses stay dropped.
+grep -Fq -- '-4 route replace 10.7.7.1/32 dev tun2b3c4d5e' "$TMP/ip-split.log" ||
+    fail 'pushed DNS server not routed through the split tunnel'
+if grep -Fq -- '999.1.1.1' "$TMP/ip-split.log"; then fail 'invalid DNS server routed'; fi
+# A full tunnel covers DNS via the default route; no /32 pinning expected.
+if grep -Fq -- '10.9.8.1/32' "$TMP/ip-full.log"; then fail 'full tunnel pinned a DNS /32 route'; fi
 [[ -f "$TMP/hook-split/edgewall.oc-split" ]] || fail 'split marker missing'
 grep -Fq 'nameserver 10.7.7.1' "$TMP/resolv-split.conf" || fail 'valid DNS missing'
 if grep -Fq '999.1.1.1' "$TMP/resolv-split.conf"; then fail 'invalid DNS written'; fi
+
+# A gateway that pushes no resolvers must fall back to the profile dns= key;
+# the fallback resolver gets a pinned tunnel route in split mode.
+cat > "$TMP/dnsfallback.oc" <<'EOF_DNSFALLBACK'
+server=https://vpn.example.com
+dns=10.99.0.53
+EOF_DNSFALLBACK
+(
+    state="$TMP/hook-dnsfb"; mkdir -p "$state"
+    load_cfg() { NS_NAME=mock-ns; TUN_MTU=''; DEFAULT_PROFILE=dnsfallback.oc; }
+    profiles_dir() { printf '%s\n' "$TMP"; }
+    openconnect_state_dir() { printf '%s\n' "$state"; }
+    openconnect_hook_ns_ok() { return 0; }
+    namespace_resolv_conf_path() { printf '%s/resolv-dnsfb.conf\n' "$TMP"; }
+    install() { local last=${!#}; mkdir -p "$last"; }
+    ip() { local IFS=' '; printf '%s\n' "$*" >>"$TMP/ip-dnsfb.log"; return 0; }
+    INTERNAL_IP4_ADDRESS=10.7.7.7
+    INTERNAL_IP4_NETMASK=24
+    unset INTERNAL_IP4_DNS
+    export CISCO_SPLIT_INC_0_ADDR=10.0.0.0
+    export CISCO_SPLIT_INC_0_MASKLEN=8
+    openconnect_hook_up edgewall tun6a7b8c9d
+)
+grep -Fq -- '-4 route replace 10.99.0.53/32 dev tun6a7b8c9d' "$TMP/ip-dnsfb.log" ||
+    fail 'profile dns fallback not routed through the split tunnel'
+grep -Fq 'nameserver 10.99.0.53' "$TMP/resolv-dnsfb.conf" ||
+    fail 'profile dns fallback not written to the namespace resolver'
+
+# With no pushed resolvers and no profile dns=, the VPN gateway address is
+# used as the fallback resolver, and the configured bootstrap resolvers are
+# appended (unpinned) so kill-switch-off setups can resolve public names
+# directly. The gateway fallback itself IS pinned through the tunnel.
+cat > "$TMP/plain.oc2" <<'EOF_PLAIN2'
+server=https://vpn.example.com
+EOF_PLAIN2
+(
+    state="$TMP/hook-gw"; mkdir -p "$state"
+    load_cfg() { NS_NAME=mock-ns; TUN_MTU=''; DEFAULT_PROFILE=plain.oc2; DNS_SERVERS='1.1.1.1 9.9.9.9'; }
+    profiles_dir() { printf '%s\n' "$TMP"; }
+    openconnect_state_dir() { printf '%s\n' "$state"; }
+    openconnect_hook_ns_ok() { return 0; }
+    namespace_resolv_conf_path() { printf '%s/resolv-gw.conf\n' "$TMP"; }
+    install() { local last=${!#}; mkdir -p "$last"; }
+    ip() { local IFS=' '; printf '%s\n' "$*" >>"$TMP/ip-gw.log"; return 0; }
+    INTERNAL_IP4_ADDRESS=10.7.7.7
+    INTERNAL_IP4_NETMASK=24
+    unset INTERNAL_IP4_DNS
+    VPNGATEWAY=10.98.0.1
+    export CISCO_SPLIT_INC_0_ADDR=10.0.0.0
+    export CISCO_SPLIT_INC_0_MASKLEN=8
+    openconnect_hook_up edgewall tun7a8b9c0d
+)
+grep -Fq -- '-4 route replace 10.98.0.1/32 dev tun7a8b9c0d' "$TMP/ip-gw.log" ||
+    fail 'VPN gateway fallback resolver not routed through the tunnel'
+if grep -Fq -- '1.1.1.1/32' "$TMP/ip-gw.log"; then fail 'bootstrap DNS pinned through the tunnel'; fi
+grep -Fq 'nameserver 10.98.0.1' "$TMP/resolv-gw.conf" ||
+    fail 'VPN gateway fallback resolver not written'
+grep -Fq 'nameserver 1.1.1.1' "$TMP/resolv-gw.conf" ||
+    fail 'bootstrap fallback resolver not appended'
+grep -Fq 'nameserver 9.9.9.9' "$TMP/resolv-gw.conf" ||
+    fail 'second bootstrap fallback resolver not appended'
+
+# attempt-reconnect must drop the readiness markers without touching the TUN
+# (openconnect reuses it for the retry).
+(
+    state="$TMP/hook-attempt"; mkdir -p "$state"
+    touch "$state/edgewall.oc-ready" "$state/edgewall.oc-split"
+    load_cfg() { NS_NAME=mock-ns; }
+    openconnect_state_dir() { printf '%s\n' "$state"; }
+    ip() { printf '%s\n' "$*" >>"$TMP/ip-attempt.log"; return 0; }
+    openconnect_hook edgewall attempt-reconnect
+)
+[[ ! -e "$TMP/hook-attempt/edgewall.oc-ready" ]] ||
+    fail 'attempt-reconnect kept the ready marker'
+[[ ! -e "$TMP/hook-attempt/edgewall.oc-split" ]] ||
+    fail 'attempt-reconnect kept the split marker'
+[[ ! -s "$TMP/ip-attempt.log" ]] || fail 'attempt-reconnect touched the network'
 
 # --- hook: namespace guard and disconnect cleanup ----------------------------
 (
@@ -591,15 +865,55 @@ grep -Fq -- '-4 route replace default dev tun5a6b7c8d' "$TMP/contract-ip.log" ||
 grep -Fq 'nameserver 10.9.8.1' "$STATE/resolv.conf" ||
     fail 'full-contract simulation did not write pushed DNS'
 
-# --- auth failure detection --------------------------------------------------
+# --- auth/cert failure detection --------------------------------------------
+# Form error fields like "Login failed." and the trust-check "signer not
+# found" line are printed on every healthy connection to multi-attempt
+# gateways; only terminal markers may classify as fatal failures.
 (
-    journalctl() { printf 'Login failed\n'; }
-    anyconnect_auth_failure_detected edgewall || fail 'auth failure not detected'
+    journalctl() { printf 'Login failed.\n'; }
+    if anyconnect_auth_failure_detected edgewall; then fail 'benign form error classified as auth failure'; fi
 )
 (
-    journalctl() { printf 'Established DTLS (CSTP)\n'; }
-    if anyconnect_auth_failure_detected edgewall; then fail 'false auth failure'; fi
+    journalctl() { printf 'Server certificate verify failed: signer not found\n'; }
+    if anyconnect_cert_failure_detected edgewall; then fail 'benign trust-check line classified as cert failure'; fi
 )
+(
+    journalctl() { printf 'Failed to complete authentication\n'; }
+    anyconnect_auth_failure_detected edgewall || fail 'terminal auth failure not detected'
+)
+(
+    journalctl() { printf 'Cookie was rejected by server; exiting.\n'; }
+    anyconnect_auth_failure_detected edgewall || fail 'rejected cookie not detected'
+)
+(
+    journalctl() { printf 'SSL connection failure: Error in the certificate.\n'; }
+    anyconnect_cert_failure_detected edgewall || fail 'terminal cert failure not detected'
+)
+(
+    journalctl() { printf 'None of the 1 fingerprint(s) specified via --servercert match the certificate\n'; }
+    anyconnect_cert_failure_detected edgewall || fail 'pin mismatch not detected'
+)
+
+# Status diagnosis must ignore the same benign noise.
+cat >"$TMP/diag-benign.log" <<'EOF_DIAG_BENIGN'
+Server certificate verify failed: signer not found
+Login failed.
+Established DTLS connection (using GnuTLS). Ciphersuite (DTLS1.2)-(ECDHE-RSA)-(AES-256-GCM).
+EOF_DIAG_BENIGN
+diagnosis=$(openconnect_status_diagnosis "$TMP/diag-benign.log")
+grep -Fqi 'authentication failed' <<<"$diagnosis" && fail 'benign log misdiagnosed as auth failure'
+grep -Fqi 'certificate verification failed' <<<"$diagnosis" && fail 'benign log misdiagnosed as cert failure'
+cat >"$TMP/diag-auth.log" <<'EOF_DIAG_AUTH'
+Failed to complete authentication
+EOF_DIAG_AUTH
+openconnect_status_diagnosis "$TMP/diag-auth.log" | grep -Fqi 'authentication failed' ||
+    fail 'terminal auth failure not diagnosed'
+cat >"$TMP/diag-cert.log" <<'EOF_DIAG_CERT'
+SSL connection failure: Error in the certificate.
+EOF_DIAG_CERT
+openconnect_status_diagnosis "$TMP/diag-cert.log" | grep -Fqi 'certificate verification failed' ||
+    fail 'terminal cert failure not diagnosed'
+
 
 # --- on-demand backend add-on installers -------------------------------------
 # openconnect/wireguard tools must never be auto-installed by the engine; the
@@ -654,17 +968,31 @@ grep -Fq 'wireguard-tools' "$TMP/backend-pkgs" || fail 'wireguard add-on did not
         fail 'openconnect_binary succeeded without the binary'
     fi
 )
-grep -Fq 'sudo nns-app --install openconnect' "$TMP/oc-missing.err" ||
+grep -Fq 'nns-app --install openconnect' "$TMP/oc-missing.err" ||
     fail 'missing-binary error lacks the add-on installer hint'
 # add must point at the matching installer when the backend binaries are gone.
-grep -Fq 'sudo nns-app --install openconnect' "$ROOT/src/30-profiles.sh" ||
+grep -Fq 'nns-app --install openconnect' "$ROOT/src/30-profiles.sh" ||
     fail 'add does not suggest the openconnect add-on'
-grep -Fq 'sudo nns-app --install wireguard' "$ROOT/src/30-profiles.sh" ||
+grep -Fq 'nns-app --install wireguard' "$ROOT/src/30-profiles.sh" ||
     fail 'add does not suggest the wireguard add-on'
-grep -Fq 'sudo nns-app --install amnezia' "$ROOT/src/30-profiles.sh" ||
+grep -Fq 'nns-app --install amnezia' "$ROOT/src/30-profiles.sh" ||
     fail 'add does not suggest the amnezia add-on'
 
 # --- route readiness and wait_online ------------------------------------------
+# AnyConnect's multi-stage authentication needs a longer start window: at
+# least 30s, while other backends keep the 5s default and -i/probe stays 1s.
+[[ "$(start_readiness_timeout anyconnect off '')" == 30 ]] ||
+    fail 'anyconnect does not get a 30s minimum readiness window'
+[[ "$(start_readiness_timeout anyconnect off 5)" == 30 ]] ||
+    fail 'configured 5s overrides the anyconnect minimum'
+[[ "$(start_readiness_timeout anyconnect off 60)" == 60 ]] ||
+    fail 'larger configured READY_TIMEOUT is not honored for anyconnect'
+[[ "$(start_readiness_timeout openvpn off '')" == 5 ]] ||
+    fail 'non-anyconnect backends lost the 5s default'
+[[ "$(start_readiness_timeout anyconnect probe '')" == 1 ]] ||
+    fail 'probe mode lost the 1s window'
+[[ "$(start_readiness_timeout anyconnect on '')" == 1 ]] ||
+    fail 'ignore-start-error did not keep the fast window'
 (
     state="$TMP/route"; mkdir -p "$state"
     echo tun1234abcd >"$state/edgewall.oc-ready"
@@ -734,7 +1062,7 @@ grep -Fq 'oc_stop_result=auth-required' "$ROOT/src/50-runtime.sh" ||
         WD_TOTAL_RESTARTS=0; WD_LAST_CHECK=0; WD_LAST_RESULT=offline
     }
     watchdog_state_save() { :; }
-    journalctl() { printf 'Login failed\n'; }
+    journalctl() { printf 'Failed to complete authentication\n'; }
     systemctl() { printf '%s\n' "$2" >>"$TMP/wd-restart"; return 0; }
     acquire_lock() { return 0; }
     release_lock() { return 0; }
@@ -758,7 +1086,7 @@ if [[ -s "$TMP/wd-restart" ]]; then fail 'watchdog restarted the backend on an a
         WD_TOTAL_RESTARTS=0; WD_LAST_CHECK=0; WD_LAST_RESULT=offline
     }
     watchdog_state_save() { :; }
-    journalctl() { printf 'Server certificate verify failed: signer not found\n'; }
+    journalctl() { printf 'SSL connection failure: Error in the certificate.\n'; }
     systemctl() { printf '%s\n' "$2" >>"$TMP/wd-restart"; return 0; }
     acquire_lock() { return 0; }
     release_lock() { return 0; }
@@ -771,6 +1099,39 @@ grep -Fq 'WD_LAST_RESULT=$oc_stop_result' "$ROOT/src/50-runtime.sh" ||
     fail 'watchdog does not record a distinct result for certificate failures'
 grep -Fq 'oc_stop_result=config-required' "$ROOT/src/50-runtime.sh" ||
     fail 'watchdog does not classify certificate failures as config-required'
+# Benign multi-attempt noise ("Login failed." + trust-check line) must NOT
+# suppress the watchdog restart of an otherwise offline tunnel.
+(
+    rm -f "$TMP/wd-restart"
+    load_cfg() { NS_NAME=mock-ns; WATCHDOG_MODE=auto; WATCHDOG_FAILURES=1; WATCHDOG_COOLDOWN=30; }
+    vpn_type_for_app() { printf 'anyconnect\n'; }
+    watchdog_enabled_for_type() { return 0; }
+    app_is_started() { return 0; }
+    watchdog_namespace_exists() { return 0; }
+    runtime_via_for_app() { printf 'host\n'; }
+    wait_online() { return 1; }
+    watchdog_state_load() {
+        WD_ARMED=1; WD_FAILURES=1; WD_LAST_RESTART=0
+        WD_TOTAL_RESTARTS=0; WD_LAST_CHECK=0; WD_LAST_RESULT=offline
+    }
+    watchdog_state_save() { :; }
+    journalctl() { printf 'Login failed.\nServer certificate verify failed: signer not found\n'; }
+    systemctl() {
+        printf '%s\n' "$2" >>"$TMP/wd-restart"
+        if [[ "$2" == is-active ]]; then return 1; fi
+        return 0
+    }
+    acquire_lock() { return 0; }
+    release_lock() { return 0; }
+    require_root() { return 0; }
+    warn() { :; }
+    log() { :; }
+    restart_gateways_via_app() { :; }
+    watchdog_check edgewall
+)
+grep -Fq 'nns-openvpn@edgewall.service' "$TMP/wd-restart" ||
+    fail 'benign auth noise suppressed the watchdog restart'
+
 # The same scenario WITHOUT an auth failure must reach the restart path.
 (
     rm -f "$TMP/wd-restart"

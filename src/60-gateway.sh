@@ -1006,9 +1006,16 @@ PY_GATEWAY_POOL
     # A private-only exit (split-tunnel upstream with kill switch) cannot
     # carry public Internet, so clients must not be promised a default
     # route: push the upstream's private networks and DNS policy instead.
+    # An upstream with server-driven routing (AnyConnect/OpenConnect) has no
+    # static networks or DNS policy to inherit; declaring it private would
+    # leave clients with an empty push, so fall back to a full exit: the
+    # gateway's own data path reaches the upstream tunnel.
     private_exit=off
+    local upstream_networks="" upstream_dns_policy=""
     if [[ "${VIA_APP:-host}" != host ]] && app_is_private_only "$VIA_APP"; then
-        private_exit=on
+        upstream_networks=$(app_profile_networks "$VIA_APP" 2>/dev/null || true)
+        upstream_dns_policy=$(app_profile_dns_policy "$VIA_APP" 2>/dev/null || true)
+        [[ -n "$upstream_networks" || -n "$upstream_dns_policy" ]] && private_exit=on
     fi
 
     {
@@ -1083,12 +1090,14 @@ PY_GATEWAY_POOL
             while read -r net mask; do
                 [[ -n "$net" ]] || continue
                 printf 'push "route %s %s"\n' "$net" "$mask"
-            done < <(app_profile_networks "$VIA_APP" 2>/dev/null || true)
-            dns_policy=$(app_profile_dns_policy "$VIA_APP" 2>/dev/null || true)
+            done <<<"$upstream_networks"
+            dns_policy=$upstream_dns_policy
             if [[ -n "$dns_policy" ]]; then
                 servers=${dns_policy%%$'\n'*}
                 domains=${dns_policy#*$'\n'}
-                for dns in $servers; do
+                local -a gw_dns=()
+                IFS=' ' read -r -a gw_dns <<<"$servers"
+                for dns in "${gw_dns[@]}"; do
                     printf 'push "dhcp-option DNS %s"\n' "$dns"
                 done
                 if [[ "$domains" != "." ]]; then
@@ -1099,7 +1108,9 @@ PY_GATEWAY_POOL
             fi
         else
             printf 'push "redirect-gateway def1 bypass-dhcp"\n'
-            for dns in $DNS_SERVERS; do
+            local -a gw_dns=()
+            IFS=' ' read -r -a gw_dns <<<"$DNS_SERVERS"
+            for dns in "${gw_dns[@]}"; do
                 printf 'push "dhcp-option DNS %s"\n' "$dns"
             done
         fi

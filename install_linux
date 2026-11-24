@@ -21,6 +21,8 @@
 # Author: Maxim Lyadvinsky
 #
 # Public commands:
+#   --install openconnect  (OpenConnect add-on for AnyConnect and related protocols)
+#   --install wireguard     (wg and wg-quick tools add-on)
 #   --install amnezia  (explicit Ubuntu userspace AmneziaWG dependencies)
 #   install [--local-only]
 #   install <name> --server [--amnezia] [--listen udp:1194|tcp:443] [--public host:port]
@@ -46,8 +48,9 @@
 #   client  export <app_name> <client_name> --output <file>
 #   client  remove <app_name> <client_name>
 #   revoke  <app_name> <client_name>
-#   add     <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf>
+#   add     <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf|anyconnect.oc>
 #   add     <app_name> any [country] [--refresh] [--via <upstream-app>|host]
+#   oc-login <app_name>
 #   start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
 #   stop    <app_name> [--local-only]
 #   run     <app_name> <command> [args...]
@@ -77,9 +80,9 @@ if [[ "$(uname -s)" == Darwin && "${NNS_APP_SOURCE_ONLY:-0}" != 1 ]]; then
 fi
 
 # Sole source of truth is the repo-root VERSION file. build.sh substitutes the
-# 2.1.27 token when assembling install_linux. An unsubstituted value
+# 2.2.59 token when assembling install_linux. An unsubstituted value
 # still contains "@", which triggers the source-tree file lookup.
-_nns_version="2.1.27"
+_nns_version="2.2.59"
 if [[ "$_nns_version" == *@* ]]; then
     _nns_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
     if [[ -f "$_nns_dir/VERSION" ]]; then
@@ -257,6 +260,14 @@ openvpn_binary() {
     required_binary openvpn
 }
 
+openconnect_binary() {
+    local path
+    path=$(command -v openconnect 2>/dev/null || true)
+    [[ -n "$path" && -x "$path" ]] ||
+        die "Required executable 'openconnect' is unavailable. Install it with: nns-app --install openconnect"
+    readlink -f -- "$path"
+}
+
 ip_binary() {
     required_binary ip
 }
@@ -319,7 +330,7 @@ show_version() {
 usage() {
     cat <<'USAGE'
 Usage:
-  nns-app --install amnezia
+  nns-app --install openconnect|wireguard|amnezia
   nns-app install [--local-only]
   nns-app install <name> --server [--amnezia] [--listen udp:1194|tcp:443] [--public host:port]
                   [--transport direct|cloak] [--server-name <cloak-decoy-host>]
@@ -353,8 +364,9 @@ Usage:
   nns-app client list <app_name>
   nns-app client status <gateway_name> <client_name>
   nns-app revoke <app_name> <client_name> [--modern|--embedded]
-  nns-app add     <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf>
+  nns-app add     <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf|anyconnect.oc>
   nns-app add     <app_name> any [country-code-or-name] [--refresh] [--via <upstream-app>|host]
+  nns-app oc-login <app_name>
   nns-app start   [-i|--ignore-start-error] <app_name> [--via <upstream-app>|host]
   nns-app restart [-i|--ignore-start-error] [<app_name> [--via <upstream-app>|host]]
                   # without a name: restart every active app and gateway
@@ -398,12 +410,15 @@ Usage:
 
 Simple managed-remote mode:
   nns-app install <app_name> via --remote <user@host> [--remote-port <port>]
-  nns-app add <app_name> <self-contained-profile.ovpn|wireguard.conf>
+  nns-app add <app_name> <self-contained-profile.ovpn|wireguard.conf|anyconnect.oc>
   nns-app run <app_name> <command> [arguments...]
 
 Examples:
   sudo ./nns-app.sh install
   sudo ./nns-app.sh install --local-only
+  nns-app --install wireguard    # add-on: wg + wg-quick (auto-elevates via sudo)
+  nns-app --install openconnect  # add-on: AnyConnect and related protocols
+  nns-app --install amnezia      # add-on: Ubuntu AmneziaWG userspace build
   sudo nns-app install my-upstream-vpn
   sudo nns-app install office-vpn --server
   sudo nns-app install amn-test --server --amnezia --listen udp:51821
@@ -419,6 +434,8 @@ Examples:
   sudo nns-app install my-shared-app --backend inherit --via my-remote-exit
   sudo nns-app add my-private-app ~/my-app-profile.ovpn
   sudo nns-app add my-private-app ~/my-wireguard-profile.conf
+  sudo nns-app add my-private-app ~/my-corporate-anyconnect.oc
+  nns-app oc-login my-private-app   # interactive AnyConnect session cookie (auto-elevates)
   sudo nns-app add my-private-app any US --via my-upstream-vpn
   nns-app start my-private-app
   nns-app start -i my-private-app --via my-upstream-vpn
@@ -519,7 +536,7 @@ reexec_as_root_if_needed() {
         list|status|myip|myloc|start|stop|restart|run)
             sudo_args+=( -n )
             ;;
-        --install|install|remove|add|purge|repair|backup|restore|gateway|remote|link|export|client|revoke|fixed-ip|route-mode|client-to-client|set-via)
+        --install|install|remove|add|oc-login|purge|repair|backup|restore|gateway|remote|link|export|client|revoke|fixed-ip|route-mode|client-to-client|set-via)
             ;;
         *)
             die "Unknown command '$cmd'."
@@ -536,18 +553,26 @@ reexec_as_root_if_needed() {
 
     # Canonicalize flexible start-option ordering before sudo. This lets the
     # per-app sudoers entry remain narrow while accepting --via in any position.
+    # Note $# still counts the command name here, so a bare `restart` has one
+    # argument left before the shift and must pass through unchanged.
     if [[ "$cmd" == start || "$cmd" == restart ]]; then
         local -a canonical=("$cmd")
         if (( $# > 0 )); then
             shift
-            parse_start_cli "$@"
-            if managed_gateway_exists "$START_APP_NAME"; then
-                sudo_args=(/usr/bin/sudo)
-            fi
-            bool_on "$START_IGNORE" && canonical+=(-i)
-            canonical+=("$START_APP_NAME")
-            if [[ "$START_VIA" != __default__ ]]; then
-                canonical+=(--via "$START_VIA")
+            if (( $# == 0 )) && [[ "$cmd" == restart ]]; then
+                # Bare `nns-app restart` restarts every active app and
+                # gateway; there is no app name to canonicalize.
+                :
+            else
+                parse_start_cli "$@"
+                if managed_gateway_exists "$START_APP_NAME"; then
+                    sudo_args=(/usr/bin/sudo)
+                fi
+                bool_on "$START_IGNORE" && canonical+=(-i)
+                canonical+=("$START_APP_NAME")
+                if [[ "$START_VIA" != __default__ ]]; then
+                    canonical+=(--via "$START_VIA")
+                fi
             fi
         fi
         "${sudo_args[@]}" "$target" "${canonical[@]}"
@@ -776,6 +801,18 @@ vpn_route_iface() {
             ip netns exec "$ns" "$wgcmd" show "$expected" >/dev/null 2>&1 || return 1
             dev=$expected
             ;;
+        anyconnect)
+            # Readiness is authoritative only after the hook configured the
+            # TUN: marker file, live device, IPv4 address and at least one
+            # route (default or a gateway-pushed split route) via it.
+            expected=$(openconnect_iface_name "$app")
+            [[ -f "$(openconnect_state_dir)/${app}.oc-ready" ]] || return 1
+            ip -n "$ns" link show dev "$expected" up >/dev/null 2>&1 || return 1
+            ip -n "$ns" -4 addr show dev "$expected" 2>/dev/null |
+                grep -Eq '[[:space:]]inet[[:space:]]' || return 1
+            ip -n "$ns" -4 route show dev "$expected" 2>/dev/null | grep -q . || return 1
+            dev=$expected
+            ;;
         inherit)
             dev=$(cfg_read_value "$app" VETH_NS 2>/dev/null || true)
             upstream=$(runtime_via_for_app "$app" 2>/dev/null || true)
@@ -928,6 +965,7 @@ dependency_package_for() {
         debian:ssh|debian:scp) printf 'openssh-client\n' ;;
         fedora:ssh|fedora:scp) printf 'openssh-clients\n' ;;
         *:openvpn) printf 'openvpn\n' ;;
+        *:openconnect) printf 'openconnect\n' ;;
         *:wg|*:wg-quick) printf 'wireguard-tools\n' ;;
         *:curl) printf 'curl\n' ;;
         *:setpriv) printf 'util-linux\n' ;;
@@ -959,6 +997,56 @@ install_dependency_packages() {
     esac
 }
 
+# On-demand backend add-on installer shared by `nns-app --install wireguard`
+# and `nns-app --install openconnect`: resolves the missing commands to their
+# distribution packages and installs only those. Never invoked automatically
+# by engine/app installation.
+install_backend_packages() {
+    local backend=$1
+    shift
+    local family command_name package
+    local -a commands=("$@")
+    local -a missing=()
+    local -A selected=()
+
+    family=$(detect_platform_family 2>/dev/null || true)
+    [[ -n "$family" ]] ||
+        die "Unsupported Linux distribution. Install the required commands manually; supported automatic installers are Ubuntu/Debian and Fedora."
+
+    for command_name in "${commands[@]}"; do
+        command -v "$command_name" >/dev/null 2>&1 && continue
+        package=$(dependency_package_for "$family" "$command_name" 2>/dev/null || true)
+        [[ -n "$package" ]] ||
+            die "No package mapping for missing command '$command_name' on '$family'."
+        if [[ -z "${selected[$package]:-}" ]]; then
+            selected[$package]=1
+            missing+=("$package")
+        fi
+    done
+
+    if (( ${#missing[@]} )); then
+        log "Installing $backend packages: ${missing[*]}"
+        install_dependency_packages "$family" "${missing[@]}"
+    fi
+
+    for command_name in "${commands[@]}"; do
+        command -v "$command_name" >/dev/null 2>&1 ||
+            die "Required command '$command_name' is still unavailable after dependency installation."
+    done
+}
+
+install_wireguard_tools() {
+    require_root
+    install_backend_packages wireguard wg wg-quick
+    log "Installed WireGuard tools. Start an existing WireGuard app with: nns-app start <app_name>"
+}
+
+install_openconnect_tools() {
+    require_root
+    install_backend_packages openconnect openconnect
+    log "Installed OpenConnect. Start an existing AnyConnect app with: nns-app start <app_name>"
+}
+
 check_openvpn_version() {
     local raw version binary
     binary=$(openvpn_binary)
@@ -975,8 +1063,11 @@ check_openvpn_version() {
 
 ensure_dependencies() {
     local family command_name package
+    # Only OpenVPN is a base dependency. WireGuard, OpenConnect and AmneziaWG
+    # tools are protocol add-ons installed on demand via `nns-app --install`,
+    # never pulled in automatically by an engine or app install.
     local -a commands=(
-        ip openvpn wg wg-quick iptables curl ping setpriv sudo openssl
+        ip openvpn iptables curl ping setpriv sudo openssl
         python3 ssh scp
     )
     local -a missing=()
@@ -1560,7 +1651,8 @@ install_app() {
 APP_NAME="$app"
 APP_USER="$user"
 DEFAULT_PROFILE=""
-# Empty until a profile is added; the add command sets this to openvpn or wireguard.
+# Empty until a profile is added; the add command sets this to openvpn,
+# wireguard, amneziawg or anyconnect.
 VPN_TYPE=""
 
 # on: application traffic cannot fall back to the host uplink.
@@ -1587,6 +1679,9 @@ DISABLE_DCO="off"
 #     add a data-ciphers fallback for legacy CBC-only profiles.
 # off: store the profile byte-for-byte without compatibility changes.
 PROFILE_FIXUPS="on"
+# Seconds `start` waits for the tunnel data path. AnyConnect authentication
+# is multi-stage, so AnyConnect apps wait at least 30 seconds regardless of
+# this value; set it higher for unusually slow gateways.
 READY_TIMEOUT="5"
 EXTERNAL_IP_URL="https://api.ipify.org"
 # Check HTTPS on start; tune OpenVPN MTU only when basic IP connectivity is
@@ -1656,6 +1751,7 @@ CONFIG_EOF
     log "Upstream: ${normalized_via:-host}"
     log "Next:     sudo $USER_PATH add $app /path/to/profile.ovpn"
     log "          or: sudo $USER_PATH add $app /path/to/wireguard.conf"
+    log "          or: sudo $USER_PATH add $app /path/to/anyconnect.oc"
     log "          or: sudo $USER_PATH add $app any [country]${normalized_via:+ --via $normalized_via}"
 }
 
@@ -1793,6 +1889,12 @@ profile_type_from_file() {
         else
             printf 'wireguard\n'
         fi
+    elif [[ "$file" == *.oc ]] ||
+         grep -Eiq '^[[:space:]]*protocol[[:space:]]*=[[:space:]]*(anyconnect|nc|pulse|gp|fortinet|f5|array)[[:space:]]*(#.*)?$' "$file"; then
+        # The `.oc` extension is an nns-app convention for OpenConnect
+        # profiles (AnyConnect first); the protocol= probe also recognizes
+        # them regardless of the file name.
+        printf 'anyconnect\n'
     elif grep -Eiq '^[[:space:]]*remote[[:space:]]+' "$file"; then
         printf 'openvpn\n'
     else
@@ -1804,7 +1906,7 @@ vpn_type_for_app() {
     local app=$1 configured profile file detected
     configured=$(cfg_read_value "$app" VPN_TYPE 2>/dev/null || true)
     case "$configured" in
-        openvpn|wireguard|amneziawg|inherit)
+        openvpn|wireguard|amneziawg|anyconnect|inherit)
             printf '%s
 ' "$configured"
             return 0
@@ -1829,6 +1931,8 @@ vpn_type_label() {
         wireguard) printf 'WireGuard
 ' ;;
         amneziawg) printf 'AmneziaWG
+' ;;
+        anyconnect) printf 'AnyConnect
 ' ;;
         inherit) printf 'Inherit
 ' ;;
@@ -1870,6 +1974,7 @@ profile_name_from_path() {
     case "$type" in
         openvpn) suffix=ovpn ;;
         wireguard|amneziawg) suffix=conf ;;
+        anyconnect) suffix=oc ;;
         *) die "Unsupported VPN profile type '$type'." ;;
     esac
     printf '%.64s.%s\n' "$name" "$suffix"
@@ -2482,6 +2587,7 @@ app_profile_networks() {
     case "$backend" in
         wireguard|amneziawg) wireguard_profile_networks "$profile" ;;
         openvpn) openvpn_profile_networks "$profile" ;;
+        anyconnect) anyconnect_profile_networks "$profile" ;;
         *) return 1 ;;
     esac
 }
@@ -2495,6 +2601,7 @@ app_profile_route_sample() {
     case "$backend" in
         wireguard|amneziawg) wireguard_profile_route_sample "$profile" ;;
         openvpn) openvpn_profile_route_sample "$profile" ;;
+        anyconnect) anyconnect_profile_route_sample "$profile" ;;
         *) return 1 ;;
     esac
 }
@@ -2508,6 +2615,7 @@ app_profile_dns_policy() {
     case "$backend" in
         wireguard|amneziawg) wireguard_profile_dns_policy "$profile" "$mode" ;;
         openvpn) openvpn_profile_dns_policy "$profile" "$mode" ;;
+        anyconnect) anyconnect_profile_dns_policy "$profile" "$mode" ;;
         *) return 1 ;;
     esac
 }
@@ -2527,12 +2635,19 @@ app_is_private_only() {
 app_split_tunnel() {
     local app=$1 backend profile
     backend=$(vpn_type_for_app "$app" 2>/dev/null || true)
-    case "$backend" in wireguard|amneziawg|openvpn) ;; *) return 1 ;; esac
+    case "$backend" in wireguard|amneziawg|openvpn|anyconnect) ;; *) return 1 ;; esac
     profile=$(cfg_read_value "$app" DEFAULT_PROFILE 2>/dev/null || true)
     [[ -n "$profile" && -f "$(profiles_dir "$app")/$profile" ]] || return 1
     profile="$(profiles_dir "$app")/$profile"
     case "$backend" in
         openvpn) [[ "$(openvpn_profile_route_mode "$profile")" == split ]] ;;
+        anyconnect)
+            # Routing is pushed by the gateway at connect time, so a split
+            # tunnel is authoritative either from the profile declaration or
+            # from the split includes the hook recorded for the live session.
+            [[ "$(anyconnect_profile_route_mode "$profile")" == split ]] ||
+            [[ -f "$(openconnect_state_dir)/${app}.oc-split" ]]
+            ;;
         *) [[ "$(wireguard_profile_route_mode "$profile")" == split ]] ;;
     esac
 }
@@ -2963,13 +3078,34 @@ add_profile() {
     local type
     type=$(profile_type_from_file "$src" 2>/dev/null || true)
     [[ -n "$type" ]] ||
-        die "Cannot identify '$src' as an OpenVPN, WireGuard or AmneziaWG profile."
+        die "Cannot identify '$src' as an OpenVPN, WireGuard, AmneziaWG or AnyConnect profile."
 
     case "$type" in
         openvpn) validate_ovpn "$src" ;;
         wireguard) validate_wireguard "$src" ;;
         amneziawg) validate_amneziawg "$src" ;;
+        anyconnect) validate_anyconnect "$src" ;;
         *) die "Unsupported VPN profile type '$type'." ;;
+    esac
+
+    # Backends beyond OpenVPN are add-ons: engine and app installs never pull
+    # their tools automatically. Say so up front when the profile's backend
+    # binaries are missing, with the exact installer command.
+    case "$type" in
+        anyconnect)
+            command -v openconnect >/dev/null 2>&1 ||
+                warn "openconnect is not installed; the AnyConnect backend needs it. Install it with: nns-app --install openconnect"
+            ;;
+        wireguard)
+            if ! command -v wg >/dev/null 2>&1 || ! command -v wg-quick >/dev/null 2>&1; then
+                warn "WireGuard tools (wg, wg-quick) are not installed. Install them with: nns-app --install wireguard"
+            fi
+            ;;
+        amneziawg)
+            if ! command -v awg >/dev/null 2>&1 || ! command -v awg-quick >/dev/null 2>&1; then
+                warn "AmneziaWG tools (awg, awg-quick) are not installed. Install them with: nns-app --install amnezia"
+            fi
+            ;;
     esac
 
     local name dest tmp
@@ -2996,6 +3132,12 @@ add_profile() {
         amneziawg)
             validate_amneziawg "$tmp"
             ;;
+        anyconnect)
+            validate_anyconnect "$tmp"
+            ;;
+        *)
+            die "Unsupported VPN profile type '$type'."
+            ;;
     esac
 
     install -o root -g root -m 0600 "$tmp" "$dest"
@@ -3016,6 +3158,16 @@ add_profile() {
             log "No compatibility fixes were needed."
         else
             log "OpenVPN profile fixups are disabled in $(cfg_file "$app")."
+        fi
+    elif [[ "$type" == anyconnect ]]; then
+        # A replaced profile targets a possibly different gateway: a stale
+        # session cookie from `oc-login` must not outlive its profile.
+        rm -f "$dest.cookie"
+        if ! grep -Eiq '^[[:space:]]*(user|passwd|password|token-secret)[[:space:]]*=' "$dest"; then
+            warn "The AnyConnect profile has no inline credentials; run: nns-app oc-login $app"
+        fi
+        if [[ "$(anyconnect_profile_route_mode "$dest")" == split ]]; then
+            log "Profile declares route-mode=split; the gateway may also push split tunnels at connect time."
         fi
     else
         local dns_policy="" dns_domains="" policy_label
@@ -3042,6 +3194,11 @@ add_profile() {
             if ! bool_on "${KILLSWITCH:-on}"; then
                 warn "KILLSWITCH is off: traffic outside AllowedIPs may use the host uplink."
             fi
+        fi
+    fi
+    if [[ "$type" == anyconnect && "$(anyconnect_profile_route_mode "$dest")" == split ]]; then
+        if ! bool_on "${KILLSWITCH:-on}"; then
+            warn "KILLSWITCH is off: traffic outside the gateway-pushed split routes may use the host uplink."
         fi
     fi
     log "Default profile is now '$name' ($(vpn_type_label "$type"))."
@@ -3782,6 +3939,9 @@ for raw in text.splitlines():
     print(f"{host}|{port}|udp")
 PY_WG_ENDPOINTS
             ;;
+        anyconnect)
+            anyconnect_endpoint_lines "$profile"
+            ;;
     esac
 }
 
@@ -3801,8 +3961,18 @@ resolve_profile_endpoints() {
         [[ -n "$host" && -n "$port" && -n "$proto" ]] || continue
         [[ "$port" =~ ^[0-9]+$ ]] ||
             die "Invalid VPN endpoint port '$port' in $profile"
-        (( port >= 1 && port <= 65535 )) ||
+        if (( port == 0 )); then
+            # Port 0 marks "any destination port" and is valid only for UDP
+            # endpoints: the AnyConnect gateway advertises its DTLS port
+            # dynamically, so the kill switch permits UDP to the whole
+            # gateway address instead of guessing a port.
+            [[ "$proto" == udp ]] ||
+                die "Endpoint port 0 (any port) is valid only for udp in $profile"
+        elif (( port >= 1 && port <= 65535 )); then
+            :
+        else
             die "VPN endpoint port '$port' is outside 1..65535 in $profile"
+        fi
         case "$proto" in
             tcp|udp) ;;
             *) die "Invalid VPN endpoint protocol '$proto' in $profile" ;;
@@ -4080,6 +4250,12 @@ ensure_namespace_dns_nsswitch() {
     namespace_dns_nsswitch_write /etc/nsswitch.conf "$target"
 }
 
+# The bind-mounted resolver inside an app namespace. A small helper (rather
+# than an inline path) so runtime hooks and tests share one source of truth.
+namespace_resolv_conf_path() {
+    printf '/etc/netns/%s/resolv.conf\n' "$NS_NAME"
+}
+
 # Restore the normal per-namespace resolver during WireGuard bootstrap.
 # This permits hostname endpoints to be resolved by wg-quick before the VPN
 # route exists. The pre-tunnel firewall allows DNS only for uid 0.
@@ -4169,7 +4345,7 @@ netns_up() {
             [[ "$via_app" != host ]] || die "Inherit backend '$app' requires an upstream NNS app."
             tunnel_iface=$VETH_NS
             ;;
-        openvpn) tunnel_iface='tun+' ;;
+        openvpn|anyconnect) tunnel_iface='tun+' ;;
         *) die "Unsupported VPN backend '$vpn_type'." ;;
     esac
     if [[ "$vpn_type" != inherit ]]; then
@@ -4302,9 +4478,16 @@ netns_up() {
 
     if bool_on "$KILLSWITCH"; then
         while IFS='|' read -r endpoint_ip endpoint_port endpoint_proto; do
-            ip netns exec "$NS_NAME" iptables -w 5 -A OUTPUT \
-                -o "$VETH_NS" -d "$endpoint_ip" \
-                -p "$endpoint_proto" --dport "$endpoint_port" -j ACCEPT
+            if [[ "$endpoint_port" == 0 ]]; then
+                # Any-port form (dynamic DTLS port): permit by protocol only.
+                ip netns exec "$NS_NAME" iptables -w 5 -A OUTPUT \
+                    -o "$VETH_NS" -d "$endpoint_ip" \
+                    -p "$endpoint_proto" -j ACCEPT
+            else
+                ip netns exec "$NS_NAME" iptables -w 5 -A OUTPUT \
+                    -o "$VETH_NS" -d "$endpoint_ip" \
+                    -p "$endpoint_proto" --dport "$endpoint_port" -j ACCEPT
+            fi
         done <"$endpoints_file"
 
         local dns_server
@@ -4438,14 +4621,14 @@ wireguard_exec() {
     iface=$(wireguard_iface_name "$app")
     runtime_config=$(wireguard_runtime_config_path "$app")
     case "$protocol" in
-        wireguard) wg_cmd=wg; wg_quick=$(command -v wg-quick || true) ;;
-        amneziawg) wg_cmd=awg; wg_quick=$(command -v awg-quick || true) ;;
+        wireguard) wg_cmd=wg; wg_quick=$(command -v wg-quick || true); wg_install=wireguard ;;
+        amneziawg) wg_cmd=awg; wg_quick=$(command -v awg-quick || true); wg_install=amnezia ;;
         *) die "Unknown WireGuard-family backend '$protocol'." ;;
     esac
     [[ -n "$wg_quick" && -x "$wg_quick" ]] ||
-        die "$protocol requires ${wg_cmd} and ${wg_cmd}-quick. On Ubuntu run: sudo nns-app --install amnezia"
+        die "$protocol requires ${wg_cmd} and ${wg_cmd}-quick. Install them with: nns-app --install $wg_install"
     command -v "$wg_cmd" >/dev/null 2>&1 ||
-        die "$protocol requires '$wg_cmd'. On Ubuntu run: sudo nns-app --install amnezia"
+        die "$protocol requires '$wg_cmd'. Install it with: nns-app --install $wg_install"
 
     validate_wireguard "$profile" "$protocol"
     # A reconnect may start with a DNS stub left by the prior successful
@@ -4525,6 +4708,11 @@ vpn_exec() {
             esac
             ;;
         wireguard|amneziawg) wireguard_exec "$app" "$profile" "$type" ;;
+        anyconnect)
+            [[ "${TRANSPORT_TYPE:-direct}" == direct || -z "${TRANSPORT_TYPE:-}" ]] ||
+                die "Transport wrappers (stunnel/cloak/ssh) are not supported for the AnyConnect backend."
+            openconnect_exec "$app" "$profile"
+            ;;
         inherit)
             trap 'exit 0' TERM INT HUP
             while :; do sleep 3600 & wait $! || true; done
@@ -4542,6 +4730,21 @@ app_is_started() {
 wait_online() {
     local app=$1 timeout=$2 deadline
     load_cfg "$app"
+
+    # AnyConnect routing is pushed by the gateway at connect time, so there
+    # is no client-side route list to probe. Readiness means the hook has
+    # configured the TUN (address and default or split routes); a public
+    # 1.1.1.1 probe is intentionally not required for corporate tunnels.
+    if [[ "$(vpn_type_for_app "$app" 2>/dev/null || true)" == anyconnect ]]; then
+        deadline=$((SECONDS + timeout))
+        while (( SECONDS < deadline )); do
+            if vpn_route_ready "$app"; then
+                return 0
+            fi
+            sleep 0.2
+        done
+        return 1
+    fi
 
     # In split-tunnel mode a route to 1.1.1.1 is intentionally absent.
     # Verify the interface and its AllowedIPs route instead. This is a READY
@@ -4606,11 +4809,11 @@ watchdog_enabled_for_type() {
     case "${mode,,}" in
         off|no|false|0|disabled) return 1 ;;
         auto|on|yes|true|1|enabled)
-            [[ "$type" == openvpn || "$type" == wireguard || "$type" == amneziawg ]]
+            [[ "$type" == openvpn || "$type" == wireguard || "$type" == amneziawg || "$type" == anyconnect ]]
             ;;
         *)
             warn "Invalid WATCHDOG_MODE='$mode'; treating it as auto."
-            [[ "$type" == openvpn || "$type" == wireguard || "$type" == amneziawg ]]
+            [[ "$type" == openvpn || "$type" == wireguard || "$type" == amneziawg || "$type" == anyconnect ]]
             ;;
     esac
 }
@@ -4688,7 +4891,8 @@ sync_mtu_timer() {
     local app=$1 kind
     load_cfg "$app"
     kind=$(vpn_type_for_app "$app" 2>/dev/null || true)
-    if [[ "$kind" == openvpn && "${TUN_MTU:-}" =~ ^[0-9]+$ ]] &&
+    if [[ "$kind" == openvpn || "$kind" == anyconnect ]] &&
+       [[ "${TUN_MTU:-}" =~ ^[0-9]+$ ]] &&
        (( TUN_MTU >= 576 && TUN_MTU <= 1500 )); then
         if bool_on "${AUTOSTART:-off}" || app_is_started "$app"; then
             systemctl enable "nns-mtu@${app}.timer" >/dev/null 2>&1 || true
@@ -4799,6 +5003,37 @@ watchdog_check() {
         return 0
     fi
 
+    # Failures that a restart can never fix — expired AnyConnect
+    # authentication or an untrusted/rotated gateway certificate — need user
+    # intervention. Distinguish them from network failures before counting
+    # failures, so the watchdog does not loop on a backend that can only be
+    # repaired interactively or by fixing the profile.
+    if [[ "$type" == anyconnect ]]; then
+        local oc_stop_reason="" oc_stop_result="" oc_stop_hint=""
+        if anyconnect_auth_failure_detected "$app"; then
+            oc_stop_reason="failed or expired AnyConnect authentication"
+            oc_stop_result=auth-required
+            oc_stop_hint="Run: nns-app oc-login $app"
+        elif anyconnect_cert_failure_detected "$app"; then
+            oc_stop_reason="an AnyConnect certificate verification failure"
+            oc_stop_result=config-required
+            oc_stop_hint="Fix fingerprint= in the profile (the gateway may have rotated its certificate) or the system trust store."
+        fi
+        if [[ -n "$oc_stop_reason" ]]; then
+            if [[ "$WD_LAST_RESULT" != "$oc_stop_result" ]]; then
+                warn "Watchdog detected $oc_stop_reason for '$app'; the backend needs user intervention."
+                warn "$oc_stop_hint"
+            fi
+            WD_ARMED=1
+            WD_FAILURES=0
+            WD_LAST_CHECK=$now
+            WD_LAST_RESULT=$oc_stop_result
+            watchdog_state_save "$app"
+            release_lock "watchdog-$app"
+            return 0
+        fi
+    fi
+
     WD_FAILURES=$((WD_FAILURES + 1))
     WD_LAST_CHECK=$now
     WD_LAST_RESULT=offline
@@ -4847,6 +5082,26 @@ watchdog_check() {
     return 0
 }
 
+# The interactive `start`/`restart` readiness window. AnyConnect
+# authentication is multi-stage HTTP (redirect, forms, certificate checks)
+# and routinely exceeds the 5-second default, so AnyConnect gets at least 30
+# seconds; a larger configured READY_TIMEOUT still wins. -i/probe keeps the
+# fast one-second probe.
+start_readiness_timeout() {
+    local vpn_type=$1 ignore=${2:-off} configured=${3:-}
+    local timeout
+    if [[ "$ignore" == probe ]] || bool_on "$ignore"; then
+        timeout=1
+    else
+        timeout=${configured:-5}
+        [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || timeout=5
+        if [[ "$vpn_type" == anyconnect ]] && (( timeout < 30 )); then
+            timeout=30
+        fi
+    fi
+    printf '%s\n' "$timeout"
+}
+
 start_app() {
     require_root
     local app=$1
@@ -4866,7 +5121,7 @@ start_app() {
     # through to the generic backend-detection error.
     if [[ "${REMOTE_MODE:-}" == auto &&
           ( -z "${DEFAULT_PROFILE:-}" || -z "${VPN_TYPE:-}" ) ]]; then
-        die "Automatic remote app '$app' is configured, but no provider profile has been deployed. Run: nns-app add $app /path/to/profile.ovpn"
+        die "Automatic remote app '$app' is configured, but no provider profile has been deployed. Run: nns-app add $app /path/to/profile.ovpn|wireguard.conf|anyconnect.oc"
     fi
 
     # An explicitly started automatic-remote app owns both ends of the path.
@@ -4884,7 +5139,7 @@ start_app() {
     if [[ "$vpn_type" == inherit ]]; then
         profile_marker="inherit:${UPSTREAM_APP:-host}"
     else
-        [[ -n "$DEFAULT_PROFILE" ]] || die "No profile configured. Use: nns-app add $app profile.ovpn|wireguard.conf|amneziawg.conf"
+        [[ -n "$DEFAULT_PROFILE" ]] || die "No profile configured. Use: nns-app add $app profile.ovpn|wireguard.conf|amneziawg.conf|anyconnect.oc"
         [[ -f "$(profiles_dir "$app")/$DEFAULT_PROFILE" ]] ||
             die "Configured profile '$DEFAULT_PROFILE' is missing."
         profile_marker=$DEFAULT_PROFILE
@@ -4959,13 +5214,7 @@ start_app() {
     sync_watchdog_timer "$app"
 
     local timeout
-    if [[ "$ignore_start_error" == probe ]] || bool_on "$ignore_start_error"; then
-        timeout=1
-    else
-        timeout=${READY_TIMEOUT:-5}
-        [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || timeout=5
-    fi
-
+    timeout=$(start_readiness_timeout "$vpn_type" "$ignore_start_error" "${READY_TIMEOUT:-}")
     if wait_online "$app" "$timeout"; then
         if [[ "$ignore_start_error" == off ]]; then
             mtu_auto_repair "$app"
@@ -5151,9 +5400,12 @@ remove_app() {
         "$RUN_DIR/${app}.profile" \
         "$RUN_DIR/${app}.type" \
         "$RUN_DIR/${app}.via" \
+        "$RUN_DIR/${app}.oc-ready" \
+        "$RUN_DIR/${app}.oc-split" \
         "$(watchdog_state_file "$app")" \
         "$(wireguard_runtime_config_path "$app")" \
         "$(wireguard_legacy_runtime_config_path "$app")"
+    rm -rf "$RUN_DIR/${app}.oc-certs"
 
     if [[ -n "$auto_alias" ]] &&
        ! remote_alias_used_by_other_app "$auto_alias" "$app"; then
@@ -5253,7 +5505,7 @@ purge_engine() {
     firewalld_remove_integration
 
     # Remove all files installed by this engine. Do not remove dependency
-    # packages (openvpn, wireguard-tools, iproute2, iptables, curl, sudo, etc.).
+    # packages (openvpn, openconnect, wireguard-tools, iproute2, iptables, curl, sudo, etc.).
     rm -rf -- "$BASE_DIR" "$RUN_DIR"
 
     if [[ -d /etc/netns ]]; then
@@ -5443,7 +5695,7 @@ mtu_apply_saved() {
         return 1
     }
     type=$(vpn_type_for_app "$app" 2>/dev/null || true)
-    [[ "$type" == openvpn ]] || return 0
+    [[ "$type" == openvpn || "$type" == anyconnect ]] || return 0
     dev=$(vpn_route_iface "$app" 2>/dev/null || true)
     [[ "$dev" == tun* ]] || return 0
     actual=$(ip -n "$NS_NAME" -o link show dev "$dev" 2>/dev/null |
@@ -5490,7 +5742,7 @@ mtu_auto_repair_locked() {
     mtu_apply_saved "$app" || true
     [[ "${AUTO_MTU:-on}" != off ]] || { mtu_probe_state "$app" disabled; return 0; }
     kind=$(vpn_type_for_app "$app" 2>/dev/null || true)
-    [[ "$kind" == openvpn ]] || return 0
+    [[ "$kind" == openvpn || "$kind" == anyconnect ]] || return 0
     app_split_tunnel "$app" && { mtu_probe_state "$app" split-tunnel-skipped; return 0; }
     ns=$NS_NAME
     dev=$(vpn_route_iface "$app" 2>/dev/null || true)
@@ -5574,6 +5826,862 @@ mtu_auto_repair_locked() {
     mtu_probe_state "$app" "unresolved:MTU=$original"
     warn "'$app': HTTPS did not reliably recover with reduced MTU; keeping $original."
     return 0
+}
+
+# nns-app source module: OpenConnect/AnyConnect profile handling and runtime.
+# OpenConnect is a generic backend: the AnyConnect protocol is the first
+# validated one, and the same plumbing serves nc/pulse/gp/fortinet/f5/array.
+# The profile format is nns-app's own key=value convention (`.oc`), not a
+# Cisco or OpenConnect native format. Imported profiles are untrusted input:
+# only a fixed allow-list of directives is accepted, helper scripts named by
+# the profile are rejected, and the gateway URL is the only endpoint.
+
+# Deterministic per-app TUN name. The `tun` prefix keeps the existing `tun+`
+# firewall wildcard valid, and the suffix makes the interface unique and
+# predictable inside the app's own network namespace.
+openconnect_iface_name() {
+    local app=$1 crc hex
+    crc=$(printf '%s' "$app" | cksum | awk '{print $1}')
+    printf -v hex '%08x' "$crc"
+    printf 'tun%s\n' "$hex"
+}
+
+# The session cookie saved by `nns-app oc-login` lives next to the managed
+# profile, root-owned and 0600 like every other credential material.
+anyconnect_cookie_path() {
+    local app=$1 profile
+    profile=$(cfg_read_value "$app" DEFAULT_PROFILE 2>/dev/null || true)
+    [[ -n "$profile" ]] || return 1
+    printf '%s/%s.cookie\n' "$(profiles_dir "$app")" "$profile"
+}
+
+anyconnect_profile_value() {
+    local file=$1 key=${2,,}
+    awk -F= -v wanted="$key" '
+        BEGIN { inblock=0 }
+        { gsub(/\r/, "") }
+        /^[[:space:]]*<(cert|key)>[[:space:]]*$/ { inblock=1; next }
+        /^[[:space:]]*<\/(cert|key)>[[:space:]]*$/ { inblock=0; next }
+        inblock { next }
+        /^[[:space:]]*#/ { next }
+        {
+            k=$1; sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k)
+            k=tolower(k)
+            # `password=` is an accepted alias for `passwd=`.
+            if (k == "password") k = "passwd"
+            if (k == wanted) {
+                v=substr($0, index($0, "=") + 1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+                # Inline comments: `key=value  # note` is allowed. A value
+                # containing " #" is therefore not representable; passwords
+                # with that substring must be avoided (use oc-login).
+                sub(/[[:space:]]+#.*$/, "", v)
+                gsub(/[[:space:]]+$/, "", v)
+                print v
+                exit
+            }
+        }
+    ' "$file"
+}
+
+# Extract the body of an inline <cert>/<key> PEM block without the markers.
+anyconnect_pem_block() {
+    local file=$1 tag=$2 body
+    body=$(sed -n "/^[[:space:]]*<$tag>[[:space:]]*$/,\
+/^[[:space:]]*<\/$tag>[[:space:]]*$/p" "$file" | tr -d '\r' | sed '1d;$d')
+    printf '%s\n' "$body"
+}
+
+anyconnect_pem_block_valid() {
+    local file=$1 tag=$2 body first last middle
+    body=$(anyconnect_pem_block "$file" "$tag")
+    [[ -n "$body" ]] || return 1
+    first=$(printf '%s\n' "$body" | sed -n '1p')
+    last=$(printf '%s\n' "$body" | sed -n '$p')
+    [[ "$first" =~ ^-----BEGIN[[:space:]]+(CERTIFICATE|RSA PRIVATE KEY|EC PRIVATE KEY|ENCRYPTED PRIVATE KEY|PRIVATE KEY)-----$ ]] || return 1
+    [[ "$last" =~ ^-----END[[:space:]]+(CERTIFICATE|RSA PRIVATE KEY|EC PRIVATE KEY|ENCRYPTED PRIVATE KEY|PRIVATE KEY)-----$ ]] || return 1
+    middle=$(printf '%s\n' "$body" | sed '1d;$d')
+    [[ -n "$middle" ]] || return 1
+    ! printf '%s\n' "$middle" | grep -Eqv '^[A-Za-z0-9+/=[:space:]]*$' || return 1
+    return 0
+}
+
+validate_anyconnect() {
+    local file=$1 size
+    [[ -f "$file" ]] || die "Profile not found: $file"
+    [[ -s "$file" ]] || die "Profile is empty: $file"
+    size=$(stat -c '%s' "$file" 2>/dev/null || true)
+    if [[ "$size" =~ ^[0-9]+$ ]] && (( size <= 65536 )); then
+        :
+    else
+        die "AnyConnect profile is unexpectedly large (>64 KiB) or its size cannot be determined."
+    fi
+
+    # Only the documented allow-list is accepted. OpenConnect itself can load
+    # options that name helper scripts or external files; an imported profile
+    # is untrusted input, so anything else is rejected outright. Duplicate
+    # directives are rejected too: the first-match-wins parser must never
+    # silently drop a second value. Error lines name the key only, never the
+    # value (credentials must not leak into stderr or the service journal).
+    if ! awk '
+        BEGIN { inblock=0; bad=0
+            allowed = "^(protocol|server|user|passwd|authgroup|fingerprint|"
+            allowed = allowed "token-mode|token-secret|route-mode|mtu|useragent|dtls|dns)$"
+        }
+        { gsub(/\r/, "") }
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        /^[[:space:]]*<(cert|key)>[[:space:]]*$/ {
+            if (inblock) { print "nested inline block: " $0 > "/dev/stderr"; bad=1; next }
+            inblock=1; next
+        }
+        /^[[:space:]]*<\/(cert|key)>[[:space:]]*$/ {
+            if (!inblock) { print "unmatched inline block end: " $0 > "/dev/stderr"; bad=1; next }
+            inblock=0; next
+        }
+        inblock { next }
+        {
+            key=$1; sub(/=.*/, "", key); key=tolower(key)
+            # `password=` is an accepted alias for `passwd=`; declaring both
+            # is ambiguous and rejected as a duplicate.
+            if (key == "password") key = "passwd"
+            if (key !~ allowed) {
+                print "unsupported directive: " key > "/dev/stderr"
+                bad=1
+            } else if (seen[key]++) {
+                print "duplicate directive: " key > "/dev/stderr"
+                bad=1
+            }
+        }
+        END { exit bad }
+    ' "$file"; then
+        die "AnyConnect profile contains unsupported directives; only protocol, server, user, passwd (or password), authgroup, fingerprint, token-mode, token-secret, route-mode, mtu, useragent, dtls, dns and inline <cert>/<key> blocks are allowed."
+    fi
+
+    local server proto user passwd authgroup fingerprint tmode tsec rmode mtu ua
+    local host port
+
+    server=$(anyconnect_profile_value "$file" server)
+    [[ -n "$server" ]] || die "AnyConnect profile has no 'server=' entry."
+    if [[ "$server" =~ ^https://([A-Za-z0-9.-]+)(:([0-9]{1,5}))?(/)?$ ]] ||
+       [[ "$server" =~ ^https://([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})(:([0-9]{1,5}))?(/)?$ ]]; then
+        host=${BASH_REMATCH[1]}
+        port=${BASH_REMATCH[3]:-443}
+    else
+        die "Invalid AnyConnect server URL '$server'; use https://host[:port]."
+    fi
+    (( port >= 1 && port <= 65535 )) ||
+        die "AnyConnect server port must be within 1..65535 in '$server'."
+
+    proto=$(anyconnect_profile_value "$file" protocol)
+    [[ -n "$proto" ]] || proto=anyconnect
+    case "$proto" in
+        anyconnect|nc|pulse|gp|fortinet|f5|array) ;;
+        *) die "Unsupported OpenConnect protocol '$proto'; expected one of anyconnect, nc, pulse, gp, fortinet, f5, array." ;;
+    esac
+
+    user=$(anyconnect_profile_value "$file" user)
+    if [[ -n "$user" ]]; then
+        [[ "$user" =~ ^[A-Za-z0-9@._-]{1,128}$ ]] ||
+            die "Invalid AnyConnect username in profile."
+    fi
+
+    passwd=$(anyconnect_profile_value "$file" passwd)
+    if [[ -n "$passwd" ]]; then
+        # Printable ASCII only; the length is checked separately because
+        # some regex engines cap repetition bounds at 255.
+        if [[ ! "$passwd" =~ ^[[:print:]]+$ || "$passwd" =~ [[:cntrl:]] ]] ||
+           (( ${#passwd} > 256 )); then
+            die "Invalid AnyConnect password in profile (printable characters only, no tabs, max 256)."
+        fi
+    fi
+
+    authgroup=$(anyconnect_profile_value "$file" authgroup)
+    if [[ -n "$authgroup" ]]; then
+        grep -Eq '^[A-Za-z0-9][A-Za-z0-9 ._@/()-]{0,126}$' <<<"$authgroup" ||
+            die "Invalid AnyConnect auth group in profile."
+    fi
+
+    fingerprint=$(anyconnect_profile_value "$file" fingerprint)
+    if [[ -n "$fingerprint" ]]; then
+        local fp_kind=${fingerprint%%:*} fp_body=${fingerprint#*:}
+        case "${fp_kind^^}" in
+            SHA1)   [[ "$fp_body" =~ ^([0-9A-Fa-f]{2}:){19}[0-9A-Fa-f]{2}$ ]] ||
+                        die "Invalid SHA1 fingerprint in profile; use SHA1:<hex pairs separated by colons>." ;;
+            SHA256) [[ "$fp_body" =~ ^([0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2}$ ]] ||
+                        die "Invalid SHA256 fingerprint in profile; use SHA256:<hex pairs separated by colons>." ;;
+            PIN-SHA256)
+                # The format openconnect itself prints in its certificate
+                # error message: a base64-encoded SHA-256 digest.
+                [[ "$fp_body" =~ ^[A-Za-z0-9+/]{40,48}={0,2}$ ]] ||
+                    die "Invalid pin-sha256 fingerprint in profile; use the value shown in openconnect's certificate error." ;;
+            *) die "Invalid fingerprint kind '${fp_kind}'; use SHA1:, SHA256: or pin-sha256:." ;;
+        esac
+    fi
+
+    tmode=$(anyconnect_profile_value "$file" token-mode)
+    if [[ -n "$tmode" ]]; then
+        case "$tmode" in
+            rsa|totp|hotp|oidc|yubioath) ;;
+            *) die "Unsupported token-mode '$tmode'; expected one of rsa, totp, hotp, oidc, yubioath." ;;
+        esac
+    fi
+
+    tsec=$(anyconnect_profile_value "$file" token-secret)
+    if [[ -n "$tsec" ]]; then
+        [[ "$tsec" =~ ^(base32|hotp):[A-Za-z2-7]{16,128}$ ]] ||
+            die "Invalid token-secret in profile; use base32:<secret> (TOTP) or hotp:<secret>."
+    fi
+
+    rmode=$(anyconnect_profile_value "$file" route-mode)
+    if [[ -n "$rmode" ]]; then
+        case "$rmode" in
+            split|full) ;;
+            *) die "Invalid route-mode '$rmode'; use split or full." ;;
+        esac
+    fi
+
+    mtu=$(anyconnect_profile_value "$file" mtu)
+    if [[ -n "$mtu" ]]; then
+        [[ "$mtu" =~ ^[0-9]{3,4}$ ]] && (( mtu >= 576 && mtu <= 9000 )) ||
+            die "Invalid AnyConnect mtu '$mtu'; use 576..9000."
+    fi
+
+    ua=$(anyconnect_profile_value "$file" useragent)
+    if [[ -n "$ua" ]]; then
+        grep -Eq '^[A-Za-z0-9][A-Za-z0-9 .()/_-]{7,127}$' <<<"$ua" ||
+            die "Invalid AnyConnect useragent in profile."
+    fi
+
+    local dtls
+    dtls=$(anyconnect_profile_value "$file" dtls)
+    if [[ -n "$dtls" ]]; then
+        case "$dtls" in
+            on|off) ;;
+            *) die "Invalid dtls value '$dtls'; use on or off." ;;
+        esac
+    fi
+
+    # Fallback resolvers for gateways that push none; used by the hook when
+    # INTERNAL_IP4_DNS is empty. Space-separated IPv4 list, max four.
+    local dns_key dns_list
+    dns_key=$(anyconnect_profile_value "$file" dns)
+    if [[ -n "$dns_key" ]]; then
+        [[ "$dns_key" =~ ^[0-9.]+( [0-9.]+){0,3}$ ]] ||
+            die "Invalid dns value in profile; use a space-separated IPv4 list (max four)."
+        local -a dns_items=()
+        IFS=' ' read -r -a dns_items <<<"$dns_key"
+        for dns_list in "${dns_items[@]}"; do
+            ipv4_address_valid "$dns_list" ||
+                die "Invalid dns entry '$dns_list' in profile; use IPv4 addresses."
+        done
+    fi
+
+    # Client certificates must be fully embedded. Both blocks are required
+    # together, each exactly once, so an imported profile can never make root
+    # read an arbitrary host file through a sidecar path reference.
+    local has_cert has_key
+    # grep -c exits 1 on zero matches, which must not abort the validator.
+    has_cert=$(grep -Eic '^[[:space:]]*<cert>[[:space:]]*$' "$file" || true)
+    has_key=$(grep -Eic '^[[:space:]]*<key>[[:space:]]*$' "$file" || true)
+    if (( has_cert != has_key )) || (( has_cert > 1 )); then
+        die "AnyConnect client certificates must embed exactly one <cert> and one <key> block."
+    fi
+    if (( has_cert == 1 )); then
+        anyconnect_pem_block_valid "$file" cert ||
+            die "AnyConnect <cert> block does not contain a valid PEM certificate."
+        anyconnect_pem_block_valid "$file" key ||
+            die "AnyConnect <key> block does not contain a valid PEM private key."
+    fi
+}
+
+# Routing for AnyConnect is pushed by the gateway at connect time, so the
+# profile itself carries no client-side networks. The functions below keep
+# the generic dispatchers uniform.
+anyconnect_profile_networks() {
+    return 0
+}
+
+anyconnect_profile_route_sample() {
+    return 1
+}
+
+anyconnect_profile_dns_policy() {
+    return 0
+}
+
+anyconnect_profile_route_mode() {
+    local profile=$1 mode
+    mode=$(anyconnect_profile_value "$profile" route-mode)
+    if [[ "$mode" == split ]]; then
+        printf 'split\n'
+    else
+        printf 'full\n'
+    fi
+}
+
+# Endpoint lines for the kill switch and inventory. TLS runs on the
+# configured port; DTLS runs on a port the server advertises dynamically in
+# the CONNECT response (X-DTLS-Port), so UDP must be permitted to the whole
+# gateway address. A port of 0 marks "any port" for the firewall rules.
+# Output: host|port|proto.
+anyconnect_endpoint_lines() {
+    local file=$1 server host port
+    server=$(anyconnect_profile_value "$file" server)
+    [[ -n "$server" ]] || return 1
+    host=${server#https://}
+    host=${host%/}
+    port=443
+    if [[ "$host" == *:* ]]; then
+        port=${host##*:}
+        host=${host%:*}
+    fi
+    [[ "$host" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || return 1
+    printf '%s|%s|tcp\n' "$host" "$port"
+    printf '%s|0|udp\n' "$host"
+}
+
+ipv4_address_valid() {
+    [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+    awk -F. 'BEGIN{ok=1} {for(i=1;i<=4;i++) if ($i<0||$i>255) ok=0} END{exit !ok}' <<<"$1"
+}
+
+# Convert a dotted-quad netmask to a prefix length by counting set bits.
+# Non-contiguous masks (invalid as netmasks) print "invalid" so callers can
+# refuse them instead of installing a bogus route.
+ipv4_netmask_prefix() {
+    awk -F. '{
+        p=0; seen=0; bad=0
+        for(i=1;i<=4;i++){
+            v=$i+0
+            for(b=7;b>=0;b--){
+                bit=(v >= 2^b) ? 1 : 0
+                if (bit) v -= 2^b
+                if (bit && seen) bad=1
+                if (!bit) seen=1
+                if (bit) p++
+            }
+        }
+        print (bad ? "invalid" : p)
+    }' <<<"$1"
+}
+
+# OpenConnect runs the hook inside the app's network namespace; refuse to
+# configure anything if that invariant is broken (never touch the host).
+openconnect_hook_ns_ok() {
+    local current_ns named_ns
+    current_ns=$(stat -Lc '%d:%i' /proc/self/ns/net 2>/dev/null || true)
+    named_ns=$(stat -Lc '%d:%i' "/run/netns/$NS_NAME" 2>/dev/null || true)
+    [[ -n "$current_ns" && "$current_ns" == "$named_ns" ]]
+}
+
+# vpnc-script replacement. openconnect runs the script via `/bin/sh -c` and
+# passes the reason in the `reason` environment variable (not as an argv
+# argument); the dispatcher forwards it, and older argv-based callers remain
+# supported via the $2 fallback. TUNDEV / INTERNAL_IP4_* / CISCO_* arrive in
+# the environment.
+openconnect_hook() {
+    local app=$1 dev=${TUNDEV:-} env_reason=${reason:-}
+    local reason=${2:-}
+    [[ -n "$reason" ]] || reason=$env_reason
+    [[ -n "$dev" ]] || dev=$(openconnect_iface_name "$app")
+    validate_app_name "$app"
+    load_cfg "$app"
+    case "$reason" in
+        pre-init)
+            # openconnect calls this BEFORE the TUN device exists; the real
+            # configuration happens on connect/reconnect.
+            return 0
+            ;;
+        connect|reconnect) openconnect_hook_up "$app" "$dev" ;;
+        attempt-reconnect)
+            # The transport is down and openconnect is about to retry. Drop
+            # the readiness markers so the namespace honestly reports
+            # offline while the session is being re-established; the TUN
+            # device and its routes stay in place for the retry.
+            rm -f "$(openconnect_state_dir)/${app}.oc-ready" \
+                  "$(openconnect_state_dir)/${app}.oc-split"
+            return 0
+            ;;
+        disconnect) openconnect_hook_down "$app" "$dev" ;;
+        *)
+            warn "OpenConnect hook for '$app' received unknown reason '$reason'."
+            return 0
+            ;;
+    esac
+}
+
+# Write the pushed DNS resolvers into the namespace's resolv.conf file.
+# Values come from the gateway and are untrusted: only validated IPv4
+# addresses and a well-formed search domain survive.
+openconnect_hook_write_resolv() {
+    local app=$1
+    shift
+    local target search dns tmp
+    target=$(namespace_resolv_conf_path)
+    install -d -o root -g root -m 0755 "$(dirname -- "$target")" 2>/dev/null || return 1
+    search=${CISCO_DEF_DOMAIN:-}
+    [[ "$search" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] || search=
+    tmp=$(mktemp "${target}.XXXXXX")
+    {
+        for dns in "$@"; do
+            [[ -n "$dns" ]] && printf 'nameserver %s\n' "$dns"
+        done
+        [[ -z "$search" ]] || printf 'search %s\n' "$search"
+        printf 'options timeout:2 attempts:2 rotate\n'
+    } >"$tmp"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$target"
+}
+
+openconnect_hook_up() {
+    local app=$1 dev=$2 prefix mtu ip mask
+    local -a dns_servers=()
+    local split=0
+    validate_app_name "$app"
+    # Self-contained: the pushed config comes from the environment, but the
+    # TUN_MTU override and the dns= fallback live in the app configuration.
+    load_cfg "$app"
+
+    [[ "$dev" =~ ^[A-Za-z0-9._-]{1,15}$ ]] || {
+        warn "AnyConnect hook received an invalid interface name."
+        return 1
+    }
+    if ! openconnect_hook_ns_ok; then
+        warn "'$app': AnyConnect hook is not in the expected network namespace; refusing to configure '$dev'."
+        return 0
+    fi
+
+    ip=${INTERNAL_IP4_ADDRESS:-}
+    ipv4_address_valid "$ip" || {
+        warn "'$app': AnyConnect hook received no usable IPv4 address."
+        return 1
+    }
+
+    # openconnect supplies the netmask either as a prefix length or as a
+    # dotted quad depending on version and protocol family.
+    mask=${INTERNAL_IP4_NETMASK:-}
+    if [[ "$mask" =~ ^[0-9]{1,2}$ ]] && (( mask <= 32 )); then
+        prefix=$mask
+    elif [[ "$mask" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+        prefix=$(ipv4_netmask_prefix "$mask")
+        [[ "$prefix" =~ ^[0-9]{1,2}$ ]] || prefix=32
+    else
+        prefix=32
+    fi
+
+    # The server-negotiated MTU applies unless a validated TUN_MTU was
+    # measured and saved by the MTU auto-repair machinery.
+    mtu=${INTERNAL_IP4_MTU:-}
+    if [[ "$mtu" =~ ^[0-9]{3,4}$ ]] && (( mtu >= 576 && mtu <= 9000 )); then
+        :
+    else
+        mtu=
+    fi
+    if [[ "${TUN_MTU:-}" =~ ^[0-9]+$ ]] &&
+       (( TUN_MTU >= 576 && TUN_MTU <= 1500 )); then
+        mtu=$TUN_MTU
+    fi
+
+    ip addr flush dev "$dev" 2>/dev/null || true
+    ip -4 addr add "$ip/$prefix" dev "$dev" ||
+        { warn "'$app': could not assign $ip/$prefix to '$dev'."; return 1; }
+    if [[ -n "$mtu" ]]; then
+        ip link set dev "$dev" mtu "$mtu" 2>/dev/null || true
+    fi
+    ip link set dev "$dev" up ||
+        { warn "'$app': could not bring up '$dev'."; return 1; }
+
+    # Split-tunnel includes are CISCO_SPLIT_INC_<n>_ADDR with an optional
+    # _MASK (dotted) or _MASKLEN (prefix). With none pushed, the gateway
+    # expects a full tunnel and the default route belongs to the TUN.
+    local split_vars
+    split_vars=$(compgen -A variable | grep -E '^CISCO_SPLIT_INC_[0-9]+_ADDR$' || true)
+    if [[ -n "$split_vars" ]]; then
+        split=1
+        local key n addr mlen msk p
+        while IFS= read -r key; do
+            n=${key#CISCO_SPLIT_INC_}
+            n=${n%_ADDR}
+            addr=${!key:-}
+            mlen="CISCO_SPLIT_INC_${n}_MASKLEN"
+            msk="CISCO_SPLIT_INC_${n}_MASK"
+            if [[ "${!mlen:-}" =~ ^[0-9]{1,2}$ ]] && (( ${!mlen} <= 32 )); then
+                p=${!mlen}
+            elif [[ "${!msk:-}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+                p=$(ipv4_netmask_prefix "${!msk}")
+            else
+                p=32
+            fi
+            if ipv4_address_valid "$addr"; then
+                ip -4 route replace "$addr/$p" dev "$dev" 2>/dev/null ||
+                    warn "'$app': could not install pushed split route $addr/$p via '$dev'."
+            fi
+        done <<<"$split_vars"
+    else
+        ip -4 route replace default dev "$dev" 2>/dev/null ||
+            warn "'$app': could not install the default route via '$dev'."
+    fi
+
+    # The engine keeps IFS=$'\n\t' globally, so split the space-separated
+    # DNS list explicitly (openconnect's INTERNAL_IP4_DNS convention).
+    local -a dns_tokens=()
+    IFS=' ' read -r -a dns_tokens <<<"${INTERNAL_IP4_DNS:-}"
+    for dns in "${dns_tokens[@]}"; do
+        ipv4_address_valid "$dns" && dns_servers+=("$dns")
+    done
+    if (( ${#dns_servers[@]} == 0 )); then
+        # Some gateways push no resolvers at all; honor an explicit dns=
+        # fallback from the managed profile so split tunnels still resolve
+        # corporate names instead of dying on the unreachable bootstrap DNS.
+        if [[ -n "${DEFAULT_PROFILE:-}" && -f "$(profiles_dir "$app")/$DEFAULT_PROFILE" ]]; then
+            local profile_dns
+            profile_dns=$(anyconnect_profile_value "$(profiles_dir "$app")/$DEFAULT_PROFILE" dns)
+            IFS=' ' read -r -a dns_tokens <<<"$profile_dns"
+            for dns in "${dns_tokens[@]}"; do
+                ipv4_address_valid "$dns" && dns_servers+=("$dns")
+            done
+        fi
+    fi
+    if (( ${#dns_servers[@]} == 0 )); then
+        # Last resort: many deployments answer DNS on the VPN gateway
+        # address itself.
+        local vpn_gateway=${VPNGATEWAY:-}
+        if ipv4_address_valid "$vpn_gateway"; then
+            dns_servers+=("$vpn_gateway")
+        fi
+    fi
+    # The gateway's pushed resolvers are answered through the tunnel. A
+    # misconfigured split-tunnel gateway may omit them from its pushed
+    # includes, which would make every DNS query die at the kill switch.
+    # Pin explicit routes so name resolution always has a data path.
+    if (( split )); then
+        for dns in "${dns_servers[@]}"; do
+            ip -4 route replace "$dns/32" dev "$dev" 2>/dev/null || true
+        done
+    fi
+    if (( ${#dns_servers[@]} )); then
+        # Append the configured bootstrap resolvers as fallbacks so public
+        # names can still resolve directly when the kill switch is off.
+        # They are deliberately NOT pinned through the tunnel: fallback
+        # queries must leave via the host uplink.
+        local -a dns_all=("${dns_servers[@]}")
+        local -a boot_tokens=()
+        local boot_dns seen
+        IFS=' ' read -r -a boot_tokens <<<"${DNS_SERVERS:-}"
+        for boot_dns in "${boot_tokens[@]}"; do
+            ipv4_address_valid "$boot_dns" || continue
+            seen=0
+            for dns in "${dns_all[@]}"; do
+                if [[ "$dns" == "$boot_dns" ]]; then seen=1; break; fi
+            done
+            (( seen )) || dns_all+=("$boot_dns")
+            (( ${#dns_all[@]} < 3 )) || break
+        done
+        openconnect_hook_write_resolv "$app" "${dns_all[@]}" ||
+            warn "'$app': could not write the pushed DNS resolvers."
+    fi
+
+    install -d -o root -g root -m 0755 "$(openconnect_state_dir)"
+    printf '%s\n' "$dev" >"$(openconnect_state_dir)/${app}.oc-ready"
+    chmod 0644 "$(openconnect_state_dir)/${app}.oc-ready"
+    if (( split )); then
+        : >"$(openconnect_state_dir)/${app}.oc-split"
+        chmod 0644 "$(openconnect_state_dir)/${app}.oc-split"
+    else
+        rm -f "$(openconnect_state_dir)/${app}.oc-split"
+    fi
+    log "'$app': AnyConnect tunnel '$dev' is up ($ip/$prefix)."
+    return 0
+}
+
+openconnect_hook_down() {
+    local app=$1 dev=$2
+    [[ "$dev" =~ ^[A-Za-z0-9._-]{1,15}$ ]] || return 0
+    rm -f "$(openconnect_state_dir)/${app}.oc-ready" \
+          "$(openconnect_state_dir)/${app}.oc-split"
+    if openconnect_hook_ns_ok; then
+        ip link set dev "$dev" down 2>/dev/null || true
+        ip link del dev "$dev" 2>/dev/null || true
+    fi
+    # Restore bootstrap DNS so a fresh connection can resolve the gateway
+    # from the namespace's original resolvers before the tunnel is up.
+    reset_namespace_bootstrap_dns "$app" 2>/dev/null || true
+    return 0
+}
+
+openconnect_exec() {
+    local app=$1 profile=$2 oc_bin ip_bin
+    local -a args=()
+    local server proto user passwd authgroup fingerprint tmode tsec ua dtls cookie creds certdir
+    # The app name is interpolated into the --script command string; validate
+    # it here too instead of relying on the caller (defense in depth).
+    validate_app_name "$app"
+    load_cfg "$app"
+    validate_anyconnect "$profile"
+    oc_bin=$(openconnect_binary)
+    ip_bin=$(ip_binary)
+
+    server=$(anyconnect_profile_value "$profile" server)
+    proto=$(anyconnect_profile_value "$profile" protocol)
+    [[ -n "$proto" ]] || proto=anyconnect
+    user=$(anyconnect_profile_value "$profile" user)
+    passwd=$(anyconnect_profile_value "$profile" passwd)
+    authgroup=$(anyconnect_profile_value "$profile" authgroup)
+    fingerprint=$(anyconnect_profile_value "$profile" fingerprint)
+    tmode=$(anyconnect_profile_value "$profile" token-mode)
+    tsec=$(anyconnect_profile_value "$profile" token-secret)
+    ua=$(anyconnect_profile_value "$profile" useragent)
+    dtls=$(anyconnect_profile_value "$profile" dtls)
+
+    args+=("$oc_bin" --non-inter --protocol "$proto")
+    # OpenConnect requires a vpnc-script. The engine supplies its own hook:
+    # addresses, routes, MTU and namespace DNS are applied only inside the
+    # app's network namespace; host networking is never modified.
+    args+=(--script "$ENGINE_PATH _oc-hook $app")
+    args+=(--interface "$(openconnect_iface_name "$app")")
+    [[ -n "$authgroup" ]] && args+=(--authgroup "$authgroup")
+    [[ -n "$fingerprint" ]] && args+=(--servercert "$fingerprint")
+    [[ -n "$tmode" ]] && args+=(--token-mode "$tmode")
+    [[ -n "$tsec" ]] && args+=(--token-secret "$tsec")
+    [[ -n "$ua" ]] && args+=(--useragent "$ua")
+    # DTLS is attempted automatically; a network that blocks UDP makes
+    # openconnect retry it every minute, so allow disabling it explicitly.
+    [[ "$dtls" != off ]] || args+=(--no-dtls)
+    # The engine is IPv4-only; never let openconnect negotiate an IPv6
+    # tunnel address or try AAAA-only paths the namespace cannot route.
+    if bool_on "${DISABLE_IPV6:-on}"; then
+        args+=(--disable-ipv6)
+    fi
+    # openconnect >= 9.x defaults the tun queue to 32, which enables
+    # vhost-net; that acceleration path is unreliable for plain TUN devices
+    # and inside network namespaces (control plane up, zero payload
+    # traffic). A queue below 16 disables vhost-net while keeping the
+    # userspace tun path openconnect used for years.
+    args+=(--queue-len 8)
+    if [[ "${TUN_MTU:-}" =~ ^[0-9]+$ ]] &&
+       (( TUN_MTU >= 576 && TUN_MTU <= 1500 )); then
+        args+=(--mtu "$TUN_MTU")
+    fi
+
+    if grep -Eiq '^[[:space:]]*<(cert|key)>[[:space:]]*$' "$profile"; then
+        # Embedded PEM blocks are materialized into a root-only runtime
+        # directory; a stale copy from a crashed session is replaced here.
+        certdir="$RUN_DIR/${app}.oc-certs"
+        rm -rf "$certdir"
+        install -d -o root -g root -m 0700 "$certdir"
+        anyconnect_pem_block "$profile" cert >"$certdir/cert.pem"
+        anyconnect_pem_block "$profile" key >"$certdir/key.pem"
+        chown root:root "$certdir/cert.pem" "$certdir/key.pem"
+        chmod 0600 "$certdir/cert.pem" "$certdir/key.pem"
+        args+=(--certificate "$certdir/cert.pem" --sslkey "$certdir/key.pem")
+    fi
+
+    # Credential selection. A valid saved cookie (from `nns-app oc-login` or
+    # a previous automatic start) survives unattended restarts until the
+    # gateway expires it. With scriptable inline credentials the backend
+    # obtains and persists a fresh cookie itself, so later restarts skip the
+    # gateway's authentication forms entirely; a cookie that the previous
+    # invocation logged as rejected is refreshed the same way. Gateways that
+    # mint their session cookie only during the CONNECT exchange cannot
+    # provide one to `--authenticate`; that outcome is remembered so later
+    # starts skip the doomed round trip and use inline credentials directly.
+    cookie=$(anyconnect_cookie_path "$app" 2>/dev/null || true)
+    local use_cookie=0 fresh_cookie="" noauth_marker=""
+    [[ -z "$cookie" ]] || noauth_marker="${cookie}.no-auth"
+    if [[ -n "$cookie" && -s "$cookie" ]] && ! anyconnect_auth_failure_detected "$app"; then
+        use_cookie=1
+        log "Using the saved AnyConnect session cookie for '$app'."
+        creds=$(<"$cookie")
+    elif [[ -n "$user" && -n "$passwd" && ( -z "$tmode" || -n "$tsec" ) ]]; then
+        if [[ -n "$noauth_marker" && -f "$noauth_marker" ]]; then
+            warn "Skipping automatic cookie acquisition for '$app': the gateway does not expose a session cookie to --authenticate. Using inline credentials."
+        elif fresh_cookie=$(openconnect_obtain_cookie "$app" "$profile" no "$NS_NAME"); then
+            anyconnect_save_cookie "$app" "$fresh_cookie" ||
+                warn "Could not persist the AnyConnect session cookie for '$app'."
+            rm -f "$noauth_marker"
+            use_cookie=1
+            creds=$fresh_cookie
+            log "Stored a fresh AnyConnect session cookie for '$app'; later restarts will reuse it."
+        else
+            [[ -n "$noauth_marker" ]] && : >"$noauth_marker"
+            warn "The gateway did not provide a session cookie during authentication (it may mint it only during CONNECT); connecting with inline credentials."
+        fi
+    fi
+    if (( use_cookie )); then
+        args+=(--cookie-on-stdin)
+    elif [[ -n "$user" && -n "$passwd" ]]; then
+        args+=(--user "$user" --passwd-on-stdin)
+        creds=$(printf '%s\n%s\n' "$user" "$passwd")
+    else
+        die "No AnyConnect credentials are available for '$app'. Run: nns-app oc-login $app (interactive), or set user=/passwd= in the profile."
+    fi
+
+    # Resolve the gateway from bootstrap DNS before the tunnel replaces it.
+    reset_namespace_bootstrap_dns "$app" 2>/dev/null || true
+    install -d -o root -g root -m 0755 "$RUN_DIR"
+    # exec keeps openconnect as the service main process, so SIGTERM
+    # teardown and Restart=on-failure behave exactly like the OpenVPN
+    # backend. The here-string carries credentials/cookie on stdin only.
+    exec "$ip_bin" netns exec "$NS_NAME" "${args[@]}" "$server" <<<"$creds"
+}
+
+# Where the hook records per-session state. A tiny indirection so unit tests
+# can redirect the root-owned runtime directory without touching production
+# paths; normal execution always uses the fixed $RUN_DIR.
+openconnect_state_dir() {
+    printf '%s\n' "$RUN_DIR"
+}
+
+# Write a validated session cookie next to the managed profile, root 0600.
+anyconnect_save_cookie() {
+    local app=$1 cookie=$2 cookiefile tmp
+    cookiefile=$(anyconnect_cookie_path "$app") ||
+        die "Cannot determine the AnyConnect cookie path for '$app'."
+    install -d -o root -g root -m 0755 "$(dirname -- "$cookiefile")"
+    tmp=$(mktemp "${cookiefile}.XXXXXX")
+    # Never leave a half-written cookie or a stray temp file behind.
+    if ! printf '%s' "$cookie" >"$tmp" ||
+       ! chown root:root "$tmp" ||
+       ! chmod 0600 "$tmp" ||
+       ! mv -f "$tmp" "$cookiefile"; then
+        rm -f "$tmp"
+        die "Could not store the AnyConnect session cookie for '$app'."
+    fi
+}
+
+# Detect a failed or expired authentication in the current service log so
+# the watchdog can stop restarting a backend that needs user interaction.
+# Only terminal markers count: form error fields like "Login failed." are
+# printed for the first, rejected submission of multi-attempt gateways and
+# are followed by a successful connection, so they must not classify as a
+# fatal authentication failure.
+anyconnect_auth_failure_detected() {
+    local app=$1
+    journalctl -u "nns-openvpn@${app}.service" -n 60 -o cat --no-pager 2>/dev/null |
+        grep -Eqi 'Failed to complete authentication|Failed to obtain WebVPN cookie|Cookie was rejected by server|not authorized|is no longer valid|401 Unauthorized|User input required in non-interactive mode'
+}
+
+# Certificate verification failures are equally deterministic: no restart can
+# fix an untrusted or rotated gateway certificate. Classify them separately so
+# the watchdog reports the right remedy instead of restarting the backend.
+# "signer not found" alone is benign when a matching pin-sha256 fingerprint
+# lets the connection proceed; only the terminal markers count.
+anyconnect_cert_failure_detected() {
+    local app=$1
+    journalctl -u "nns-openvpn@${app}.service" -n 60 -o cat --no-pager 2>/dev/null |
+        grep -Eqi 'SSL connection failure|None of the [0-9]+ fingerprint|Error in the certificate'
+}
+
+# Run `openconnect --authenticate` for the profile and print the resulting
+# session cookie. With fully scriptable credentials (inline password and no
+# interactive OTP) authentication runs non-interactively; with
+# interactive=yes the terminal stays attached for password/push/OTP prompts.
+# A non-empty ns runs the helper inside that network namespace, so chained
+# apps authenticate through their upstream data path.
+openconnect_obtain_cookie() {
+    local app=$1 profile=$2 interactive=${3:-no} ns=${4:-}
+    local -a args=()
+    local -a run=()
+    local server proto user passwd authgroup fingerprint tmode tsec ua
+    local output cookie certdir
+
+    server=$(anyconnect_profile_value "$profile" server)
+    proto=$(anyconnect_profile_value "$profile" protocol)
+    [[ -n "$proto" ]] || proto=anyconnect
+    user=$(anyconnect_profile_value "$profile" user)
+    passwd=$(anyconnect_profile_value "$profile" passwd)
+    authgroup=$(anyconnect_profile_value "$profile" authgroup)
+    fingerprint=$(anyconnect_profile_value "$profile" fingerprint)
+    tmode=$(anyconnect_profile_value "$profile" token-mode)
+    tsec=$(anyconnect_profile_value "$profile" token-secret)
+    ua=$(anyconnect_profile_value "$profile" useragent)
+
+    [[ -n "$user" ]] || return 1
+
+    args+=("$(openconnect_binary)" --authenticate --quiet --protocol "$proto" --user "$user")
+    [[ -n "$authgroup" ]] && args+=(--authgroup "$authgroup")
+    [[ -n "$fingerprint" ]] && args+=(--servercert "$fingerprint")
+    [[ -n "$tmode" ]] && args+=(--token-mode "$tmode")
+    [[ -n "$tsec" ]] && args+=(--token-secret "$tsec")
+    [[ -n "$ua" ]] && args+=(--useragent "$ua")
+
+    certdir=""
+    if grep -Eiq '^[[:space:]]*<(cert|key)>[[:space:]]*$' "$profile"; then
+        certdir=$(mktemp -d)
+        chmod 0700 "$certdir"
+        anyconnect_pem_block "$profile" cert >"$certdir/cert.pem"
+        anyconnect_pem_block "$profile" key >"$certdir/key.pem"
+        chmod 0600 "$certdir/cert.pem" "$certdir/key.pem"
+        args+=(--certificate "$certdir/cert.pem" --sslkey "$certdir/key.pem")
+    fi
+
+    run=("${args[@]}" "$server")
+    [[ -z "$ns" ]] || run=("$(ip_binary)" netns exec "$ns" "${run[@]}")
+
+    if [[ -n "$passwd" && ( -z "$tmode" || -n "$tsec" ) ]]; then
+        output=$(printf '%s\n%s\n' "$user" "$passwd" |
+                 "${run[@]}" 2>/dev/null) || {
+            rm -rf "${certdir:-}"
+            return 1
+        }
+    elif [[ "$interactive" == yes ]]; then
+        # stderr stays attached to the terminal: openconnect prints password
+        # and one-time-code prompts there.
+        output=$("${run[@]}") || {
+            rm -rf "${certdir:-}"
+            return 1
+        }
+    else
+        rm -rf "${certdir:-}"
+        return 1
+    fi
+    rm -rf "${certdir:-}"
+
+    cookie=$(grep -E '^COOKIE=' <<<"$output" | tail -n1 | cut -d= -f2-)
+    # openconnect prints `COOKIE='<value>'` (single-quoted); accept both the
+    # quoted and the legacy unquoted form.
+    cookie=${cookie#\'}
+    cookie=${cookie%\'}
+    if [[ ! "$cookie" =~ ^[A-Za-z0-9+/=_-]+$ ]] ||
+       (( ${#cookie} < 8 || ${#cookie} > 4096 )); then
+        warn "openconnect did not return a valid session cookie for '$app'."
+        return 1
+    fi
+    printf '%s\n' "$cookie"
+}
+
+# `nns-app oc-login <app>`: interactive or scripted authentication that
+# stores the resulting session cookie without ever touching the tunnel.
+openconnect_login() {
+    require_root
+    local app=$1 profile type cookie
+    validate_app_name "$app"
+    load_cfg "$app"
+    type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    [[ "$type" == anyconnect ]] ||
+        die "App '$app' does not use an AnyConnect profile."
+    [[ -n "${DEFAULT_PROFILE:-}" ]] ||
+        die "No AnyConnect profile is configured for '$app'."
+    profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
+    [[ -f "$profile" ]] || die "AnyConnect profile is missing: $profile"
+    validate_anyconnect "$profile"
+
+    local server
+    server=$(anyconnect_profile_value "$profile" server)
+    local user
+    user=$(anyconnect_profile_value "$profile" user)
+    [[ -n "$user" ]] ||
+        die "AnyConnect profile for '$app' has no 'user=' entry; add one before oc-login."
+    log "Authenticating to ${server} for '$app'; answer the prompts shown by openconnect."
+
+    cookie=$(openconnect_obtain_cookie "$app" "$profile" yes) ||
+        die "openconnect --authenticate failed for '$app'."
+
+    anyconnect_save_cookie "$app" "$cookie"
+    log "AnyConnect session cookie saved for '$app'."
+    log "The backend uses it until the gateway expires the session; re-authenticate with: nns-app oc-login $app"
 }
 
 # nns-app source module: managed remote gateway, PKI, routing and client lifecycle.
@@ -6584,9 +7692,16 @@ PY_GATEWAY_POOL
     # A private-only exit (split-tunnel upstream with kill switch) cannot
     # carry public Internet, so clients must not be promised a default
     # route: push the upstream's private networks and DNS policy instead.
+    # An upstream with server-driven routing (AnyConnect/OpenConnect) has no
+    # static networks or DNS policy to inherit; declaring it private would
+    # leave clients with an empty push, so fall back to a full exit: the
+    # gateway's own data path reaches the upstream tunnel.
     private_exit=off
+    local upstream_networks="" upstream_dns_policy=""
     if [[ "${VIA_APP:-host}" != host ]] && app_is_private_only "$VIA_APP"; then
-        private_exit=on
+        upstream_networks=$(app_profile_networks "$VIA_APP" 2>/dev/null || true)
+        upstream_dns_policy=$(app_profile_dns_policy "$VIA_APP" 2>/dev/null || true)
+        [[ -n "$upstream_networks" || -n "$upstream_dns_policy" ]] && private_exit=on
     fi
 
     {
@@ -6661,12 +7776,14 @@ PY_GATEWAY_POOL
             while read -r net mask; do
                 [[ -n "$net" ]] || continue
                 printf 'push "route %s %s"\n' "$net" "$mask"
-            done < <(app_profile_networks "$VIA_APP" 2>/dev/null || true)
-            dns_policy=$(app_profile_dns_policy "$VIA_APP" 2>/dev/null || true)
+            done <<<"$upstream_networks"
+            dns_policy=$upstream_dns_policy
             if [[ -n "$dns_policy" ]]; then
                 servers=${dns_policy%%$'\n'*}
                 domains=${dns_policy#*$'\n'}
-                for dns in $servers; do
+                local -a gw_dns=()
+                IFS=' ' read -r -a gw_dns <<<"$servers"
+                for dns in "${gw_dns[@]}"; do
                     printf 'push "dhcp-option DNS %s"\n' "$dns"
                 done
                 if [[ "$domains" != "." ]]; then
@@ -6677,7 +7794,9 @@ PY_GATEWAY_POOL
             fi
         else
             printf 'push "redirect-gateway def1 bypass-dhcp"\n'
-            for dns in $DNS_SERVERS; do
+            local -a gw_dns=()
+            IFS=' ' read -r -a gw_dns <<<"$DNS_SERVERS"
+            for dns in "${gw_dns[@]}"; do
                 printf 'push "dhcp-option DNS %s"\n' "$dns"
             done
         fi
@@ -9254,13 +10373,13 @@ gateway_remove() {
 awg_server_config() { printf '%s/%s.conf\n' "$(gateway_dir "$1")" "$(gateway_cfg_value "$1" GATEWAY_TUN)"; }
 
 awg_server_require_runtime() {
-    command -v awg >/dev/null 2>&1 || die "AmneziaWG 3.1 tools missing. On Ubuntu run: sudo nns-app --install amnezia"
-    command -v awg-quick >/dev/null 2>&1 || die "AmneziaWG awg-quick missing. On Ubuntu run: sudo nns-app --install amnezia"
+    command -v awg >/dev/null 2>&1 || die "AmneziaWG 3.1 tools missing. On Ubuntu run: nns-app --install amnezia"
+    command -v awg-quick >/dev/null 2>&1 || die "AmneziaWG awg-quick missing. On Ubuntu run: nns-app --install amnezia"
     # Prefer the userspace backend and do not request an AWG kernel module
     # when amneziawg-go is installed.
     if ! command -v amneziawg-go >/dev/null 2>&1 &&
        ! modprobe -q amneziawg 2>/dev/null; then
-        die "AmneziaWG userspace backend missing. On Ubuntu run: sudo nns-app --install amnezia"
+        die "AmneziaWG userspace backend missing. On Ubuntu run: nns-app --install amnezia"
     fi
     [[ -c /dev/net/tun ]] || modprobe tun 2>/dev/null || true
 }
@@ -10732,9 +11851,15 @@ gateway_write_client_profile_file() {
     # A private-only gateway exit cannot carry public Internet. Embed the
     # upstream's private routes and DNS policy in the client profile so the
     # client machine classifies it as private-only without trusting pushes.
+    # An upstream with server-driven routing (AnyConnect/OpenConnect) has no
+    # static networks or DNS policy to inherit; fall back to a full exit so
+    # the exported profile is usable instead of route-less.
     private_exit=off
+    local upstream_networks="" upstream_dns_policy=""
     if [[ "${VIA_APP:-host}" != host ]] && app_is_private_only "$VIA_APP"; then
-        private_exit=on
+        upstream_networks=$(app_profile_networks "$VIA_APP" 2>/dev/null || true)
+        upstream_dns_policy=$(app_profile_dns_policy "$VIA_APP" 2>/dev/null || true)
+        [[ -n "$upstream_networks" || -n "$upstream_dns_policy" ]] && private_exit=on
     fi
 
     if [[ "$target_mode" == local ]]; then
@@ -10788,12 +11913,14 @@ gateway_write_client_profile_file() {
             while read -r net mask; do
                 [[ -n "$net" ]] || continue
                 printf 'route %s %s\n' "$net" "$mask"
-            done < <(app_profile_networks "$VIA_APP" 2>/dev/null || true)
-            dns_policy=$(app_profile_dns_policy "$VIA_APP" 2>/dev/null || true)
+            done <<<"$upstream_networks"
+            dns_policy=$upstream_dns_policy
             if [[ -n "$dns_policy" ]]; then
                 servers=${dns_policy%%$'\n'*}
                 domains=${dns_policy#*$'\n'}
-                for dns in $servers; do
+                local -a gw_dns=()
+                IFS=' ' read -r -a gw_dns <<<"$servers"
+                for dns in "${gw_dns[@]}"; do
                     printf 'dhcp-option DNS %s\n' "$dns"
                 done
                 if [[ "$domains" != "." ]]; then
@@ -12908,11 +14035,12 @@ remote_auto_add_profile() {
     src=$(readlink -f "$src")
     local type
     type=$(profile_type_from_file "$src" 2>/dev/null || true)
-    [[ -n "$type" ]] || die "Cannot identify '$src' as an OpenVPN or WireGuard profile."
+    [[ -n "$type" ]] || die "Cannot identify '$src' as an OpenVPN, WireGuard or AnyConnect profile."
     case "$type" in
         openvpn) validate_ovpn "$src" ;;
         wireguard) validate_wireguard "$src" ;;
         amneziawg) validate_amneziawg "$src" ;;
+        anyconnect) validate_anyconnect "$src" ;;
     esac
     alias=$REMOTE_ALIAS
     owner=$REMOTE_OWNER_ID
@@ -13735,8 +14863,15 @@ run_in_app() {
     if bool_on "$KILLSWITCH"; then
         systemctl is-active --quiet "nns-openvpn@${app}.service" ||
             die "VPN service for '$app' is not running."
-        vpn_route_ready "$app" ||
-            die "VPN tunnel for '$app' is not ready."
+        if ! vpn_route_ready "$app"; then
+            local run_type
+            run_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+            if [[ "$run_type" == anyconnect ]]; then
+                die "VPN tunnel for '$app' is not ready; the AnyConnect session may be re-authenticating. Check: nns-app status $app"
+            else
+                die "VPN tunnel for '$app' is not ready."
+            fi
+        fi
         wait_online "$app" 2 ||
             die "VPN data path for '$app' is not online yet."
     fi
@@ -13896,6 +15031,22 @@ myip_app_route_path() {
                 printf "app:%s -> %s -> OpenVPN -> Internet\n" "$app" "${route_iface:-tunnel}"
             fi
             ;;
+        anyconnect)
+            if [[ -n "${DEFAULT_PROFILE:-}" ]]; then
+                profile_file="$(profiles_dir "$app")/$DEFAULT_PROFILE"
+                if [[ -f "$profile_file" ]]; then
+                    IFS='|' read -r endpoint_host endpoint_port endpoint_proto < <(
+                        profile_endpoints "$profile_file" 2>/dev/null | head -n 1 || true
+                    )
+                fi
+            fi
+            if [[ -n "${endpoint_host:-}" ]]; then
+                printf "app:%s -> %s -> AnyConnect:%s:%s/%s -> Internet\n" \
+                    "$app" "${route_iface:-tunnel}" "$endpoint_host" "$endpoint_port" "$endpoint_proto"
+            else
+                printf "app:%s -> %s -> AnyConnect -> Internet\n" "$app" "${route_iface:-tunnel}"
+            fi
+            ;;
         wireguard|amneziawg)
             printf "app:%s -> %s -> %s -> Internet\n" "$app" "${route_iface:-tunnel}" "$(vpn_type_label "$type")"
             ;;
@@ -13982,6 +15133,9 @@ myip_report_app() {
     if app_split_tunnel "$app"; then
         if [[ "$(vpn_type_for_app "$app" 2>/dev/null || true)" == openvpn ]]; then
             printf 'Routing mode:      split (client routes only)\n'
+            printf 'VPN tunnel:        %s\n' "${dev:-unavailable}"
+        elif [[ "$(vpn_type_for_app "$app" 2>/dev/null || true)" == anyconnect ]]; then
+            printf 'Routing mode:      split (gateway-pushed routes only)\n'
             printf 'VPN tunnel:        %s\n' "${dev:-unavailable}"
         else
             printf 'Routing mode:      split (IPv4 AllowedIPs only)\n'
@@ -14184,6 +15338,24 @@ openvpn_status_diagnosis() {
     fi
 }
 
+openconnect_status_diagnosis() {
+    local log_file=$1
+    # Only terminal markers are diagnosed. "Login failed." / "signer not
+    # found" appear on every healthy connection to multi-attempt gateways
+    # (first form submission rejected, pin fallback after the trust check).
+    if grep -Eqi 'Failed to complete authentication|Failed to obtain WebVPN cookie|Cookie was rejected by server|not authorized|is no longer valid|401 Unauthorized|User input required in non-interactive mode' "$log_file"; then
+        printf 'AnyConnect authentication failed or the session expired; run: nns-app oc-login <app>'
+    elif grep -Eqi 'SSL connection failure|None of the [0-9]+ fingerprint|Error in the certificate' "$log_file"; then
+        printf 'AnyConnect server certificate verification failed; add fingerprint= to the profile (the openconnect log shows the exact pin-sha256 value) or fix the system trust store.'
+    elif grep -Eqi 'Failed to connect|getaddrinfo|Connection refused|Network is unreachable|No route to host|connection timed out' "$log_file"; then
+        printf 'The AnyConnect gateway is unreachable.'
+    elif grep -Eq 'Connected (as|tun)' "$log_file"; then
+        printf 'AnyConnect connected, but the namespace data path is not currently usable.'
+    else
+        printf 'AnyConnect is running, but no established connection was found in the current service invocation.'
+    fi
+}
+
 status_remote_topology() {
     local app=$1 alias owner output
     # Caller already loaded the app configuration.
@@ -14319,6 +15491,7 @@ status_app() {
         health="STARTING"
         case "$type" in
             openvpn) diagnosis=$(openvpn_status_diagnosis "$vpn_log") ;;
+            anyconnect) diagnosis=$(openconnect_status_diagnosis "$vpn_log") ;;
             wireguard|amneziawg) diagnosis="$(vpn_type_label "$type") is running, but its interface or AllowedIPs routes are not ready." ;;
             inherit) diagnosis="The inherited upstream data path is not ready." ;;
             *) diagnosis="The network backend is active, but no usable route exists." ;;
@@ -14342,6 +15515,7 @@ status_app() {
         health="OFFLINE"
         case "$type" in
             openvpn) diagnosis=$(openvpn_status_diagnosis "$vpn_log") ;;
+            anyconnect) diagnosis=$(openconnect_status_diagnosis "$vpn_log") ;;
             wireguard|amneziawg) diagnosis="The $(vpn_type_label "$type") interface exists, but the Internet data-path probe failed." ;;
             inherit) diagnosis="The upstream route exists, but the inherited Internet data-path probe failed." ;;
             *) diagnosis="The tunnel exists, but the Internet data-path probe failed." ;;
@@ -14397,6 +15571,8 @@ status_app() {
     if app_split_tunnel "$app"; then
         if [[ "$type" == openvpn ]]; then
             printf 'Routing mode:      split (client routes only; no Internet probe)\n'
+        elif [[ "$type" == anyconnect ]]; then
+            printf 'Routing mode:      split (gateway-pushed routes; no Internet probe)\n'
         else
             printf 'Routing mode:      split (AllowedIPs only; no Internet probe)\n'
         fi
@@ -14454,7 +15630,11 @@ status_app() {
         while IFS='|' read -r endpoint_host endpoint_port endpoint_proto; do
             [[ -n "$endpoint_host" && -n "$endpoint_port" && -n "$endpoint_proto" ]] || continue
             endpoint_count=$((endpoint_count + 1))
-            endpoint_line="${endpoint_proto^^} ${endpoint_host}:${endpoint_port}"
+            if [[ "$endpoint_port" == 0 ]]; then
+                endpoint_line="${endpoint_proto^^} ${endpoint_host}:any"
+            else
+                endpoint_line="${endpoint_proto^^} ${endpoint_host}:${endpoint_port}"
+            fi
             if (( endpoint_count == 1 )); then
                 printf 'Endpoint:          %s\n' "$endpoint_line"
             elif (( endpoint_count <= 4 )); then
@@ -14483,6 +15663,24 @@ status_app() {
         else
             printf 'OpenVPN handshake: not established\n'
         fi
+    elif [[ "$type" == anyconnect ]]; then
+        local oc_connected oc_cookie_file oc_tunnel_dns
+        oc_connected=$(grep -E 'Connected as [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$vpn_log" 2>/dev/null | tail -n 1 || true)
+        [[ -z "$oc_connected" ]] || printf 'AnyConnect state:  %s\n' "$oc_connected"
+        if grep -Eq 'Established DTLS' "$vpn_log"; then
+            printf 'AnyConnect DTLS:   established\n'
+        elif grep -Eq 'DTLS' "$vpn_log"; then
+            printf 'AnyConnect DTLS:   negotiating or failed (falling back to TLS)\n'
+        fi
+        oc_cookie_file=$(anyconnect_cookie_path "$app" 2>/dev/null || true)
+        if [[ -n "$oc_cookie_file" && -s "$oc_cookie_file" ]]; then
+            printf 'Authentication:    saved session cookie\n'
+        else
+            printf 'Authentication:    profile credentials\n'
+        fi
+        oc_tunnel_dns=$(awk '/^[[:space:]]*nameserver[[:space:]]+/ {
+            for (i=2;i<=NF;i++) printf "%s ", $i }' "/etc/netns/$NS_NAME/resolv.conf" 2>/dev/null || true)
+        [[ -z "$oc_tunnel_dns" ]] || printf 'Tunnel DNS:        %s\n' "$oc_tunnel_dns"
     elif [[ ( "$type" == wireguard || "$type" == amneziawg ) && -n "$route_iface" ]]; then
         local latest now age peer_count wg_endpoint rx_bytes tx_bytes wg_cmd=wg
         [[ "$type" != amneziawg ]] || wg_cmd=awg
@@ -14519,14 +15717,14 @@ status_app() {
     if [[ "$health" == ONLINE ]]; then
         print_status_log_cut \
             "Recent successful backend markers:" "$vpn_log" \
-            'Initialization Sequence Completed|Peer Connection Initiated|WireGuard interface .* active|latest handshake' 8
+            'Initialization Sequence Completed|Peer Connection Initiated|WireGuard interface .* active|latest handshake|Connected tun|Established DTLS' 8
     else
         print_status_log_cut \
             "Important namespace log cuts:" "$ns_log" \
             'error|warning|failed|invalid|no such|stale|endpoint|upstream|ready|iptables|nft|route' 14
         print_status_log_cut \
             "Important VPN log cuts:" "$vpn_log" \
-            'error|warning|failed|fatal|AUTH_FAILED|VERIFY ERROR|TLS:|TLS Error|TCP connection|Attempting to establish|Peer Connection|Initialization Sequence|WireGuard|AmneziaWG|wg-quick|awg-quick|RTNETLINK|handshake|endpoint|timed out|refused|unreachable' 18
+            'error|warning|failed|fatal|AUTH_FAILED|VERIFY ERROR|TLS:|TLS Error|TCP connection|Attempting to establish|Peer Connection|Initialization Sequence|WireGuard|AmneziaWG|wg-quick|awg-quick|RTNETLINK|handshake|endpoint|timed out|refused|unreachable|Login failed|Connected tun|Established DTLS|cookie' 18
     fi
 
     rm -rf "$tmpdir"
@@ -14560,6 +15758,7 @@ list_apps() {
         else
             profile=${profile%.ovpn}
             profile=${profile%.conf}
+            profile=${profile%.oc}
         fi
         type_label=$(vpn_type_label "${type:-unknown}")
         status=stopped
@@ -14782,11 +15981,13 @@ list_local_instance_records() {
         else
             profile=${profile%.ovpn}
             profile=${profile%.conf}
+            profile=${profile%.oc}
         fi
         case "$vpn_type" in
             openvpn) app_type=vpn-client/ovpn ;;
             wireguard) app_type=vpn-client/wg ;;
             amneziawg) app_type=vpn-client/awg ;;
+            anyconnect) app_type=vpn-client/oc ;;
             inherit) app_type=vpn-client/inherit ;;
             *) app_type=vpn-client ;;
         esac
@@ -17194,6 +18395,15 @@ main() {
             mtu_openvpn_up "$2" "$3"
             exit
             ;;
+        _oc-hook)
+            require_root
+            # openconnect runs its vpnc-script as `/bin/sh -c <script>` and
+            # passes the reason in the `reason` environment variable; TUNDEV /
+            # INTERNAL_IP4_* / CISCO_* also arrive via the environment.
+            (( $# >= 2 )) || die "_oc-hook requires app_name."
+            openconnect_hook "$2" "${3:-${reason:-}}"
+            exit
+            ;;
         _mtu-reconcile)
             require_root
             [[ $# -eq 2 ]] || die "_mtu-reconcile requires app_name."
@@ -17218,9 +18428,14 @@ main() {
 
     case "$cmd" in
         --install)
-            [[ $# -eq 2 && "$2" == amnezia ]] ||
-                die "Usage: nns-app --install amnezia"
-            install_amnezia_userspace_tools
+            [[ $# -eq 2 ]] ||
+                die "Usage: nns-app --install openconnect|wireguard|amnezia"
+            case "$2" in
+                openconnect) install_openconnect_tools ;;
+                wireguard) install_wireguard_tools ;;
+                amnezia) install_amnezia_userspace_tools ;;
+                *) die "Usage: nns-app --install openconnect|wireguard|amnezia" ;;
+            esac
             ;;
         backup)
             shift
@@ -17605,7 +18820,7 @@ main() {
             ;;
         add)
             (( $# >= 3 )) ||
-                die "Usage: nns-app add <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf>|any [country] [--refresh] [--via <upstream-app>|host]"
+                die "Usage: nns-app add <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf|anyconnect.oc>|any [country] [--refresh] [--via <upstream-app>|host]"
             if [[ "$3" == any ]]; then
                 local add_app=$2 add_country="" add_refresh="off" add_via="__default__"
                 shift 3
@@ -17677,6 +18892,10 @@ main() {
             # A stopped app is not an error for restart; proceed to start.
             managed_app_stop "$START_APP_NAME" || true
             managed_app_start "$START_APP_NAME" "$START_IGNORE" "$START_VIA"
+            ;;
+        oc-login)
+            (( $# == 2 )) || die "Usage: nns-app oc-login <app_name>"
+            openconnect_login "$2"
             ;;
         set-via)
             (( $# == 3 )) || die "Usage: nns-app set-via <gateway-app> <upstream-app|host>"

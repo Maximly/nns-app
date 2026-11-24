@@ -42,6 +42,7 @@ dependency_package_for() {
         debian:ssh|debian:scp) printf 'openssh-client\n' ;;
         fedora:ssh|fedora:scp) printf 'openssh-clients\n' ;;
         *:openvpn) printf 'openvpn\n' ;;
+        *:openconnect) printf 'openconnect\n' ;;
         *:wg|*:wg-quick) printf 'wireguard-tools\n' ;;
         *:curl) printf 'curl\n' ;;
         *:setpriv) printf 'util-linux\n' ;;
@@ -73,6 +74,56 @@ install_dependency_packages() {
     esac
 }
 
+# On-demand backend add-on installer shared by `nns-app --install wireguard`
+# and `nns-app --install openconnect`: resolves the missing commands to their
+# distribution packages and installs only those. Never invoked automatically
+# by engine/app installation.
+install_backend_packages() {
+    local backend=$1
+    shift
+    local family command_name package
+    local -a commands=("$@")
+    local -a missing=()
+    local -A selected=()
+
+    family=$(detect_platform_family 2>/dev/null || true)
+    [[ -n "$family" ]] ||
+        die "Unsupported Linux distribution. Install the required commands manually; supported automatic installers are Ubuntu/Debian and Fedora."
+
+    for command_name in "${commands[@]}"; do
+        command -v "$command_name" >/dev/null 2>&1 && continue
+        package=$(dependency_package_for "$family" "$command_name" 2>/dev/null || true)
+        [[ -n "$package" ]] ||
+            die "No package mapping for missing command '$command_name' on '$family'."
+        if [[ -z "${selected[$package]:-}" ]]; then
+            selected[$package]=1
+            missing+=("$package")
+        fi
+    done
+
+    if (( ${#missing[@]} )); then
+        log "Installing $backend packages: ${missing[*]}"
+        install_dependency_packages "$family" "${missing[@]}"
+    fi
+
+    for command_name in "${commands[@]}"; do
+        command -v "$command_name" >/dev/null 2>&1 ||
+            die "Required command '$command_name' is still unavailable after dependency installation."
+    done
+}
+
+install_wireguard_tools() {
+    require_root
+    install_backend_packages wireguard wg wg-quick
+    log "Installed WireGuard tools. Start an existing WireGuard app with: nns-app start <app_name>"
+}
+
+install_openconnect_tools() {
+    require_root
+    install_backend_packages openconnect openconnect
+    log "Installed OpenConnect. Start an existing AnyConnect app with: nns-app start <app_name>"
+}
+
 check_openvpn_version() {
     local raw version binary
     binary=$(openvpn_binary)
@@ -89,8 +140,11 @@ check_openvpn_version() {
 
 ensure_dependencies() {
     local family command_name package
+    # Only OpenVPN is a base dependency. WireGuard, OpenConnect and AmneziaWG
+    # tools are protocol add-ons installed on demand via `nns-app --install`,
+    # never pulled in automatically by an engine or app install.
     local -a commands=(
-        ip openvpn wg wg-quick iptables curl ping setpriv sudo openssl
+        ip openvpn iptables curl ping setpriv sudo openssl
         python3 ssh scp
     )
     local -a missing=()
@@ -674,7 +728,8 @@ install_app() {
 APP_NAME="$app"
 APP_USER="$user"
 DEFAULT_PROFILE=""
-# Empty until a profile is added; the add command sets this to openvpn or wireguard.
+# Empty until a profile is added; the add command sets this to openvpn,
+# wireguard, amneziawg or anyconnect.
 VPN_TYPE=""
 
 # on: application traffic cannot fall back to the host uplink.
@@ -701,6 +756,9 @@ DISABLE_DCO="off"
 #     add a data-ciphers fallback for legacy CBC-only profiles.
 # off: store the profile byte-for-byte without compatibility changes.
 PROFILE_FIXUPS="on"
+# Seconds `start` waits for the tunnel data path. AnyConnect authentication
+# is multi-stage, so AnyConnect apps wait at least 30 seconds regardless of
+# this value; set it higher for unusually slow gateways.
 READY_TIMEOUT="5"
 EXTERNAL_IP_URL="https://api.ipify.org"
 # Check HTTPS on start; tune OpenVPN MTU only when basic IP connectivity is
@@ -770,6 +828,7 @@ CONFIG_EOF
     log "Upstream: ${normalized_via:-host}"
     log "Next:     sudo $USER_PATH add $app /path/to/profile.ovpn"
     log "          or: sudo $USER_PATH add $app /path/to/wireguard.conf"
+    log "          or: sudo $USER_PATH add $app /path/to/anyconnect.oc"
     log "          or: sudo $USER_PATH add $app any [country]${normalized_via:+ --via $normalized_via}"
 }
 

@@ -26,6 +26,7 @@ ifeq ($(shell uname -s),Linux)
 	./tests/test-client-routing.sh
 	./tests/test-backup.sh
 	./tests/test-amneziawg.sh
+	./tests/test-anyconnect.sh
 	./tests/test-awg-server.sh
 	./tests/test-split-tunnel.sh
 	./tests/test-split-dns.sh
@@ -33,6 +34,7 @@ ifeq ($(shell uname -s),Linux)
 	./tests/test-wg-apparmor.sh
 else
 	./macos/tests/test-static.sh
+	./tests/test-anyconnect.sh
 endif
 
 test-macos:

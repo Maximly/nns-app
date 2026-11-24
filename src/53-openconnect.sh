@@ -96,7 +96,7 @@ validate_anyconnect() {
     if ! awk '
         BEGIN { inblock=0; bad=0
             allowed = "^(protocol|server|user|passwd|authgroup|fingerprint|"
-            allowed = allowed "token-mode|token-secret|route-mode|mtu|useragent)$"
+            allowed = allowed "token-mode|token-secret|route-mode|mtu|useragent|dtls|dns)$"
         }
         { gsub(/\r/, "") }
         /^[[:space:]]*#/ { next }
@@ -125,7 +125,7 @@ validate_anyconnect() {
         }
         END { exit bad }
     ' "$file"; then
-        die "AnyConnect profile contains unsupported directives; only protocol, server, user, passwd (or password), authgroup, fingerprint, token-mode, token-secret, route-mode, mtu, useragent and inline <cert>/<key> blocks are allowed."
+        die "AnyConnect profile contains unsupported directives; only protocol, server, user, passwd (or password), authgroup, fingerprint, token-mode, token-secret, route-mode, mtu, useragent, dtls, dns and inline <cert>/<key> blocks are allowed."
     fi
 
     local server proto user passwd authgroup fingerprint tmode tsec rmode mtu ua
@@ -223,6 +223,30 @@ validate_anyconnect() {
             die "Invalid AnyConnect useragent in profile."
     fi
 
+    local dtls
+    dtls=$(anyconnect_profile_value "$file" dtls)
+    if [[ -n "$dtls" ]]; then
+        case "$dtls" in
+            on|off) ;;
+            *) die "Invalid dtls value '$dtls'; use on or off." ;;
+        esac
+    fi
+
+    # Fallback resolvers for gateways that push none; used by the hook when
+    # INTERNAL_IP4_DNS is empty. Space-separated IPv4 list, max four.
+    local dns_key dns_list
+    dns_key=$(anyconnect_profile_value "$file" dns)
+    if [[ -n "$dns_key" ]]; then
+        [[ "$dns_key" =~ ^[0-9.]+( [0-9.]+){0,3}$ ]] ||
+            die "Invalid dns value in profile; use a space-separated IPv4 list (max four)."
+        local -a dns_items=()
+        IFS=' ' read -r -a dns_items <<<"$dns_key"
+        for dns_list in "${dns_items[@]}"; do
+            ipv4_address_valid "$dns_list" ||
+                die "Invalid dns entry '$dns_list' in profile; use IPv4 addresses."
+        done
+    fi
+
     # Client certificates must be fully embedded. Both blocks are required
     # together, each exactly once, so an imported profile can never make root
     # read an arbitrary host file through a sidecar path reference.
@@ -266,8 +290,11 @@ anyconnect_profile_route_mode() {
     fi
 }
 
-# Endpoint lines for the kill switch and inventory: the gateway host with
-# TLS (TCP) and DTLS (UDP) on the configured port. Output: host|port|proto.
+# Endpoint lines for the kill switch and inventory. TLS runs on the
+# configured port; DTLS runs on a port the server advertises dynamically in
+# the CONNECT response (X-DTLS-Port), so UDP must be permitted to the whole
+# gateway address. A port of 0 marks "any port" for the firewall rules.
+# Output: host|port|proto.
 anyconnect_endpoint_lines() {
     local file=$1 server host port
     server=$(anyconnect_profile_value "$file" server)
@@ -282,7 +309,7 @@ anyconnect_endpoint_lines() {
     [[ "$host" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
     [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || return 1
     printf '%s|%s|tcp\n' "$host" "$port"
-    printf '%s|%s|udp\n' "$host" "$port"
+    printf '%s|0|udp\n' "$host"
 }
 
 ipv4_address_valid() {
@@ -338,6 +365,15 @@ openconnect_hook() {
             return 0
             ;;
         connect|reconnect) openconnect_hook_up "$app" "$dev" ;;
+        attempt-reconnect)
+            # The transport is down and openconnect is about to retry. Drop
+            # the readiness markers so the namespace honestly reports
+            # offline while the session is being re-established; the TUN
+            # device and its routes stay in place for the retry.
+            rm -f "$(openconnect_state_dir)/${app}.oc-ready" \
+                  "$(openconnect_state_dir)/${app}.oc-split"
+            return 0
+            ;;
         disconnect) openconnect_hook_down "$app" "$dev" ;;
         *)
             warn "OpenConnect hook for '$app' received unknown reason '$reason'."
@@ -373,6 +409,10 @@ openconnect_hook_up() {
     local app=$1 dev=$2 prefix mtu ip mask
     local -a dns_servers=()
     local split=0
+    validate_app_name "$app"
+    # Self-contained: the pushed config comes from the environment, but the
+    # TUN_MTU override and the dns= fallback live in the app configuration.
+    load_cfg "$app"
 
     [[ "$dev" =~ ^[A-Za-z0-9._-]{1,15}$ ]] || {
         warn "AnyConnect hook received an invalid interface name."
@@ -461,8 +501,55 @@ openconnect_hook_up() {
     for dns in "${dns_tokens[@]}"; do
         ipv4_address_valid "$dns" && dns_servers+=("$dns")
     done
+    if (( ${#dns_servers[@]} == 0 )); then
+        # Some gateways push no resolvers at all; honor an explicit dns=
+        # fallback from the managed profile so split tunnels still resolve
+        # corporate names instead of dying on the unreachable bootstrap DNS.
+        if [[ -n "${DEFAULT_PROFILE:-}" && -f "$(profiles_dir "$app")/$DEFAULT_PROFILE" ]]; then
+            local profile_dns
+            profile_dns=$(anyconnect_profile_value "$(profiles_dir "$app")/$DEFAULT_PROFILE" dns)
+            IFS=' ' read -r -a dns_tokens <<<"$profile_dns"
+            for dns in "${dns_tokens[@]}"; do
+                ipv4_address_valid "$dns" && dns_servers+=("$dns")
+            done
+        fi
+    fi
+    if (( ${#dns_servers[@]} == 0 )); then
+        # Last resort: many deployments answer DNS on the VPN gateway
+        # address itself.
+        local vpn_gateway=${VPNGATEWAY:-}
+        if ipv4_address_valid "$vpn_gateway"; then
+            dns_servers+=("$vpn_gateway")
+        fi
+    fi
+    # The gateway's pushed resolvers are answered through the tunnel. A
+    # misconfigured split-tunnel gateway may omit them from its pushed
+    # includes, which would make every DNS query die at the kill switch.
+    # Pin explicit routes so name resolution always has a data path.
+    if (( split )); then
+        for dns in "${dns_servers[@]}"; do
+            ip -4 route replace "$dns/32" dev "$dev" 2>/dev/null || true
+        done
+    fi
     if (( ${#dns_servers[@]} )); then
-        openconnect_hook_write_resolv "$app" "${dns_servers[@]}" ||
+        # Append the configured bootstrap resolvers as fallbacks so public
+        # names can still resolve directly when the kill switch is off.
+        # They are deliberately NOT pinned through the tunnel: fallback
+        # queries must leave via the host uplink.
+        local -a dns_all=("${dns_servers[@]}")
+        local -a boot_tokens=()
+        local boot_dns seen
+        IFS=' ' read -r -a boot_tokens <<<"${DNS_SERVERS:-}"
+        for boot_dns in "${boot_tokens[@]}"; do
+            ipv4_address_valid "$boot_dns" || continue
+            seen=0
+            for dns in "${dns_all[@]}"; do
+                if [[ "$dns" == "$boot_dns" ]]; then seen=1; break; fi
+            done
+            (( seen )) || dns_all+=("$boot_dns")
+            (( ${#dns_all[@]} < 3 )) || break
+        done
+        openconnect_hook_write_resolv "$app" "${dns_all[@]}" ||
             warn "'$app': could not write the pushed DNS resolvers."
     fi
 
@@ -497,7 +584,7 @@ openconnect_hook_down() {
 openconnect_exec() {
     local app=$1 profile=$2 oc_bin ip_bin
     local -a args=()
-    local server proto user passwd authgroup fingerprint tmode tsec ua cookie creds certdir
+    local server proto user passwd authgroup fingerprint tmode tsec ua dtls cookie creds certdir
     # The app name is interpolated into the --script command string; validate
     # it here too instead of relying on the caller (defense in depth).
     validate_app_name "$app"
@@ -516,6 +603,7 @@ openconnect_exec() {
     tmode=$(anyconnect_profile_value "$profile" token-mode)
     tsec=$(anyconnect_profile_value "$profile" token-secret)
     ua=$(anyconnect_profile_value "$profile" useragent)
+    dtls=$(anyconnect_profile_value "$profile" dtls)
 
     args+=("$oc_bin" --non-inter --protocol "$proto")
     # OpenConnect requires a vpnc-script. The engine supplies its own hook:
@@ -528,6 +616,20 @@ openconnect_exec() {
     [[ -n "$tmode" ]] && args+=(--token-mode "$tmode")
     [[ -n "$tsec" ]] && args+=(--token-secret "$tsec")
     [[ -n "$ua" ]] && args+=(--useragent "$ua")
+    # DTLS is attempted automatically; a network that blocks UDP makes
+    # openconnect retry it every minute, so allow disabling it explicitly.
+    [[ "$dtls" != off ]] || args+=(--no-dtls)
+    # The engine is IPv4-only; never let openconnect negotiate an IPv6
+    # tunnel address or try AAAA-only paths the namespace cannot route.
+    if bool_on "${DISABLE_IPV6:-on}"; then
+        args+=(--disable-ipv6)
+    fi
+    # openconnect >= 9.x defaults the tun queue to 32, which enables
+    # vhost-net; that acceleration path is unreliable for plain TUN devices
+    # and inside network namespaces (control plane up, zero payload
+    # traffic). A queue below 16 disables vhost-net while keeping the
+    # userspace tun path openconnect used for years.
+    args+=(--queue-len 8)
     if [[ "${TUN_MTU:-}" =~ ^[0-9]+$ ]] &&
        (( TUN_MTU >= 576 && TUN_MTU <= 1500 )); then
         args+=(--mtu "$TUN_MTU")
@@ -546,14 +648,39 @@ openconnect_exec() {
         args+=(--certificate "$certdir/cert.pem" --sslkey "$certdir/key.pem")
     fi
 
-    # A saved session cookie (from `nns-app oc-login`) survives unattended
-    # restarts until the gateway expires it. Otherwise inline credentials
-    # are used; without either, the managed service cannot authenticate.
+    # Credential selection. A valid saved cookie (from `nns-app oc-login` or
+    # a previous automatic start) survives unattended restarts until the
+    # gateway expires it. With scriptable inline credentials the backend
+    # obtains and persists a fresh cookie itself, so later restarts skip the
+    # gateway's authentication forms entirely; a cookie that the previous
+    # invocation logged as rejected is refreshed the same way. Gateways that
+    # mint their session cookie only during the CONNECT exchange cannot
+    # provide one to `--authenticate`; that outcome is remembered so later
+    # starts skip the doomed round trip and use inline credentials directly.
     cookie=$(anyconnect_cookie_path "$app" 2>/dev/null || true)
-    if [[ -n "$cookie" && -s "$cookie" ]]; then
+    local use_cookie=0 fresh_cookie="" noauth_marker=""
+    [[ -z "$cookie" ]] || noauth_marker="${cookie}.no-auth"
+    if [[ -n "$cookie" && -s "$cookie" ]] && ! anyconnect_auth_failure_detected "$app"; then
+        use_cookie=1
         log "Using the saved AnyConnect session cookie for '$app'."
-        args+=(--cookie-on-stdin)
         creds=$(<"$cookie")
+    elif [[ -n "$user" && -n "$passwd" && ( -z "$tmode" || -n "$tsec" ) ]]; then
+        if [[ -n "$noauth_marker" && -f "$noauth_marker" ]]; then
+            warn "Skipping automatic cookie acquisition for '$app': the gateway does not expose a session cookie to --authenticate. Using inline credentials."
+        elif fresh_cookie=$(openconnect_obtain_cookie "$app" "$profile" no "$NS_NAME"); then
+            anyconnect_save_cookie "$app" "$fresh_cookie" ||
+                warn "Could not persist the AnyConnect session cookie for '$app'."
+            rm -f "$noauth_marker"
+            use_cookie=1
+            creds=$fresh_cookie
+            log "Stored a fresh AnyConnect session cookie for '$app'; later restarts will reuse it."
+        else
+            [[ -n "$noauth_marker" ]] && : >"$noauth_marker"
+            warn "The gateway did not provide a session cookie during authentication (it may mint it only during CONNECT); connecting with inline credentials."
+        fi
+    fi
+    if (( use_cookie )); then
+        args+=(--cookie-on-stdin)
     elif [[ -n "$user" && -n "$passwd" ]]; then
         args+=(--user "$user" --passwd-on-stdin)
         creds=$(printf '%s\n%s\n' "$user" "$passwd")
@@ -596,40 +723,39 @@ anyconnect_save_cookie() {
 
 # Detect a failed or expired authentication in the current service log so
 # the watchdog can stop restarting a backend that needs user interaction.
+# Only terminal markers count: form error fields like "Login failed." are
+# printed for the first, rejected submission of multi-attempt gateways and
+# are followed by a successful connection, so they must not classify as a
+# fatal authentication failure.
 anyconnect_auth_failure_detected() {
     local app=$1
     journalctl -u "nns-openvpn@${app}.service" -n 60 -o cat --no-pager 2>/dev/null |
-        grep -Eqi 'Login failed|Failed to obtain WebVPN cookie|authentication failed|not authorized|is no longer valid|401 Unauthorized'
+        grep -Eqi 'Failed to complete authentication|Failed to obtain WebVPN cookie|Cookie was rejected by server|not authorized|is no longer valid|401 Unauthorized|User input required in non-interactive mode'
 }
 
 # Certificate verification failures are equally deterministic: no restart can
 # fix an untrusted or rotated gateway certificate. Classify them separately so
 # the watchdog reports the right remedy instead of restarting the backend.
+# "signer not found" alone is benign when a matching pin-sha256 fingerprint
+# lets the connection proceed; only the terminal markers count.
 anyconnect_cert_failure_detected() {
     local app=$1
     journalctl -u "nns-openvpn@${app}.service" -n 60 -o cat --no-pager 2>/dev/null |
-        grep -Eqi 'certificate.*failed verification|signer not found|self.signed|certificate verify failed'
+        grep -Eqi 'SSL connection failure|None of the [0-9]+ fingerprint|Error in the certificate'
 }
 
-# `nns-app oc-login <app>`: interactive or scripted authentication that
-# stores the resulting session cookie without ever touching the tunnel.
-openconnect_login() {
-    require_root
-    local app=$1 profile type oc_bin
+# Run `openconnect --authenticate` for the profile and print the resulting
+# session cookie. With fully scriptable credentials (inline password and no
+# interactive OTP) authentication runs non-interactively; with
+# interactive=yes the terminal stays attached for password/push/OTP prompts.
+# A non-empty ns runs the helper inside that network namespace, so chained
+# apps authenticate through their upstream data path.
+openconnect_obtain_cookie() {
+    local app=$1 profile=$2 interactive=${3:-no} ns=${4:-}
     local -a args=()
+    local -a run=()
     local server proto user passwd authgroup fingerprint tmode tsec ua
     local output cookie certdir
-    validate_app_name "$app"
-    load_cfg "$app"
-    type=$(vpn_type_for_app "$app" 2>/dev/null || true)
-    [[ "$type" == anyconnect ]] ||
-        die "App '$app' does not use an AnyConnect profile."
-    [[ -n "${DEFAULT_PROFILE:-}" ]] ||
-        die "No AnyConnect profile is configured for '$app'."
-    profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
-    [[ -f "$profile" ]] || die "AnyConnect profile is missing: $profile"
-    validate_anyconnect "$profile"
-    oc_bin=$(openconnect_binary)
 
     server=$(anyconnect_profile_value "$profile" server)
     proto=$(anyconnect_profile_value "$profile" protocol)
@@ -642,10 +768,9 @@ openconnect_login() {
     tsec=$(anyconnect_profile_value "$profile" token-secret)
     ua=$(anyconnect_profile_value "$profile" useragent)
 
-    [[ -n "$user" ]] ||
-        die "AnyConnect profile for '$app' has no 'user=' entry; add one before oc-login."
+    [[ -n "$user" ]] || return 1
 
-    args+=("$oc_bin" --authenticate --quiet --protocol "$proto" --user "$user")
+    args+=("$(openconnect_binary)" --authenticate --quiet --protocol "$proto" --user "$user")
     [[ -n "$authgroup" ]] && args+=(--authgroup "$authgroup")
     [[ -n "$fingerprint" ]] && args+=(--servercert "$fingerprint")
     [[ -n "$tmode" ]] && args+=(--token-mode "$tmode")
@@ -662,23 +787,25 @@ openconnect_login() {
         args+=(--certificate "$certdir/cert.pem" --sslkey "$certdir/key.pem")
     fi
 
-    # Fully scriptable credentials (inline password and no interactive OTP)
-    # authenticate non-interactively; otherwise keep the terminal attached
-    # so the user can answer password, push or one-time-code prompts.
+    run=("${args[@]}" "$server")
+    [[ -z "$ns" ]] || run=("$(ip_binary)" netns exec "$ns" "${run[@]}")
+
     if [[ -n "$passwd" && ( -z "$tmode" || -n "$tsec" ) ]]; then
         output=$(printf '%s\n%s\n' "$user" "$passwd" |
-                 "${args[@]}" "$server" 2>/dev/null) || {
+                 "${run[@]}" 2>/dev/null) || {
             rm -rf "${certdir:-}"
-            die "openconnect --authenticate failed for '$app'; check the credentials in the profile."
+            return 1
         }
-    else
-        log "Authenticating to ${server} for '$app'; answer the prompts shown by openconnect."
+    elif [[ "$interactive" == yes ]]; then
         # stderr stays attached to the terminal: openconnect prints password
         # and one-time-code prompts there.
-        output=$("${args[@]}" "$server") || {
+        output=$("${run[@]}") || {
             rm -rf "${certdir:-}"
-            die "openconnect --authenticate failed for '$app'."
+            return 1
         }
+    else
+        rm -rf "${certdir:-}"
+        return 1
     fi
     rm -rf "${certdir:-}"
 
@@ -689,8 +816,38 @@ openconnect_login() {
     cookie=${cookie%\'}
     if [[ ! "$cookie" =~ ^[A-Za-z0-9+/=_-]+$ ]] ||
        (( ${#cookie} < 8 || ${#cookie} > 4096 )); then
-        die "openconnect did not return a valid session cookie for '$app'."
+        warn "openconnect did not return a valid session cookie for '$app'."
+        return 1
     fi
+    printf '%s\n' "$cookie"
+}
+
+# `nns-app oc-login <app>`: interactive or scripted authentication that
+# stores the resulting session cookie without ever touching the tunnel.
+openconnect_login() {
+    require_root
+    local app=$1 profile type cookie
+    validate_app_name "$app"
+    load_cfg "$app"
+    type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    [[ "$type" == anyconnect ]] ||
+        die "App '$app' does not use an AnyConnect profile."
+    [[ -n "${DEFAULT_PROFILE:-}" ]] ||
+        die "No AnyConnect profile is configured for '$app'."
+    profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
+    [[ -f "$profile" ]] || die "AnyConnect profile is missing: $profile"
+    validate_anyconnect "$profile"
+
+    local server
+    server=$(anyconnect_profile_value "$profile" server)
+    local user
+    user=$(anyconnect_profile_value "$profile" user)
+    [[ -n "$user" ]] ||
+        die "AnyConnect profile for '$app' has no 'user=' entry; add one before oc-login."
+    log "Authenticating to ${server} for '$app'; answer the prompts shown by openconnect."
+
+    cookie=$(openconnect_obtain_cookie "$app" "$profile" yes) ||
+        die "openconnect --authenticate failed for '$app'."
 
     anyconnect_save_cookie "$app" "$cookie"
     log "AnyConnect session cookie saved for '$app'."

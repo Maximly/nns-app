@@ -14,6 +14,12 @@ profile_type_from_file() {
         else
             printf 'wireguard\n'
         fi
+    elif [[ "$file" == *.oc ]] ||
+         grep -Eiq '^[[:space:]]*protocol[[:space:]]*=[[:space:]]*(anyconnect|nc|pulse|gp|fortinet|f5|array)[[:space:]]*(#.*)?$' "$file"; then
+        # The `.oc` extension is an nns-app convention for OpenConnect
+        # profiles (AnyConnect first); the protocol= probe also recognizes
+        # them regardless of the file name.
+        printf 'anyconnect\n'
     elif grep -Eiq '^[[:space:]]*remote[[:space:]]+' "$file"; then
         printf 'openvpn\n'
     else
@@ -25,7 +31,7 @@ vpn_type_for_app() {
     local app=$1 configured profile file detected
     configured=$(cfg_read_value "$app" VPN_TYPE 2>/dev/null || true)
     case "$configured" in
-        openvpn|wireguard|amneziawg|inherit)
+        openvpn|wireguard|amneziawg|anyconnect|inherit)
             printf '%s
 ' "$configured"
             return 0
@@ -50,6 +56,8 @@ vpn_type_label() {
         wireguard) printf 'WireGuard
 ' ;;
         amneziawg) printf 'AmneziaWG
+' ;;
+        anyconnect) printf 'AnyConnect
 ' ;;
         inherit) printf 'Inherit
 ' ;;
@@ -91,6 +99,7 @@ profile_name_from_path() {
     case "$type" in
         openvpn) suffix=ovpn ;;
         wireguard|amneziawg) suffix=conf ;;
+        anyconnect) suffix=oc ;;
         *) die "Unsupported VPN profile type '$type'." ;;
     esac
     printf '%.64s.%s\n' "$name" "$suffix"
@@ -703,6 +712,7 @@ app_profile_networks() {
     case "$backend" in
         wireguard|amneziawg) wireguard_profile_networks "$profile" ;;
         openvpn) openvpn_profile_networks "$profile" ;;
+        anyconnect) anyconnect_profile_networks "$profile" ;;
         *) return 1 ;;
     esac
 }
@@ -716,6 +726,7 @@ app_profile_route_sample() {
     case "$backend" in
         wireguard|amneziawg) wireguard_profile_route_sample "$profile" ;;
         openvpn) openvpn_profile_route_sample "$profile" ;;
+        anyconnect) anyconnect_profile_route_sample "$profile" ;;
         *) return 1 ;;
     esac
 }
@@ -729,6 +740,7 @@ app_profile_dns_policy() {
     case "$backend" in
         wireguard|amneziawg) wireguard_profile_dns_policy "$profile" "$mode" ;;
         openvpn) openvpn_profile_dns_policy "$profile" "$mode" ;;
+        anyconnect) anyconnect_profile_dns_policy "$profile" "$mode" ;;
         *) return 1 ;;
     esac
 }
@@ -748,12 +760,19 @@ app_is_private_only() {
 app_split_tunnel() {
     local app=$1 backend profile
     backend=$(vpn_type_for_app "$app" 2>/dev/null || true)
-    case "$backend" in wireguard|amneziawg|openvpn) ;; *) return 1 ;; esac
+    case "$backend" in wireguard|amneziawg|openvpn|anyconnect) ;; *) return 1 ;; esac
     profile=$(cfg_read_value "$app" DEFAULT_PROFILE 2>/dev/null || true)
     [[ -n "$profile" && -f "$(profiles_dir "$app")/$profile" ]] || return 1
     profile="$(profiles_dir "$app")/$profile"
     case "$backend" in
         openvpn) [[ "$(openvpn_profile_route_mode "$profile")" == split ]] ;;
+        anyconnect)
+            # Routing is pushed by the gateway at connect time, so a split
+            # tunnel is authoritative either from the profile declaration or
+            # from the split includes the hook recorded for the live session.
+            [[ "$(anyconnect_profile_route_mode "$profile")" == split ]] ||
+            [[ -f "$(openconnect_state_dir)/${app}.oc-split" ]]
+            ;;
         *) [[ "$(wireguard_profile_route_mode "$profile")" == split ]] ;;
     esac
 }
@@ -1184,13 +1203,34 @@ add_profile() {
     local type
     type=$(profile_type_from_file "$src" 2>/dev/null || true)
     [[ -n "$type" ]] ||
-        die "Cannot identify '$src' as an OpenVPN, WireGuard or AmneziaWG profile."
+        die "Cannot identify '$src' as an OpenVPN, WireGuard, AmneziaWG or AnyConnect profile."
 
     case "$type" in
         openvpn) validate_ovpn "$src" ;;
         wireguard) validate_wireguard "$src" ;;
         amneziawg) validate_amneziawg "$src" ;;
+        anyconnect) validate_anyconnect "$src" ;;
         *) die "Unsupported VPN profile type '$type'." ;;
+    esac
+
+    # Backends beyond OpenVPN are add-ons: engine and app installs never pull
+    # their tools automatically. Say so up front when the profile's backend
+    # binaries are missing, with the exact installer command.
+    case "$type" in
+        anyconnect)
+            command -v openconnect >/dev/null 2>&1 ||
+                warn "openconnect is not installed; the AnyConnect backend needs it. Install it with: nns-app --install openconnect"
+            ;;
+        wireguard)
+            if ! command -v wg >/dev/null 2>&1 || ! command -v wg-quick >/dev/null 2>&1; then
+                warn "WireGuard tools (wg, wg-quick) are not installed. Install them with: nns-app --install wireguard"
+            fi
+            ;;
+        amneziawg)
+            if ! command -v awg >/dev/null 2>&1 || ! command -v awg-quick >/dev/null 2>&1; then
+                warn "AmneziaWG tools (awg, awg-quick) are not installed. Install them with: nns-app --install amnezia"
+            fi
+            ;;
     esac
 
     local name dest tmp
@@ -1217,6 +1257,12 @@ add_profile() {
         amneziawg)
             validate_amneziawg "$tmp"
             ;;
+        anyconnect)
+            validate_anyconnect "$tmp"
+            ;;
+        *)
+            die "Unsupported VPN profile type '$type'."
+            ;;
     esac
 
     install -o root -g root -m 0600 "$tmp" "$dest"
@@ -1237,6 +1283,16 @@ add_profile() {
             log "No compatibility fixes were needed."
         else
             log "OpenVPN profile fixups are disabled in $(cfg_file "$app")."
+        fi
+    elif [[ "$type" == anyconnect ]]; then
+        # A replaced profile targets a possibly different gateway: a stale
+        # session cookie from `oc-login` must not outlive its profile.
+        rm -f "$dest.cookie"
+        if ! grep -Eiq '^[[:space:]]*(user|passwd|password|token-secret)[[:space:]]*=' "$dest"; then
+            warn "The AnyConnect profile has no inline credentials; run: nns-app oc-login $app"
+        fi
+        if [[ "$(anyconnect_profile_route_mode "$dest")" == split ]]; then
+            log "Profile declares route-mode=split; the gateway may also push split tunnels at connect time."
         fi
     else
         local dns_policy="" dns_domains="" policy_label
@@ -1263,6 +1319,11 @@ add_profile() {
             if ! bool_on "${KILLSWITCH:-on}"; then
                 warn "KILLSWITCH is off: traffic outside AllowedIPs may use the host uplink."
             fi
+        fi
+    fi
+    if [[ "$type" == anyconnect && "$(anyconnect_profile_route_mode "$dest")" == split ]]; then
+        if ! bool_on "${KILLSWITCH:-on}"; then
+            warn "KILLSWITCH is off: traffic outside the gateway-pushed split routes may use the host uplink."
         fi
     fi
     log "Default profile is now '$name' ($(vpn_type_label "$type"))."

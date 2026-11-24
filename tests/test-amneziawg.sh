@@ -165,8 +165,10 @@ reject_change timer_overflow 'RekeyTimeout = 4-7' 'RekeyTimeout = 4-65536'
 grep -Fq 'awg show' "$TMP/ip.log" || fail 'AWG route was checked with wg instead of awg'
 
 # The server-side code must select awg-quick, not invoke wg-quick on AWG config.
-grep -Fq 'amneziawg) wg_cmd=awg; wg_quick=$(command -v awg-quick || true)' "$ROOT/src/50-runtime.sh" ||
+grep -Fq 'amneziawg) wg_cmd=awg; wg_quick=$(command -v awg-quick || true); wg_install=amnezia' "$ROOT/src/50-runtime.sh" ||
     fail 'AWG quick backend unavailable'
+grep -Fq 'wireguard) wg_cmd=wg; wg_quick=$(command -v wg-quick || true); wg_install=wireguard' "$ROOT/src/50-runtime.sh" ||
+    fail 'WireGuard backend hints its own add-on installer'
 grep -Fq 'wireguard|amneziawg) tunnel_iface=' "$ROOT/src/40-network.sh" || fail 'network path rejects AWG'
 grep -Fq 'amneziawg) app_type=vpn-client/awg' "$ROOT/src/70-run-status.sh" || fail 'inventory type missing'
 

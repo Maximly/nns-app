@@ -40,14 +40,14 @@ wireguard_exec() {
     iface=$(wireguard_iface_name "$app")
     runtime_config=$(wireguard_runtime_config_path "$app")
     case "$protocol" in
-        wireguard) wg_cmd=wg; wg_quick=$(command -v wg-quick || true) ;;
-        amneziawg) wg_cmd=awg; wg_quick=$(command -v awg-quick || true) ;;
+        wireguard) wg_cmd=wg; wg_quick=$(command -v wg-quick || true); wg_install=wireguard ;;
+        amneziawg) wg_cmd=awg; wg_quick=$(command -v awg-quick || true); wg_install=amnezia ;;
         *) die "Unknown WireGuard-family backend '$protocol'." ;;
     esac
     [[ -n "$wg_quick" && -x "$wg_quick" ]] ||
-        die "$protocol requires ${wg_cmd} and ${wg_cmd}-quick. On Ubuntu run: sudo nns-app --install amnezia"
+        die "$protocol requires ${wg_cmd} and ${wg_cmd}-quick. Install them with: nns-app --install $wg_install"
     command -v "$wg_cmd" >/dev/null 2>&1 ||
-        die "$protocol requires '$wg_cmd'. On Ubuntu run: sudo nns-app --install amnezia"
+        die "$protocol requires '$wg_cmd'. Install it with: nns-app --install $wg_install"
 
     validate_wireguard "$profile" "$protocol"
     # A reconnect may start with a DNS stub left by the prior successful
@@ -127,6 +127,11 @@ vpn_exec() {
             esac
             ;;
         wireguard|amneziawg) wireguard_exec "$app" "$profile" "$type" ;;
+        anyconnect)
+            [[ "${TRANSPORT_TYPE:-direct}" == direct || -z "${TRANSPORT_TYPE:-}" ]] ||
+                die "Transport wrappers (stunnel/cloak/ssh) are not supported for the AnyConnect backend."
+            openconnect_exec "$app" "$profile"
+            ;;
         inherit)
             trap 'exit 0' TERM INT HUP
             while :; do sleep 3600 & wait $! || true; done
@@ -144,6 +149,21 @@ app_is_started() {
 wait_online() {
     local app=$1 timeout=$2 deadline
     load_cfg "$app"
+
+    # AnyConnect routing is pushed by the gateway at connect time, so there
+    # is no client-side route list to probe. Readiness means the hook has
+    # configured the TUN (address and default or split routes); a public
+    # 1.1.1.1 probe is intentionally not required for corporate tunnels.
+    if [[ "$(vpn_type_for_app "$app" 2>/dev/null || true)" == anyconnect ]]; then
+        deadline=$((SECONDS + timeout))
+        while (( SECONDS < deadline )); do
+            if vpn_route_ready "$app"; then
+                return 0
+            fi
+            sleep 0.2
+        done
+        return 1
+    fi
 
     # In split-tunnel mode a route to 1.1.1.1 is intentionally absent.
     # Verify the interface and its AllowedIPs route instead. This is a READY
@@ -208,11 +228,11 @@ watchdog_enabled_for_type() {
     case "${mode,,}" in
         off|no|false|0|disabled) return 1 ;;
         auto|on|yes|true|1|enabled)
-            [[ "$type" == openvpn || "$type" == wireguard || "$type" == amneziawg ]]
+            [[ "$type" == openvpn || "$type" == wireguard || "$type" == amneziawg || "$type" == anyconnect ]]
             ;;
         *)
             warn "Invalid WATCHDOG_MODE='$mode'; treating it as auto."
-            [[ "$type" == openvpn || "$type" == wireguard || "$type" == amneziawg ]]
+            [[ "$type" == openvpn || "$type" == wireguard || "$type" == amneziawg || "$type" == anyconnect ]]
             ;;
     esac
 }
@@ -290,7 +310,8 @@ sync_mtu_timer() {
     local app=$1 kind
     load_cfg "$app"
     kind=$(vpn_type_for_app "$app" 2>/dev/null || true)
-    if [[ "$kind" == openvpn && "${TUN_MTU:-}" =~ ^[0-9]+$ ]] &&
+    if [[ "$kind" == openvpn || "$kind" == anyconnect ]] &&
+       [[ "${TUN_MTU:-}" =~ ^[0-9]+$ ]] &&
        (( TUN_MTU >= 576 && TUN_MTU <= 1500 )); then
         if bool_on "${AUTOSTART:-off}" || app_is_started "$app"; then
             systemctl enable "nns-mtu@${app}.timer" >/dev/null 2>&1 || true
@@ -401,6 +422,37 @@ watchdog_check() {
         return 0
     fi
 
+    # Failures that a restart can never fix — expired AnyConnect
+    # authentication or an untrusted/rotated gateway certificate — need user
+    # intervention. Distinguish them from network failures before counting
+    # failures, so the watchdog does not loop on a backend that can only be
+    # repaired interactively or by fixing the profile.
+    if [[ "$type" == anyconnect ]]; then
+        local oc_stop_reason="" oc_stop_result="" oc_stop_hint=""
+        if anyconnect_auth_failure_detected "$app"; then
+            oc_stop_reason="failed or expired AnyConnect authentication"
+            oc_stop_result=auth-required
+            oc_stop_hint="Run: nns-app oc-login $app"
+        elif anyconnect_cert_failure_detected "$app"; then
+            oc_stop_reason="an AnyConnect certificate verification failure"
+            oc_stop_result=config-required
+            oc_stop_hint="Fix fingerprint= in the profile (the gateway may have rotated its certificate) or the system trust store."
+        fi
+        if [[ -n "$oc_stop_reason" ]]; then
+            if [[ "$WD_LAST_RESULT" != "$oc_stop_result" ]]; then
+                warn "Watchdog detected $oc_stop_reason for '$app'; the backend needs user intervention."
+                warn "$oc_stop_hint"
+            fi
+            WD_ARMED=1
+            WD_FAILURES=0
+            WD_LAST_CHECK=$now
+            WD_LAST_RESULT=$oc_stop_result
+            watchdog_state_save "$app"
+            release_lock "watchdog-$app"
+            return 0
+        fi
+    fi
+
     WD_FAILURES=$((WD_FAILURES + 1))
     WD_LAST_CHECK=$now
     WD_LAST_RESULT=offline
@@ -449,6 +501,26 @@ watchdog_check() {
     return 0
 }
 
+# The interactive `start`/`restart` readiness window. AnyConnect
+# authentication is multi-stage HTTP (redirect, forms, certificate checks)
+# and routinely exceeds the 5-second default, so AnyConnect gets at least 30
+# seconds; a larger configured READY_TIMEOUT still wins. -i/probe keeps the
+# fast one-second probe.
+start_readiness_timeout() {
+    local vpn_type=$1 ignore=${2:-off} configured=${3:-}
+    local timeout
+    if [[ "$ignore" == probe ]] || bool_on "$ignore"; then
+        timeout=1
+    else
+        timeout=${configured:-5}
+        [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || timeout=5
+        if [[ "$vpn_type" == anyconnect ]] && (( timeout < 30 )); then
+            timeout=30
+        fi
+    fi
+    printf '%s\n' "$timeout"
+}
+
 start_app() {
     require_root
     local app=$1
@@ -468,7 +540,7 @@ start_app() {
     # through to the generic backend-detection error.
     if [[ "${REMOTE_MODE:-}" == auto &&
           ( -z "${DEFAULT_PROFILE:-}" || -z "${VPN_TYPE:-}" ) ]]; then
-        die "Automatic remote app '$app' is configured, but no provider profile has been deployed. Run: nns-app add $app /path/to/profile.ovpn"
+        die "Automatic remote app '$app' is configured, but no provider profile has been deployed. Run: nns-app add $app /path/to/profile.ovpn|wireguard.conf|anyconnect.oc"
     fi
 
     # An explicitly started automatic-remote app owns both ends of the path.
@@ -486,7 +558,7 @@ start_app() {
     if [[ "$vpn_type" == inherit ]]; then
         profile_marker="inherit:${UPSTREAM_APP:-host}"
     else
-        [[ -n "$DEFAULT_PROFILE" ]] || die "No profile configured. Use: nns-app add $app profile.ovpn|wireguard.conf|amneziawg.conf"
+        [[ -n "$DEFAULT_PROFILE" ]] || die "No profile configured. Use: nns-app add $app profile.ovpn|wireguard.conf|amneziawg.conf|anyconnect.oc"
         [[ -f "$(profiles_dir "$app")/$DEFAULT_PROFILE" ]] ||
             die "Configured profile '$DEFAULT_PROFILE' is missing."
         profile_marker=$DEFAULT_PROFILE
@@ -561,13 +633,7 @@ start_app() {
     sync_watchdog_timer "$app"
 
     local timeout
-    if [[ "$ignore_start_error" == probe ]] || bool_on "$ignore_start_error"; then
-        timeout=1
-    else
-        timeout=${READY_TIMEOUT:-5}
-        [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || timeout=5
-    fi
-
+    timeout=$(start_readiness_timeout "$vpn_type" "$ignore_start_error" "${READY_TIMEOUT:-}")
     if wait_online "$app" "$timeout"; then
         if [[ "$ignore_start_error" == off ]]; then
             mtu_auto_repair "$app"
@@ -753,9 +819,12 @@ remove_app() {
         "$RUN_DIR/${app}.profile" \
         "$RUN_DIR/${app}.type" \
         "$RUN_DIR/${app}.via" \
+        "$RUN_DIR/${app}.oc-ready" \
+        "$RUN_DIR/${app}.oc-split" \
         "$(watchdog_state_file "$app")" \
         "$(wireguard_runtime_config_path "$app")" \
         "$(wireguard_legacy_runtime_config_path "$app")"
+    rm -rf "$RUN_DIR/${app}.oc-certs"
 
     if [[ -n "$auto_alias" ]] &&
        ! remote_alias_used_by_other_app "$auto_alias" "$app"; then
@@ -855,7 +924,7 @@ purge_engine() {
     firewalld_remove_integration
 
     # Remove all files installed by this engine. Do not remove dependency
-    # packages (openvpn, wireguard-tools, iproute2, iptables, curl, sudo, etc.).
+    # packages (openvpn, openconnect, wireguard-tools, iproute2, iptables, curl, sudo, etc.).
     rm -rf -- "$BASE_DIR" "$RUN_DIR"
 
     if [[ -d /etc/netns ]]; then

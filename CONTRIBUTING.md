@@ -7,7 +7,9 @@ preserve. The user-facing topology and commands are documented in `README.md`.
 
 The maintained source is split into ordered modules under `src/`. The sole
 release version lives in the repo-root `VERSION` file; `build.sh` embeds it
-into `install_linux` / `install_macos` (replacing `@@NNS_VERSION@@`). `build.sh`
+into `install_linux` / `install_macos` (replacing `@@NNS_VERSION@@`) and
+rewrites the `**Current release:**` line of `README.md` from it, so bumping
+`VERSION` is the only version-related step a release requires. `build.sh`
 dispatches by build host OS. On Linux, it syntax-checks every source module,
 concatenates them, validates the combined Bash file and embedded Python, and
 writes `install_linux`. On macOS, it compiles the Darwin C launcher and
@@ -42,6 +44,10 @@ location, host, or personal names into public help, comments, tests, or docs.
 - OpenVPN directives capable of executing code, loading plug-ins, changing
   process confinement, or exposing management interfaces are rejected.
 - WireGuard hook directives are rejected.
+- AnyConnect (`.oc`) profiles accept only a fixed key allow-list plus inline
+  `<cert>`/`<key>` PEM blocks; helper scripts and external file references
+  are rejected, and `openconnect` always runs with the engine's own hook in
+  place of `vpnc-script`.
 - Generated private keys use mode `0600` or `0640` as appropriate.
 - `.nnslink` archives are untrusted input and must be allow-listed by member name and type before extraction.
 - Remote SSH targets are structured data, never shell fragments; host keys remain pinned in a dedicated root-owned `known_hosts` file.

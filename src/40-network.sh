@@ -49,6 +49,9 @@ for raw in text.splitlines():
     print(f"{host}|{port}|udp")
 PY_WG_ENDPOINTS
             ;;
+        anyconnect)
+            anyconnect_endpoint_lines "$profile"
+            ;;
     esac
 }
 
@@ -68,8 +71,18 @@ resolve_profile_endpoints() {
         [[ -n "$host" && -n "$port" && -n "$proto" ]] || continue
         [[ "$port" =~ ^[0-9]+$ ]] ||
             die "Invalid VPN endpoint port '$port' in $profile"
-        (( port >= 1 && port <= 65535 )) ||
+        if (( port == 0 )); then
+            # Port 0 marks "any destination port" and is valid only for UDP
+            # endpoints: the AnyConnect gateway advertises its DTLS port
+            # dynamically, so the kill switch permits UDP to the whole
+            # gateway address instead of guessing a port.
+            [[ "$proto" == udp ]] ||
+                die "Endpoint port 0 (any port) is valid only for udp in $profile"
+        elif (( port >= 1 && port <= 65535 )); then
+            :
+        else
             die "VPN endpoint port '$port' is outside 1..65535 in $profile"
+        fi
         case "$proto" in
             tcp|udp) ;;
             *) die "Invalid VPN endpoint protocol '$proto' in $profile" ;;
@@ -347,6 +360,12 @@ ensure_namespace_dns_nsswitch() {
     namespace_dns_nsswitch_write /etc/nsswitch.conf "$target"
 }
 
+# The bind-mounted resolver inside an app namespace. A small helper (rather
+# than an inline path) so runtime hooks and tests share one source of truth.
+namespace_resolv_conf_path() {
+    printf '/etc/netns/%s/resolv.conf\n' "$NS_NAME"
+}
+
 # Restore the normal per-namespace resolver during WireGuard bootstrap.
 # This permits hostname endpoints to be resolved by wg-quick before the VPN
 # route exists. The pre-tunnel firewall allows DNS only for uid 0.
@@ -436,7 +455,7 @@ netns_up() {
             [[ "$via_app" != host ]] || die "Inherit backend '$app' requires an upstream NNS app."
             tunnel_iface=$VETH_NS
             ;;
-        openvpn) tunnel_iface='tun+' ;;
+        openvpn|anyconnect) tunnel_iface='tun+' ;;
         *) die "Unsupported VPN backend '$vpn_type'." ;;
     esac
     if [[ "$vpn_type" != inherit ]]; then
@@ -569,9 +588,16 @@ netns_up() {
 
     if bool_on "$KILLSWITCH"; then
         while IFS='|' read -r endpoint_ip endpoint_port endpoint_proto; do
-            ip netns exec "$NS_NAME" iptables -w 5 -A OUTPUT \
-                -o "$VETH_NS" -d "$endpoint_ip" \
-                -p "$endpoint_proto" --dport "$endpoint_port" -j ACCEPT
+            if [[ "$endpoint_port" == 0 ]]; then
+                # Any-port form (dynamic DTLS port): permit by protocol only.
+                ip netns exec "$NS_NAME" iptables -w 5 -A OUTPUT \
+                    -o "$VETH_NS" -d "$endpoint_ip" \
+                    -p "$endpoint_proto" -j ACCEPT
+            else
+                ip netns exec "$NS_NAME" iptables -w 5 -A OUTPUT \
+                    -o "$VETH_NS" -d "$endpoint_ip" \
+                    -p "$endpoint_proto" --dport "$endpoint_port" -j ACCEPT
+            fi
         done <"$endpoints_file"
 
         local dns_server

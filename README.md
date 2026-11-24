@@ -10,7 +10,7 @@ is available: a managed kernel `utun`, interface-scoped route and an opt-in C
 socket interposer. The macOS backend is **not a network namespace or a security
 sandbox**.
 
-**Current release:** 2.1.7 · **License:** GPL-3.0-or-later · **Platforms:** Linux with systemd (Ubuntu and Fedora tested); experimental macOS WireGuard/OpenVPN TCP client · **Network stack:** IPv4
+**Current release:** 2.2.59 · **License:** GPL-3.0-or-later · **Platforms:** Linux with systemd (Ubuntu and Fedora tested); experimental macOS WireGuard/OpenVPN/AnyConnect client · **Network stack:** IPv4
 
 ## Contents
 
@@ -21,6 +21,7 @@ sandbox**.
 - [Install and upgrade](#install-and-upgrade)
 - [Quick start](#quick-start)
 - [Client workflows](#client-workflows)
+  - [AnyConnect / OpenConnect client](#anyconnect--openconnect-client)
   - [WireGuard and private DNS](#wireguard-and-private-dns)
   - [Git over a private VPN](#git-over-a-private-vpn)
   - [VPN chaining and inherited networks](#vpn-chaining-and-inherited-networks)
@@ -39,18 +40,21 @@ sandbox**.
 ## Linux vs macOS feature compatibility
 
 **Linux behavior is unchanged in 2.1** apart from the version number and an
-explicit guard preventing the Linux installer from executing on macOS.
+explicit guard preventing the Linux installer from executing on macOS; 2.2
+adds the AnyConnect/OpenConnect backend and nothing else on Linux.
 The macOS backend is a separate implementation, not a fork of Linux modules.
 
 | Feature / command | Linux (systemd) | macOS (experimental) |
 | --- | --- | --- |
-| `install <app>`, `add <app> profile` | Supported | Supported for **WireGuard `.conf`** and **OpenVPN `.ovpn`** |
+| `install <app>`, `add <app> profile` | Supported | Supported for **WireGuard `.conf`**, **OpenVPN `.ovpn`** and **AnyConnect `.oc`** |
 | `start`, `stop`, `status`, `list`, `remove` | Supported | Supported; `start/stop/recover` require `sudo` |
 | `run <app> command` | General Linux network namespace | **Compatible unsandboxed IPv4 executables only**: DYLD interposition for TCP, plus native bind options for `ping`, `nc`, `ssh`/`scp`/`sftp`, `curl`, `dig` and `traceroute`. In-scope hostnames for `ping`/`nc`/`ssh`/`scp`/`sftp` are resolved via the per-app VPN resolver and substituted numerically, since SIP binaries ignore DYLD injection |
 | Host network impact | Host default route unchanged; namespace/veth/firewall infrastructure | Default route and DNS unchanged; **creates system-visible `utun` + interface-scoped route** |
 | VPN clients: WireGuard | Supported | Supported (`wireguard-go`, `wg`, `wg-quick strip`) |
 | VPN clients: OpenVPN | Supported | Experimental client (`openvpn --route-noexec`; inline certs only) |
 | VPN clients: AmneziaWG | Supported | Not implemented |
+| VPN clients: AnyConnect / OpenConnect | Supported (`openconnect`, generic backend: `anyconnect`, `nc`, `pulse`, `gp`, `fortinet`, `f5`, `array`) | Supported (`openconnect` + managed `utun`; cookie or inline credentials) |
+| Interactive gateway login (`oc-login`) | `nns-app oc-login <app>` stores a session cookie for unattended restarts | Supported |
 | Separate namespace / routing domain | True Linux `ip netns` | **No**: shared macOS kernel network stack |
 | Per-app routing | Namespace routes | `IP_BOUND_IF` + source IP + interface-scoped route for intercepted TCP; native source/interface binding for supported SIP tools |
 | DNS isolation | Namespace-specific resolver and NSS policy | Limited IPv4 A queries in injected `getaddrinfo()`, via optional VPN DNS; no host DNS changes |
@@ -76,9 +80,15 @@ and Darwin CLI in a **single executable `install_macos`** next to `build.sh`.
 Installing it requires no sources, compiler or build step. Homebrew is the
 prerequisite for runtime dependencies (`wireguard-go`, `wireguard-tools`,
 `openvpn`, Homebrew curl and OpenSSH), which `install_macos` installs when
-missing. The Linux-built release ZIP contains `install_linux`; run `./build.sh`
-on your Mac to produce its platform-specific `install_macos` (do not copy a
-Linux or other-architecture binary in its place).
+missing. `openconnect` is an on-demand add-on: `nns-app add` suggests
+`brew install openconnect` when an `.oc` profile needs it.
+
+macOS has no background watchdog (no launchd by design); when a VPN engine
+exits, `status`/`list` report the app as `STALE` and `nns-app run` /
+`git-via` **auto-restart it** before executing (passwordless sudo for
+`nns-app start` is required so run/git can elevate without a TTY). The Linux-built release ZIP contains `install_linux`;
+run `./build.sh` on your Mac to produce its platform-specific `install_macos`
+(do not copy a Linux or other-architecture binary in its place).
 
 WireGuard profiles need an IPv4 `[Interface] Address` and peer `AllowedIPs` that
 cover the private destination. OpenVPN profiles must be self-contained `.ovpn`
@@ -93,7 +103,7 @@ sudo ./install_macos
 nns-app --version
 
 nns-app install work-vpn
-nns-app add work-vpn ~/work-wg.conf    # or ~/work.ovpn
+nns-app add work-vpn ~/work-wg.conf    # or ~/work.ovpn, or ~/corp.oc
 # If profile DNS is absent, specify the reachable VPN resolver:
 nns-app dns work-vpn 10.3.1.1
 sudo nns-app start work-vpn
@@ -109,13 +119,16 @@ sudo nns-app stop work-vpn
 
 `install` creates a user-owned configuration directory under
 `~/Library/Application Support/nns-app/apps/`; `add` copies the profile with
-permissions `0600`. `start` brings up WireGuard (`wireguard-go`) or OpenVPN,
-records the tunnel IPv4/`utun`, and adds **only** a route scoped to that
-interface. It does **not** execute profile shell hooks, change the unscoped
-default route, enable PF, create Unix groups, or modify host DNS. Runtime
-metadata is under `/var/run/nns-app-macos/<uid>/`. `stop` removes the scoped
-route **before** closing the tunnel. If interrupted,
-`sudo nns-app recover <app>` retries cleanup.
+permissions `0600`. `start` brings up WireGuard (`wireguard-go`), OpenVPN or
+AnyConnect (`openconnect`), records the tunnel IPv4/`utun`, and adds **only**
+a route scoped to that interface. It does **not** execute profile shell
+hooks, change the unscoped default route, enable PF, create Unix groups, or
+modify host DNS. AnyConnect uses a generated nns-app hook in place of
+`vpnc-script`, so pushed routes stay interface-scoped and pushed DNS becomes
+the per-app resolver hint. Runtime metadata is under
+`/var/run/nns-app-macos/<uid>/`. `stop` removes the scoped route **before**
+closing the tunnel. If interrupted, `sudo nns-app recover <app>` retries
+cleanup.
 
 `myip` and `myloc` are available without an app name for the host’s current
 egress, or with an app name to probe the selected tunnel. An app probe runs
@@ -217,23 +230,28 @@ To update only the local machine without refreshing managed remote hosts:
 sudo ./install_linux --local-only
 ```
 
-Installer-managed packages include `iproute2`, `iptables`, Python 3, OpenSSL,
-SSH, OpenVPN, WireGuard tools, and other runtime dependencies as appropriate.
+Installer-managed base packages include `iproute2`, `iptables`, Python 3,
+OpenSSL, SSH, OpenVPN, and other runtime dependencies as appropriate.
 The installer supports `apt` and `dnf`; it does not automatically add third-party
 repositories or install a kernel module for AmneziaWG.
 On Fedora, `iptables-nft` is used and firewalld integration manages the
 `nns-app` zone and `nns-app-forward` policy.
 
-**Optional AmneziaWG userspace tools (Ubuntu):**
+**Protocol backends beyond OpenVPN are add-ons.** Engine and app installs
+never install WireGuard, OpenConnect or AmneziaWG tools automatically;
+`nns-app add` suggests the matching command when a profile's backend binaries
+are missing:
 
 ```bash
-sudo nns-app --install amnezia
+nns-app --install wireguard    # wg and wg-quick
+nns-app --install openconnect  # AnyConnect and related protocols
+nns-app --install amnezia      # AmneziaWG userspace build (Ubuntu only)
 ```
 
-This explicitly builds `awg`, `awg-quick`, and `amneziawg-go` from pinned
-upstream AmneziaWG 3.1 tags. It needs Internet access and build tools. Other
-Linux distributions need compatible tools installed separately; DKMS is not
-required by the userspace implementation.
+The AmneziaWG installer explicitly builds `awg`, `awg-quick`, and
+`amneziawg-go` from pinned upstream AmneziaWG 3.1 tags. It needs Internet
+access and build tools. Other Linux distributions need compatible tools
+installed separately; DKMS is not required by the userspace implementation.
 
 **Prerequisites:** systemd, Linux network namespaces, IPv4 forwarding, iptables,
 root privileges for network administration, and appropriate SSH/sudo access for
@@ -246,11 +264,15 @@ that environment:
 
 ```bash
 nns-app install work-vpn
-nns-app add work-vpn ~/work.conf   # .conf: WireGuard or AmneziaWG; .ovpn: OpenVPN
+nns-app add work-vpn ~/work.conf   # .conf: WireGuard or AmneziaWG; .ovpn: OpenVPN; .oc: AnyConnect
 nns-app start work-vpn
 nns-app status work-vpn
 nns-app run work-vpn curl -4 https://api.ipify.org
 ```
+
+On a fresh host the non-OpenVPN backend tools are add-ons: `nns-app add`
+tells you to run `nns-app --install wireguard` or
+`nns-app --install openconnect` when the matching binaries are missing.
 
 Run your normal program in place of `curl`. The command retains the configured
 application user's privileges and file access; only its network context changes.
@@ -268,6 +290,120 @@ ready is not necessarily able to reach its remote peer; check the handshake
 and application service separately.
 
 ## Client workflows
+
+### AnyConnect / OpenConnect client
+
+Cisco AnyConnect (and, through the same generic OpenConnect backend, Juniper
+`nc`, Pulse/Ivanti `pulse`, GlobalProtect `gp`, Fortinet `fortinet`, F5 `f5` and
+Array `array`) runs through `openconnect` inside the app's network namespace.
+`nns-app` supplies its own `vpnc-script` replacement, so gateway-pushed
+addresses, MTU, routes and DNS are applied only inside the namespace and the
+host network stack is never modified. The kill switch permits the gateway's
+TLS (TCP) port and **UDP to the whole gateway address**: Cisco advertises the
+DTLS port dynamically in the CONNECT response, so the firewall allows UDP by
+destination IP rather than guessing a port. DTLS (UDP) is attempted
+automatically and falls back to TLS-over-TCP when the network blocks it;
+set `dtls=off` in the profile to skip the periodic retries on networks that
+permanently filter UDP.
+
+The profile is an nns-app key=value file with the `.oc` extension
+(a nns-app convention, not a Cisco format):
+
+```ini
+# Corporate AnyConnect gateway
+protocol=anyconnect      # optional: anyconnect (default), nc, pulse, gp, fortinet, f5, array
+server=https://vpn.example.com   # required; https://host[:port]
+user=employee            # optional; required for oc-login or inline credentials
+passwd=secret            # optional; stored root-only (0600) like every profile
+                         # `password=` is accepted as an alias for `passwd=`
+authgroup=Employees      # optional
+fingerprint=SHA256:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:8a   # optional server certificate pin (SHA1:/SHA256:/pin-sha256:)
+token-mode=totp          # optional; rsa|totp|hotp|oidc|yubioath
+token-secret=base32:JBSWY3DPEHPK3PXP   # optional; TOTP/HOTP secret for unattended OTP
+route-mode=split         # optional; split|full, defaults to full
+mtu=1400                 # optional; 576..9000
+dns=10.99.0.53           # optional; fallback resolvers when the gateway pushes none
+dtls=on                  # optional; off skips DTLS retries on networks that block UDP
+# Client certificate authentication (optional; replace the bodies below with
+# your real certificate and key, and keep both blocks embedded together):
+<cert>
+-----BEGIN CERTIFICATE-----
+MIIBszCCAVmgAwIBAgIUTx+0aGVzdC1jZXJ0IHRlc3QwDQYJKoZIhvcNAQELBQAw
+-----END CERTIFICATE-----
+</cert>
+<key>
+-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCrb3Rlc3Qta2V5
+-----END PRIVATE KEY-----
+</key>
+```
+
+`#` starts a comment on its own line or after a value (`key=value  # note`).
+Because of that, a password containing the substring " #" is not
+representable inline; use `nns-app oc-login` for such accounts.
+`password=` is accepted as an alias for `passwd=`; declaring both is
+ambiguous and rejected.
+For gateways with a private or self-signed certificate, pin it with
+`fingerprint=pin-sha256:<base64>` — the exact value openconnect prints in
+its own certificate error — or with the `SHA1:`/`SHA256:` hex forms.
+
+Import and run it like any other profile. The OpenConnect backend is an
+add-on: if `openconnect` is missing, `add` reminds you to install it
+(`nns-app --install openconnect` on Linux, `brew install openconnect` on
+macOS).
+
+```bash
+nns-app add corporate ~/corp.oc
+nns-app start corporate
+nns-app status corporate
+nns-app run corporate ssh internal-server
+git-via corporate pull
+nns-app stop corporate
+```
+
+**Authentication.** Only the allow-listed keys above are accepted — helper
+scripts, external file references and unknown directives are rejected because
+imported profiles are untrusted input. Three credential modes exist, in
+priority order:
+
+1. **Session cookie** (`nns-app oc-login corporate`): runs
+   `openconnect --authenticate` interactively (password, Duo/SMS push or OTP
+   prompts) and stores the resulting cookie root-owned next to the profile.
+   The managed service then reconnects unattended until the gateway expires
+   the session; run `oc-login` again after expiry. With inline
+   `user=`+`passwd=` (optionally `token-secret=`) the cookie is obtained and
+   stored **automatically on start**, so the first start authenticates once
+   and later restarts skip the gateway's login forms entirely; a cookie the
+   gateway rejected is refreshed the same way.
+2. **Inline credentials** (`user=` + `passwd=`), optionally with a
+   `token-secret` so the one-time code is computed locally. Suitable for
+   unattended restarts on gateways without a mandatory interactive second
+   factor.
+3. **Embedded client certificate** (`<cert>` + `<key>` PEM blocks).
+
+Gateways that mint their session cookie only during the CONNECT exchange (the
+`--authenticate` output stays empty) cannot use cookie mode; the backend
+detects that once, remembers it, and connects with inline credentials
+directly. Some gateways push no DNS resolvers at all; for those, set
+`dns=` in the profile so split tunnels still resolve corporate names —
+the hook pins a route to each fallback resolver through the tunnel.
+
+Enterprise SSO/browser flows and Cisco HostScan posture assessment that
+mandate the proprietary client are not supported. The watchdog distinguishes
+expired authentication from network failure: it records `auth-required`
+instead of endlessly restarting a backend that needs interactive login, and
+`status` points at `oc-login` when authentication is the cause.
+
+Routing is decided by the gateway at connect time: full-tunnel pushes install
+a namespace-local default route via the TUN; split-tunnel pushes
+(`CISCO_SPLIT_INC_*`) install individual routes. Readiness for AnyConnect is
+tunnel-up rather than a public-IP probe, so corporate tunnels that block
+arbitrary Internet still report online. Because authentication is multi-stage
+HTTP, `start` waits at least 30 seconds (instead of the 5-second default) for
+the AnyConnect tunnel; raise `READY_TIMEOUT` in the app config for unusually
+slow gateways. On macOS the same model uses a managed `utun`, `/32` address
+confinement and interface-scoped routes; pushed DNS becomes the per-app
+resolver used by `nns-app run` (or set an override with `nns-app dns`).
 
 ### WireGuard and private DNS
 

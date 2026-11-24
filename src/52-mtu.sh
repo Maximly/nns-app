@@ -120,7 +120,7 @@ mtu_apply_saved() {
         return 1
     }
     type=$(vpn_type_for_app "$app" 2>/dev/null || true)
-    [[ "$type" == openvpn ]] || return 0
+    [[ "$type" == openvpn || "$type" == anyconnect ]] || return 0
     dev=$(vpn_route_iface "$app" 2>/dev/null || true)
     [[ "$dev" == tun* ]] || return 0
     actual=$(ip -n "$NS_NAME" -o link show dev "$dev" 2>/dev/null |
@@ -167,7 +167,7 @@ mtu_auto_repair_locked() {
     mtu_apply_saved "$app" || true
     [[ "${AUTO_MTU:-on}" != off ]] || { mtu_probe_state "$app" disabled; return 0; }
     kind=$(vpn_type_for_app "$app" 2>/dev/null || true)
-    [[ "$kind" == openvpn ]] || return 0
+    [[ "$kind" == openvpn || "$kind" == anyconnect ]] || return 0
     app_split_tunnel "$app" && { mtu_probe_state "$app" split-tunnel-skipped; return 0; }
     ns=$NS_NAME
     dev=$(vpn_route_iface "$app" 2>/dev/null || true)

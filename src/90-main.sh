@@ -475,6 +475,15 @@ main() {
             mtu_openvpn_up "$2" "$3"
             exit
             ;;
+        _oc-hook)
+            require_root
+            # openconnect runs its vpnc-script as `/bin/sh -c <script>` and
+            # passes the reason in the `reason` environment variable; TUNDEV /
+            # INTERNAL_IP4_* / CISCO_* also arrive via the environment.
+            (( $# >= 2 )) || die "_oc-hook requires app_name."
+            openconnect_hook "$2" "${3:-${reason:-}}"
+            exit
+            ;;
         _mtu-reconcile)
             require_root
             [[ $# -eq 2 ]] || die "_mtu-reconcile requires app_name."
@@ -499,9 +508,14 @@ main() {
 
     case "$cmd" in
         --install)
-            [[ $# -eq 2 && "$2" == amnezia ]] ||
-                die "Usage: nns-app --install amnezia"
-            install_amnezia_userspace_tools
+            [[ $# -eq 2 ]] ||
+                die "Usage: nns-app --install openconnect|wireguard|amnezia"
+            case "$2" in
+                openconnect) install_openconnect_tools ;;
+                wireguard) install_wireguard_tools ;;
+                amnezia) install_amnezia_userspace_tools ;;
+                *) die "Usage: nns-app --install openconnect|wireguard|amnezia" ;;
+            esac
             ;;
         backup)
             shift
@@ -886,7 +900,7 @@ main() {
             ;;
         add)
             (( $# >= 3 )) ||
-                die "Usage: nns-app add <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf>|any [country] [--refresh] [--via <upstream-app>|host]"
+                die "Usage: nns-app add <app_name> <profile.ovpn|wireguard.conf|amneziawg.conf|anyconnect.oc>|any [country] [--refresh] [--via <upstream-app>|host]"
             if [[ "$3" == any ]]; then
                 local add_app=$2 add_country="" add_refresh="off" add_via="__default__"
                 shift 3
@@ -958,6 +972,10 @@ main() {
             # A stopped app is not an error for restart; proceed to start.
             managed_app_stop "$START_APP_NAME" || true
             managed_app_start "$START_APP_NAME" "$START_IGNORE" "$START_VIA"
+            ;;
+        oc-login)
+            (( $# == 2 )) || die "Usage: nns-app oc-login <app_name>"
+            openconnect_login "$2"
             ;;
         set-via)
             (( $# == 3 )) || die "Usage: nns-app set-via <gateway-app> <upstream-app|host>"

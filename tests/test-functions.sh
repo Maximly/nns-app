@@ -866,6 +866,73 @@ grep -Fxq 'dhcp-option DNS 1.1.1.1' "$profile_root/out.ovpn" ||
 grep -Fxq 'dhcp-option DOMAIN promobit.loc' "$profile_root/out.ovpn" ||
     fail 'private client profile missing DOMAIN'
 
+# An upstream with server-driven routing (e.g. AnyConnect) contributes no
+# static networks or DNS policy; such a gateway must fall back to a full exit
+# instead of exporting a route-less private-only profile.
+serverless_root="$TEST_TMP/gateway-config-serverless"
+mkdir -p "$serverless_root/pki"
+cat >"$serverless_root/gateway.cfg" <<'EOF_TEST_GATEWAY_SERVERLESS'
+GATEWAY_NAME=serverless-gateway
+GATEWAY_BACKEND=openvpn
+VIA_APP=anyconnect-upstream
+TRANSPORT=direct
+LISTEN_PROTO=udp
+LISTEN_PORT=21198
+OPENVPN_LISTEN_PROTO=udp
+OPENVPN_LISTEN_PORT=21198
+PUBLIC_HOST=router.example.net
+PUBLIC_PORT=21198
+CLIENT_POOL=10.253.102.0/24
+DNS_SERVERS='1.1.1.1 9.9.9.9'
+GATEWAY_TUN=ngwserverless
+SERVER_CN=nns-gateway-serverless-gateway
+EOF_TEST_GATEWAY_SERVERLESS
+(
+    app_is_private_only() { [[ "$1" == anyconnect-upstream ]]; }
+    app_profile_networks() { return 0; }
+    app_profile_dns_policy() { return 0; }
+    gateway_write_server_config serverless-gateway "$serverless_root" ||
+        fail 'serverless-upstream gateway server config generation'
+)
+grep -Fxq 'push "redirect-gateway def1 bypass-dhcp"' "$serverless_root/server.conf" ||
+    fail 'empty-inheritance gateway must push redirect-gateway'
+grep -Fq 'push "dhcp-option DNS ' "$serverless_root/server.conf" ||
+    fail 'full-exit gateway missing bootstrap DNS push'
+if grep -Fq 'push "route ' "$serverless_root/server.conf"; then
+    fail 'empty-inheritance gateway must not push upstream routes'
+fi
+(
+    profile_root="$TEST_TMP/serverless-client-profile"
+    mkdir -p "$profile_root/pki" "$profile_root/client"
+    printf 'CA\n' >"$profile_root/pki/ca.crt"
+    printf 'TLSKEY\n' >"$profile_root/pki/tls-crypt-v2-server.key"
+    printf 'CERT\n' >"$profile_root/client/client.crt"
+    printf 'KEY\n' >"$profile_root/client/client.key"
+    printf 'CLIENTTLS\n' >"$profile_root/client/tls-crypt-v2-client.key"
+    load_gateway_cfg() {
+        VIA_APP=anyconnect-upstream
+        LISTEN_PROTO=udp
+        PUBLIC_HOST=router.example.net
+        PUBLIC_PORT=21198
+        SERVER_CN=nns-gateway-serverless-gateway
+        OPENVPN_COMPAT=modern
+    }
+    gateway_client_load() { STATUS=active; }
+    gateway_client_dir() { printf '%s\n' "$profile_root/client"; }
+    gateway_pki_dir() { printf '%s\n' "$profile_root/pki"; }
+    app_is_private_only() { [[ "$1" == anyconnect-upstream ]]; }
+    app_profile_networks() { return 0; }
+    app_profile_dns_policy() { return 0; }
+    gateway_write_client_profile_file serverless-gateway unit-client "$profile_root/out.ovpn" public ||
+        fail 'serverless-upstream client profile generation'
+)
+if grep -Fq 'nns-app private-only' "$profile_root/out.ovpn"; then
+    fail 'empty-inheritance client profile must not be marked private-only'
+fi
+if grep -Eq '^route ' "$profile_root/out.ovpn"; then
+    fail 'empty-inheritance client profile must not carry client routes'
+fi
+
 # Managed gateway roots must allow traversal after OpenVPN drops privileges so
 # it can re-stat/reload pki/crl.pem, without allowing directory listings.
 (

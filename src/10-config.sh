@@ -52,7 +52,7 @@ reexec_as_root_if_needed() {
         list|status|myip|myloc|start|stop|restart|run)
             sudo_args+=( -n )
             ;;
-        --install|install|remove|add|purge|repair|backup|restore|gateway|remote|link|export|client|revoke|fixed-ip|route-mode|client-to-client|set-via)
+        --install|install|remove|add|oc-login|purge|repair|backup|restore|gateway|remote|link|export|client|revoke|fixed-ip|route-mode|client-to-client|set-via)
             ;;
         *)
             die "Unknown command '$cmd'."
@@ -69,18 +69,26 @@ reexec_as_root_if_needed() {
 
     # Canonicalize flexible start-option ordering before sudo. This lets the
     # per-app sudoers entry remain narrow while accepting --via in any position.
+    # Note $# still counts the command name here, so a bare `restart` has one
+    # argument left before the shift and must pass through unchanged.
     if [[ "$cmd" == start || "$cmd" == restart ]]; then
         local -a canonical=("$cmd")
         if (( $# > 0 )); then
             shift
-            parse_start_cli "$@"
-            if managed_gateway_exists "$START_APP_NAME"; then
-                sudo_args=(/usr/bin/sudo)
-            fi
-            bool_on "$START_IGNORE" && canonical+=(-i)
-            canonical+=("$START_APP_NAME")
-            if [[ "$START_VIA" != __default__ ]]; then
-                canonical+=(--via "$START_VIA")
+            if (( $# == 0 )) && [[ "$cmd" == restart ]]; then
+                # Bare `nns-app restart` restarts every active app and
+                # gateway; there is no app name to canonicalize.
+                :
+            else
+                parse_start_cli "$@"
+                if managed_gateway_exists "$START_APP_NAME"; then
+                    sudo_args=(/usr/bin/sudo)
+                fi
+                bool_on "$START_IGNORE" && canonical+=(-i)
+                canonical+=("$START_APP_NAME")
+                if [[ "$START_VIA" != __default__ ]]; then
+                    canonical+=(--via "$START_VIA")
+                fi
             fi
         fi
         "${sudo_args[@]}" "$target" "${canonical[@]}"
@@ -307,6 +315,18 @@ vpn_route_iface() {
             expected=$(wireguard_iface_name "$app")
             ip -n "$ns" link show dev "$expected" up >/dev/null 2>&1 || return 1
             ip netns exec "$ns" "$wgcmd" show "$expected" >/dev/null 2>&1 || return 1
+            dev=$expected
+            ;;
+        anyconnect)
+            # Readiness is authoritative only after the hook configured the
+            # TUN: marker file, live device, IPv4 address and at least one
+            # route (default or a gateway-pushed split route) via it.
+            expected=$(openconnect_iface_name "$app")
+            [[ -f "$(openconnect_state_dir)/${app}.oc-ready" ]] || return 1
+            ip -n "$ns" link show dev "$expected" up >/dev/null 2>&1 || return 1
+            ip -n "$ns" -4 addr show dev "$expected" 2>/dev/null |
+                grep -Eq '[[:space:]]inet[[:space:]]' || return 1
+            ip -n "$ns" -4 route show dev "$expected" 2>/dev/null | grep -q . || return 1
             dev=$expected
             ;;
         inherit)

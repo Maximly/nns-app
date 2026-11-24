@@ -42,6 +42,8 @@ has_command wireguard-go || packages+=(wireguard-go)
 if ! has_command wg || ! has_command wg-quick; then packages+=(wireguard-tools); fi
 # OpenVPN client backend (optional until an .ovpn profile is used).
 has_command openvpn || packages+=(openvpn)
+# OpenConnect is an on-demand add-on: the CLI suggests `brew install
+# openconnect` when an .oc profile is added and the binary is missing.
 has_command curl || packages+=(curl)
 # macOS /usr/bin/ssh is SIP-protected; Git needs a Homebrew-compatible SSH.
 has_command ssh || packages+=(openssh)

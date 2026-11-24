@@ -4,13 +4,13 @@
 awg_server_config() { printf '%s/%s.conf\n' "$(gateway_dir "$1")" "$(gateway_cfg_value "$1" GATEWAY_TUN)"; }
 
 awg_server_require_runtime() {
-    command -v awg >/dev/null 2>&1 || die "AmneziaWG 3.1 tools missing. On Ubuntu run: sudo nns-app --install amnezia"
-    command -v awg-quick >/dev/null 2>&1 || die "AmneziaWG awg-quick missing. On Ubuntu run: sudo nns-app --install amnezia"
+    command -v awg >/dev/null 2>&1 || die "AmneziaWG 3.1 tools missing. On Ubuntu run: nns-app --install amnezia"
+    command -v awg-quick >/dev/null 2>&1 || die "AmneziaWG awg-quick missing. On Ubuntu run: nns-app --install amnezia"
     # Prefer the userspace backend and do not request an AWG kernel module
     # when amneziawg-go is installed.
     if ! command -v amneziawg-go >/dev/null 2>&1 &&
        ! modprobe -q amneziawg 2>/dev/null; then
-        die "AmneziaWG userspace backend missing. On Ubuntu run: sudo nns-app --install amnezia"
+        die "AmneziaWG userspace backend missing. On Ubuntu run: nns-app --install amnezia"
     fi
     [[ -c /dev/net/tun ]] || modprobe tun 2>/dev/null || true
 }
