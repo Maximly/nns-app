@@ -650,6 +650,222 @@ grep -Fxq 'cipher AES-256-GCM' "$embedded_gateway_root/server.conf" ||
         fail "OpenVPN diagnostic commentization: $output"
 )
 
+# Private-only OpenVPN profiles: classification, client-side routes, DNS.
+private_ovpn="$TEST_TMP/private-client.ovpn"
+cat >"$private_ovpn" <<'EOF_TEST_PRIVATE_OVPN'
+# nns-app private-only: client-side routes below, no redirect-gateway
+client
+remote vpn.example.net 1197
+proto udp
+route 192.168.83.0 255.255.255.0
+route 10.20.0.0/16
+route 192.168.84.7
+dhcp-option DNS 1.1.1.1
+dhcp-option DNS 9.9.9.9
+dhcp-option DOMAIN promobit.loc
+dhcp-option ADAPTER_DOMAIN-SEARCH promobit.loc
+<ca>
+x
+</ca>
+EOF_TEST_PRIVATE_OVPN
+[[ "$(openvpn_profile_route_mode "$private_ovpn")" == split ]] || fail 'private OpenVPN profile not split'
+ovpn_networks=$(openvpn_profile_networks "$private_ovpn")
+grep -Fxq '192.168.83.0 255.255.255.0' <<<"$ovpn_networks" || fail 'OpenVPN net/mask route parsing'
+grep -Fxq '10.20.0.0 255.255.0.0' <<<"$ovpn_networks" || fail 'OpenVPN CIDR route parsing'
+grep -Fxq '192.168.84.7 255.255.255.255' <<<"$ovpn_networks" || fail 'OpenVPN bare-IP route parsing'
+[[ "$(openvpn_profile_route_sample "$private_ovpn")" == 192.168.83.1 ]] || fail 'OpenVPN route sample'
+ovpn_policy=$(openvpn_profile_dns_policy "$private_ovpn")
+grep -Fxq '1.1.1.1 9.9.9.9' <<<"$ovpn_policy" || fail 'OpenVPN DNS servers'
+grep -Fxq 'promobit.loc' <<<"$ovpn_policy" || fail 'OpenVPN DNS domains'
+[[ "$(openvpn_profile_dns_policy "$private_ovpn" search)" == promobit.loc ]] || fail 'OpenVPN DNS search list'
+plain_ovpn="$TEST_TMP/plain-client.ovpn"
+printf 'client\nremote vpn.example.net 1197\nproto udp\n<ca>\nx\n</ca>\n' >"$plain_ovpn"
+[[ "$(openvpn_profile_route_mode "$plain_ovpn")" == full ]] || fail 'plain OpenVPN profile classified split'
+dns_only_ovpn="$TEST_TMP/dns-only.ovpn"
+printf 'client\nremote vpn.example.net 1197\nproto udp\ndhcp-option DNS 1.1.1.1\n' >"$dns_only_ovpn"
+grep -Fxq '.' <<<"$(openvpn_profile_dns_policy "$dns_only_ovpn")" ||
+    fail 'DNS-only OpenVPN policy must cover all queries'
+# WireGuard private networks feed gateway route pushes.
+wg_private="$TEST_TMP/private-upstream.conf"
+cat >"$wg_private" <<'EOF_TEST_WG_PRIVATE'
+[Interface]
+PrivateKey = xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=
+Address = 10.3.1.52/32
+DNS = 1.1.1.1, 9.9.9.9, ~promobit.loc
+
+[Peer]
+PublicKey = yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy=
+Endpoint = 77.221.196.190:49018
+AllowedIPs = 192.168.83.0/24, 1.1.1.1/32, 9.9.9.9/32
+EOF_TEST_WG_PRIVATE
+wg_networks=$(wireguard_profile_networks "$wg_private")
+grep -Fxq '192.168.83.0 255.255.255.0' <<<"$wg_networks" || fail 'WG AllowedIPs network parsing'
+grep -Fxq '1.1.1.1 255.255.255.255' <<<"$wg_networks" || fail 'WG AllowedIPs host parsing'
+[[ "$(wireguard_profile_route_mode "$wg_private")" == split ]] || fail 'WG private profile not split'
+# App-level classification dispatches by backend; kill switch gates private-only.
+(
+    mkdir -p "$TEST_TMP/app-profiles"
+    cp "$private_ovpn" "$TEST_TMP/app-profiles/client.ovpn"
+    vpn_type_for_app() { printf 'openvpn\n'; }
+    profiles_dir() { printf '%s/app-profiles\n' "$TEST_TMP"; }
+    cfg_read_value() {
+        case "$2" in
+            DEFAULT_PROFILE) printf 'client.ovpn\n' ;;
+            KILLSWITCH) printf 'off\n' ;;
+        esac
+    }
+    app_split_tunnel unitapp || fail 'private OpenVPN app not classified split'
+    app_is_private_only unitapp && fail 'kill-switched-off app must not be private-only'
+    cfg_read_value() { [[ "$2" == DEFAULT_PROFILE ]] && printf 'client.ovpn\n'; }
+    app_is_private_only unitapp || fail 'private OpenVPN app not private-only with kill switch on'
+    [[ "$(app_profile_route_sample unitapp)" == 192.168.83.1 ]] || fail 'app route sample dispatch'
+    app_profile_networks unitapp | grep -Fxq '192.168.83.0 255.255.255.0' ||
+        fail 'app network dispatch'
+    app_profile_dns_policy unitapp | grep -Fxq '1.1.1.1 9.9.9.9' ||
+        fail 'app DNS policy dispatch'
+)
+# Private OpenVPN route detection must probe the client route, not 1.1.1.1.
+(
+    cfg_read_value() {
+        case "$2" in
+            NS_NAME) printf 'nns-unitapp\n' ;;
+            DEFAULT_PROFILE) printf 'client.ovpn\n' ;;
+        esac
+    }
+    vpn_type_for_app() { printf 'openvpn\n'; }
+    app_split_tunnel() { return 0; }
+    app_profile_route_sample() { printf '192.168.83.1\n'; }
+    ip() {
+        if [[ "$4" == route && "$5" == get ]]; then
+            [[ "$6" == 192.168.83.1 ]] || fail 'private OpenVPN iface probe used wrong route'
+            printf '192.168.83.0 dev tun0 scope link src 10.253.3.2\n'
+            return 0
+        fi
+        fail "Unexpected ip call: $*"
+    }
+    [[ "$(vpn_route_iface unitapp)" == tun0 ]] || fail 'private OpenVPN route iface detection'
+)
+# The namespace DNS proxy derives OpenVPN split-DNS from dhcp-option lines
+# in the managed profile; all-queries policies become default forwarders.
+(
+    require_root() { :; }
+    load_cfg() { NS_NAME=nns-unitapp; DEFAULT_PROFILE=client.ovpn; DNS_SERVERS='1.1.1.1 9.9.9.9'; }
+    cfg_read_value() { [[ "$2" == DEFAULT_PROFILE ]] && printf 'client.ovpn\n'; }
+    profiles_dir() { printf '%s/app-profiles\n' "$TEST_TMP"; }
+    vpn_type_for_app() { printf 'openvpn\n'; }
+    ip() { [[ "$1" == netns && "$2" == list ]] && printf '%s\n' nns-unitapp; }
+    ip_binary() { printf '%s/fake-ip-capture\n' "$TEST_TMP"; }
+    cat >"$TEST_TMP/fake-ip-capture" <<'S'
+#!/bin/bash
+shift 2
+printf '%s\n' "$*" >"${CAPTURE_FILE:?}"
+S
+    chmod +x "$TEST_TMP/fake-ip-capture"
+    mkdir -p "$TEST_TMP/app-profiles"
+    cat >"$TEST_TMP/app-profiles/client.ovpn" <<'S'
+# nns-app private-only: client-side routes below, no redirect-gateway
+client
+remote x 1197
+proto udp
+route 192.168.83.0 255.255.255.0
+dhcp-option DNS 192.168.83.10
+dhcp-option DOMAIN promobit.loc
+S
+    CAPTURE_FILE="$TEST_TMP/dnsproxy-args" dns_proxy_exec unitapp
+    grep -Fq '/usr/bin/python3 - 1.1.1.1 9.9.9.9' "$TEST_TMP/dnsproxy-args" ||
+        fail "OpenVPN split DNS proxy arguments: $(cat "$TEST_TMP/dnsproxy-args")"
+    grep -Fq '192.168.83.10 promobit.loc 83.168.192.in-addr.arpa' "$TEST_TMP/dnsproxy-args" ||
+        fail "OpenVPN split DNS private/reverse arguments: $(cat "$TEST_TMP/dnsproxy-args")"
+    printf 'client\nremote x 1197\nproto udp\ndhcp-option DNS 10.99.0.53\n' >"$TEST_TMP/app-profiles/client.ovpn"
+    CAPTURE_FILE="$TEST_TMP/dnsproxy-args2" dns_proxy_exec unitapp
+    grep -Fq '/usr/bin/python3 - 10.99.0.53' "$TEST_TMP/dnsproxy-args2" ||
+        fail "OpenVPN all-queries DNS proxy arguments: $(cat "$TEST_TMP/dnsproxy-args2")"
+    grep -Fq 'promobit.loc' "$TEST_TMP/dnsproxy-args2" &&
+        fail 'all-queries policy must not keep a split domain list'
+    grep -Fq 'in-addr.arpa' "$TEST_TMP/dnsproxy-args2" &&
+        fail 'all-queries policy must not carry reverse zones'
+)
+
+# A private-only gateway exit pushes the upstream routes/DNS instead of
+# redirect-gateway, in both the server config and the exported client profile.
+private_gateway_root="$TEST_TMP/gateway-config-private"
+mkdir -p "$private_gateway_root/pki"
+cat >"$private_gateway_root/gateway.cfg" <<'EOF_TEST_GATEWAY_PRIVATE'
+GATEWAY_NAME=private-gateway
+GATEWAY_BACKEND=openvpn
+VIA_APP=private-exit
+TRANSPORT=direct
+LISTEN_PROTO=udp
+LISTEN_PORT=21197
+OPENVPN_LISTEN_PROTO=udp
+OPENVPN_LISTEN_PORT=21197
+PUBLIC_HOST=router.example.net
+PUBLIC_PORT=21197
+CLIENT_POOL=10.253.101.0/24
+DNS_SERVERS='1.1.1.1 9.9.9.9'
+GATEWAY_TUN=ngwprivate01
+SERVER_CN=nns-gateway-private-gateway
+EOF_TEST_GATEWAY_PRIVATE
+(
+    app_is_private_only() { [[ "$1" == private-exit ]]; }
+    app_profile_networks() { printf '192.168.83.0 255.255.255.0\n10.20.0.0 255.255.0.0\n'; }
+    app_profile_dns_policy() { printf '1.1.1.1 9.9.9.9\npromobit.loc\n'; }
+    upstream_tunnel_mtu() { printf '1420\n'; }
+    gateway_write_server_config private-gateway "$private_gateway_root" ||
+        fail 'private gateway server config generation'
+)
+grep -Fxq 'tun-mtu 1420' "$private_gateway_root/server.conf" ||
+    fail 'private gateway missing nested tun-mtu'
+grep -Fxq 'push "route 192.168.83.0 255.255.255.0"' "$private_gateway_root/server.conf" ||
+    fail 'private gateway missing route push'
+grep -Fxq 'push "route 10.20.0.0 255.255.0.0"' "$private_gateway_root/server.conf" ||
+    fail 'private gateway missing second route push'
+grep -Fxq 'push "dhcp-option DNS 1.1.1.1"' "$private_gateway_root/server.conf" ||
+    fail 'private gateway missing DNS push'
+grep -Fxq 'push "dhcp-option DOMAIN promobit.loc"' "$private_gateway_root/server.conf" ||
+    fail 'private gateway missing DOMAIN push'
+if grep -Fq 'redirect-gateway' "$private_gateway_root/server.conf"; then
+    fail 'private gateway must not push redirect-gateway'
+fi
+(
+    profile_root="$TEST_TMP/private-client-profile"
+    mkdir -p "$profile_root/pki" "$profile_root/client"
+    printf 'CA\n' >"$profile_root/pki/ca.crt"
+    printf 'TLSKEY\n' >"$profile_root/pki/tls-crypt-v2-server.key"
+    printf 'CERT\n' >"$profile_root/client/client.crt"
+    printf 'KEY\n' >"$profile_root/client/client.key"
+    printf 'CLIENTTLS\n' >"$profile_root/client/tls-crypt-v2-client.key"
+    load_gateway_cfg() {
+        VIA_APP=private-exit
+        LISTEN_PROTO=udp
+        PUBLIC_HOST=router.example.net
+        PUBLIC_PORT=21197
+        SERVER_CN=nns-gateway-private-gateway
+        OPENVPN_COMPAT=modern
+    }
+    gateway_client_load() { STATUS=active; }
+    gateway_client_dir() { printf '%s\n' "$profile_root/client"; }
+    gateway_pki_dir() { printf '%s\n' "$profile_root/pki"; }
+    app_is_private_only() { [[ "$1" == private-exit ]]; }
+    app_profile_networks() { printf '192.168.83.0 255.255.255.0\n'; }
+    app_profile_dns_policy() { printf '1.1.1.1\npromobit.loc\n'; }
+    upstream_tunnel_mtu() { printf '1420\n'; }
+    gateway_write_client_profile_file private-gateway unit-client "$profile_root/out.ovpn" public ||
+        fail 'private client profile generation'
+)
+grep -Fq 'nns-app private-only' "$profile_root/out.ovpn" ||
+    fail 'private client profile missing marker'
+grep -Fxq 'tun-mtu 1420' "$profile_root/out.ovpn" ||
+    fail 'private client profile missing nested tun-mtu'
+grep -Fxq 'mssfix 1380' "$profile_root/out.ovpn" ||
+    fail 'private client profile missing nested mssfix'
+grep -Fxq 'route 192.168.83.0 255.255.255.0' "$profile_root/out.ovpn" ||
+    fail 'private client profile missing route'
+grep -Fxq 'dhcp-option DNS 1.1.1.1' "$profile_root/out.ovpn" ||
+    fail 'private client profile missing DNS'
+grep -Fxq 'dhcp-option DOMAIN promobit.loc' "$profile_root/out.ovpn" ||
+    fail 'private client profile missing DOMAIN'
+
 # Managed gateway roots must allow traversal after OpenVPN drops privileges so
 # it can re-stat/reload pki/crl.pem, without allowing directory listings.
 (

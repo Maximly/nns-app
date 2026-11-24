@@ -632,6 +632,166 @@ static int nns_dns_lookup(const char *hostname, struct in_addr *out)
 
 
 /**
+ * nns_hosts_entry_match() - whether @name is a host-level /etc/hosts alias
+ *  @name: hostname to classify (may carry one trailing dot)
+ *
+ * Names the machine itself defines in /etc/hosts (e.g. per-host VPN aliases
+ * like mlwin11box.vpn) must stay on the system resolver: the VPN resolver
+ * cannot answer them. The file is parsed once and cached for the process
+ * lifetime.
+ *
+ * Return: 1 when @name is a local hosts entry, 0 otherwise
+ */
+static int nns_hosts_entry_match(const char* name)
+{
+    static char* cache = NULL;
+    static int cached = 0;
+    size_t nlen;
+
+    if (!name || !*name)
+        return 0;
+    nlen = strlen(name);
+    if (nlen > 1 && name[nlen - 1] == '.')
+        nlen--;
+
+    if (!cached) {
+        cached = 1;
+        FILE* f = fopen("/etc/hosts", "r");
+        if (f) {
+            char line[512];
+            size_t total = 0, cap = 4096;
+            cache = malloc(cap);
+            if (cache) {
+                cache[0] = '\0';
+                while (fgets(line, sizeof(line), f)) {
+                    char* p = line;
+                    while (*p == ' ' || *p == '\t')
+                        p++;
+                    if (*p == '#' || *p == '\0')
+                        continue;
+                    while (*p && *p != ' ' && *p != '\t')
+                        p++; /* skip the address token */
+                    while (*p) {
+                        while (*p == ' ' || *p == '\t')
+                            p++;
+                        if (*p == '#' || *p == '\0')
+                            break;
+                        char* start = p;
+                        while (*p && *p != ' ' && *p != '\t' && *p != '#' &&
+                               *p != '\n' && *p != '\r')
+                            p++;
+                        size_t len = (size_t)(p - start);
+                        if (len == 0) {
+                            /* A lone line terminator; consume it so the
+                             * outer loop always makes progress. */
+                            if (*p)
+                                p++;
+                            continue;
+                        }
+                        if (total + len + 2 < cap) {
+                            memcpy(cache + total, start, len);
+                            total += len;
+                            cache[total++] = '|';
+                        }
+                    }
+                }
+                fclose(f);
+            }
+            if (cache && total > 0)
+                cache[total - 1] = '\0';
+        }
+    }
+
+    if (!cache || !*cache)
+        return 0;
+
+    const char* p = cache;
+    while (*p) {
+        const char* end = strchr(p, '|');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (len == nlen && strncasecmp(p, name, nlen) == 0)
+            return 1;
+        if (!end)
+            break;
+        p = end + 1;
+    }
+    return 0;
+}
+
+
+/**
+ * nns_dns_host_is_local() - exported /etc/hosts check for the launcher
+ *
+ * nns-run consults this before substituting a numeric address so local
+ * aliases keep their original argv text and resolve on the host stack.
+ *
+ * Return: 1 when @hostname is a local hosts entry, 0 otherwise
+ */
+int nns_dns_host_is_local(const char* hostname)
+{
+    return nns_hosts_entry_match(hostname);
+}
+
+
+/**
+ * nns_dns_resolve_host() - exported entry point for the nns-run launcher
+ *  @hostname: name to query (A / IN)
+ *  @out: filled with the first A record on success
+ *
+ * Same environment contract as the interposed getaddrinfo(): the query is
+ * sourced from NNS_BIND_IPV4 and pinned to NNS_BIND_IFACE, targeting
+ * NNS_DNS_IPV4. The launcher dlopen()s this symbol so SIP-protected tools
+ * (which ignore DYLD injection) still get scoped VPN DNS resolution by
+ * substituting numeric addresses into their argv.
+ *
+ * Return: NNS_OK on success, NNS_ERR otherwise
+ */
+int nns_dns_resolve_host(const char* hostname, struct in_addr* out)
+{
+    return nns_dns_lookup(hostname, out);
+}
+
+
+/**
+ * nns_dns_name_in_scope() - decide whether @node uses the VPN resolver
+ *  @node: hostname to classify
+ *
+ * NNS_DNS_DOMAINS holds the route-only domain suffixes imported from the
+ * profile (space-separated). When it is set, only names inside those
+ * suffixes use the per-app VPN resolver; every other name keeps the system
+ * resolver. When it is unset or empty, all names use the VPN resolver
+ * (full-tunnel behavior).
+ *
+ * Return: 1 when the VPN resolver applies, 0 otherwise
+ */
+static int nns_dns_name_in_scope(const char* node)
+{
+    const char* domains = getenv("NNS_DNS_DOMAINS");
+    if (!domains || !*domains)
+        return 1;
+
+    size_t node_len = strlen(node);
+    const char* p = domains;
+    while (*p) {
+        while (*p == ' ' || *p == '\t')
+            p++;
+        const char* start = p;
+        while (*p && *p != ' ' && *p != '\t')
+            p++;
+        size_t len = (size_t)(p - start);
+        if (len == 0)
+            continue;
+        if (node_len == len && strncasecmp(node, start, len) == 0)
+            return 1;
+        if (node_len > len + 1 && node[node_len - len - 1] == '.' &&
+            strncasecmp(node + node_len - len, start, len) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+
+/**
  * nns_getaddrinfo() - interpose getaddrinfo(3); VPN DNS for IPv4 names
  * @node: hostname or numeric address
  * @service: service name or port string
@@ -639,8 +799,11 @@ static int nns_dns_lookup(const char *hostname, struct in_addr *out)
  * @res: result list on success
  *
  * Numeric hosts, localhost*, and AI_NUMERICHOST keep the system resolver.
- * Other IPv4/UNSPEC queries use nns_dns_lookup(), then re-enter getaddrinfo
- * with AI_NUMERICHOST. Non-IPv4 families return EAI_NONAME.
+ * With NNS_DNS_DOMAINS configured, only matching route-only domain suffixes
+ * use nns_dns_lookup() through the VPN; other names keep the system
+ * resolver. Without a domain scope, every IPv4/UNSPEC name uses
+ * nns_dns_lookup(), then re-enters getaddrinfo with AI_NUMERICHOST.
+ * Non-IPv4 families return EAI_NONAME.
  *
  * Return: 0 on success, or a getaddrinfo(3) EAI_* code
  */
@@ -666,6 +829,18 @@ static int nns_getaddrinfo(
             (node_len > suffix_len &&
             strcmp(node + node_len - suffix_len, localhost_suffix) == 0)) {
 
+        return getaddrinfo(node, service, hints, res);
+    }
+
+    /* Split-DNS scope: names outside the route-only domains keep the
+     * system resolver, so a private-only VPN never hijacks public DNS. */
+    if (!nns_dns_name_in_scope(node))
+        return getaddrinfo(node, service, hints, res);
+
+    /* Host-level /etc/hosts aliases are local by definition; the VPN
+     * resolver cannot answer them. */
+    if (nns_hosts_entry_match(node)) {
+        nns_log("dns-local-hosts", node);
         return getaddrinfo(node, service, hints, res);
     }
 

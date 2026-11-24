@@ -288,7 +288,14 @@ vpn_route_iface() {
 
     case "$type" in
         openvpn)
-            dev=$(ip -n "$ns" -4 route get 1.1.1.1 2>/dev/null |
+            local probe=1.1.1.1
+            if app_split_tunnel "$app"; then
+                # A private-only client has no default route to probe; its
+                # own client-side routes define the data path instead.
+                probe=$(app_profile_route_sample "$app" 2>/dev/null || true)
+                [[ -n "$probe" ]] || return 1
+            fi
+            dev=$(ip -n "$ns" -4 route get "$probe" 2>/dev/null |
                   awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
             [[ "$dev" =~ ^(tun|tap) ]] || return 1
             ;;
@@ -334,6 +341,21 @@ upstream_tunnel_iface() {
     dev=$(vpn_route_iface "$upstream" 2>/dev/null || true)
     [[ -n "$dev" ]] || return 1
     printf '%s|%s\n' "$ns" "$dev"
+}
+
+# MTU of an upstream app's tunnel interface. A gateway nested behind this
+# tunnel must cap its OpenVPN tun (and client MSS) at this value, otherwise
+# large packets are dropped at the upstream's path MTU.
+upstream_tunnel_mtu() {
+    local upstream=$1 ns dev mtu
+    ns=$(cfg_read_value "$upstream" NS_NAME 2>/dev/null || true)
+    [[ -n "$ns" ]] || return 1
+    dev=$(vpn_route_iface "$upstream" 2>/dev/null || true)
+    [[ -n "$dev" ]] || return 1
+    mtu=$(ip -n "$ns" -o link show dev "$dev" 2>/dev/null |
+        awk '{for (i=1;i<=NF;i++) if ($i=="mtu") {print $(i+1); exit}}')
+    [[ "$mtu" =~ ^[0-9]+$ ]] && (( mtu >= 1000 )) && (( mtu <= 1500 )) || return 1
+    printf '%s\n' "$mtu"
 }
 
 

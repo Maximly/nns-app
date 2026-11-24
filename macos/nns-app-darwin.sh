@@ -256,6 +256,7 @@ known = {
 host_re = re.compile(r"^[A-Za-z0-9._:-]+$")
 has_remote = False
 dns = []
+domains = []
 inblock = False
 kept = []
 
@@ -312,20 +313,37 @@ for raw in text.splitlines(keepends=True):
     if key == "persist-key":
         kept.append(comment(line))
         continue
-    if key == "dhcp-option" and len(parts) >= 3 and parts[1].lower() == "dns":
-        try:
-            address = ipaddress.ip_address(parts[2])
-        except ValueError as exc:
-            raise SystemExit(f"invalid dhcp-option DNS: {parts[2]}") from exc
-        if address.version == 4 and not address.is_unspecified and not address.is_multicast:
-            dns.append(str(address))
+    if key == "dhcp-option":
+        # OpenVPN's native macOS DNS integration would rewrite the system
+        # resolver from these options. nns-app never touches host DNS: it
+        # extracts the policy here and applies it through the per-app
+        # interposer instead, so drop the directive from the active profile.
+        if len(parts) >= 3:
+            if parts[1].lower() == "dns":
+                try:
+                    address = ipaddress.ip_address(parts[2])
+                except ValueError as exc:
+                    raise SystemExit(f"invalid dhcp-option DNS: {parts[2]}") from exc
+                if address.version == 4 and not address.is_unspecified and not address.is_multicast:
+                    dns.append(str(address))
+            elif parts[1].lower() == "domain":
+                domain = parts[2].lower().rstrip(".")
+                if domain and len(domain) <= 253 and all(
+                    1 <= len(label) <= 63 and
+                    re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+                    for label in domain.split(".")
+                ):
+                    domains.append(domain)
+                else:
+                    raise SystemExit(f"invalid dhcp-option DOMAIN: {parts[2]}")
+        kept.append(comment(line))
+        continue
     kept.append(line + "\n")
 
 if not has_remote:
     raise SystemExit("Profile has no 'remote' directive.")
 path.write_text("".join(kept), encoding="utf-8")
-if dns:
-    print(dns[0])
+print("|".join((dns[0] if dns else "", " ".join(dict.fromkeys(domains)))))
 PY
 }
 profile_ip() {
@@ -347,6 +365,14 @@ selected_dns() {
     cat "$CFG_DIR/dns_ipv4"
   elif [ "$APP_TYPE" = wireguard ] && [ -f "$CONF" ]; then
     profile_dns
+  fi
+}
+
+# Route-only domains from the imported profile: only these names use the
+# per-app VPN resolver; every other name keeps the system resolver.
+selected_dns_domains() {
+  if [ -f "$CFG_DIR/dns_domains" ]; then
+    cat "$CFG_DIR/dns_domains"
   fi
 }
 ensure_binaries() {
@@ -408,13 +434,18 @@ cleanup_state() {
     fi
   fi
   if [ -s "$RUNSTATE/ovpn_pid" ]; then
-    local pid
+    local pid waited
     pid=$(cat "$RUNSTATE/ovpn_pid")
     case "$pid" in ''|*[!0-9]*) fail 'Invalid OpenVPN engine PID.';; esac
     if ps -p "$pid" -o command= 2>/dev/null | grep -Eqi 'openvpn'; then
       kill "$pid" 2>/dev/null || true
-      # Give OpenVPN a moment to release utun before removing state.
-      sleep 1
+      # Let OpenVPN exit gracefully: its native macOS down-path restores
+      # any system DNS it may have changed. Only force-kill afterwards.
+      waited=0
+      while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 50 ]; do
+        sleep 0.1
+        waited=$((waited + 1))
+      done
       kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
     fi
   fi
@@ -583,6 +614,7 @@ start_openvpn() {
     --pull-filter ignore redirect-gateway \
     --pull-filter ignore route \
     --pull-filter ignore route-ipv6 \
+    --pull-filter ignore dhcp-option \
     --script-security 1 \
     --verb 3 \
     --connect-timeout 10 \
@@ -658,7 +690,7 @@ start_app() {
   esac
   rollback=0
   trap - EXIT INT TERM
-  info "Private DNS: $(selected_dns || true) (empty means no hostname lookup in compatible injected applications)."
+  info "Private DNS: $(selected_dns || true), split domains: $(selected_dns_domains || true) (empty DNS means no hostname lookup in compatible injected applications)."
 }
 stop_app() {
   require_admin
@@ -674,10 +706,11 @@ run_app() {
   [ "$#" -gt 0 ] || fail 'Usage: nns-app run app [--] command [args...]'
   [ "$1" != -- ] || shift
   [ "$#" -gt 0 ] || fail 'Missing command.'
-  local dns
+  local dns domains
   dns=$(selected_dns)
+  domains=$(selected_dns_domains)
   if [ -n "$dns" ]; then valid_ipv4 "$dns" || fail 'Configured DNS server is invalid.'; fi
-  export NNS_DNS_IPV4="$dns"
+  export NNS_DNS_IPV4="$dns" NNS_DNS_DOMAINS="$domains"
   exec "$LIBEXEC/nns-run" --vpn-ip "$VPN_IP" --vpn-if "$UTUN" --lib "$LIBEXEC/libnnsbind.dylib" -- "$@"
 }
 # Prefer Homebrew curl because Apple's /usr/bin/curl is SIP-protected.
@@ -703,10 +736,11 @@ run_app_output() {
   check_iface || fail "Managed interface $UTUN is absent."
   ensure_binaries
   [ "$#" -gt 0 ] || fail 'Missing command.'
-  local dns
+  local dns domains
   dns=$(selected_dns)
+  domains=$(selected_dns_domains)
   if [ -n "$dns" ]; then valid_ipv4 "$dns" || fail 'Configured DNS server is invalid.'; fi
-  NNS_DNS_IPV4="$dns" "$LIBEXEC/nns-run" --vpn-ip "$VPN_IP" --vpn-if "$UTUN" \
+  NNS_DNS_IPV4="$dns" NNS_DNS_DOMAINS="$domains" "$LIBEXEC/nns-run" --vpn-ip "$VPN_IP" --vpn-if "$UTUN" \
     --lib "$LIBEXEC/libnnsbind.dylib" -- "$@"
 }
 
@@ -1008,7 +1042,7 @@ status_app() {
     info '  interface: MISSING -- run sudo nns-app recover app'
   fi
   info "  scoped route marker: $([ -f "$RUNSTATE/scoped_route" ] && echo present || echo missing)"
-  info "  private DNS: $(selected_dns || true)"
+  info "  private DNS: $(selected_dns || true), split domains: $(selected_dns_domains || true)"
   if [ "$(id -u)" -eq 0 ] && [ "$backend" = wireguard ]; then
     wg show "$UTUN" latest-handshakes 2>/dev/null || true
   fi
@@ -1151,6 +1185,16 @@ main() {
   esac
   local cmd=$1
   shift
+  # start/stop/recover manage kernel interfaces and must run as root. Re-exec
+  # with sudo automatically instead of failing with an instruction; after the
+  # elevation SUDO_USER still identifies the owning account.
+  case "$cmd" in
+    start|stop|recover)
+      if [ "$(id -u)" -ne 0 ]; then
+        exec /usr/bin/sudo "$SELF" "$cmd" "$@"
+      fi
+      ;;
+  esac
   owner_init
   case "$cmd" in
     install)
@@ -1168,16 +1212,18 @@ main() {
       app_paths "$1"; [ -d "$CFG_DIR" ] || fail "First run nns-app install $APP."
       [ ! -e "$RUNSTATE" ] || fail 'Stop the app before replacing its profile.'
       [ -r "$2" ] || fail 'Cannot read profile.'
-      local kind hook_dns='' previous_conf err dest
+      local kind hook_dns='' hook_domains='' hook_info previous_conf err dest
       kind=$(detect_profile_kind "$2")
       cp -- "$2" "$CFG_DIR/.incoming"; chmod 600 "$CFG_DIR/.incoming"
       case "$kind" in
         openvpn)
-          if ! hook_dns=$(normalize_ovpn_profile "$CFG_DIR/.incoming" 2>"$CFG_DIR/.hook-err"); then
+          if ! hook_info=$(normalize_ovpn_profile "$CFG_DIR/.incoming" 2>"$CFG_DIR/.hook-err"); then
             err=$(cat "$CFG_DIR/.hook-err" 2>/dev/null || true)
             rm -f "$CFG_DIR/.incoming" "$CFG_DIR/.hook-err"
             fail "${err:-Cannot import OpenVPN profile.}"
           fi
+          hook_dns=${hook_info%%|*}
+          hook_domains=${hook_info#*|}
           rm -f "$CFG_DIR/.hook-err"
           dest="$CFG_DIR/profile.ovpn"
           rm -f "$CFG_DIR/profile.conf"
@@ -1187,7 +1233,17 @@ main() {
           if [ -n "$hook_dns" ]; then
             printf '%s\n' "$hook_dns" > "$CFG_DIR/dns_ipv4"
             chmod 600 "$CFG_DIR/dns_ipv4"
-            info "Imported OpenVPN profile into $APP (DNS $hook_dns from dhcp-option; scripts not executed)."
+          else
+            rm -f "$CFG_DIR/dns_ipv4"
+          fi
+          if [ -n "$hook_domains" ]; then
+            printf '%s\n' "$hook_domains" > "$CFG_DIR/dns_domains"
+            chmod 600 "$CFG_DIR/dns_domains"
+          else
+            rm -f "$CFG_DIR/dns_domains"
+          fi
+          if [ -n "$hook_dns" ] || [ -n "$hook_domains" ]; then
+            info "Imported OpenVPN profile into $APP (DNS ${hook_dns:-none}, split domains ${hook_domains:-none}; scripts not executed)."
           else
             info "Imported OpenVPN profile into $APP."
           fi

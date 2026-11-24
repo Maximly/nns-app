@@ -149,16 +149,22 @@ wait_online() {
     # Verify the interface and its AllowedIPs route instead. This is a READY
     # check, not a claim that a remote peer has completed a handshake.
     if app_split_tunnel "$app"; then
-        local profile probe dev expected
+        local profile probe dev expected backend
         profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
-        expected=$(wireguard_iface_name "$app")
-        probe=$(wireguard_profile_route_sample "$profile")
+        backend=$(vpn_type_for_app "$app" 2>/dev/null || true)
+        probe=$(app_profile_route_sample "$app")
         deadline=$((SECONDS + timeout))
         while (( SECONDS < deadline )); do
             if vpn_route_ready "$app"; then
                 dev=$(ip -n "$NS_NAME" -4 route get "$probe" 2>/dev/null |
                       awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
-                [[ "$dev" != "$expected" ]] || return 0
+                if [[ "$backend" == openvpn ]]; then
+                    [[ "$dev" =~ ^(tun|tap) ]] || continue
+                else
+                    expected=$(wireguard_iface_name "$app")
+                    [[ "$dev" == "$expected" ]] || continue
+                fi
+                return 0
             fi
             sleep 0.2
         done

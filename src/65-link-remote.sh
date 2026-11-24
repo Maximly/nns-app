@@ -1067,11 +1067,19 @@ PY_CLOAK_CLIENT_EXPORT
 
 gateway_write_client_profile_file() {
     local gateway=$1 client=$2 output=$3 target_mode=${4:-public}
-    local cdir pki proto remote_host remote_port
+    local cdir pki proto remote_host remote_port private_exit dns_policy servers domains
     load_gateway_cfg "$gateway"
     gateway_client_load "$gateway" "$client"
     cdir=$(gateway_client_dir "$gateway" "$client")
     pki=$(gateway_pki_dir "$gateway")
+
+    # A private-only gateway exit cannot carry public Internet. Embed the
+    # upstream's private routes and DNS policy in the client profile so the
+    # client machine classifies it as private-only without trusting pushes.
+    private_exit=off
+    if [[ "${VIA_APP:-host}" != host ]] && app_is_private_only "$VIA_APP"; then
+        private_exit=on
+    fi
 
     if [[ "$target_mode" == local ]]; then
         proto=tcp-client
@@ -1111,6 +1119,34 @@ gateway_write_client_profile_file() {
             printf 'explicit-exit-notify 2\n'
         fi
         printf 'verb 3\n'
+        if [[ "$private_exit" == on ]]; then
+            printf '# nns-app private-only: client-side routes below, no redirect-gateway\n'
+            local net mask nested_mtu mssfix
+            if nested_mtu=$(upstream_tunnel_mtu "$VIA_APP" 2>/dev/null || true) &&
+               [[ -n "$nested_mtu" ]]; then
+                mssfix=$((nested_mtu - 40))
+                [ "$mssfix" -ge 576 ] || mssfix=576
+                printf 'tun-mtu %s\n' "$nested_mtu"
+                printf 'mssfix %s\n' "$mssfix"
+            fi
+            while read -r net mask; do
+                [[ -n "$net" ]] || continue
+                printf 'route %s %s\n' "$net" "$mask"
+            done < <(app_profile_networks "$VIA_APP" 2>/dev/null || true)
+            dns_policy=$(app_profile_dns_policy "$VIA_APP" 2>/dev/null || true)
+            if [[ -n "$dns_policy" ]]; then
+                servers=${dns_policy%%$'\n'*}
+                domains=${dns_policy#*$'\n'}
+                for dns in $servers; do
+                    printf 'dhcp-option DNS %s\n' "$dns"
+                done
+                if [[ "$domains" != "." ]]; then
+                    for domain in $domains; do
+                        printf 'dhcp-option DOMAIN %s\n' "$domain"
+                    done
+                fi
+            fi
+        fi
         printf '\n<ca>\n'; cat "$pki/ca.crt"; printf '</ca>\n'
         printf '\n<cert>\n'; cat "$cdir/client.crt"; printf '</cert>\n'
         printf '\n<key>\n'; cat "$cdir/client.key"; printf '</key>\n'

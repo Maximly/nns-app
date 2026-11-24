@@ -136,8 +136,9 @@ dns_proxy_exec() {
     ip netns list | awk '{print $1}' | grep -Fxq "$NS_NAME" ||
         die "Namespace '$NS_NAME' does not exist for the DNS compatibility proxy."
 
-    local profile policy split_servers="" split_domains="" vpn_type
+    local profile policy split_servers="" split_domains="" vpn_type default_dns reverse_zones=""
     vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    default_dns=${DNS_SERVERS:-}
     if [[ "$vpn_type" == wireguard || "$vpn_type" == amneziawg ]]; then
         profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
         policy=$(wireguard_profile_dns_policy "$profile") ||
@@ -146,6 +147,66 @@ dns_proxy_exec() {
             split_servers=${policy%%$'\n'*}
             split_domains=${policy#*$'\n'}
         fi
+    elif [[ "$vpn_type" == openvpn ]]; then
+        # Private-only OpenVPN clients carry their DNS policy as
+        # dhcp-option DNS/DOMAIN lines in the managed profile.
+        profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
+        policy=$(openvpn_profile_dns_policy "$profile" 2>/dev/null || true)
+        if [[ -n "$policy" ]]; then
+            split_servers=${policy%%$'\n'*}
+            split_domains=${policy#*$'\n'}
+            if [[ "$split_domains" == "." ]]; then
+                # All queries belong to the tunnel: the profile's DNS
+                # servers are the default forwarders, with no split list.
+                default_dns=$split_servers
+                split_servers=""
+                split_domains=""
+            else
+                # Split DNS: public queries stay on the configured servers,
+                # with the host's own resolvers appended as a fallback for
+                # uplinks that block direct access to public resolvers.
+                local host_ns candidate
+                host_ns=$(awk '/^[[:space:]]*nameserver[[:space:]]+/{ for (i=2;i<=NF;i++) if ($i !~ /^127\./ && $i != "::1") printf "%s ", $i }' /etc/resolv.conf 2>/dev/null)
+                for candidate in $host_ns; do
+                    [[ " $default_dns " == *" $candidate "* ]] ||
+                        default_dns="${default_dns:+$default_dns }$candidate"
+                done
+            fi
+        fi
+    fi
+
+    # Reverse (PTR) lookups for hosts inside the tunneled networks must use
+    # the private upstreams, not public DNS. Derive one in-addr.arpa zone per
+    # routed network (octet-aligned, /8-/24 granularity).
+    if app_split_tunnel "$app" && [[ -n "$split_servers" ]]; then
+        local networks
+        networks=$(app_profile_networks "$app" 2>/dev/null || true)
+        reverse_zones=$(python3 - "$networks" <<'PY_REVERSE_ZONES'
+import ipaddress
+import sys
+
+zones = []
+for raw in sys.argv[1].splitlines():
+    parts = raw.split()
+    if len(parts) != 2:
+        continue
+    try:
+        net = ipaddress.ip_network("%s/%s" % (parts[0], parts[1]), strict=False)
+    except ValueError:
+        continue
+    if net.version != 4 or net.prefixlen == 0:
+        continue
+    octets = str(net.network_address).split(".")
+    if net.prefixlen == 32:
+        count = 4
+    elif net.prefixlen > 24:
+        count = 3
+    else:
+        count = max((net.prefixlen + 7) // 8, 1)
+    zones.append(".".join(reversed(octets[:count])) + ".in-addr.arpa")
+print(" ".join(dict.fromkeys(zones)))
+PY_REVERSE_ZONES
+        )
     fi
 
     # Snap reuses a persistent mount namespace and can therefore see the
@@ -156,7 +217,7 @@ dns_proxy_exec() {
     # root-only DNS exception cannot leak application DNS around the kill
     # switch while the VPN is down.
     exec "$(ip_binary)" netns exec "$NS_NAME" \
-        /usr/bin/python3 - "$DNS_SERVERS" "$split_servers" "$split_domains" <<'PY_NNS_DNS_PROXY'
+        /usr/bin/python3 - "$default_dns" "$split_servers" "$split_domains" "$reverse_zones" <<'PY_NNS_DNS_PROXY'
 from __future__ import annotations
 
 import ipaddress
@@ -199,6 +260,9 @@ if not upstreams:
 # no fallback to ordinary DNS for private names, even if that server is down.
 private_upstreams = [(address, UPSTREAM_PORT) for address in sys.argv[2].split()]
 private_domains = tuple(suffix.lower() for suffix in sys.argv[3].split())
+private_reverse_zones = tuple(
+    suffix.lower() for suffix in sys.argv[4].split()
+) if len(sys.argv) > 4 else ()
 if bool(private_upstreams) != bool(private_domains):
     raise SystemExit("incomplete namespace split DNS policy")
 
@@ -234,6 +298,11 @@ def dns_upstreams(packet: bytes) -> list[tuple[str, int]]:
         return []
     if private_domains and any(suffix == "." or name == suffix or name.endswith("." + suffix)
                                for suffix in private_domains):
+        return private_upstreams
+    if (private_upstreams and private_reverse_zones and name.endswith(".in-addr.arpa") and
+            any(name == zone or name.endswith("." + zone) for zone in private_reverse_zones)):
+        # PTR lookups for tunneled networks belong to the private resolvers,
+        # not to public DNS.
         return private_upstreams
     return upstreams
 
@@ -958,8 +1027,13 @@ myip_report_app() {
     printf 'Default gateway:   %s\n' "${gateway:-direct or unavailable}"
     printf 'Backend:           %s\n' "$type_label"
     if app_split_tunnel "$app"; then
-        printf 'Routing mode:      split (IPv4 AllowedIPs only)\n'
-        printf 'VPN tunnel:        %s\n' "$(wireguard_iface_name "$app")"
+        if [[ "$(vpn_type_for_app "$app" 2>/dev/null || true)" == openvpn ]]; then
+            printf 'Routing mode:      split (client routes only)\n'
+            printf 'VPN tunnel:        %s\n' "${dev:-unavailable}"
+        else
+            printf 'Routing mode:      split (IPv4 AllowedIPs only)\n'
+            printf 'VPN tunnel:        %s\n' "$(wireguard_iface_name "$app")"
+        fi
         printf 'VPN reachability:  not verified by external-IP probe\n'
     fi
     printf 'Configured via:    %s\n' "$configured_via"
@@ -1368,14 +1442,18 @@ status_app() {
     [[ -z "$ns_since" ]] || printf 'Namespace active:  %s\n' "$ns_since"
     [[ -z "$vpn_since" ]] || printf 'VPN active:        %s\n' "$vpn_since"
     if app_split_tunnel "$app"; then
-        printf 'Routing mode:      split (AllowedIPs only; no Internet probe)\n'
+        if [[ "$type" == openvpn ]]; then
+            printf 'Routing mode:      split (client routes only; no Internet probe)\n'
+        else
+            printf 'Routing mode:      split (AllowedIPs only; no Internet probe)\n'
+        fi
     fi
     printf 'Kill switch:       %s\n' "${KILLSWITCH:-unknown}"
     printf 'DNS servers:       %s\n' "${DNS_SERVERS:-not configured}"
-    if [[ "$type" == wireguard || "$type" == amneziawg ]]; then
+    if [[ "$type" == wireguard || "$type" == amneziawg || "$type" == openvpn ]]; then
         local dns_policy="" routed_dns="" routed_domains=""
         if [[ -n "${DEFAULT_PROFILE:-}" && -f "$(profiles_dir "$app")/$DEFAULT_PROFILE" ]]; then
-            dns_policy=$(wireguard_profile_dns_policy "$(profiles_dir "$app")/$DEFAULT_PROFILE" 2>/dev/null || true)
+            dns_policy=$(app_profile_dns_policy "$app" 2>/dev/null || true)
         fi
         if [[ -n "$dns_policy" ]]; then
             routed_dns=${dns_policy%%$'\n'*}

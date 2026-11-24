@@ -534,15 +534,228 @@ raise SystemExit("WireGuard profile has no IPv4 AllowedIPs")
 PY_WG_ROUTE_SAMPLE
 }
 
+# All IPv4 networks a profile routes through its tunnel, as "network netmask"
+# pairs (excluding a default route). Used by gateways to push a private-only
+# exit's routes to OpenVPN clients instead of redirect-gateway.
+wireguard_profile_networks() {
+    local profile=$1
+    python3 - "$profile" <<'PY_WG_NETWORKS'
+import ipaddress
+import re
+import sys
+from pathlib import Path
+networks = []
+section = None
+for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = raw.split("#", 1)[0].strip()
+    if re.fullmatch(r"\[\s*peer\s*\]", line, flags=re.IGNORECASE):
+        section = "peer"
+    elif line.startswith("["):
+        section = None
+    elif section == "peer" and "=" in line:
+        key, value = line.split("=", 1)
+        if key.strip().lower() == "allowedips":
+            for address in value.split(","):
+                network = ipaddress.ip_network(address.strip(), strict=False)
+                if network.version == 4 and network.prefixlen != 0:
+                    networks.append(network)
+for network in ipaddress.collapse_addresses(networks):
+    if network.prefixlen != 0:
+        print("%s %s" % (network.network_address, network.netmask))
+PY_WG_NETWORKS
+}
+
+# The same "network netmask" list for an OpenVPN profile, taken from its
+# client-side `route` directives (CIDR, bare IP, or net/mask forms).
+openvpn_profile_networks() {
+    local profile=$1
+    python3 - "$profile" <<'PY_OVPN_NETWORKS'
+import ipaddress
+import re
+import sys
+from pathlib import Path
+networks = []
+for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = raw.split("#", 1)[0].strip()
+    match = re.match(r"^route\s+(\S+)(?:\s+(\S+))?", line, flags=re.IGNORECASE)
+    if not match:
+        continue
+    target, mask = match.group(1), match.group(2)
+    try:
+        network = ipaddress.ip_network(
+            "%s/%s" % (target, mask) if mask else target, strict=False)
+    except ValueError:
+        continue
+    if network.version == 4 and network.prefixlen != 0:
+        networks.append(network)
+for network in ipaddress.collapse_addresses(networks):
+    if network.prefixlen != 0:
+        print("%s %s" % (network.network_address, network.netmask))
+PY_OVPN_NETWORKS
+}
+
+# An OpenVPN profile is private-only when nns-app exported it with the
+# private-only marker and client-side routes; ordinary or third-party
+# profiles remain "full" so readiness keeps probing public connectivity.
+openvpn_profile_route_mode() {
+    local profile=$1
+    grep -Eqi '^[[:space:]]*#[[:space:]]*nns-app private-only' "$profile" ||
+        { printf 'full\n'; return 0; }
+    grep -Eqi '^[[:space:]]*route[[:space:]]+' "$profile" &&
+        { printf 'split\n'; return 0; }
+    printf 'full\n'
+}
+
+# First routable IPv4 sample from an OpenVPN profile's client-side routes.
+openvpn_profile_route_sample() {
+    local profile=$1
+    python3 - "$profile" <<'PY_OVPN_ROUTE_SAMPLE'
+import ipaddress
+import re
+import sys
+from pathlib import Path
+for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = raw.split("#", 1)[0].strip()
+    match = re.match(r"^route\s+(\S+)(?:\s+(\S+))?", line, flags=re.IGNORECASE)
+    if not match:
+        continue
+    target, mask = match.group(1), match.group(2)
+    try:
+        network = ipaddress.ip_network(
+            "%s/%s" % (target, mask) if mask else target, strict=False)
+    except ValueError:
+        continue
+    if network.version == 4 and network.prefixlen != 0:
+        print(network.network_address + int(network.num_addresses > 1))
+        raise SystemExit(0)
+raise SystemExit("OpenVPN profile has no client-side routes")
+PY_OVPN_ROUTE_SAMPLE
+}
+
+# Mirror wireguard_profile_dns_policy's contract for OpenVPN profiles:
+# routing mode prints "servers" and "domains" lines ('.' = all queries);
+# search mode prints the search list. Sources: dhcp-option DNS/DOMAIN and
+# ADAPTER_DOMAIN-SEARCH lines written by the gateway export.
+openvpn_profile_dns_policy() {
+    local profile=$1 mode=${2:-routing}
+    python3 - "$profile" "$mode" <<'PY_OVPN_DNS_POLICY'
+import ipaddress
+import re
+import shlex
+import sys
+from pathlib import Path
+
+servers = []
+route_domains = []
+search_domains = []
+
+
+def valid_domain(token):
+    suffix = token.lower().rstrip(".")
+    if not suffix or len(suffix) > 253 or any(
+        not 1 <= len(label) <= 63 or not re.fullmatch(
+            r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label
+        ) for label in suffix.split(".")
+    ):
+        raise SystemExit("invalid OpenVPN DNS domain")
+    return suffix
+
+
+def valid_ip(token):
+    address = ipaddress.ip_address(token)
+    if address.version != 4 or address.is_unspecified or address.is_multicast:
+        raise SystemExit("OpenVPN DNS requires usable IPv4 address")
+    return str(address)
+
+for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = raw.split("#", 1)[0].strip()
+    match = re.match(r"^dhcp-option\s+(\S+)(.*)$", line, flags=re.IGNORECASE)
+    if not match:
+        continue
+    kind = match.group(1).lower().replace("_", "-")
+    tokens = shlex.split(match.group(2))
+    if kind == "dns":
+        servers.extend(valid_ip(token) for token in tokens)
+    elif kind == "domain":
+        route_domains.extend(valid_domain(token) for token in tokens)
+    elif kind == "adapter-domain-search":
+        search_domains.extend(valid_domain(token) for token in tokens)
+
+if sys.argv[2] == "search":
+    print(" ".join(dict.fromkeys(search_domains)))
+elif sys.argv[2] == "routing":
+    if servers:
+        print(" ".join(dict.fromkeys(servers)))
+        print(" ".join(dict.fromkeys(route_domains or ["."])))
+else:
+    raise SystemExit("invalid OpenVPN DNS policy mode")
+PY_OVPN_DNS_POLICY
+}
+
+# Dispatchers used by gateways, readiness, and the namespace DNS proxy so
+# they treat WireGuard and OpenVPN private-only profiles uniformly.
+app_profile_networks() {
+    local app=$1 backend profile
+    backend=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    profile=$(cfg_read_value "$app" DEFAULT_PROFILE 2>/dev/null || true)
+    [[ -n "$profile" && -f "$(profiles_dir "$app")/$profile" ]] || return 1
+    profile="$(profiles_dir "$app")/$profile"
+    case "$backend" in
+        wireguard|amneziawg) wireguard_profile_networks "$profile" ;;
+        openvpn) openvpn_profile_networks "$profile" ;;
+        *) return 1 ;;
+    esac
+}
+
+app_profile_route_sample() {
+    local app=$1 backend profile
+    backend=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    profile=$(cfg_read_value "$app" DEFAULT_PROFILE 2>/dev/null || true)
+    [[ -n "$profile" && -f "$(profiles_dir "$app")/$profile" ]] || return 1
+    profile="$(profiles_dir "$app")/$profile"
+    case "$backend" in
+        wireguard|amneziawg) wireguard_profile_route_sample "$profile" ;;
+        openvpn) openvpn_profile_route_sample "$profile" ;;
+        *) return 1 ;;
+    esac
+}
+
+app_profile_dns_policy() {
+    local app=$1 mode=${2:-routing} backend profile
+    backend=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    profile=$(cfg_read_value "$app" DEFAULT_PROFILE 2>/dev/null || true)
+    [[ -n "$profile" && -f "$(profiles_dir "$app")/$profile" ]] || return 1
+    profile="$(profiles_dir "$app")/$profile"
+    case "$backend" in
+        wireguard|amneziawg) wireguard_profile_dns_policy "$profile" "$mode" ;;
+        openvpn) openvpn_profile_dns_policy "$profile" "$mode" ;;
+        *) return 1 ;;
+    esac
+}
+
+# A private-only app routes a selected set of networks and its kill switch
+# keeps everything else from leaking to the host uplink, so there is no
+# public Internet exit to promise or to probe.
+app_is_private_only() {
+    local app=$1 killswitch
+    app_split_tunnel "$app" || return 1
+    killswitch=$(cfg_read_value "$app" KILLSWITCH 2>/dev/null || true)
+    bool_on "${killswitch:-on}"
+}
+
 # Used by readiness, watchdog, status, and inventory. Must not force an
 # arbitrary public IPv4 connectivity probe on a private-network-only tunnel.
 app_split_tunnel() {
     local app=$1 backend profile
     backend=$(vpn_type_for_app "$app" 2>/dev/null || true)
-    case "$backend" in wireguard|amneziawg) ;; *) return 1 ;; esac
+    case "$backend" in wireguard|amneziawg|openvpn) ;; *) return 1 ;; esac
     profile=$(cfg_read_value "$app" DEFAULT_PROFILE 2>/dev/null || true)
     [[ -n "$profile" && -f "$(profiles_dir "$app")/$profile" ]] || return 1
-    [[ "$(wireguard_profile_route_mode "$(profiles_dir "$app")/$profile")" == split ]]
+    profile="$(profiles_dir "$app")/$profile"
+    case "$backend" in
+        openvpn) [[ "$(openvpn_profile_route_mode "$profile")" == split ]] ;;
+        *) [[ "$(wireguard_profile_route_mode "$profile")" == split ]] ;;
+    esac
 }
 
 # Output two newline-separated fields: upstream IPv4 addresses and matching
@@ -674,12 +887,8 @@ PY_WG_DNS_POLICY
 # True if the WireGuard profile configures an internal DNS policy.
 
 app_has_split_dns() {
-    local app=$1 vpn_type profile policy
-    vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
-    [[ "$vpn_type" == wireguard || "$vpn_type" == amneziawg ]] || return 1
-    profile=$(cfg_read_value "$app" DEFAULT_PROFILE 2>/dev/null || true)
-    [[ -n "$profile" && -f "$(profiles_dir "$app")/$profile" ]] || return 1
-    policy=$(wireguard_profile_dns_policy "$(profiles_dir "$app")/$profile") || return 1
+    local app=$1 policy
+    policy=$(app_profile_dns_policy "$app") || return 1
     [[ -n "$policy" ]]
 }
 
@@ -1030,12 +1239,18 @@ add_profile() {
             log "OpenVPN profile fixups are disabled in $(cfg_file "$app")."
         fi
     else
-        local dns_policy="" dns_domains=""
-        dns_policy=$(wireguard_profile_dns_policy "$dest")
+        local dns_policy="" dns_domains="" policy_label
+        if [[ "$type" == openvpn ]]; then
+            policy_label=OpenVPN
+            dns_policy=$(openvpn_profile_dns_policy "$dest" 2>/dev/null || true)
+        else
+            policy_label=WireGuard
+            dns_policy=$(wireguard_profile_dns_policy "$dest")
+        fi
         if [[ -n "$dns_policy" ]]; then
             dns_domains=${dns_policy#*$'\n'}
             if [[ "$dns_domains" == "." ]]; then
-                log "WireGuard DNS imported: all DNS queries use the profile's DNS servers via the tunnel."
+                log "$policy_label DNS imported: all DNS queries use the profile's DNS servers via the tunnel."
             else
                 log "Split DNS policy imported: matching domains use profile DNS via the tunnel."
             fi

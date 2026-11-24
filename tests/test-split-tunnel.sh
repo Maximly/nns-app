@@ -57,6 +57,18 @@ PublicKey = $KEY
 AllowedIPs = ::/0
 Endpoint = vpn.example.com:443
 EOF_WG
+cat > "$TMP/private-client.ovpn" <<EOF_OVPN
+# nns-app private-only: client-side routes below, no redirect-gateway
+client
+remote vpn.example.com 1197
+proto udp
+route 192.168.83.0 255.255.255.0
+dhcp-option DNS 1.1.1.1
+dhcp-option DOMAIN promobit.loc
+<ca>
+x
+</ca>
+EOF_OVPN
 [[ $(profile_type_from_file "$TMP/split-awg.conf") == amneziawg ]] || fail 'AWG detection'
 validate_amneziawg "$TMP/split-awg.conf" || fail 'AWG split validation'
 validate_wireguard "$TMP/split-wg.conf" || fail 'WG split validation'
@@ -97,6 +109,34 @@ cmp <(grep -E '^AllowedIPs' "$TMP/split-awg.conf") <(grep -E '^AllowedIPs' "$TMP
     # Wrong route must not count as ready.
     ip() { echo '10.30.0.1 dev veth0 src 10.9.0.2'; }
     if wait_online edgewall 1; then fail 'Invalid split route accepted'; fi
+)
+
+# A private-only OpenVPN client is ready when its client-side route exists on
+# a tun device, without probing 1.1.1.1.
+(
+    load_cfg() { NS_NAME=mock-netns; DEFAULT_PROFILE=private-client.ovpn; }
+    profiles_dir() { printf '%s\n' "$TMP"; }
+    vpn_type_for_app() { printf 'openvpn\n'; }
+    cfg_read_value() { if [[ "$2" == DEFAULT_PROFILE ]]; then printf 'private-client.ovpn\n'; fi; }
+    vpn_route_ready() { return 0; }
+    ip() {
+        if [[ "$1" == -n && "$2" == mock-netns && "$3" == -4 && "$4" == route && "$5" == get ]]; then
+            [[ "$6" == 192.168.83.1 ]] || fail 'Wrong OpenVPN route probe IP'
+            echo '192.168.83.1 dev tun0 src 10.253.3.2'
+            return 0
+        fi
+        fail "Unexpected ip call: $*"
+    }
+    wait_online edgewall 2 || fail 'Private OpenVPN route readiness fails'
+)
+(
+    load_cfg() { NS_NAME=mock-netns; DEFAULT_PROFILE=private-client.ovpn; }
+    profiles_dir() { printf '%s\n' "$TMP"; }
+    vpn_type_for_app() { printf 'openvpn\n'; }
+    cfg_read_value() { if [[ "$2" == DEFAULT_PROFILE ]]; then printf 'private-client.ovpn\n'; fi; }
+    vpn_route_ready() { return 0; }
+    ip() { echo '192.168.83.1 dev veth0 src 10.253.3.2'; }
+    if wait_online edgewall 1; then fail 'Non-tun private OpenVPN route accepted'; fi
 )
 
 grep -Fq 'iptables -w 5 -P OUTPUT DROP' "$ROOT/src/40-network.sh" || fail 'Kill switch unexpectedly removed'

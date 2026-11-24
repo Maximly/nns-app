@@ -34,6 +34,14 @@ Highlights are grouped by major release series. Individual patch and minor relea
   overridable via `NNS_MYLOC_URL` and `NNS_MYLOC_FALLBACK_URLS`. The provider
   that last answered for a given egress (network namespace or macOS app) is
   remembered and tried first on later runs.
+- Private-only gateways: an OpenVPN gateway whose `--via` upstream is a
+  split-tunnel app with the kill switch enabled no longer pushes
+  `redirect-gateway`; it inherits the upstream's private networks and DNS
+  policy (servers and split-DNS domains) into server pushes and exported
+  client profiles (marked `nns-app private-only`). On client hosts such
+  profiles classify as split tunnels, so start readiness, the watchdog
+  (`ready-split`), status and the namespace split-DNS proxy use client-side
+  routes instead of demanding public Internet connectivity.
 - Added an explicit Linux/macOS feature comparison and macOS static/mock tests.
 - Linux feature implementation preserved from 2.0.16. The Darwin backend is
   experimental and has weaker process isolation than Linux namespaces.

@@ -46,7 +46,7 @@ The macOS backend is a separate implementation, not a fork of Linux modules.
 | --- | --- | --- |
 | `install <app>`, `add <app> profile` | Supported | Supported for **WireGuard `.conf`** and **OpenVPN `.ovpn`** |
 | `start`, `stop`, `status`, `list`, `remove` | Supported | Supported; `start/stop/recover` require `sudo` |
-| `run <app> command` | General Linux network namespace | **Compatible unsandboxed IPv4 executables only**: DYLD interposition for TCP, plus native bind options for `ping`, `nc`, `ssh`/`scp`/`sftp`, `curl`, `dig` and `traceroute` |
+| `run <app> command` | General Linux network namespace | **Compatible unsandboxed IPv4 executables only**: DYLD interposition for TCP, plus native bind options for `ping`, `nc`, `ssh`/`scp`/`sftp`, `curl`, `dig` and `traceroute`. In-scope hostnames for `ping`/`nc`/`ssh`/`scp`/`sftp` are resolved via the per-app VPN resolver and substituted numerically, since SIP binaries ignore DYLD injection |
 | Host network impact | Host default route unchanged; namespace/veth/firewall infrastructure | Default route and DNS unchanged; **creates system-visible `utun` + interface-scoped route** |
 | VPN clients: WireGuard | Supported | Supported (`wireguard-go`, `wg`, `wg-quick strip`) |
 | VPN clients: OpenVPN | Supported | Experimental client (`openvpn --route-noexec`; inline certs only) |
@@ -453,6 +453,29 @@ selects direct host egress. AmneziaWG servers currently support host exit only.
 The public listener remains on the host; the gateway's decrypted client
 traffic uses its configured exit. Consequently, `nns-app run <gateway>
 <command>` executes in the egress context, not the listener context.
+
+#### Private-only exit
+
+When the `--via` upstream is a private-only app (split-tunnel profile with
+the kill switch enabled — no public Internet exit), the gateway no longer
+promises a default route to its OpenVPN clients. Instead it automatically
+inherits the upstream's routing and DNS policy: client profiles receive the
+upstream's private networks as routes and its DNS servers and split-DNS
+domains as `dhcp-option` settings, with no `redirect-gateway`. Exported
+profiles carry the same policy client-side (marked `nns-app private-only`),
+so on the client machine:
+
+```bash
+sudo nns-app gateway create bitblaze-gw --via bitblaze
+nns-app gateway client export bitblaze-gw --client laptop --output laptop.ovpn
+# on the client host:
+sudo nns-app add laptop laptop.ovpn
+nns-app start laptop            # no -i, no manual DNS, kill switch intact
+```
+
+Such clients are classified as split: start readiness, the watchdog
+(`ready-split`), status, and the namespace split-DNS proxy all use the
+client-side routes instead of probing public Internet connectivity.
 
 ### Cloak transport
 

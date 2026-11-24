@@ -90,8 +90,9 @@ build_macos() {
         exit 1
     }
     # The bundled launcher and DYLD interposer are compiled on the target Mac.
+    # Tests are not part of the build; run them separately with
+    # `make test` (Linux) or `make test-macos` (Darwin).
     make -C "$ROOT/macos" all
-    bash "$ROOT/macos/tests/test-static.sh"
     local binary
     for binary in "$ROOT/macos/bin/nns-run" "$ROOT/macos/bin/libnnsbind.dylib"; do
         if ! file -b "$binary" | grep -q 'Mach-O'; then

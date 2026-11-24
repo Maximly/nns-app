@@ -212,6 +212,15 @@ grep -Eq '^# persist-key' "$OVPN_PROF" || {
 [[ "$(cat "$T/home/Library/Application Support/nns-app/apps/ovpnvpn/dns_ipv4")" == 10.9.0.1 ]] || {
   echo 'ovpn dhcp-option DNS not imported' >&2; exit 1
 }
+[ ! -f "$T/home/Library/Application Support/nns-app/apps/ovpnvpn/dns_domains" ] || {
+  echo 'plain ovpn import must not create a split-domain scope' >&2; exit 1
+}
+grep -Eq '^# dhcp-option' "$OVPN_PROF" || {
+  echo 'dhcp-option was not neutralized in the stored profile' >&2; exit 1
+}
+if grep -Eq '^dhcp-option' "$OVPN_PROF"; then
+  echo 'active dhcp-option leaked into stored profile (would hijack system DNS)' >&2; exit 1
+fi
 output=$(bash "$ROOT/nns-app-darwin.sh" list)
 grep -Eq 'ovpnvpn[[:space:]]+vpn-client/ovpn[[:space:]]+stopped[[:space:]]+host' <<<"$output" || {
   echo "ovpn list row mismatch: $output" >&2; exit 1
@@ -220,6 +229,55 @@ grep -Fq 'dns 10.9.0.1' <<<"$output" || { echo 'ovpn list missing DNS' >&2; exit
 bash "$ROOT/nns-app-darwin.sh" status ovpnvpn | grep -q 'vpn-client/ovpn' || {
   echo 'ovpn status missing type' >&2; exit 1
 }
+# Private-only gateway export: dhcp-option DOMAIN becomes the split-DNS scope,
+# so only matching domains use the per-app VPN resolver and public names keep
+# the system resolver.
+cat > "$T/private.ovpn" <<'S'
+# nns-app private-only: client-side routes below, no redirect-gateway
+client
+dev tun
+proto udp
+remote 135.106.161.67 1197
+nobind
+remote-cert-tls server
+route 192.168.83.0 255.255.255.0
+dhcp-option DNS 192.168.83.10
+dhcp-option DOMAIN promobit.loc
+<ca>
+-----BEGIN CERTIFICATE-----
+MIIB
+-----END CERTIFICATE-----
+</ca>
+<cert>
+-----BEGIN CERTIFICATE-----
+MIIB
+-----END CERTIFICATE-----
+</cert>
+<key>
+-----BEGIN PRIVATE KEY-----
+MIIB
+-----END PRIVATE KEY-----
+</key>
+S
+bash "$ROOT/nns-app-darwin.sh" install privatevpn
+bash "$ROOT/nns-app-darwin.sh" add privatevpn "$T/private.ovpn"
+PRIV_CFG="$T/home/Library/Application Support/nns-app/apps/privatevpn"
+[[ "$(cat "$PRIV_CFG/dns_ipv4")" == 192.168.83.10 ]] || {
+  echo 'private profile DNS not imported' >&2; exit 1
+}
+[[ "$(cat "$PRIV_CFG/dns_domains")" == promobit.loc ]] || {
+  echo 'private profile split domains not imported' >&2; exit 1
+}
+grep -Fq 'NNS_DNS_DOMAINS' "$ROOT/nns-app-darwin.sh" || {
+  echo 'interposer domain scope not exported' >&2; exit 1
+}
+grep -Fq -- '--pull-filter ignore dhcp-option' "$ROOT/nns-app-darwin.sh" || {
+  echo 'pushed dhcp-option not filtered from OpenVPN' >&2; exit 1
+}
+if grep -Eq '^dhcp-option' "$PRIV_CFG/profile.ovpn"; then
+  echo 'private profile kept an active dhcp-option (would hijack system DNS)' >&2; exit 1
+fi
+bash "$ROOT/nns-app-darwin.sh" remove privatevpn
 cat > "$T/bad.ovpn" <<'S'
 client
 dev tun
@@ -453,5 +511,20 @@ S
   grep -Fq '203.0.113.12' <<<"$loc_r2" || { echo "cached myloc second run mismatch: $loc_r2" >&2; exit 1; }
   head -n1 "$T/myloc-order2" | grep -Fq 'ipwho.is' || { echo 'cached provider not tried first on second run' >&2; exit 1; }
 fi
+
+# SIP-protected tools get scoped VPN DNS via the exported resolver symbol:
+# the launcher resolves in-scope hostnames and substitutes numeric argv.
+nm -gU "$ROOT/bin/libnnsbind.dylib" 2>/dev/null | grep -Fq '_nns_dns_resolve_host' || {
+  echo 'libnnsbind lacks the exported VPN DNS resolver' >&2; exit 1
+}
+nm -gU "$ROOT/bin/libnnsbind.dylib" 2>/dev/null | grep -Fq '_nns_dns_host_is_local' || {
+  echo 'libnnsbind lacks the exported /etc/hosts classifier' >&2; exit 1
+}
+strings "$ROOT/bin/nns-run" | grep -Fq 'nns_dns_resolve_host' || {
+  echo 'nns-run lacks the VPN DNS resolution hook' >&2; exit 1
+}
+strings "$ROOT/bin/nns-run" | grep -Fq 'nns_dns_host_is_local' || {
+  echo 'nns-run lacks the local-hosts passthrough hook' >&2; exit 1
+}
 
 echo 'macOS static + mock CLI tests passed.'

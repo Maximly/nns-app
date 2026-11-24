@@ -77,9 +77,9 @@ if [[ "$(uname -s)" == Darwin && "${NNS_APP_SOURCE_ONLY:-0}" != 1 ]]; then
 fi
 
 # Sole source of truth is the repo-root VERSION file. build.sh substitutes the
-# 2.1.9 token when assembling install_linux. An unsubstituted value
+# 2.1.25 token when assembling install_linux. An unsubstituted value
 # still contains "@", which triggers the source-tree file lookup.
-_nns_version="2.1.9"
+_nns_version="2.1.25"
 if [[ "$_nns_version" == *@* ]]; then
     _nns_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
     if [[ -f "$_nns_dir/VERSION" ]]; then
@@ -753,7 +753,14 @@ vpn_route_iface() {
 
     case "$type" in
         openvpn)
-            dev=$(ip -n "$ns" -4 route get 1.1.1.1 2>/dev/null |
+            local probe=1.1.1.1
+            if app_split_tunnel "$app"; then
+                # A private-only client has no default route to probe; its
+                # own client-side routes define the data path instead.
+                probe=$(app_profile_route_sample "$app" 2>/dev/null || true)
+                [[ -n "$probe" ]] || return 1
+            fi
+            dev=$(ip -n "$ns" -4 route get "$probe" 2>/dev/null |
                   awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
             [[ "$dev" =~ ^(tun|tap) ]] || return 1
             ;;
@@ -799,6 +806,21 @@ upstream_tunnel_iface() {
     dev=$(vpn_route_iface "$upstream" 2>/dev/null || true)
     [[ -n "$dev" ]] || return 1
     printf '%s|%s\n' "$ns" "$dev"
+}
+
+# MTU of an upstream app's tunnel interface. A gateway nested behind this
+# tunnel must cap its OpenVPN tun (and client MSS) at this value, otherwise
+# large packets are dropped at the upstream's path MTU.
+upstream_tunnel_mtu() {
+    local upstream=$1 ns dev mtu
+    ns=$(cfg_read_value "$upstream" NS_NAME 2>/dev/null || true)
+    [[ -n "$ns" ]] || return 1
+    dev=$(vpn_route_iface "$upstream" 2>/dev/null || true)
+    [[ -n "$dev" ]] || return 1
+    mtu=$(ip -n "$ns" -o link show dev "$dev" 2>/dev/null |
+        awk '{for (i=1;i<=NF;i++) if ($i=="mtu") {print $(i+1); exit}}')
+    [[ "$mtu" =~ ^[0-9]+$ ]] && (( mtu >= 1000 )) && (( mtu <= 1500 )) || return 1
+    printf '%s\n' "$mtu"
 }
 
 
@@ -2280,15 +2302,228 @@ raise SystemExit("WireGuard profile has no IPv4 AllowedIPs")
 PY_WG_ROUTE_SAMPLE
 }
 
+# All IPv4 networks a profile routes through its tunnel, as "network netmask"
+# pairs (excluding a default route). Used by gateways to push a private-only
+# exit's routes to OpenVPN clients instead of redirect-gateway.
+wireguard_profile_networks() {
+    local profile=$1
+    python3 - "$profile" <<'PY_WG_NETWORKS'
+import ipaddress
+import re
+import sys
+from pathlib import Path
+networks = []
+section = None
+for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = raw.split("#", 1)[0].strip()
+    if re.fullmatch(r"\[\s*peer\s*\]", line, flags=re.IGNORECASE):
+        section = "peer"
+    elif line.startswith("["):
+        section = None
+    elif section == "peer" and "=" in line:
+        key, value = line.split("=", 1)
+        if key.strip().lower() == "allowedips":
+            for address in value.split(","):
+                network = ipaddress.ip_network(address.strip(), strict=False)
+                if network.version == 4 and network.prefixlen != 0:
+                    networks.append(network)
+for network in ipaddress.collapse_addresses(networks):
+    if network.prefixlen != 0:
+        print("%s %s" % (network.network_address, network.netmask))
+PY_WG_NETWORKS
+}
+
+# The same "network netmask" list for an OpenVPN profile, taken from its
+# client-side `route` directives (CIDR, bare IP, or net/mask forms).
+openvpn_profile_networks() {
+    local profile=$1
+    python3 - "$profile" <<'PY_OVPN_NETWORKS'
+import ipaddress
+import re
+import sys
+from pathlib import Path
+networks = []
+for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = raw.split("#", 1)[0].strip()
+    match = re.match(r"^route\s+(\S+)(?:\s+(\S+))?", line, flags=re.IGNORECASE)
+    if not match:
+        continue
+    target, mask = match.group(1), match.group(2)
+    try:
+        network = ipaddress.ip_network(
+            "%s/%s" % (target, mask) if mask else target, strict=False)
+    except ValueError:
+        continue
+    if network.version == 4 and network.prefixlen != 0:
+        networks.append(network)
+for network in ipaddress.collapse_addresses(networks):
+    if network.prefixlen != 0:
+        print("%s %s" % (network.network_address, network.netmask))
+PY_OVPN_NETWORKS
+}
+
+# An OpenVPN profile is private-only when nns-app exported it with the
+# private-only marker and client-side routes; ordinary or third-party
+# profiles remain "full" so readiness keeps probing public connectivity.
+openvpn_profile_route_mode() {
+    local profile=$1
+    grep -Eqi '^[[:space:]]*#[[:space:]]*nns-app private-only' "$profile" ||
+        { printf 'full\n'; return 0; }
+    grep -Eqi '^[[:space:]]*route[[:space:]]+' "$profile" &&
+        { printf 'split\n'; return 0; }
+    printf 'full\n'
+}
+
+# First routable IPv4 sample from an OpenVPN profile's client-side routes.
+openvpn_profile_route_sample() {
+    local profile=$1
+    python3 - "$profile" <<'PY_OVPN_ROUTE_SAMPLE'
+import ipaddress
+import re
+import sys
+from pathlib import Path
+for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = raw.split("#", 1)[0].strip()
+    match = re.match(r"^route\s+(\S+)(?:\s+(\S+))?", line, flags=re.IGNORECASE)
+    if not match:
+        continue
+    target, mask = match.group(1), match.group(2)
+    try:
+        network = ipaddress.ip_network(
+            "%s/%s" % (target, mask) if mask else target, strict=False)
+    except ValueError:
+        continue
+    if network.version == 4 and network.prefixlen != 0:
+        print(network.network_address + int(network.num_addresses > 1))
+        raise SystemExit(0)
+raise SystemExit("OpenVPN profile has no client-side routes")
+PY_OVPN_ROUTE_SAMPLE
+}
+
+# Mirror wireguard_profile_dns_policy's contract for OpenVPN profiles:
+# routing mode prints "servers" and "domains" lines ('.' = all queries);
+# search mode prints the search list. Sources: dhcp-option DNS/DOMAIN and
+# ADAPTER_DOMAIN-SEARCH lines written by the gateway export.
+openvpn_profile_dns_policy() {
+    local profile=$1 mode=${2:-routing}
+    python3 - "$profile" "$mode" <<'PY_OVPN_DNS_POLICY'
+import ipaddress
+import re
+import shlex
+import sys
+from pathlib import Path
+
+servers = []
+route_domains = []
+search_domains = []
+
+
+def valid_domain(token):
+    suffix = token.lower().rstrip(".")
+    if not suffix or len(suffix) > 253 or any(
+        not 1 <= len(label) <= 63 or not re.fullmatch(
+            r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label
+        ) for label in suffix.split(".")
+    ):
+        raise SystemExit("invalid OpenVPN DNS domain")
+    return suffix
+
+
+def valid_ip(token):
+    address = ipaddress.ip_address(token)
+    if address.version != 4 or address.is_unspecified or address.is_multicast:
+        raise SystemExit("OpenVPN DNS requires usable IPv4 address")
+    return str(address)
+
+for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = raw.split("#", 1)[0].strip()
+    match = re.match(r"^dhcp-option\s+(\S+)(.*)$", line, flags=re.IGNORECASE)
+    if not match:
+        continue
+    kind = match.group(1).lower().replace("_", "-")
+    tokens = shlex.split(match.group(2))
+    if kind == "dns":
+        servers.extend(valid_ip(token) for token in tokens)
+    elif kind == "domain":
+        route_domains.extend(valid_domain(token) for token in tokens)
+    elif kind == "adapter-domain-search":
+        search_domains.extend(valid_domain(token) for token in tokens)
+
+if sys.argv[2] == "search":
+    print(" ".join(dict.fromkeys(search_domains)))
+elif sys.argv[2] == "routing":
+    if servers:
+        print(" ".join(dict.fromkeys(servers)))
+        print(" ".join(dict.fromkeys(route_domains or ["."])))
+else:
+    raise SystemExit("invalid OpenVPN DNS policy mode")
+PY_OVPN_DNS_POLICY
+}
+
+# Dispatchers used by gateways, readiness, and the namespace DNS proxy so
+# they treat WireGuard and OpenVPN private-only profiles uniformly.
+app_profile_networks() {
+    local app=$1 backend profile
+    backend=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    profile=$(cfg_read_value "$app" DEFAULT_PROFILE 2>/dev/null || true)
+    [[ -n "$profile" && -f "$(profiles_dir "$app")/$profile" ]] || return 1
+    profile="$(profiles_dir "$app")/$profile"
+    case "$backend" in
+        wireguard|amneziawg) wireguard_profile_networks "$profile" ;;
+        openvpn) openvpn_profile_networks "$profile" ;;
+        *) return 1 ;;
+    esac
+}
+
+app_profile_route_sample() {
+    local app=$1 backend profile
+    backend=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    profile=$(cfg_read_value "$app" DEFAULT_PROFILE 2>/dev/null || true)
+    [[ -n "$profile" && -f "$(profiles_dir "$app")/$profile" ]] || return 1
+    profile="$(profiles_dir "$app")/$profile"
+    case "$backend" in
+        wireguard|amneziawg) wireguard_profile_route_sample "$profile" ;;
+        openvpn) openvpn_profile_route_sample "$profile" ;;
+        *) return 1 ;;
+    esac
+}
+
+app_profile_dns_policy() {
+    local app=$1 mode=${2:-routing} backend profile
+    backend=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    profile=$(cfg_read_value "$app" DEFAULT_PROFILE 2>/dev/null || true)
+    [[ -n "$profile" && -f "$(profiles_dir "$app")/$profile" ]] || return 1
+    profile="$(profiles_dir "$app")/$profile"
+    case "$backend" in
+        wireguard|amneziawg) wireguard_profile_dns_policy "$profile" "$mode" ;;
+        openvpn) openvpn_profile_dns_policy "$profile" "$mode" ;;
+        *) return 1 ;;
+    esac
+}
+
+# A private-only app routes a selected set of networks and its kill switch
+# keeps everything else from leaking to the host uplink, so there is no
+# public Internet exit to promise or to probe.
+app_is_private_only() {
+    local app=$1 killswitch
+    app_split_tunnel "$app" || return 1
+    killswitch=$(cfg_read_value "$app" KILLSWITCH 2>/dev/null || true)
+    bool_on "${killswitch:-on}"
+}
+
 # Used by readiness, watchdog, status, and inventory. Must not force an
 # arbitrary public IPv4 connectivity probe on a private-network-only tunnel.
 app_split_tunnel() {
     local app=$1 backend profile
     backend=$(vpn_type_for_app "$app" 2>/dev/null || true)
-    case "$backend" in wireguard|amneziawg) ;; *) return 1 ;; esac
+    case "$backend" in wireguard|amneziawg|openvpn) ;; *) return 1 ;; esac
     profile=$(cfg_read_value "$app" DEFAULT_PROFILE 2>/dev/null || true)
     [[ -n "$profile" && -f "$(profiles_dir "$app")/$profile" ]] || return 1
-    [[ "$(wireguard_profile_route_mode "$(profiles_dir "$app")/$profile")" == split ]]
+    profile="$(profiles_dir "$app")/$profile"
+    case "$backend" in
+        openvpn) [[ "$(openvpn_profile_route_mode "$profile")" == split ]] ;;
+        *) [[ "$(wireguard_profile_route_mode "$profile")" == split ]] ;;
+    esac
 }
 
 # Output two newline-separated fields: upstream IPv4 addresses and matching
@@ -2420,12 +2655,8 @@ PY_WG_DNS_POLICY
 # True if the WireGuard profile configures an internal DNS policy.
 
 app_has_split_dns() {
-    local app=$1 vpn_type profile policy
-    vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
-    [[ "$vpn_type" == wireguard || "$vpn_type" == amneziawg ]] || return 1
-    profile=$(cfg_read_value "$app" DEFAULT_PROFILE 2>/dev/null || true)
-    [[ -n "$profile" && -f "$(profiles_dir "$app")/$profile" ]] || return 1
-    policy=$(wireguard_profile_dns_policy "$(profiles_dir "$app")/$profile") || return 1
+    local app=$1 policy
+    policy=$(app_profile_dns_policy "$app") || return 1
     [[ -n "$policy" ]]
 }
 
@@ -2776,12 +3007,18 @@ add_profile() {
             log "OpenVPN profile fixups are disabled in $(cfg_file "$app")."
         fi
     else
-        local dns_policy="" dns_domains=""
-        dns_policy=$(wireguard_profile_dns_policy "$dest")
+        local dns_policy="" dns_domains="" policy_label
+        if [[ "$type" == openvpn ]]; then
+            policy_label=OpenVPN
+            dns_policy=$(openvpn_profile_dns_policy "$dest" 2>/dev/null || true)
+        else
+            policy_label=WireGuard
+            dns_policy=$(wireguard_profile_dns_policy "$dest")
+        fi
         if [[ -n "$dns_policy" ]]; then
             dns_domains=${dns_policy#*$'\n'}
             if [[ "$dns_domains" == "." ]]; then
-                log "WireGuard DNS imported: all DNS queries use the profile's DNS servers via the tunnel."
+                log "$policy_label DNS imported: all DNS queries use the profile's DNS servers via the tunnel."
             else
                 log "Split DNS policy imported: matching domains use profile DNS via the tunnel."
             fi
@@ -3856,16 +4093,16 @@ activate_namespace_split_dns() {
     local app=$1 vpn_type profile policy target search_domains
     load_cfg "$app"
     vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
-    [[ "$vpn_type" == wireguard || "$vpn_type" == amneziawg ]] || return 0
+    case "$vpn_type" in wireguard|amneziawg|openvpn) ;; *) return 0 ;; esac
     profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
-    policy=$(wireguard_profile_dns_policy "$profile") || return 1
+    policy=$(app_profile_dns_policy "$app") || return 1
     [[ -n "$policy" ]] || return 0
     target="/etc/netns/$NS_NAME/resolv.conf"
     [[ -f "$target" ]] || { warn "Missing namespace resolver for '$app'."; return 1; }
     # Start the daemon before pointing subsequent execs at the stub.
     # Unlike the bootstrap resolver, this proxy lives in the app namespace.
     ensure_snap_dns_proxy "$app"
-    search_domains=$(wireguard_profile_dns_policy "$profile" search) || return 1
+    search_domains=$(app_profile_dns_policy "$app" search) || return 1
     {
         printf 'nameserver 127.0.0.53\n'
         if [[ -n "$search_domains" ]]; then
@@ -4299,16 +4536,22 @@ wait_online() {
     # Verify the interface and its AllowedIPs route instead. This is a READY
     # check, not a claim that a remote peer has completed a handshake.
     if app_split_tunnel "$app"; then
-        local profile probe dev expected
+        local profile probe dev expected backend
         profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
-        expected=$(wireguard_iface_name "$app")
-        probe=$(wireguard_profile_route_sample "$profile")
+        backend=$(vpn_type_for_app "$app" 2>/dev/null || true)
+        probe=$(app_profile_route_sample "$app")
         deadline=$((SECONDS + timeout))
         while (( SECONDS < deadline )); do
             if vpn_route_ready "$app"; then
                 dev=$(ip -n "$NS_NAME" -4 route get "$probe" 2>/dev/null |
                       awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
-                [[ "$dev" != "$expected" ]] || return 0
+                if [[ "$backend" == openvpn ]]; then
+                    [[ "$dev" =~ ^(tun|tap) ]] || continue
+                else
+                    expected=$(wireguard_iface_name "$app")
+                    [[ "$dev" == "$expected" ]] || continue
+                fi
+                return 0
             fi
             sleep 0.2
         done
@@ -6281,6 +6524,7 @@ gateway_write_server_config() {
     local gateway=$1
     local root=${2:-$(gateway_dir "$gateway")}
     local config output pki proto_option network netmask dns
+    local private_exit dns_policy servers domains
     local unpriv_user unpriv_group fixed_assignments fixed_pool dynamic_first dynamic_last fixed_netmask split_clients
 
     if [[ "$root" == "$(gateway_dir "$gateway")" ]]; then
@@ -6325,6 +6569,14 @@ PY_GATEWAY_POOL
         fixed_pool=on
     fi
     gateway_sync_fixed_ip_ccd "$root" "$fixed_assignments" "$netmask" "$split_clients" || return 1
+
+    # A private-only exit (split-tunnel upstream with kill switch) cannot
+    # carry public Internet, so clients must not be promised a default
+    # route: push the upstream's private networks and DNS policy instead.
+    private_exit=off
+    if [[ "${VIA_APP:-host}" != host ]] && app_is_private_only "$VIA_APP"; then
+        private_exit=on
+    fi
 
     {
         printf '# Generated by nns-app; recreate the gateway instead of editing this file.\n'
@@ -6387,10 +6639,37 @@ PY_GATEWAY_POOL
         printf 'group %s\n' "$unpriv_group"
         printf 'status %s 5\n' "$(gateway_status_file "$gateway")"
         printf 'status-version 3\n'
-        printf 'push "redirect-gateway def1 bypass-dhcp"\n'
-        for dns in $DNS_SERVERS; do
-            printf 'push "dhcp-option DNS %s"\n' "$dns"
-        done
+        if [[ "$private_exit" == on ]]; then
+            local net mask nested_mtu
+            if nested_mtu=$(upstream_tunnel_mtu "$VIA_APP" 2>/dev/null || true) &&
+               [[ -n "$nested_mtu" ]]; then
+                # Nested tunnel: cap the OpenVPN tun at the upstream tunnel
+                # MTU so clients never exceed the real path MTU.
+                printf 'tun-mtu %s\n' "$nested_mtu"
+            fi
+            while read -r net mask; do
+                [[ -n "$net" ]] || continue
+                printf 'push "route %s %s"\n' "$net" "$mask"
+            done < <(app_profile_networks "$VIA_APP" 2>/dev/null || true)
+            dns_policy=$(app_profile_dns_policy "$VIA_APP" 2>/dev/null || true)
+            if [[ -n "$dns_policy" ]]; then
+                servers=${dns_policy%%$'\n'*}
+                domains=${dns_policy#*$'\n'}
+                for dns in $servers; do
+                    printf 'push "dhcp-option DNS %s"\n' "$dns"
+                done
+                if [[ "$domains" != "." ]]; then
+                    for domain in $domains; do
+                        printf 'push "dhcp-option DOMAIN %s"\n' "$domain"
+                    done
+                fi
+            fi
+        else
+            printf 'push "redirect-gateway def1 bypass-dhcp"\n'
+            for dns in $DNS_SERVERS; do
+                printf 'push "dhcp-option DNS %s"\n' "$dns"
+            done
+        fi
         [[ "$LISTEN_PROTO" == udp ]] &&
             printf 'explicit-exit-notify 1\n'
         printf 'verb 3\n'
@@ -10433,11 +10712,19 @@ PY_CLOAK_CLIENT_EXPORT
 
 gateway_write_client_profile_file() {
     local gateway=$1 client=$2 output=$3 target_mode=${4:-public}
-    local cdir pki proto remote_host remote_port
+    local cdir pki proto remote_host remote_port private_exit dns_policy servers domains
     load_gateway_cfg "$gateway"
     gateway_client_load "$gateway" "$client"
     cdir=$(gateway_client_dir "$gateway" "$client")
     pki=$(gateway_pki_dir "$gateway")
+
+    # A private-only gateway exit cannot carry public Internet. Embed the
+    # upstream's private routes and DNS policy in the client profile so the
+    # client machine classifies it as private-only without trusting pushes.
+    private_exit=off
+    if [[ "${VIA_APP:-host}" != host ]] && app_is_private_only "$VIA_APP"; then
+        private_exit=on
+    fi
 
     if [[ "$target_mode" == local ]]; then
         proto=tcp-client
@@ -10477,6 +10764,34 @@ gateway_write_client_profile_file() {
             printf 'explicit-exit-notify 2\n'
         fi
         printf 'verb 3\n'
+        if [[ "$private_exit" == on ]]; then
+            printf '# nns-app private-only: client-side routes below, no redirect-gateway\n'
+            local net mask nested_mtu mssfix
+            if nested_mtu=$(upstream_tunnel_mtu "$VIA_APP" 2>/dev/null || true) &&
+               [[ -n "$nested_mtu" ]]; then
+                mssfix=$((nested_mtu - 40))
+                [ "$mssfix" -ge 576 ] || mssfix=576
+                printf 'tun-mtu %s\n' "$nested_mtu"
+                printf 'mssfix %s\n' "$mssfix"
+            fi
+            while read -r net mask; do
+                [[ -n "$net" ]] || continue
+                printf 'route %s %s\n' "$net" "$mask"
+            done < <(app_profile_networks "$VIA_APP" 2>/dev/null || true)
+            dns_policy=$(app_profile_dns_policy "$VIA_APP" 2>/dev/null || true)
+            if [[ -n "$dns_policy" ]]; then
+                servers=${dns_policy%%$'\n'*}
+                domains=${dns_policy#*$'\n'}
+                for dns in $servers; do
+                    printf 'dhcp-option DNS %s\n' "$dns"
+                done
+                if [[ "$domains" != "." ]]; then
+                    for domain in $domains; do
+                        printf 'dhcp-option DOMAIN %s\n' "$domain"
+                    done
+                fi
+            fi
+        fi
         printf '\n<ca>\n'; cat "$pki/ca.crt"; printf '</ca>\n'
         printf '\n<cert>\n'; cat "$cdir/client.crt"; printf '</cert>\n'
         printf '\n<key>\n'; cat "$cdir/client.key"; printf '</key>\n'
@@ -12763,8 +13078,9 @@ dns_proxy_exec() {
     ip netns list | awk '{print $1}' | grep -Fxq "$NS_NAME" ||
         die "Namespace '$NS_NAME' does not exist for the DNS compatibility proxy."
 
-    local profile policy split_servers="" split_domains="" vpn_type
+    local profile policy split_servers="" split_domains="" vpn_type default_dns reverse_zones=""
     vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
+    default_dns=${DNS_SERVERS:-}
     if [[ "$vpn_type" == wireguard || "$vpn_type" == amneziawg ]]; then
         profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
         policy=$(wireguard_profile_dns_policy "$profile") ||
@@ -12773,6 +13089,66 @@ dns_proxy_exec() {
             split_servers=${policy%%$'\n'*}
             split_domains=${policy#*$'\n'}
         fi
+    elif [[ "$vpn_type" == openvpn ]]; then
+        # Private-only OpenVPN clients carry their DNS policy as
+        # dhcp-option DNS/DOMAIN lines in the managed profile.
+        profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
+        policy=$(openvpn_profile_dns_policy "$profile" 2>/dev/null || true)
+        if [[ -n "$policy" ]]; then
+            split_servers=${policy%%$'\n'*}
+            split_domains=${policy#*$'\n'}
+            if [[ "$split_domains" == "." ]]; then
+                # All queries belong to the tunnel: the profile's DNS
+                # servers are the default forwarders, with no split list.
+                default_dns=$split_servers
+                split_servers=""
+                split_domains=""
+            else
+                # Split DNS: public queries stay on the configured servers,
+                # with the host's own resolvers appended as a fallback for
+                # uplinks that block direct access to public resolvers.
+                local host_ns candidate
+                host_ns=$(awk '/^[[:space:]]*nameserver[[:space:]]+/{ for (i=2;i<=NF;i++) if ($i !~ /^127\./ && $i != "::1") printf "%s ", $i }' /etc/resolv.conf 2>/dev/null)
+                for candidate in $host_ns; do
+                    [[ " $default_dns " == *" $candidate "* ]] ||
+                        default_dns="${default_dns:+$default_dns }$candidate"
+                done
+            fi
+        fi
+    fi
+
+    # Reverse (PTR) lookups for hosts inside the tunneled networks must use
+    # the private upstreams, not public DNS. Derive one in-addr.arpa zone per
+    # routed network (octet-aligned, /8-/24 granularity).
+    if app_split_tunnel "$app" && [[ -n "$split_servers" ]]; then
+        local networks
+        networks=$(app_profile_networks "$app" 2>/dev/null || true)
+        reverse_zones=$(python3 - "$networks" <<'PY_REVERSE_ZONES'
+import ipaddress
+import sys
+
+zones = []
+for raw in sys.argv[1].splitlines():
+    parts = raw.split()
+    if len(parts) != 2:
+        continue
+    try:
+        net = ipaddress.ip_network("%s/%s" % (parts[0], parts[1]), strict=False)
+    except ValueError:
+        continue
+    if net.version != 4 or net.prefixlen == 0:
+        continue
+    octets = str(net.network_address).split(".")
+    if net.prefixlen == 32:
+        count = 4
+    elif net.prefixlen > 24:
+        count = 3
+    else:
+        count = max((net.prefixlen + 7) // 8, 1)
+    zones.append(".".join(reversed(octets[:count])) + ".in-addr.arpa")
+print(" ".join(dict.fromkeys(zones)))
+PY_REVERSE_ZONES
+        )
     fi
 
     # Snap reuses a persistent mount namespace and can therefore see the
@@ -12783,7 +13159,7 @@ dns_proxy_exec() {
     # root-only DNS exception cannot leak application DNS around the kill
     # switch while the VPN is down.
     exec "$(ip_binary)" netns exec "$NS_NAME" \
-        /usr/bin/python3 - "$DNS_SERVERS" "$split_servers" "$split_domains" <<'PY_NNS_DNS_PROXY'
+        /usr/bin/python3 - "$default_dns" "$split_servers" "$split_domains" "$reverse_zones" <<'PY_NNS_DNS_PROXY'
 from __future__ import annotations
 
 import ipaddress
@@ -12826,6 +13202,9 @@ if not upstreams:
 # no fallback to ordinary DNS for private names, even if that server is down.
 private_upstreams = [(address, UPSTREAM_PORT) for address in sys.argv[2].split()]
 private_domains = tuple(suffix.lower() for suffix in sys.argv[3].split())
+private_reverse_zones = tuple(
+    suffix.lower() for suffix in sys.argv[4].split()
+) if len(sys.argv) > 4 else ()
 if bool(private_upstreams) != bool(private_domains):
     raise SystemExit("incomplete namespace split DNS policy")
 
@@ -12861,6 +13240,11 @@ def dns_upstreams(packet: bytes) -> list[tuple[str, int]]:
         return []
     if private_domains and any(suffix == "." or name == suffix or name.endswith("." + suffix)
                                for suffix in private_domains):
+        return private_upstreams
+    if (private_upstreams and private_reverse_zones and name.endswith(".in-addr.arpa") and
+            any(name == zone or name.endswith("." + zone) for zone in private_reverse_zones)):
+        # PTR lookups for tunneled networks belong to the private resolvers,
+        # not to public DNS.
         return private_upstreams
     return upstreams
 
@@ -13585,8 +13969,13 @@ myip_report_app() {
     printf 'Default gateway:   %s\n' "${gateway:-direct or unavailable}"
     printf 'Backend:           %s\n' "$type_label"
     if app_split_tunnel "$app"; then
-        printf 'Routing mode:      split (IPv4 AllowedIPs only)\n'
-        printf 'VPN tunnel:        %s\n' "$(wireguard_iface_name "$app")"
+        if [[ "$(vpn_type_for_app "$app" 2>/dev/null || true)" == openvpn ]]; then
+            printf 'Routing mode:      split (client routes only)\n'
+            printf 'VPN tunnel:        %s\n' "${dev:-unavailable}"
+        else
+            printf 'Routing mode:      split (IPv4 AllowedIPs only)\n'
+            printf 'VPN tunnel:        %s\n' "$(wireguard_iface_name "$app")"
+        fi
         printf 'VPN reachability:  not verified by external-IP probe\n'
     fi
     printf 'Configured via:    %s\n' "$configured_via"
@@ -13995,14 +14384,18 @@ status_app() {
     [[ -z "$ns_since" ]] || printf 'Namespace active:  %s\n' "$ns_since"
     [[ -z "$vpn_since" ]] || printf 'VPN active:        %s\n' "$vpn_since"
     if app_split_tunnel "$app"; then
-        printf 'Routing mode:      split (AllowedIPs only; no Internet probe)\n'
+        if [[ "$type" == openvpn ]]; then
+            printf 'Routing mode:      split (client routes only; no Internet probe)\n'
+        else
+            printf 'Routing mode:      split (AllowedIPs only; no Internet probe)\n'
+        fi
     fi
     printf 'Kill switch:       %s\n' "${KILLSWITCH:-unknown}"
     printf 'DNS servers:       %s\n' "${DNS_SERVERS:-not configured}"
-    if [[ "$type" == wireguard || "$type" == amneziawg ]]; then
+    if [[ "$type" == wireguard || "$type" == amneziawg || "$type" == openvpn ]]; then
         local dns_policy="" routed_dns="" routed_domains=""
         if [[ -n "${DEFAULT_PROFILE:-}" && -f "$(profiles_dir "$app")/$DEFAULT_PROFILE" ]]; then
-            dns_policy=$(wireguard_profile_dns_policy "$(profiles_dir "$app")/$DEFAULT_PROFILE" 2>/dev/null || true)
+            dns_policy=$(app_profile_dns_policy "$app" 2>/dev/null || true)
         fi
         if [[ -n "$dns_policy" ]]; then
             routed_dns=${dns_policy%%$'\n'*}

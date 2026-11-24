@@ -371,16 +371,16 @@ activate_namespace_split_dns() {
     local app=$1 vpn_type profile policy target search_domains
     load_cfg "$app"
     vpn_type=$(vpn_type_for_app "$app" 2>/dev/null || true)
-    [[ "$vpn_type" == wireguard || "$vpn_type" == amneziawg ]] || return 0
+    case "$vpn_type" in wireguard|amneziawg|openvpn) ;; *) return 0 ;; esac
     profile="$(profiles_dir "$app")/$DEFAULT_PROFILE"
-    policy=$(wireguard_profile_dns_policy "$profile") || return 1
+    policy=$(app_profile_dns_policy "$app") || return 1
     [[ -n "$policy" ]] || return 0
     target="/etc/netns/$NS_NAME/resolv.conf"
     [[ -f "$target" ]] || { warn "Missing namespace resolver for '$app'."; return 1; }
     # Start the daemon before pointing subsequent execs at the stub.
     # Unlike the bootstrap resolver, this proxy lives in the app namespace.
     ensure_snap_dns_proxy "$app"
-    search_domains=$(wireguard_profile_dns_policy "$profile" search) || return 1
+    search_domains=$(app_profile_dns_policy "$app" search) || return 1
     {
         printf 'nameserver 127.0.0.53\n'
         if [[ -n "$search_domains" ]]; then

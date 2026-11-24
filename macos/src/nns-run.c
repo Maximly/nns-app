@@ -11,6 +11,7 @@ Revision History:
 
 --*/
 #include <arpa/inet.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -670,6 +671,150 @@ static bool nns_host_from_operand(
 }
 
 
+typedef int (*nns_dns_resolve_fn)(const char *, struct in_addr *);
+typedef int (*nns_dns_local_fn)(const char *);
+
+
+/**
+ * nns_host_in_dns_scope() - decide whether @host uses the VPN resolver
+ *
+ * Mirrors libnnsbind's split-DNS scoping: with NNS_DNS_DOMAINS configured,
+ * only names inside those suffixes use the per-app VPN resolver; without a
+ * scope every name does.
+ *
+ * Return: 1 in scope, 0 otherwise
+ */
+static int nns_host_in_dns_scope(const char* host)
+{
+    const char* domains = getenv("NNS_DNS_DOMAINS");
+    size_t host_len;
+
+    if (!domains || !*domains)
+        return 1;
+
+    host_len = strlen(host);
+    const char* p = domains;
+    while (*p) {
+        while (*p == ' ' || *p == '\t')
+            p++;
+
+        const char* start = p;
+        while (*p && *p != ' ' && *p != '\t')
+            p++;
+
+        size_t len = (size_t)(p - start);
+        if (len == 0)
+            continue;
+        if (host_len == len && strncasecmp(host, start, len) == 0)
+            return 1;
+        if (host_len > len + 1 && host[host_len - len - 1] == '.' &&
+            strncasecmp(host + host_len - len, start, len) == 0)
+            return 1;
+    }
+
+    return 0;
+}
+
+
+/**
+ * nns_resolve_operand_text() - resolve an operand's hostname via VPN DNS
+ *  @operand: raw argv text (destination operand)
+ *  @form: plain / @server / scp / URL extraction mode
+ *  @resolve_host: dlopen()ed nns_dns_resolve_host
+ *
+ * SIP-protected tools ignore DYLD injection, so their getaddrinfo() never
+ * sees the interposer. Substitute a numeric address into their argv instead.
+ * scp/sftp host:path operands keep the ":path" suffix. Numeric, localhost,
+ * out-of-scope, and unresolvable names return NULL (argv unchanged).
+ *
+ * Return: heap-allocated replacement text, or NULL
+ */
+static char* nns_resolve_operand_text(
+    const char* operand,
+    enum nns_bind_host_form form,
+    nns_dns_resolve_fn resolve_host,
+    nns_dns_local_fn local_host)
+{
+    char host[NNS_RUN_RESOLVE_BUF];
+    char ip[NNS_RUN_RESOLVE_BUF];
+    struct in_addr addr = {};
+    const char* suffix = "";
+    size_t user_prefix_len = 0;
+    const char* dns;
+
+    if (!resolve_host)
+        return NULL;
+
+    dns = getenv("NNS_DNS_IPV4");
+    if (!dns || !*dns)
+        return NULL;
+
+    if (!nns_host_from_operand(operand, form, host, sizeof(host)))
+        return NULL;
+
+    /* Preserve any user@ prefix so ssh/scp keep the requested login; only
+     * the hostname portion is replaced with the numeric address. */
+    if (form == NNS_BIND_HOST_PLAIN) {
+        const char* at = strrchr(operand, '@');
+        if (at && at[1])
+            user_prefix_len = (size_t)(at - operand) + 1;
+    } else if (form == NNS_BIND_HOST_SCP) {
+        const char* colon = strrchr(operand, ':');
+        if (colon) {
+            for (const char* p = operand; p < colon; p++) {
+                if (*p == '@') {
+                    user_prefix_len = (size_t)(p - operand) + 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    /* ssh user@host: the scope applies to the host part. */
+    if (form == NNS_BIND_HOST_PLAIN) {
+        const char* at = strrchr(host, '@');
+        if (at && at[1]) {
+            size_t rest = strlen(at + 1) + 1;
+            memmove(host, at + 1, rest);
+        }
+    }
+
+    if (inet_pton(AF_INET, host, &addr) == 1 ||
+        inet_pton(AF_INET6, host, &addr) == 1 ||
+        strcmp(host, "localhost") == 0 || strcmp(host, "localhost.") == 0) {
+        return NULL;
+    }
+
+    /* Host-level /etc/hosts aliases resolve on the host stack; leave them
+     * untouched so the child's system resolver handles them. */
+    if (local_host && local_host(host))
+        return NULL;
+
+    if (!nns_host_in_dns_scope(host))
+        return NULL;
+
+    if (resolve_host(host, &addr) != NNS_OK)
+        return NULL;
+
+    if (!inet_ntop(AF_INET, &addr, ip, sizeof(ip)))
+        return NULL;
+
+    if (form == NNS_BIND_HOST_SCP) {
+        const char* colon = strrchr(operand, ':');
+        if (colon)
+            suffix = colon;
+    }
+
+    size_t need = user_prefix_len + strlen(ip) + strlen(suffix) + 1;
+    char* out = malloc(need);
+    if (!out)
+        return NULL;
+
+    snprintf(out, need, "%.*s%s%s", (int)user_prefix_len, operand, ip, suffix);
+    return out;
+}
+
+
 /**
  * nns_operand_is_local() - locality check for one operand under a host form
  */
@@ -921,17 +1066,23 @@ static int nns_add_bind_args(
     const char** extra,
     char* storage,
     size_t storage_size,
-    int* insert_after)
+    int* insert_after,
+    const struct nns_bind_app** out_app)
 {
     const char* name = nns_basename(program);
 
     *insert_after = NNS_RUN_INSERT_BEFORE_ALL;
+    if (out_app)
+        *out_app = NULL;
 
     for (int i = 0; i < ARRAY_SIZE(nns_bind_apps); i++) {
         const struct nns_bind_app* app = &nns_bind_apps[i];
 
         if (strcmp(name, app->name) != 0)
             continue;
+
+        if (out_app)
+            *out_app = app;
 
         switch (app->action) {
             case NNS_BIND_ACTION_REJECT_IPV6:
@@ -1015,9 +1166,21 @@ int main(int argc, char** argv)
         return 2;
     }
 
+    /* The dylib's exported resolver gives SIP-protected tools (which ignore
+     * DYLD injection) the same scoped VPN DNS the interposer provides. */
+    void* lib_handle = dlopen(lib, RTLD_LAZY | RTLD_LOCAL);
+    nns_dns_resolve_fn resolve_host = lib_handle
+        ? (nns_dns_resolve_fn)dlsym(lib_handle, "nns_dns_resolve_host")
+        : NULL;
+    nns_dns_local_fn local_host = lib_handle
+        ? (nns_dns_local_fn)dlsym(lib_handle, "nns_dns_host_is_local")
+        : NULL;
+
+    const char* existing_debug = getenv("NNS_BIND_DEBUG");
     if (setenv("NNS_BIND_IPV4", ip, 1) < 0 ||
         setenv("NNS_BIND_IFACE", iface, 1) < 0 ||
-        setenv("NNS_BIND_DEBUG", debug ? "1" : "0", 1) < 0 ||
+        setenv("NNS_BIND_DEBUG",
+            (debug || (existing_debug && *existing_debug)) ? "1" : "0", 1) < 0 ||
         unsetenv("NNS_BIND_HOOK_READY") < 0 ||
         setenv("DYLD_INSERT_LIBRARIES", lib, 1) < 0) {
         perror("setenv");
@@ -1028,10 +1191,11 @@ int main(int argc, char** argv)
     char bind_storage[NNS_RUN_BIND_STORAGE] = {};
     int insert_after = NNS_RUN_INSERT_BEFORE_ALL;
     int user_count = argc - cmd - 1;
+    const struct nns_bind_app* app = NULL;
     int extra_count = nns_add_bind_args(
         argv[cmd], iface, ip,
         (const char* const*)(argv + cmd + 1), user_count,
-        extra, bind_storage, sizeof(bind_storage), &insert_after);
+        extra, bind_storage, sizeof(bind_storage), &insert_after, &app);
 
     if (extra_count < 0)
         return NNS_RUN_EXIT_USAGE;
@@ -1063,6 +1227,38 @@ int main(int argc, char** argv)
         return NNS_RUN_EXIT_USAGE;
     }
 
+    /* Substitute a numeric address for the destination operand when the
+     * per-app VPN resolver answers an in-scope hostname. Only applies to
+     * tools with a scanned plain/scp destination (ping, nc, ssh, scp,
+     * sftp); failure keeps the original argv untouched. */
+    char** resolved_user = NULL;
+    if (resolve_host && app &&
+        (app->scan == NNS_BIND_SCAN_FIRST ||
+         app->scan == NNS_BIND_SCAN_LAST_WALK ||
+         app->scan == NNS_BIND_SCAN_LAST_PLAIN) &&
+        (app->host_form == NNS_BIND_HOST_PLAIN ||
+         app->host_form == NNS_BIND_HOST_SCP) &&
+        strcmp(app->name, "dig") != 0) {
+
+        resolved_user = calloc((size_t)user_count, sizeof(*resolved_user));
+        if (resolved_user) {
+            for (int i = 0; i < user_count; i++)
+                resolved_user[i] = (char*)argv[cmd + 1 + i];
+
+            int dest_index = -1;
+            const char* dest = nns_scan_dest(
+                (const char* const*)(argv + cmd + 1), user_count,
+                app, &dest_index);
+
+            if (dest && dest_index >= 0) {
+                char* replacement = nns_resolve_operand_text(
+                    dest, app->host_form, resolve_host, local_host);
+                if (replacement)
+                    resolved_user[dest_index] = replacement;
+            }
+        }
+    }
+
     int n = 0;
     child[n++] = argv[cmd];
     if (insert_after < NNS_RUN_INSERT_BEFORE_ALL ||
@@ -1071,13 +1267,13 @@ int main(int argc, char** argv)
     }
 
     for (int i = 0; i <= insert_after; i++)
-        child[n++] = argv[cmd + 1 + i];
+        child[n++] = resolved_user ? resolved_user[i] : argv[cmd + 1 + i];
 
     for (int i = 0; i < extra_count; i++)
         child[n++] = (char*)extra[i];
 
     for (int i = insert_after + 1; i < user_count; i++)
-        child[n++] = argv[cmd + 1 + i];
+        child[n++] = resolved_user ? resolved_user[i] : argv[cmd + 1 + i];
 
     child[n] = NULL;
 
