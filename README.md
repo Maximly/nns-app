@@ -10,7 +10,7 @@ is available: a managed kernel `utun`, interface-scoped route and an opt-in C
 socket interposer. The macOS backend is **not a network namespace or a security
 sandbox**.
 
-**Current release:** 2.2.59 · **License:** GPL-3.0-or-later · **Platforms:** Linux with systemd (Ubuntu and Fedora tested); experimental macOS WireGuard/OpenVPN/AnyConnect client · **Network stack:** IPv4
+**Current release:** 2.2.61 · **License:** GPL-3.0-or-later · **Platforms:** Linux with systemd (Ubuntu and Fedora tested); experimental macOS WireGuard/OpenVPN/AnyConnect client · **Network stack:** IPv4
 
 ## Contents
 
@@ -581,6 +581,11 @@ Change the existing gateway's exit without reissuing its client credentials:
 sudo nns-app set-via relay-gateway other-vpn
 nns-app status relay-gateway
 ```
+
+For vendor/embedded OpenVPN clients, `nns-app export ovpn … --embedded`
+produces a conservative profile (single-cipher line, no DCO/auth-nocache
+directives) for **any** server: on modern tls-crypt-v2 servers the transport
+layer stays tls-crypt-v2, only the client-side directives are simplified.
 
 Active clients briefly disconnect during upstream switching. The gateway
 attempts to restore the previous configuration if the switch fails. `host`

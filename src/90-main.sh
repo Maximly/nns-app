@@ -203,7 +203,8 @@ managed_app_run() {
 # the namespace VPN profiles configured with `nns-app add`.
 managed_client_export() {
     local app=$1 client=$2 output=$3 format=${4:-auto}
-    local fixed_ip=${5:-off} route_mode=${6:-keep} backend transport cdir sidecar
+    local fixed_ip=${5:-off} route_mode=${6:-keep} compat=${7:-modern}
+    local backend transport cdir sidecar
     require_root
     validate_gateway_name "$app"
     validate_gateway_client_name "$client"
@@ -257,7 +258,7 @@ managed_client_export() {
     if [[ "$backend" == amneziawg ]]; then
         awg_server_client_export "$app" "$client" "$output" "$route_mode"
     elif [[ "$format" == ovpn ]]; then
-        server_export_ovpn "$app" "$client" "$output" - auto modern "$fixed_ip" "$route_mode"
+        server_export_ovpn "$app" "$client" "$output" - auto "$compat" "$fixed_ip" "$route_mode"
     else
         if [[ ! -e "$cdir" ]]; then
             gateway_client_add "$app" "$client" >&2
@@ -824,8 +825,8 @@ main() {
             (( $# >= 3 )) || die "Usage: nns-app client <export|remove|add|list|revoke> <app> [client] ..."
             case "$2" in
                 export)
-                    (( $# >= 5 )) || die "Usage: nns-app client export <app> <client> --output <file> [--format ovpn|awg|nnslink] [--full-tunnel|--split-tunnel] [--fixed-ip]"
-                    local app=$3 name=$4 output="" format=auto fixed=off route=keep
+                    (( $# >= 5 )) || die "Usage: nns-app client export <app> <client> --output <file> [--format ovpn|awg|nnslink] [--embedded] [--full-tunnel|--split-tunnel] [--fixed-ip]"
+                    local app=$3 name=$4 output="" format=auto fixed=off route=keep compat=modern
                     shift 4
                     while (( $# > 0 )); do
                         case "$1" in
@@ -838,13 +839,14 @@ main() {
                                 format=$2; shift 2 ;;
                             --format=*) format=${1#--format=}; shift ;;
                             --fixed-ip) fixed=on; shift ;;
+                            --embedded) compat=embedded; shift ;;
                             --full-tunnel) route=full; shift ;;
                             --split-tunnel) route=split; shift ;;
                             *) die "Unknown client export option '$1'." ;;
                         esac
                     done
                     [[ -n "$output" ]] || die "--output is required."
-                    managed_client_export "$app" "$name" "$output" "$format" "$fixed" "$route"
+                    managed_client_export "$app" "$name" "$output" "$format" "$fixed" "$route" "$compat"
                     ;;
                 remove)
                     [[ $# -eq 4 ]] || die "Usage: nns-app client remove <app> <client>"
@@ -1135,7 +1137,7 @@ main() {
                         export)
                             (( $# >= 6 )) ||
                                 die "Usage: nns-app gateway client export <gateway_name> <client_name> --output <file.ovpn>"
-                            local export_gateway=$4 export_client=$5 export_output="" export_format="ovpn" export_static="off" export_route_mode="keep"
+                            local export_gateway=$4 export_client=$5 export_output="" export_format="ovpn" export_static="off" export_route_mode="keep" export_compat="modern"
                             shift 5
                             while (( $# > 0 )); do
                                 case "$1" in
@@ -1151,6 +1153,8 @@ main() {
                                         export_format=${1#--format=}; shift ;;
                                     --fixed-ip)
                                         export_static=on; shift ;;
+                                    --embedded)
+                                        export_compat=embedded; shift ;;
                                     --split-tunnel)
                                         export_route_mode=split; shift ;;
                                     --full-tunnel)
@@ -1161,7 +1165,7 @@ main() {
                                 esac
                             done
                             [[ -n "$export_output" ]] || die "--output is required."
-                            managed_client_export "$export_gateway" "$export_client" "$export_output" "$export_format" "$export_static" "$export_route_mode"
+                            managed_client_export "$export_gateway" "$export_client" "$export_output" "$export_format" "$export_static" "$export_route_mode" "$export_compat"
                             ;;
                         rotate)
                             [[ $# -eq 5 ]] ||

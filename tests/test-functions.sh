@@ -933,6 +933,45 @@ if grep -Eq '^route ' "$profile_root/out.ovpn"; then
     fail 'empty-inheritance client profile must not carry client routes'
 fi
 
+# --embedded for a modern server: conservative client directives, but the
+# transport layer stays tls-crypt-v2 (a client cannot change what the
+# server requires).
+(
+    profile_root="$TEST_TMP/embedded-on-modern"
+    mkdir -p "$profile_root/pki" "$profile_root/client"
+    printf 'CA\n' >"$profile_root/pki/ca.crt"
+    printf 'TLSKEY\n' >"$profile_root/pki/tls-crypt-v2-server.key"
+    printf 'CERT\n' >"$profile_root/client/client.crt"
+    printf 'KEY\n' >"$profile_root/client/client.key"
+    printf 'CLIENTTLS\n' >"$profile_root/client/tls-crypt-v2-client.key"
+    load_gateway_cfg() {
+        VIA_APP=host
+        LISTEN_PROTO=udp
+        PUBLIC_HOST=router.example.net
+        PUBLIC_PORT=21199
+        SERVER_CN=nns-gateway-serverless-gateway
+        OPENVPN_COMPAT=modern
+    }
+    gateway_client_load() { STATUS=active; }
+    gateway_client_dir() { printf '%s\n' "$profile_root/client"; }
+    gateway_pki_dir() { printf '%s\n' "$profile_root/pki"; }
+    gateway_write_client_profile_file serverless-gateway unit-client "$profile_root/out.ovpn" public embedded ||
+        fail 'embedded-on-modern client profile generation'
+)
+grep -Fxq 'cipher AES-256-GCM' "$profile_root/out.ovpn" ||
+    fail 'embedded-on-modern profile missing the conservative cipher line'
+if grep -Fq 'auth-nocache' "$profile_root/out.ovpn"; then
+    fail 'embedded-on-modern profile kept auth-nocache'
+fi
+if grep -Fq 'disable-dco' "$profile_root/out.ovpn"; then
+    fail 'embedded-on-modern profile kept disable-dco'
+fi
+grep -Fq '<tls-crypt-v2>' "$profile_root/out.ovpn" ||
+    fail 'embedded-on-modern profile lost the tls-crypt-v2 transport'
+if grep -Fq '<tls-auth>' "$profile_root/out.ovpn"; then
+    fail 'embedded-on-modern profile must not downgrade to tls-auth'
+fi
+
 # Managed gateway roots must allow traversal after OpenVPN drops privileges so
 # it can re-stat/reload pki/crl.pem, without allowing directory listings.
 (

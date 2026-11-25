@@ -1067,9 +1067,16 @@ PY_CLOAK_CLIENT_EXPORT
 
 gateway_write_client_profile_file() {
     local gateway=$1 client=$2 output=$3 target_mode=${4:-public}
+    # The profile style follows the requested compatibility (modern or
+    # embedded); the transport layer (tls-auth vs tls-crypt-v2) always
+    # follows the server's own mode, because a client cannot change what
+    # the server requires. The default resolves after load_gateway_cfg so a
+    # stale OPENVPN_COMPAT from a previous gateway cannot leak in.
+    local profile_compat=${5:-}
     local cdir pki proto remote_host remote_port private_exit dns_policy servers domains
     load_gateway_cfg "$gateway"
     gateway_client_load "$gateway" "$client"
+    [[ -n "$profile_compat" ]] || profile_compat=${OPENVPN_COMPAT:-modern}
     cdir=$(gateway_client_dir "$gateway" "$client")
     pki=$(gateway_pki_dir "$gateway")
 
@@ -1099,6 +1106,9 @@ gateway_write_client_profile_file() {
 
     {
         printf '# nns-app managed gateway profile: %s / %s\n' "$gateway" "$client"
+        if [[ "$profile_compat" == embedded && "${OPENVPN_COMPAT:-modern}" == modern ]]; then
+            printf '# Embedded-compatibility export: conservative client directives over the server tls-crypt-v2 transport.\n'
+        fi
         printf 'client\n'
         printf 'dev tun\n'
         printf 'proto %s\n' "$proto"
@@ -1106,13 +1116,13 @@ gateway_write_client_profile_file() {
         printf 'nobind\n'
         printf 'persist-key\n'
         printf 'persist-tun\n'
-        if [[ "${OPENVPN_COMPAT:-modern}" != embedded ]]; then
+        if [[ "$profile_compat" != embedded ]]; then
             printf 'auth-nocache\n'
         fi
         printf 'remote-cert-tls server\n'
         printf 'verify-x509-name %s name\n' "$SERVER_CN"
         printf 'tls-version-min 1.2\n'
-        if [[ "${OPENVPN_COMPAT:-modern}" == embedded ]]; then
+        if [[ "$profile_compat" == embedded ]]; then
             # Embedded/vendor OpenVPN clients may reject 2.5+/DCO directives.
             printf 'cipher AES-256-GCM\n'
         else

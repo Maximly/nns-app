@@ -2545,11 +2545,12 @@ gateway_client_route_mode() {
 
 gateway_client_export() {
     require_root
-    local gateway=$1 client=$2 output=$3 format=${4:-ovpn}
+    local gateway=$1 client=$2 output=$3 format=${4:-ovpn} compat=${5:-modern}
     local tmp owner group
     validate_gateway_name "$gateway"
     validate_gateway_client_name "$client"
     case "$format" in ovpn|nnslink) ;; *) die "Unsupported export format '$format'." ;; esac
+    case "$compat" in modern|embedded) ;; *) die "Unsupported export compatibility '$compat'." ;; esac
     acquire_lock "gateway-$gateway" shared
     load_gateway_cfg "$gateway"
     [[ "${GATEWAY_BACKEND:-openvpn}" != amneziawg ]] || die "Use: nns-app export awg $gateway --client $client --output client.conf"
@@ -2568,7 +2569,7 @@ gateway_client_export() {
         [[ "${TRANSPORT:-direct}" == direct ]] ||
             die "Gateway transport '$TRANSPORT' requires --format nnslink."
         tmp=$(mktemp)
-        gateway_write_client_profile_file "$gateway" "$client" "$tmp" public
+        gateway_write_client_profile_file "$gateway" "$client" "$tmp" public "$compat"
         if [[ "$output" == - ]]; then
             cat "$tmp"
         else
@@ -3610,8 +3611,8 @@ server_export_ovpn() {
     load_gateway_cfg "$gateway"
     [[ "$GATEWAY_BACKEND" == openvpn ]] ||
         die "App '$gateway' is an AmneziaWG server; export an AWG profile using 'nns-app export awg'."
-    [[ "$compat" == modern && "$OPENVPN_COMPAT" == modern ]] ||
-        die "This server uses modern OpenVPN profiles; --embedded is not supported."
+    [[ "$compat" == modern || "$compat" == embedded ]] ||
+        die "OpenVPN export compatibility must be modern or embedded."
     [[ "$public" == - || "$public" == "$PUBLIC_HOST:$PUBLIC_PORT" ]] ||
         die "Server public endpoint is $PUBLIC_HOST:$PUBLIC_PORT; export override is not supported."
     [[ "$proto" == auto || "$proto" == "$LISTEN_PROTO" ]] ||
@@ -3632,7 +3633,7 @@ server_export_ovpn() {
     if [[ "$TRANSPORT" == cloak ]]; then
         gateway_cloak_export_client_pair "$gateway" "$client" "$output"
     else
-        gateway_client_export "$gateway" "$client" "$output" ovpn
+        gateway_client_export "$gateway" "$client" "$output" ovpn "$compat"
     fi
 }
 

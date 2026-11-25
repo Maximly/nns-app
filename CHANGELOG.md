@@ -38,6 +38,12 @@ Highlights are grouped by major release series. Individual patch and minor relea
   refuses stale or utun-reused state instead of routing through the wrong
   tunnel, and `nns-app run`/`git-via` restart a stale app automatically
   via passwordless sudo before executing the command.
+
+  `nns-app export ovpn ... --embedded` now works for any OpenVPN server,
+  including modern tls-crypt-v2 ones: the profile carries conservative
+  vendor-compatible directives (single-cipher line, no DCO/auth-nocache)
+  while the transport layer follows the server's own mode. The
+  `nns-app client export` subcommand accepts `--embedded` the same way.
 - macOS: AnyConnect support with `openconnect` (Homebrew), a managed `utun`,
   `/32` address confinement, interface-scoped routes for pushed split
   networks, a generated hook instead of `vpnc-script` (no host DNS/route

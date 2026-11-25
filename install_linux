@@ -80,9 +80,9 @@ if [[ "$(uname -s)" == Darwin && "${NNS_APP_SOURCE_ONLY:-0}" != 1 ]]; then
 fi
 
 # Sole source of truth is the repo-root VERSION file. build.sh substitutes the
-# 2.2.59 token when assembling install_linux. An unsubstituted value
+# 2.2.61 token when assembling install_linux. An unsubstituted value
 # still contains "@", which triggers the source-tree file lookup.
-_nns_version="2.2.59"
+_nns_version="2.2.61"
 if [[ "$_nns_version" == *@* ]]; then
     _nns_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
     if [[ -f "$_nns_dir/VERSION" ]]; then
@@ -9231,11 +9231,12 @@ gateway_client_route_mode() {
 
 gateway_client_export() {
     require_root
-    local gateway=$1 client=$2 output=$3 format=${4:-ovpn}
+    local gateway=$1 client=$2 output=$3 format=${4:-ovpn} compat=${5:-modern}
     local tmp owner group
     validate_gateway_name "$gateway"
     validate_gateway_client_name "$client"
     case "$format" in ovpn|nnslink) ;; *) die "Unsupported export format '$format'." ;; esac
+    case "$compat" in modern|embedded) ;; *) die "Unsupported export compatibility '$compat'." ;; esac
     acquire_lock "gateway-$gateway" shared
     load_gateway_cfg "$gateway"
     [[ "${GATEWAY_BACKEND:-openvpn}" != amneziawg ]] || die "Use: nns-app export awg $gateway --client $client --output client.conf"
@@ -9254,7 +9255,7 @@ gateway_client_export() {
         [[ "${TRANSPORT:-direct}" == direct ]] ||
             die "Gateway transport '$TRANSPORT' requires --format nnslink."
         tmp=$(mktemp)
-        gateway_write_client_profile_file "$gateway" "$client" "$tmp" public
+        gateway_write_client_profile_file "$gateway" "$client" "$tmp" public "$compat"
         if [[ "$output" == - ]]; then
             cat "$tmp"
         else
@@ -10296,8 +10297,8 @@ server_export_ovpn() {
     load_gateway_cfg "$gateway"
     [[ "$GATEWAY_BACKEND" == openvpn ]] ||
         die "App '$gateway' is an AmneziaWG server; export an AWG profile using 'nns-app export awg'."
-    [[ "$compat" == modern && "$OPENVPN_COMPAT" == modern ]] ||
-        die "This server uses modern OpenVPN profiles; --embedded is not supported."
+    [[ "$compat" == modern || "$compat" == embedded ]] ||
+        die "OpenVPN export compatibility must be modern or embedded."
     [[ "$public" == - || "$public" == "$PUBLIC_HOST:$PUBLIC_PORT" ]] ||
         die "Server public endpoint is $PUBLIC_HOST:$PUBLIC_PORT; export override is not supported."
     [[ "$proto" == auto || "$proto" == "$LISTEN_PROTO" ]] ||
@@ -10318,7 +10319,7 @@ server_export_ovpn() {
     if [[ "$TRANSPORT" == cloak ]]; then
         gateway_cloak_export_client_pair "$gateway" "$client" "$output"
     else
-        gateway_client_export "$gateway" "$client" "$output" ovpn
+        gateway_client_export "$gateway" "$client" "$output" ovpn "$compat"
     fi
 }
 
@@ -11842,9 +11843,16 @@ PY_CLOAK_CLIENT_EXPORT
 
 gateway_write_client_profile_file() {
     local gateway=$1 client=$2 output=$3 target_mode=${4:-public}
+    # The profile style follows the requested compatibility (modern or
+    # embedded); the transport layer (tls-auth vs tls-crypt-v2) always
+    # follows the server's own mode, because a client cannot change what
+    # the server requires. The default resolves after load_gateway_cfg so a
+    # stale OPENVPN_COMPAT from a previous gateway cannot leak in.
+    local profile_compat=${5:-}
     local cdir pki proto remote_host remote_port private_exit dns_policy servers domains
     load_gateway_cfg "$gateway"
     gateway_client_load "$gateway" "$client"
+    [[ -n "$profile_compat" ]] || profile_compat=${OPENVPN_COMPAT:-modern}
     cdir=$(gateway_client_dir "$gateway" "$client")
     pki=$(gateway_pki_dir "$gateway")
 
@@ -11874,6 +11882,9 @@ gateway_write_client_profile_file() {
 
     {
         printf '# nns-app managed gateway profile: %s / %s\n' "$gateway" "$client"
+        if [[ "$profile_compat" == embedded && "${OPENVPN_COMPAT:-modern}" == modern ]]; then
+            printf '# Embedded-compatibility export: conservative client directives over the server tls-crypt-v2 transport.\n'
+        fi
         printf 'client\n'
         printf 'dev tun\n'
         printf 'proto %s\n' "$proto"
@@ -11881,13 +11892,13 @@ gateway_write_client_profile_file() {
         printf 'nobind\n'
         printf 'persist-key\n'
         printf 'persist-tun\n'
-        if [[ "${OPENVPN_COMPAT:-modern}" != embedded ]]; then
+        if [[ "$profile_compat" != embedded ]]; then
             printf 'auth-nocache\n'
         fi
         printf 'remote-cert-tls server\n'
         printf 'verify-x509-name %s name\n' "$SERVER_CN"
         printf 'tls-version-min 1.2\n'
-        if [[ "${OPENVPN_COMPAT:-modern}" == embedded ]]; then
+        if [[ "$profile_compat" == embedded ]]; then
             # Embedded/vendor OpenVPN clients may reject 2.5+/DCO directives.
             printf 'cipher AES-256-GCM\n'
         else
@@ -18123,7 +18134,8 @@ managed_app_run() {
 # the namespace VPN profiles configured with `nns-app add`.
 managed_client_export() {
     local app=$1 client=$2 output=$3 format=${4:-auto}
-    local fixed_ip=${5:-off} route_mode=${6:-keep} backend transport cdir sidecar
+    local fixed_ip=${5:-off} route_mode=${6:-keep} compat=${7:-modern}
+    local backend transport cdir sidecar
     require_root
     validate_gateway_name "$app"
     validate_gateway_client_name "$client"
@@ -18177,7 +18189,7 @@ managed_client_export() {
     if [[ "$backend" == amneziawg ]]; then
         awg_server_client_export "$app" "$client" "$output" "$route_mode"
     elif [[ "$format" == ovpn ]]; then
-        server_export_ovpn "$app" "$client" "$output" - auto modern "$fixed_ip" "$route_mode"
+        server_export_ovpn "$app" "$client" "$output" - auto "$compat" "$fixed_ip" "$route_mode"
     else
         if [[ ! -e "$cdir" ]]; then
             gateway_client_add "$app" "$client" >&2
@@ -18744,8 +18756,8 @@ main() {
             (( $# >= 3 )) || die "Usage: nns-app client <export|remove|add|list|revoke> <app> [client] ..."
             case "$2" in
                 export)
-                    (( $# >= 5 )) || die "Usage: nns-app client export <app> <client> --output <file> [--format ovpn|awg|nnslink] [--full-tunnel|--split-tunnel] [--fixed-ip]"
-                    local app=$3 name=$4 output="" format=auto fixed=off route=keep
+                    (( $# >= 5 )) || die "Usage: nns-app client export <app> <client> --output <file> [--format ovpn|awg|nnslink] [--embedded] [--full-tunnel|--split-tunnel] [--fixed-ip]"
+                    local app=$3 name=$4 output="" format=auto fixed=off route=keep compat=modern
                     shift 4
                     while (( $# > 0 )); do
                         case "$1" in
@@ -18758,13 +18770,14 @@ main() {
                                 format=$2; shift 2 ;;
                             --format=*) format=${1#--format=}; shift ;;
                             --fixed-ip) fixed=on; shift ;;
+                            --embedded) compat=embedded; shift ;;
                             --full-tunnel) route=full; shift ;;
                             --split-tunnel) route=split; shift ;;
                             *) die "Unknown client export option '$1'." ;;
                         esac
                     done
                     [[ -n "$output" ]] || die "--output is required."
-                    managed_client_export "$app" "$name" "$output" "$format" "$fixed" "$route"
+                    managed_client_export "$app" "$name" "$output" "$format" "$fixed" "$route" "$compat"
                     ;;
                 remove)
                     [[ $# -eq 4 ]] || die "Usage: nns-app client remove <app> <client>"
@@ -19055,7 +19068,7 @@ main() {
                         export)
                             (( $# >= 6 )) ||
                                 die "Usage: nns-app gateway client export <gateway_name> <client_name> --output <file.ovpn>"
-                            local export_gateway=$4 export_client=$5 export_output="" export_format="ovpn" export_static="off" export_route_mode="keep"
+                            local export_gateway=$4 export_client=$5 export_output="" export_format="ovpn" export_static="off" export_route_mode="keep" export_compat="modern"
                             shift 5
                             while (( $# > 0 )); do
                                 case "$1" in
@@ -19071,6 +19084,8 @@ main() {
                                         export_format=${1#--format=}; shift ;;
                                     --fixed-ip)
                                         export_static=on; shift ;;
+                                    --embedded)
+                                        export_compat=embedded; shift ;;
                                     --split-tunnel)
                                         export_route_mode=split; shift ;;
                                     --full-tunnel)
@@ -19081,7 +19096,7 @@ main() {
                                 esac
                             done
                             [[ -n "$export_output" ]] || die "--output is required."
-                            managed_client_export "$export_gateway" "$export_client" "$export_output" "$export_format" "$export_static" "$export_route_mode"
+                            managed_client_export "$export_gateway" "$export_client" "$export_output" "$export_format" "$export_static" "$export_route_mode" "$export_compat"
                             ;;
                         rotate)
                             [[ $# -eq 5 ]] ||
